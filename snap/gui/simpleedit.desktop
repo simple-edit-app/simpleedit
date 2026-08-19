@@ -1,0 +1,15 @@
+[Desktop Entry]
+Name=SimpleEdit
+GenericName=Text Editor
+GenericName[fr]=Éditeur de texte
+Comment=A fast, stable text editor with syntax highlighting
+Comment[fr]=Un éditeur de texte rapide avec coloration syntaxique
+Exec=simpleedit %F
+Icon=${SNAP}/meta/gui/simpleedit.png
+Type=Application
+Categories=Utility;TextEditor;
+MimeType=text/plain;text/x-makefile;text/x-c++hdr;text/x-c++src;text/x-chdr;text/x-csrc;text/x-java;text/x-moc;text/x-pascal;text/x-tcl;text/x-tex;application/x-shellscript;text/x-c;text/x-c++;
+StartupNotify=true
+Terminal=false
+Keywords=text;editor;code;syntax;
+Keywords[fr]=texte;éditeur;code;syntaxe;
