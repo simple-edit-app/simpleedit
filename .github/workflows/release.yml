@@ -126,12 +126,24 @@ jobs:
           cargo install --force cargo-deb
           cargo deb
           cp target/debian/*.deb ${{ github.workspace }}/
+      - name: Build AppImage
+        run: |
+          mkdir -p AppDir/usr/bin
+          cp target/release/${{ env.BINARY_NAME }} AppDir/usr/bin/
+          cp assets/simpleedit.desktop AppDir/
+          cp assets/simpleedit.png AppDir/
+          ln -s usr/bin/${{ env.BINARY_NAME }} AppDir/AppRun
+
+          curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          ./appimagetool --appimage-extract-and-run AppDir simpleedit-${{ github.ref_name }}-x86_64.AppImage
       - uses: actions/upload-artifact@v4
         with:
           name: simpleedit-linux
           path: |
             simpleedit-*.tar.gz
             *.deb
+            *.AppImage
 
   release:
     name: Create GitHub Release
@@ -151,6 +163,7 @@ jobs:
             simpleedit-*.tar.gz
             simpleedit-*-macos-aarch64.zip
             *.deb
+            *.AppImage
           generate_release_notes: true
           draft: false
 

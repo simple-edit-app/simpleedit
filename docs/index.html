@@ -296,6 +296,38 @@
 
   <div class="install-block">
     <p class="install-label">
+      <span class="lang-inline active" data-lang="en">Linux &mdash; .deb (install):</span>
+      <span class="lang-inline" data-lang="fr">Linux &mdash; .deb (installer) :</span>
+    </p>
+    <div class="code-block">
+      <code>curl -L -o simpleedit.deb "$(curl -s https://api.github.com/repos/simple-edit-app/simpleedit/releases/latest | grep -oP '"browser_download_url":\s*"\K[^"]+\.deb')" &amp;&amp; sudo apt install ./simpleedit.deb</code>
+      <button class="copy-btn" onclick="copyCode(this)">
+        <span class="lang-inline active" data-lang="en">Copy</span>
+        <span class="lang-inline" data-lang="fr">Copier</span>
+      </button>
+    </div>
+  </div>
+
+  <div class="install-block">
+    <p class="install-label">
+      <span class="lang-inline active" data-lang="en">Linux &mdash; AppImage (install):</span>
+      <span class="lang-inline" data-lang="fr">Linux &mdash; AppImage (installer) :</span>
+    </p>
+    <div class="code-block">
+      <code>curl -L -o simpleedit.AppImage "$(curl -s https://api.github.com/repos/simple-edit-app/simpleedit/releases/latest | grep -oP '"browser_download_url":\s*"\K[^"]+\.AppImage')" &amp;&amp; chmod +x simpleedit.AppImage &amp;&amp; ./simpleedit.AppImage</code>
+      <button class="copy-btn" onclick="copyCode(this)">
+        <span class="lang-inline active" data-lang="en">Copy</span>
+        <span class="lang-inline" data-lang="fr">Copier</span>
+      </button>
+    </div>
+    <p class="install-note">
+      <span lang-content="en" class="active">Portable &mdash; no installation needed. To add it to your app menu, move it into <code>~/.local/bin</code> and drop a <code>.desktop</code> entry (or use a tool like AppImageLauncher).</span>
+      <span lang-content="fr">Portable &mdash; aucune installation requise. Pour l&rsquo;ajouter &agrave; votre menu d&rsquo;applications, d&eacute;placez-le dans <code>~/.local/bin</code> et ajoutez une entr&eacute;e <code>.desktop</code> (ou utilisez un outil comme AppImageLauncher).</span>
+    </p>
+  </div>
+
+  <div class="install-block">
+    <p class="install-label">
       <span class="lang-inline active" data-lang="en">Uninstall (macOS &amp; Linux):</span>
       <span class="lang-inline" data-lang="fr">D&eacute;sinstaller (macOS &amp; Linux) :</span>
     </p>
@@ -348,12 +380,33 @@
     </p>
   </div>
 
+  <div class="install-block">
+    <p class="install-label">
+      <span class="lang-inline active" data-lang="en">Linux &mdash; AppImage (uninstall):</span>
+      <span class="lang-inline" data-lang="fr">Linux &mdash; AppImage (d&eacute;sinstaller) :</span>
+    </p>
+    <div class="code-block">
+      <code>rm -f simpleedit.AppImage ~/.local/bin/simpleedit.AppImage ~/.local/share/applications/simpleedit.desktop</code>
+      <button class="copy-btn" onclick="copyCode(this)">
+        <span class="lang-inline active" data-lang="en">Copy</span>
+        <span class="lang-inline" data-lang="fr">Copier</span>
+      </button>
+    </div>
+    <p class="install-note">
+      <span lang-content="en" class="active">Removes the AppImage from the current directory and, if you integrated it, from <code>~/.local/bin</code> and your app menu.</span>
+      <span lang-content="fr">Supprime l&rsquo;AppImage du dossier courant et, si vous l&rsquo;aviez int&eacute;gr&eacute;, de <code>~/.local/bin</code> et de votre menu d&rsquo;applications.</span>
+    </p>
+  </div>
+
   <div class="download-row">
     <a class="btn btn-secondary" href="https://github.com/simple-edit-app/simpleedit/releases/latest">
       &#127822; <span class="lang-inline active" data-lang="en">Download .tar.gz (macOS)</span><span class="lang-inline" data-lang="fr">T&eacute;l&eacute;charger .tar.gz (macOS)</span>
     </a>
     <a class="btn btn-secondary" href="https://github.com/simple-edit-app/simpleedit/releases/latest">
       &#127823; <span class="lang-inline active" data-lang="en">Download .deb (Linux)</span><span class="lang-inline" data-lang="fr">T&eacute;l&eacute;charger .deb (Linux)</span>
+    </a>
+    <a class="btn btn-secondary" href="https://github.com/simple-edit-app/simpleedit/releases/latest">
+      &#128230; <span class="lang-inline active" data-lang="en">Download .AppImage (Linux)</span><span class="lang-inline" data-lang="fr">T&eacute;l&eacute;charger .AppImage (Linux)</span>
     </a>
   </div>
 </section>
