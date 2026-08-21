@@ -74,8 +74,11 @@ case "$OS" in
 
         if command -v brew &>/dev/null; then
             info "Installing via Homebrew…"
-            brew tap simple-edit-app/tap 2>/dev/null || true
-            brew install --cask simpleedit
+            # Use the fully-qualified cask name so Homebrew auto-taps and
+            # auto-trusts this one cask non-interactively (tapping first,
+            # then installing by short name, hits the interactive tap-trust
+            # prompt added in Homebrew 6.0 and fails under `curl | bash`).
+            brew install --cask simple-edit-app/tap/simpleedit
         else
             # Manual install: extract binary to /usr/local/bin
             TARBALL="simpleedit-${VERSION}-aarch64-apple-darwin.tar.gz"
