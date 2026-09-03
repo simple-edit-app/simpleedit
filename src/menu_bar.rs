@@ -29,10 +29,6 @@ pub fn view(config: &Config, open: Option<TopMenu>) -> Element<'static, Message>
         top_button(t!("menu.edit").to_string(), TopMenu::Edit),
         top_button(t!("menu.view").to_string(), TopMenu::View),
         top_button(t!("menu.help").to_string(), TopMenu::Help),
-        Space::with_width(Length::Fill),
-        text(t!("app.title").to_string())
-            .size(12)
-            .style(theme::muted_text(dark)),
     ]
     .spacing(2)
     .padding([4, 10]);

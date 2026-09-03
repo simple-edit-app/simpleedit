@@ -611,7 +611,14 @@ impl Application for SimpleEditApp {
 
 impl SimpleEditApp {
     fn handle(&mut self, message: Message) -> Command<Message> {
-        if !matches!(&message, Message::ToggleMenu(_)) {
+        // Passive/background messages must not close an open dropdown: X11
+        // fires a spurious ModifiersChanged right after the very click that
+        // opens the menu, and AutoSave ticks every 5s regardless of the UI.
+        let closes_menu = !matches!(
+            &message,
+            Message::ToggleMenu(_) | Message::ModifiersChanged { .. } | Message::AutoSave
+        );
+        if closes_menu {
             self.open_menu = None;
         }
 
