@@ -85,8 +85,9 @@ impl EditorState {
         };
         let extension = self.language.clone().unwrap_or_default();
         let (query, case_sensitive, use_regex) = search
-            .map(|s| (s.query.clone(), s.case_sensitive, s.use_regex))
+            .and_then(SearchState::highlight_query)
             .unwrap_or_default();
+        let current = search.and_then(SearchState::current_match_line);
 
         let editor = text_editor(&self.content)
             .on_action(Message::EditorAction)
@@ -99,6 +100,7 @@ impl EditorState {
                     query,
                     case_sensitive,
                     use_regex,
+                    current,
                 },
                 highlighter::to_format,
             )

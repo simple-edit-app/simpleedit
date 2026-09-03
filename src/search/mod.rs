@@ -18,6 +18,8 @@ pub enum SearchMessage {
     Find,
     /// Shift+Enter, or the up-arrow button.
     FindPrevious,
+    /// Replaces the current match only, then advances to the next one.
+    Replace,
     ReplaceAll,
     // Not wired to any UI control yet, but supported end-to-end.
     #[allow(dead_code)]
@@ -37,6 +39,19 @@ pub struct SearchState {
     matches: Vec<Range<usize>>,
     /// Index into `matches` of the one currently selected in the editor.
     current: Option<usize>,
+    /// (line index, byte range within that line) of the current match —
+    /// `text_editor` only draws its own selection highlight while focused,
+    /// which the search field holds instead, so the editor's highlighter
+    /// needs this to mark the current match some other way. Kept alongside
+    /// `current` rather than recomputed from it, since that needs the
+    /// buffer text this struct doesn't otherwise hold onto.
+    current_line: Option<(usize, Range<usize>)>,
+    /// Whether `query`/`case_sensitive`/`use_regex` reflect a search that
+    /// actually ran (a `Find`/`FindPrevious`), as opposed to being mid-edit.
+    /// The editor's highlighter only sees the query once this is true, so
+    /// typing in the field doesn't force a full re-highlight of the buffer
+    /// on every keystroke — only committing the search does.
+    committed: bool,
 }
 
 impl SearchState {
@@ -50,7 +65,24 @@ impl SearchState {
             last_error: None,
             matches: Vec::new(),
             current: None,
+            current_line: None,
+            committed: false,
         }
+    }
+
+    /// The current match's (line index, byte range within that line), for
+    /// the editor's highlighter to style apart from the other matches.
+    pub fn current_match_line(&self) -> Option<(usize, Range<usize>)> {
+        self.current_line.clone()
+    }
+
+    /// The query the editor's highlighter should actually match against —
+    /// `None` while the field is being edited but no search has run yet, so
+    /// typing doesn't force a full re-highlight of the buffer on every
+    /// keystroke.
+    pub fn highlight_query(&self) -> Option<(String, bool, bool)> {
+        self.committed
+            .then(|| (self.query.clone(), self.case_sensitive, self.use_regex))
     }
 
     pub fn update(&mut self, msg: SearchMessage, content: &mut iced::widget::text_editor::Content) {
@@ -60,17 +92,23 @@ impl SearchState {
                 self.last_error = None;
                 self.matches.clear();
                 self.current = None;
+                self.current_line = None;
+                self.committed = false;
             }
             SearchMessage::ReplaceChanged(r) => self.replacement = r,
             SearchMessage::ToggleRegex => {
                 self.use_regex = !self.use_regex;
                 self.matches.clear();
                 self.current = None;
+                self.current_line = None;
+                self.committed = false;
             }
             SearchMessage::ToggleCaseSensitive => {
                 self.case_sensitive = !self.case_sensitive;
                 self.matches.clear();
                 self.current = None;
+                self.current_line = None;
+                self.committed = false;
             }
             SearchMessage::ReplaceAll => {
                 let text = content.text();
@@ -82,10 +120,43 @@ impl SearchState {
                 }
                 self.matches.clear();
                 self.current = None;
+                self.current_line = None;
+                self.committed = false;
             }
             SearchMessage::Find => self.jump(content, true),
             SearchMessage::FindPrevious => self.jump(content, false),
+            SearchMessage::Replace => self.replace_current(content),
         }
+    }
+
+    /// Replaces the current match — the one already selected in the editor
+    /// by a prior `Find`/`FindPrevious` — with the replacement text, then
+    /// jumps to whatever match now follows it.
+    ///
+    /// With no current match yet (the field was just opened, or the buffer
+    /// changed since), this is the same as a first `Find`: it only jumps,
+    /// same as pressing Enter — replacing nothing was ever selected would be
+    /// a surprise, not a convenience.
+    fn replace_current(&mut self, content: &mut iced::widget::text_editor::Content) {
+        if self.current.is_none() || self.matches.is_empty() {
+            self.jump(content, true);
+            return;
+        }
+
+        // The current match is already selected in the editor (that's how
+        // it got highlighted); pasting over a selection replaces it, same
+        // as the context menu's own Cut/Paste.
+        content.perform(iced::widget::text_editor::Action::Edit(
+            iced::widget::text_editor::Edit::Paste(std::sync::Arc::new(self.replacement.clone())),
+        ));
+
+        // The buffer just changed, so the old byte ranges no longer apply —
+        // re-find from the cursor, which now sits right after the
+        // replacement.
+        self.current = None;
+        self.current_line = None;
+        self.committed = false;
+        self.jump(content, true);
     }
 
     /// (Re)finds every match, then selects the next one (`forward`) or the
@@ -103,6 +174,8 @@ impl SearchState {
                 self.matches.clear();
                 self.match_count = 0;
                 self.current = None;
+                self.current_line = None;
+                self.committed = false;
                 self.last_error = Some(e);
                 return;
             }
@@ -110,6 +183,8 @@ impl SearchState {
 
         if self.matches.is_empty() {
             self.current = None;
+            self.current_line = None;
+            self.committed = false;
             return;
         }
 
@@ -122,6 +197,8 @@ impl SearchState {
         };
 
         self.current = Some(next);
+        self.current_line = Some(byte_range_to_line_local(&text, &self.matches[next]));
+        self.committed = true;
         select_range(content, &text, self.matches[next].clone());
     }
 
@@ -165,6 +242,7 @@ impl SearchState {
         let find_placeholder = t!("search.find_placeholder").to_string();
         let replace_placeholder = t!("search.replace_placeholder").to_string();
         let find_label = t!("search.find").to_string();
+        let replace_label = t!("search.replace").to_string();
         let replace_all_label = t!("search.replace_all").to_string();
 
         let action = |label: String, message: Message| {
@@ -199,6 +277,7 @@ impl SearchState {
                 .size(13)
                 .width(220),
             action(find_label, Message::Search(SearchMessage::Find)),
+            action(replace_label, Message::Search(SearchMessage::Replace)),
             action(
                 replace_all_label,
                 Message::Search(SearchMessage::ReplaceAll)
@@ -301,6 +380,21 @@ fn byte_range_to_line_col(text: &str, range: &Range<usize>) -> (usize, usize, us
     (0, 0, 0)
 }
 
+/// Converts a byte range into (line index, byte range within that line) —
+/// what the editor's highlighter matches its own per-line, byte-based
+/// search results against.
+fn byte_range_to_line_local(text: &str, range: &Range<usize>) -> (usize, Range<usize>) {
+    let mut offset = 0;
+    for (line_idx, l) in text.split('\n').enumerate() {
+        let line_end = offset + l.len();
+        if range.start >= offset && range.start <= line_end {
+            return (line_idx, range.start - offset..range.end - offset);
+        }
+        offset = line_end + 1;
+    }
+    (0, 0..0)
+}
+
 /// Selects `range` in the editor. `text_editor` has no "select this byte
 /// range" action, only relative motions — same approach as jumping to a
 /// line in the Go to Line dialog.
@@ -340,6 +434,8 @@ mod tests {
             last_error: None,
             matches: Vec::new(),
             current: None,
+            current_line: None,
+            committed: false,
         }
     }
 

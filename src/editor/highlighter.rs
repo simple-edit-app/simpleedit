@@ -3,50 +3,78 @@
 //! losing syntax colors.
 //!
 //! `iced`'s text-highlighting API can only recolor/re-font a range of text —
-//! there is no per-range background, so a match reads as bold, accent-
-//! colored text rather than a classic highlighter-pen box. The *current*
-//! match still gets a real highlighted background: the search module
-//! additionally selects it in the editor, and selection highlighting is a
-//! real background the editor already draws.
+//! there is no per-range background — and, separately, `text_editor` only
+//! draws its selection highlight while it holds keyboard focus, which the
+//! search field does instead while searching. So neither the "all matches"
+//! nor the "current match" indication can lean on the editor's own
+//! selection; both go through this highlighter, driven by data (the query,
+//! and the current match's position) rather than focus or a real
+//! background.
 
 use std::ops::Range;
 
 use iced::advanced::text::{self, highlighter::Format};
-use iced::{highlighter as syntax, Font};
+use iced::{highlighter as syntax, Color, Font};
 use regex::Regex;
 
 /// Settings for the combined highlighter: the underlying syntax settings,
-/// plus the live search query driving the second pass.
+/// the live search query driving the second pass, and — if a search is
+/// active and has a current match — that match's position, so it can be
+/// styled apart from the others.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     pub syntax: syntax::Settings,
     pub query: String,
     pub case_sensitive: bool,
     pub use_regex: bool,
+    /// (line index, byte range within that line) of the current match.
+    pub current: Option<(usize, Range<usize>)>,
 }
 
-/// One highlighted span: the syntax format underneath, and whether a search
-/// match covers it.
+/// Whether a highlighted span is a search match, and if so, whether it's the
+/// one the search bar is currently on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchKind {
+    None,
+    Match,
+    Current,
+}
+
+/// One highlighted span: the syntax format underneath, and whether/how a
+/// search match covers it.
 #[derive(Debug, Clone, Copy)]
 pub struct Highlight {
     format: Format<Font>,
-    is_match: bool,
+    kind: MatchKind,
+}
+
+/// The accent violet used for every other match, so the current one — a
+/// warmer amber — reads as distinct rather than as "yet another match".
+fn current_match_color() -> Color {
+    Color::from_rgb(0.90, 0.58, 0.10)
+}
+
+fn bold() -> Font {
+    Font {
+        weight: iced::font::Weight::Bold,
+        ..Font::DEFAULT
+    }
 }
 
 /// The `to_format` callback `text_editor::highlight` expects — a bare `fn`,
-/// so a search match's styling (bold + accent) has to be hardcoded here
-/// rather than threaded through as data.
+/// so this styling has to be hardcoded here rather than threaded through as
+/// data.
 pub fn to_format(highlight: &Highlight, _theme: &iced::Theme) -> Format<Font> {
-    if highlight.is_match {
-        Format {
+    match highlight.kind {
+        MatchKind::Current => Format {
+            color: Some(current_match_color()),
+            font: Some(bold()),
+        },
+        MatchKind::Match => Format {
             color: Some(crate::theme::accent_color()),
-            font: Some(Font {
-                weight: iced::font::Weight::Bold,
-                ..Font::DEFAULT
-            }),
-        }
-    } else {
-        highlight.format
+            font: Some(bold()),
+        },
+        MatchKind::None => highlight.format,
     }
 }
 
@@ -56,17 +84,20 @@ pub struct Highlighter {
     query: String,
     case_sensitive: bool,
     use_regex: bool,
+    current: Option<(usize, Range<usize>)>,
     /// Compiled once per `update`, not per line — `None` when the query
     /// isn't in use, is empty, or (regex mode) doesn't compile.
     regex: Option<Regex>,
 }
 
 impl Highlighter {
-    fn line_matches(&self, line: &str) -> Vec<Range<usize>> {
+    /// Every match on `line`, each flagged with whether it's the current one
+    /// — `line_idx` is which line this is, matched against `self.current`.
+    fn line_matches(&self, line: &str, line_idx: usize) -> Vec<(Range<usize>, bool)> {
         if self.query.is_empty() {
             return Vec::new();
         }
-        if self.use_regex {
+        let ranges: Vec<Range<usize>> = if self.use_regex {
             match &self.regex {
                 Some(re) => re.find_iter(line).map(|m| m.start()..m.end()).collect(),
                 None => Vec::new(),
@@ -82,7 +113,21 @@ impl Highlighter {
                 .match_indices(lower_query.as_str())
                 .map(|(i, _)| i..i + lower_query.len())
                 .collect()
-        }
+        };
+
+        let current = self
+            .current
+            .as_ref()
+            .filter(|(l, _)| *l == line_idx)
+            .map(|(_, r)| r.clone());
+
+        ranges
+            .into_iter()
+            .map(|r| {
+                let is_current = current.as_ref() == Some(&r);
+                (r, is_current)
+            })
+            .collect()
     }
 }
 
@@ -106,20 +151,29 @@ impl text::Highlighter for Highlighter {
             query: settings.query.clone(),
             case_sensitive: settings.case_sensitive,
             use_regex: settings.use_regex,
+            current: settings.current.clone(),
             regex: compile_regex(settings),
         }
     }
 
     fn update(&mut self, settings: &Self::Settings) {
-        // Re-parsing from scratch is only needed when the syntax itself
-        // changed — a keystroke in the search field shouldn't pay for that.
-        if settings.syntax != self.syntax_settings {
-            self.inner.update(&settings.syntax);
-            self.syntax_settings = settings.syntax.clone();
-        }
+        // `update` is only called when `Settings` actually changed (the
+        // widget compares by PartialEq), and — since `SearchState` only
+        // hands the query over once a search has actually run, not on every
+        // keystroke — that's now a real action (Find/Next/Previous/Replace,
+        // or a file/theme switch), not something that fires on every
+        // keystroke. So there's no need to guard the inner update: even
+        // when only the search overlay changed, every already-shaped line
+        // needs telling its *effective* highlight may have changed, and
+        // `iced_highlighter::Highlighter::update` is what does that (it
+        // resets to line 0 internally) — re-deriving the same syntax/theme
+        // it already has is a rounding error next to that.
+        self.inner.update(&settings.syntax);
+        self.syntax_settings = settings.syntax.clone();
         self.query = settings.query.clone();
         self.case_sensitive = settings.case_sensitive;
         self.use_regex = settings.use_regex;
+        self.current = settings.current.clone();
         self.regex = compile_regex(settings);
     }
 
@@ -128,16 +182,20 @@ impl text::Highlighter for Highlighter {
     }
 
     fn highlight_line(&mut self, line: &str) -> Self::Iterator<'_> {
+        // current_line() is the index of the line about to be processed —
+        // highlight_line() below advances it, so this has to be read first.
+        let line_idx = self.inner.current_line();
+
         let base: Vec<(Range<usize>, Format<Font>)> = self
             .inner
             .highlight_line(line)
             .map(|(range, highlight)| (range, highlight.to_format()))
             .collect();
 
-        let matches = self.line_matches(line);
+        let matches = self.line_matches(line, line_idx);
         overlay_matches(base, &matches)
             .into_iter()
-            .map(|(range, format, is_match)| (range, Highlight { format, is_match }))
+            .map(|(range, format, kind)| (range, Highlight { format, kind }))
             .collect::<Vec<_>>()
             .into_iter()
     }
@@ -148,22 +206,23 @@ impl text::Highlighter for Highlighter {
 }
 
 /// Splits `base` (ranges tiling a line, each carrying a `T`) at every
-/// boundary in `matches` (non-overlapping ranges into the same line),
-/// producing the minimal set of sub-ranges needed to tag each one with both
-/// its underlying `T` and whether a match covers it.
+/// boundary in `matches` (non-overlapping ranges into the same line, each
+/// flagged with whether it's the current match), producing the minimal set
+/// of sub-ranges needed to tag each one with its underlying `T` and its
+/// [`MatchKind`].
 fn overlay_matches<T: Copy>(
     base: Vec<(Range<usize>, T)>,
-    matches: &[Range<usize>],
-) -> Vec<(Range<usize>, T, bool)> {
+    matches: &[(Range<usize>, bool)],
+) -> Vec<(Range<usize>, T, MatchKind)> {
     if matches.is_empty() {
         return base
             .into_iter()
-            .map(|(range, t)| (range, t, false))
+            .map(|(range, t)| (range, t, MatchKind::None))
             .collect();
     }
 
     let mut cuts: Vec<usize> = base.iter().flat_map(|(r, _)| [r.start, r.end]).collect();
-    cuts.extend(matches.iter().flat_map(|r| [r.start, r.end]));
+    cuts.extend(matches.iter().flat_map(|(r, _)| [r.start, r.end]));
     cuts.sort_unstable();
     cuts.dedup();
 
@@ -176,8 +235,12 @@ fn overlay_matches<T: Copy>(
         let Some(&(_, t)) = base.iter().find(|(r, _)| r.start <= a && a < r.end) else {
             continue;
         };
-        let is_match = matches.iter().any(|r| r.start <= a && a < r.end);
-        out.push((a..b, t, is_match));
+        let kind = match matches.iter().find(|(r, _)| r.start <= a && a < r.end) {
+            Some((_, true)) => MatchKind::Current,
+            Some((_, false)) => MatchKind::Match,
+            None => MatchKind::None,
+        };
+        out.push((a..b, t, kind));
     }
     out
 }
@@ -198,7 +261,13 @@ mod tests {
     fn no_matches_leaves_base_ranges_untouched() {
         let base = vec![(0..3, fmt(1)), (3..6, fmt(2))];
         let out = overlay_matches(base.clone(), &[]);
-        assert_eq!(out, vec![(0..3, fmt(1), false), (3..6, fmt(2), false)]);
+        assert_eq!(
+            out,
+            vec![
+                (0..3, fmt(1), MatchKind::None),
+                (3..6, fmt(2), MatchKind::None)
+            ]
+        );
     }
 
     #[test]
@@ -206,13 +275,13 @@ mod tests {
         // "let x = 1" — one base range (plain text, no real syntax spans),
         // with a match on "x" at 4..5.
         let base = vec![(0..9, fmt(1))];
-        let out = overlay_matches(base, &[4..5]);
+        let out = overlay_matches(base, &[(4..5, false)]);
         assert_eq!(
             out,
             vec![
-                (0..4, fmt(1), false),
-                (4..5, fmt(1), true),
-                (5..9, fmt(1), false)
+                (0..4, fmt(1), MatchKind::None),
+                (4..5, fmt(1), MatchKind::Match),
+                (5..9, fmt(1), MatchKind::None)
             ]
         );
     }
@@ -220,14 +289,14 @@ mod tests {
     #[test]
     fn a_match_spanning_two_base_ranges_splits_both() {
         let base = vec![(0..3, fmt(1)), (3..6, fmt(2))];
-        let out = overlay_matches(base, &[2..4]);
+        let out = overlay_matches(base, &[(2..4, false)]);
         assert_eq!(
             out,
             vec![
-                (0..2, fmt(1), false),
-                (2..3, fmt(1), true),
-                (3..4, fmt(2), true),
-                (4..6, fmt(2), false)
+                (0..2, fmt(1), MatchKind::None),
+                (2..3, fmt(1), MatchKind::Match),
+                (3..4, fmt(2), MatchKind::Match),
+                (4..6, fmt(2), MatchKind::None)
             ]
         );
     }
@@ -235,8 +304,29 @@ mod tests {
     #[test]
     fn a_match_exactly_covering_a_base_range_needs_no_split() {
         let base = vec![(0..3, fmt(1)), (3..6, fmt(2))];
-        let out = overlay_matches(base, &[3..6]);
-        assert_eq!(out, vec![(0..3, fmt(1), false), (3..6, fmt(2), true)]);
+        let out = overlay_matches(base, &[(3..6, false)]);
+        assert_eq!(
+            out,
+            vec![
+                (0..3, fmt(1), MatchKind::None),
+                (3..6, fmt(2), MatchKind::Match)
+            ]
+        );
+    }
+
+    #[test]
+    fn the_current_match_is_tagged_separately_from_the_others() {
+        let base = vec![(0..9, fmt(1))];
+        let out = overlay_matches(base, &[(0..1, false), (4..5, true)]);
+        assert_eq!(
+            out,
+            vec![
+                (0..1, fmt(1), MatchKind::Match),
+                (1..4, fmt(1), MatchKind::None),
+                (4..5, fmt(1), MatchKind::Current),
+                (5..9, fmt(1), MatchKind::None),
+            ]
+        );
     }
 
     #[test]
@@ -249,6 +339,7 @@ mod tests {
             query: query.to_string(),
             case_sensitive: false,
             use_regex,
+            current: None,
         };
         assert!(compile_regex(&s("abc", false)).is_none());
         assert!(compile_regex(&s("", true)).is_none());

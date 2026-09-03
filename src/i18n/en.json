@@ -43,6 +43,7 @@
   "search.find_placeholder": "Find...",
   "search.replace_placeholder": "Replace with...",
   "search.find": "Find",
+  "search.replace": "Replace",
   "search.replace_all": "Replace All",
   "search.matches": "matches",
   "search.regex": "Regex",

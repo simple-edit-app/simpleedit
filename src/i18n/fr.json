@@ -43,6 +43,7 @@
   "search.find_placeholder": "Chercher...",
   "search.replace_placeholder": "Remplacer par...",
   "search.find": "Chercher",
+  "search.replace": "Remplacer",
   "search.replace_all": "Tout remplacer",
   "search.matches": "correspondances",
   "search.regex": "Regex",
