@@ -152,8 +152,31 @@ fn install_blocking(path: &std::path::Path) -> Result<(), String> {
     }
 }
 
-pub fn restart() {
+/// Re-executes the just-installed binary and exits this process.
+///
+/// The `Ok` case never actually returns — a successful respawn calls
+/// `process::exit` immediately. The `Err` case lets the caller show the
+/// user something instead of the app just vanishing, which is what used to
+/// happen: the spawn failure was silently swallowed.
+pub fn restart() -> Result<(), String> {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("simpleedit"));
-    let _ = std::process::Command::new(exe).spawn();
+
+    // A package manager (dpkg, etc.) replaces the binary file in place while
+    // this process is still running it. On Linux that makes current_exe()
+    // report something like "/usr/bin/simpleedit (deleted)": the kernel's
+    // way of saying the path this process was loaded from no longer has a
+    // directory entry, even though a freshly installed file now sits at
+    // that same path. Command::new() on that literal string can't find
+    // anything there, so fall back to the bare name and let PATH resolve
+    // the new file instead.
+    let exe = if exe.exists() {
+        exe
+    } else {
+        PathBuf::from("simpleedit")
+    };
+
+    std::process::Command::new(&exe)
+        .spawn()
+        .map_err(|e| t!("update.err_restart", error = e.to_string()).to_string())?;
     std::process::exit(0);
 }

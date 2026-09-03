@@ -1512,7 +1512,10 @@ impl SimpleEditApp {
                 Command::none()
             }
             Message::UpdateInstalled(Ok(())) => {
-                crate::updater::restart();
+                // On success this never returns — the process re-execs and exits.
+                if let Err(e) = crate::updater::restart() {
+                    self.overlay = ActiveOverlay::UpdateError(e);
+                }
                 Command::none()
             }
             Message::UpdateInstalled(Err(e)) => {

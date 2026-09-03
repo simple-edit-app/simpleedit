@@ -39,6 +39,7 @@
   "update.err_api": "Réponse de l'API invalide",
   "update.err_extract": "Échec de l'extraction de l'archive",
   "update.err_install": "Échec de l'installation (%{tool})",
+  "update.err_restart": "Mise à jour installée, mais SimpleEdit n'a pas pu redémarrer automatiquement (%{error}). Relancez-le manuellement.",
   "search.find_placeholder": "Chercher...",
   "search.replace_placeholder": "Remplacer par...",
   "search.find": "Chercher",

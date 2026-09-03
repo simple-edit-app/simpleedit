@@ -39,6 +39,7 @@
   "update.err_api": "Invalid API response",
   "update.err_extract": "Could not extract the archive",
   "update.err_install": "Installation failed (%{tool})",
+  "update.err_restart": "Update installed, but SimpleEdit couldn't restart itself (%{error}). Please start it again manually.",
   "search.find_placeholder": "Find...",
   "search.replace_placeholder": "Replace with...",
   "search.find": "Find",

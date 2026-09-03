@@ -59,14 +59,15 @@ impl PreviewKind {
         }
     }
 
-    /// Glyphs picked from DejaVu Sans, the default face on every target: stacked
-    /// lines for the source, a pilcrow for the rendered document, a split square
-    /// for the side-by-side view, a boxed plus for the expandable JSON tree.
+    /// Stacked lines for the source, a pilcrow for the rendered document, a
+    /// split square for the side-by-side view, literal braces for the JSON
+    /// tree — chosen so every one of them is a plain, unambiguous glyph
+    /// rather than a symbol that depends on a particular font's coverage.
     fn icon(self, mode: ViewMode) -> &'static str {
         match (self, mode) {
             (_, ViewMode::Raw) => "\u{2261}",
             (PreviewKind::Markdown, ViewMode::Preview) => "\u{00B6}",
-            (PreviewKind::Json, ViewMode::Preview) => "\u{229E}",
+            (PreviewKind::Json, ViewMode::Preview) => "{}",
             (_, ViewMode::Split) => "\u{25EB}",
         }
     }
@@ -80,13 +81,20 @@ pub fn toolbar(kind: PreviewKind, mode: ViewMode, dark: bool) -> Element<'static
     let mut bar = row![Space::with_width(Length::Fill)].spacing(2);
 
     for m in kind.modes() {
-        let icon = button(text(kind.icon(*m)).size(15))
-            .padding([1, 7])
-            .on_press(Message::SetViewMode(*m))
-            .style(iced::theme::Button::custom(theme::GhostButton {
-                dark,
-                active: mode == *m,
-            }));
+        // Advanced shaping: the same fix as the preview's own emoji glyphs,
+        // in case one of these symbols isn't in whatever font the button
+        // ends up resolving on a given system.
+        let icon = button(
+            text(kind.icon(*m))
+                .size(15)
+                .shaping(iced::widget::text::Shaping::Advanced),
+        )
+        .padding([1, 7])
+        .on_press(Message::SetViewMode(*m))
+        .style(iced::theme::Button::custom(theme::GhostButton {
+            dark,
+            active: mode == *m,
+        }));
 
         bar = bar.push(
             tooltip(
