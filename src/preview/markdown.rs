@@ -739,28 +739,40 @@ fn table_view(
         .len()
         .max(rows.iter().map(Vec::len).max().unwrap_or(0));
 
-    let align_of = |col: usize| alignments.get(col).copied().unwrap_or(Align::Left).into();
-
-    let cell = |spans: &[Span], col: usize, is_header: bool| -> Element<'static, Message> {
+    // A cell must report its own natural (Shrink) width for Grid to size
+    // the column around it — Grid's own measurement pass hands every cell
+    // `Limits::NONE` (i.e. an unbounded max), and a `Length::Fill` cell
+    // resolves that straight to `f32::INFINITY`, which Grid then treats as
+    // contributing *zero* to the column's width. So alignment can't be a
+    // per-cell `container::align_x` here (that collapses the whole table);
+    // it's Grid's own single, table-wide `horizontal_alignment` instead,
+    // applied only when every column actually agrees on one.
+    let cell = |spans: &[Span], is_header: bool| -> Element<'static, Message> {
         let font = if is_header {
             bold_font()
         } else {
             Font::DEFAULT
         };
         container(spans_view(spans, BODY_SIZE, p.text, dark, font))
-            .width(Length::Fill)
-            .align_x(align_of(col))
             .padding([6, 10])
             .style(theme::table_cell(dark, is_header))
             .into()
     };
 
+    let uniform_alignment = alignments
+        .first()
+        .filter(|first| alignments.iter().all(|a| a == *first))
+        .copied();
+
     let mut grid = Grid::new().column_width(Length::Shrink);
+    if let Some(align) = uniform_alignment {
+        grid = grid.horizontal_alignment(align.into());
+    }
 
     let mut header_row = GridRow::new();
     for col in 0..columns {
         let spans = header.get(col).map(Vec::as_slice).unwrap_or(&[]);
-        header_row = header_row.push(cell(spans, col, true));
+        header_row = header_row.push(cell(spans, true));
     }
     grid = grid.push(header_row);
 
@@ -768,7 +780,7 @@ fn table_view(
         let mut grid_row = GridRow::new();
         for col in 0..columns {
             let spans = row.get(col).map(Vec::as_slice).unwrap_or(&[]);
-            grid_row = grid_row.push(cell(spans, col, false));
+            grid_row = grid_row.push(cell(spans, false));
         }
         grid = grid.push(grid_row);
     }
