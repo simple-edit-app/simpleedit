@@ -48,10 +48,35 @@ pub struct Highlight {
     kind: MatchKind,
 }
 
-/// The accent violet used for every other match, so the current one — a
-/// warmer amber — reads as distinct rather than as "yet another match".
-fn current_match_color() -> Color {
-    Color::from_rgb(0.90, 0.58, 0.10)
+/// Bold + a saturated "highlighter" color is the most `Format` (color and
+/// font, nothing else) can do to stand in for a real highlighter-pen
+/// background — picked bright enough, and different enough from the app's
+/// own violet accent used all over the rest of the UI, to actually read as
+/// "this is a search match" at a glance. Two tones per role: `Theme::palette`
+/// gives `to_format` enough to tell dark from light without Settings having
+/// to carry it separately.
+fn match_color(dark: bool) -> Color {
+    if dark {
+        Color::from_rgb(0.95, 0.80, 0.20) // warm gold
+    } else {
+        Color::from_rgb(0.62, 0.46, 0.02) // deep amber, readable on pale paper
+    }
+}
+
+/// The current match's color — distinct from every other match's gold, not
+/// just bolder.
+fn current_match_color(dark: bool) -> Color {
+    if dark {
+        Color::from_rgb(1.0, 0.42, 0.30) // vivid coral
+    } else {
+        Color::from_rgb(0.78, 0.20, 0.10) // brick red
+    }
+}
+
+fn is_dark(theme: &iced::Theme) -> bool {
+    let bg = theme.palette().background;
+    let luminance = 0.299 * bg.r + 0.587 * bg.g + 0.114 * bg.b;
+    luminance < 0.5
 }
 
 fn bold() -> Font {
@@ -64,14 +89,15 @@ fn bold() -> Font {
 /// The `to_format` callback `text_editor::highlight` expects — a bare `fn`,
 /// so this styling has to be hardcoded here rather than threaded through as
 /// data.
-pub fn to_format(highlight: &Highlight, _theme: &iced::Theme) -> Format<Font> {
+pub fn to_format(highlight: &Highlight, theme: &iced::Theme) -> Format<Font> {
+    let dark = is_dark(theme);
     match highlight.kind {
         MatchKind::Current => Format {
-            color: Some(current_match_color()),
+            color: Some(current_match_color(dark)),
             font: Some(bold()),
         },
         MatchKind::Match => Format {
-            color: Some(crate::theme::accent_color()),
+            color: Some(match_color(dark)),
             font: Some(bold()),
         },
         MatchKind::None => highlight.format,

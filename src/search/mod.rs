@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use iced::{
-    widget::{button, container, row, text, text_input, Space},
+    widget::{button, container, row, text, text_input, tooltip, Space},
     Command, Element, Length,
 };
 use regex::Regex;
@@ -21,10 +21,7 @@ pub enum SearchMessage {
     /// Replaces the current match only, then advances to the next one.
     Replace,
     ReplaceAll,
-    // Not wired to any UI control yet, but supported end-to-end.
-    #[allow(dead_code)]
     ToggleRegex,
-    #[allow(dead_code)]
     ToggleCaseSensitive,
 }
 
@@ -267,6 +264,8 @@ impl SearchState {
         let find_label = t!("search.find").to_string();
         let replace_label = t!("search.replace").to_string();
         let replace_all_label = t!("search.replace_all").to_string();
+        let case_sensitive_label = t!("search.case_sensitive").to_string();
+        let regex_label = t!("search.regex").to_string();
 
         let action = |label: String, message: Message| {
             button(text(label).size(12))
@@ -286,6 +285,21 @@ impl SearchState {
                     active: false,
                 }))
         };
+        // A toggle button with its full label as a hover tooltip — same
+        // pattern as the preview pane's mode-switcher icons.
+        let toggle = |label: &'static str, hint: String, active: bool, message: Message| {
+            let btn = button(text(label).size(12))
+                .padding([4, 8])
+                .on_press(message)
+                .style(iced::theme::Button::custom(theme::GhostButton {
+                    dark,
+                    active,
+                }));
+            tooltip(btn, text(hint).size(11), tooltip::Position::Bottom)
+                .gap(4)
+                .padding(6)
+                .style(theme::card(dark))
+        };
 
         let bar = row![
             text_input(find_placeholder.as_str(), &self.query)
@@ -293,6 +307,18 @@ impl SearchState {
                 .on_submit(Message::Search(SearchMessage::Find))
                 .size(13)
                 .width(220),
+            toggle(
+                "Aa",
+                case_sensitive_label,
+                self.case_sensitive,
+                Message::Search(SearchMessage::ToggleCaseSensitive),
+            ),
+            toggle(
+                ".*",
+                regex_label,
+                self.use_regex,
+                Message::Search(SearchMessage::ToggleRegex),
+            ),
             nav("↑", Message::Search(SearchMessage::FindPrevious)),
             nav("↓", Message::Search(SearchMessage::Find)),
             text_input(replace_placeholder.as_str(), &self.replacement)
