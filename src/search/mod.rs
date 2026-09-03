@@ -2,7 +2,7 @@ use std::ops::Range;
 
 use iced::{
     widget::{button, container, row, text, text_input, Space},
-    Element, Length,
+    Command, Element, Length,
 };
 use regex::Regex;
 
@@ -85,7 +85,11 @@ impl SearchState {
             .then(|| (self.query.clone(), self.case_sensitive, self.use_regex))
     }
 
-    pub fn update(&mut self, msg: SearchMessage, content: &mut iced::widget::text_editor::Content) {
+    pub fn update(
+        &mut self,
+        msg: SearchMessage,
+        content: &mut iced::widget::text_editor::Content,
+    ) -> Command<Message> {
         match msg {
             SearchMessage::QueryChanged(q) => {
                 self.query = q;
@@ -94,14 +98,19 @@ impl SearchState {
                 self.current = None;
                 self.current_line = None;
                 self.committed = false;
+                Command::none()
             }
-            SearchMessage::ReplaceChanged(r) => self.replacement = r,
+            SearchMessage::ReplaceChanged(r) => {
+                self.replacement = r;
+                Command::none()
+            }
             SearchMessage::ToggleRegex => {
                 self.use_regex = !self.use_regex;
                 self.matches.clear();
                 self.current = None;
                 self.current_line = None;
                 self.committed = false;
+                Command::none()
             }
             SearchMessage::ToggleCaseSensitive => {
                 self.case_sensitive = !self.case_sensitive;
@@ -109,6 +118,7 @@ impl SearchState {
                 self.current = None;
                 self.current_line = None;
                 self.committed = false;
+                Command::none()
             }
             SearchMessage::ReplaceAll => {
                 let text = content.text();
@@ -122,9 +132,16 @@ impl SearchState {
                 self.current = None;
                 self.current_line = None;
                 self.committed = false;
+                Command::none()
             }
-            SearchMessage::Find => self.jump(content, true),
-            SearchMessage::FindPrevious => self.jump(content, false),
+            SearchMessage::Find => {
+                self.jump(content, true);
+                Command::none()
+            }
+            SearchMessage::FindPrevious => {
+                self.jump(content, false);
+                Command::none()
+            }
             SearchMessage::Replace => self.replace_current(content),
         }
     }
@@ -137,10 +154,13 @@ impl SearchState {
     /// changed since), this is the same as a first `Find`: it only jumps,
     /// same as pressing Enter — replacing nothing was ever selected would be
     /// a surprise, not a convenience.
-    fn replace_current(&mut self, content: &mut iced::widget::text_editor::Content) {
+    fn replace_current(
+        &mut self,
+        content: &mut iced::widget::text_editor::Content,
+    ) -> Command<Message> {
         if self.current.is_none() || self.matches.is_empty() {
             self.jump(content, true);
-            return;
+            return Command::none();
         }
 
         // The current match is already selected in the editor (that's how
@@ -149,14 +169,17 @@ impl SearchState {
         content.perform(iced::widget::text_editor::Action::Edit(
             iced::widget::text_editor::Edit::Paste(std::sync::Arc::new(self.replacement.clone())),
         ));
-
-        // The buffer just changed, so the old byte ranges no longer apply —
-        // re-find from the cursor, which now sits right after the
-        // replacement.
         self.current = None;
         self.current_line = None;
         self.committed = false;
-        self.jump(content, true);
+
+        // cosmic-text needs a layout pass to reshape the buffer before any
+        // cursor/selection query is safe to make (the same reasoning as
+        // MoveCursorLeft after bracket auto-close in app.rs — calling
+        // content.cursor_position() synchronously right after this edit
+        // panics: "layout not found"). So finding the next match happens on
+        // the next update cycle instead of immediately here.
+        Command::perform(async {}, |_| Message::Search(SearchMessage::Find))
     }
 
     /// (Re)finds every match, then selects the next one (`forward`) or the

@@ -941,10 +941,7 @@ impl SimpleEditApp {
                 ),
                 SidebarAction::None => Command::none(),
             },
-            Message::Search(msg) => {
-                self.search.update(msg, &mut self.editor.content);
-                Command::none()
-            }
+            Message::Search(msg) => self.search.update(msg, &mut self.editor.content),
             Message::Preferences(msg) => {
                 self.preferences.update(msg, &mut self.config);
                 self.config.save();
