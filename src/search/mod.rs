@@ -1,3 +1,5 @@
+use std::ops::Range;
+
 use iced::{
     widget::{button, container, row, text, text_input, Space},
     Element, Length,
@@ -8,16 +10,20 @@ use crate::app::Message;
 use crate::theme;
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum SearchMessage {
     QueryChanged(String),
     ReplaceChanged(String),
+    /// Enter in the query field, or the "Find" button: (re)runs the search
+    /// against the current buffer and jumps to the next match.
     Find,
-    ReplaceNext,
+    /// Shift+Enter, or the up-arrow button.
+    FindPrevious,
     ReplaceAll,
+    // Not wired to any UI control yet, but supported end-to-end.
+    #[allow(dead_code)]
     ToggleRegex,
+    #[allow(dead_code)]
     ToggleCaseSensitive,
-    Close,
 }
 
 pub struct SearchState {
@@ -27,6 +33,10 @@ pub struct SearchState {
     pub case_sensitive: bool,
     pub match_count: usize,
     pub last_error: Option<String>,
+    /// Byte ranges of every match found by the last `Find`/`FindPrevious`.
+    matches: Vec<Range<usize>>,
+    /// Index into `matches` of the one currently selected in the editor.
+    current: Option<usize>,
 }
 
 impl SearchState {
@@ -38,6 +48,8 @@ impl SearchState {
             case_sensitive: false,
             match_count: 0,
             last_error: None,
+            matches: Vec::new(),
+            current: None,
         }
     }
 
@@ -46,43 +58,71 @@ impl SearchState {
             SearchMessage::QueryChanged(q) => {
                 self.query = q;
                 self.last_error = None;
+                self.matches.clear();
+                self.current = None;
             }
             SearchMessage::ReplaceChanged(r) => self.replacement = r,
-            SearchMessage::ToggleRegex => self.use_regex = !self.use_regex,
-            SearchMessage::ToggleCaseSensitive => self.case_sensitive = !self.case_sensitive,
+            SearchMessage::ToggleRegex => {
+                self.use_regex = !self.use_regex;
+                self.matches.clear();
+                self.current = None;
+            }
+            SearchMessage::ToggleCaseSensitive => {
+                self.case_sensitive = !self.case_sensitive;
+                self.matches.clear();
+                self.current = None;
+            }
             SearchMessage::ReplaceAll => {
-                let text = content.text().to_string();
+                let text = content.text();
                 match self.replace_all(&text) {
                     Ok(new_text) => {
                         *content = iced::widget::text_editor::Content::with_text(&new_text);
                     }
                     Err(e) => self.last_error = Some(e),
                 }
+                self.matches.clear();
+                self.current = None;
             }
-            SearchMessage::Find => {
-                let text = content.text().to_string();
-                self.match_count = self.count_matches(&text);
-            }
-            _ => {}
+            SearchMessage::Find => self.jump(content, true),
+            SearchMessage::FindPrevious => self.jump(content, false),
         }
     }
 
-    pub fn count_matches(&self, text: &str) -> usize {
-        if self.query.is_empty() {
-            return 0;
+    /// (Re)finds every match, then selects the next one (`forward`) or the
+    /// previous one, wrapping around either end. The very first jump after a
+    /// fresh search starts from whichever match is nearest the cursor.
+    fn jump(&mut self, content: &mut iced::widget::text_editor::Content, forward: bool) {
+        let text = content.text();
+        match find_matches(&text, &self.query, self.case_sensitive, self.use_regex) {
+            Ok(matches) => {
+                self.matches = matches;
+                self.match_count = self.matches.len();
+                self.last_error = None;
+            }
+            Err(e) => {
+                self.matches.clear();
+                self.match_count = 0;
+                self.current = None;
+                self.last_error = Some(e);
+                return;
+            }
         }
-        if self.use_regex {
-            let flags = if self.case_sensitive { "" } else { "(?i)" };
-            Regex::new(&format!("{}{}", flags, self.query))
-                .map(|re| re.find_iter(text).count())
-                .unwrap_or(0)
-        } else if self.case_sensitive {
-            text.matches(&self.query).count()
-        } else {
-            let q = self.query.to_lowercase();
-            let t = text.to_lowercase();
-            t.matches(q.as_str()).count()
+
+        if self.matches.is_empty() {
+            self.current = None;
+            return;
         }
+
+        let next = match self.current {
+            Some(i) => advance_index(i, self.matches.len(), forward),
+            None => {
+                let cursor = line_col_to_byte(&text, content.cursor_position());
+                nearest_match_index(&self.matches, cursor, forward)
+            }
+        };
+
+        self.current = Some(next);
+        select_range(content, &text, self.matches[next].clone());
     }
 
     pub fn replace_all(&self, text: &str) -> Result<String, String> {
@@ -112,10 +152,13 @@ impl SearchState {
     }
 
     pub fn view(&self, dark: bool) -> Element<'_, Message> {
-        let count_label = if self.match_count > 0 {
-            format!("{} {}", self.match_count, t!("search.matches"))
-        } else if let Some(ref e) = self.last_error {
+        let count_label = if let Some(ref e) = self.last_error {
             e.clone()
+        } else if !self.query.is_empty() {
+            match self.current {
+                Some(i) => format!("{} / {}", i + 1, self.match_count),
+                None => format!("{} {}", self.match_count, t!("search.matches")),
+            }
         } else {
             String::new()
         };
@@ -133,12 +176,24 @@ impl SearchState {
                     active: false,
                 }))
         };
+        let nav = |label: &str, message: Message| {
+            button(text(label.to_string()).size(12))
+                .padding([4, 8])
+                .on_press(message)
+                .style(iced::theme::Button::custom(theme::GhostButton {
+                    dark,
+                    active: false,
+                }))
+        };
 
         let bar = row![
             text_input(find_placeholder.as_str(), &self.query)
                 .on_input(|v| Message::Search(SearchMessage::QueryChanged(v)))
+                .on_submit(Message::Search(SearchMessage::Find))
                 .size(13)
                 .width(220),
+            nav("↑", Message::Search(SearchMessage::FindPrevious)),
+            nav("↓", Message::Search(SearchMessage::Find)),
             text_input(replace_placeholder.as_str(), &self.replacement)
                 .on_input(|v| Message::Search(SearchMessage::ReplaceChanged(v)))
                 .size(13)
@@ -162,6 +217,110 @@ impl SearchState {
     }
 }
 
+/// The next match index, wrapping at either end of a non-empty `matches`.
+fn advance_index(current: usize, len: usize, forward: bool) -> usize {
+    if forward {
+        (current + 1) % len
+    } else {
+        (current + len - 1) % len
+    }
+}
+
+/// The index of whichever match in `matches` (sorted by position, non-empty)
+/// sits closest to `cursor` in the search direction, wrapping to the far end
+/// if the cursor is past the last match (searching forward) or before the
+/// first (searching backward).
+fn nearest_match_index(matches: &[Range<usize>], cursor: usize, forward: bool) -> usize {
+    if forward {
+        matches.iter().position(|m| m.start >= cursor).unwrap_or(0)
+    } else {
+        matches
+            .iter()
+            .rposition(|m| m.start <= cursor)
+            .unwrap_or(matches.len() - 1)
+    }
+}
+
+/// Every match of `query` in `text`, as byte ranges. `Err` only for an
+/// invalid regex; an empty query yields no matches rather than an error.
+fn find_matches(
+    text: &str,
+    query: &str,
+    case_sensitive: bool,
+    use_regex: bool,
+) -> Result<Vec<Range<usize>>, String> {
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    if use_regex {
+        let flags = if case_sensitive { "" } else { "(?i)" };
+        let re = Regex::new(&format!("{flags}{query}")).map_err(|e| e.to_string())?;
+        Ok(re.find_iter(text).map(|m| m.start()..m.end()).collect())
+    } else if case_sensitive {
+        Ok(text
+            .match_indices(query)
+            .map(|(i, m)| i..i + m.len())
+            .collect())
+    } else {
+        let lower_text = text.to_lowercase();
+        let lower_query = query.to_lowercase();
+        Ok(lower_text
+            .match_indices(lower_query.as_str())
+            .map(|(i, _)| i..i + lower_query.len())
+            .collect())
+    }
+}
+
+/// Converts a `text_editor` cursor position (line, column — both in chars)
+/// to a byte offset into `text`.
+fn line_col_to_byte(text: &str, (line, col): (usize, usize)) -> usize {
+    let mut offset = 0;
+    for (i, l) in text.split('\n').enumerate() {
+        if i == line {
+            let take: usize = l.chars().take(col).map(char::len_utf8).sum();
+            return offset + take;
+        }
+        offset += l.len() + 1;
+    }
+    offset
+}
+
+/// Converts a byte range into (line, start column, length) — all in chars,
+/// what `text_editor`'s `Motion::Right` steps over.
+fn byte_range_to_line_col(text: &str, range: &Range<usize>) -> (usize, usize, usize) {
+    let mut offset = 0;
+    for (line_idx, l) in text.split('\n').enumerate() {
+        let line_end = offset + l.len();
+        if range.start >= offset && range.start <= line_end {
+            let col = l[..range.start - offset].chars().count();
+            let len = text[range.start..range.end].chars().count();
+            return (line_idx, col, len);
+        }
+        offset = line_end + 1;
+    }
+    (0, 0, 0)
+}
+
+/// Selects `range` in the editor. `text_editor` has no "select this byte
+/// range" action, only relative motions — same approach as jumping to a
+/// line in the Go to Line dialog.
+fn select_range(content: &mut iced::widget::text_editor::Content, text: &str, range: Range<usize>) {
+    use iced::widget::text_editor::{Action, Motion};
+
+    let (line, col, len) = byte_range_to_line_col(text, &range);
+    content.perform(Action::Move(Motion::DocumentStart));
+    for _ in 0..line {
+        content.perform(Action::Move(Motion::Down));
+    }
+    content.perform(Action::Move(Motion::Home));
+    for _ in 0..col {
+        content.perform(Action::Move(Motion::Right));
+    }
+    for _ in 0..len {
+        content.perform(Action::Select(Motion::Right));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,31 +338,53 @@ mod tests {
             case_sensitive,
             match_count: 0,
             last_error: None,
+            matches: Vec::new(),
+            current: None,
         }
     }
 
     #[test]
     fn count_matches_literal() {
         let s = make_search("hello", "", false, true);
-        assert_eq!(s.count_matches("hello world hello"), 2);
+        assert_eq!(
+            find_matches("hello world hello", &s.query, s.case_sensitive, s.use_regex)
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
     fn count_matches_case_insensitive() {
         let s = make_search("hello", "", false, false);
-        assert_eq!(s.count_matches("Hello HELLO hello"), 3);
+        assert_eq!(
+            find_matches("Hello HELLO hello", &s.query, s.case_sensitive, s.use_regex)
+                .unwrap()
+                .len(),
+            3
+        );
     }
 
     #[test]
     fn count_matches_regex() {
         let s = make_search(r"\d+", "", true, false);
-        assert_eq!(s.count_matches("abc 123 def 456"), 2);
+        assert_eq!(
+            find_matches("abc 123 def 456", &s.query, s.case_sensitive, s.use_regex)
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
     fn count_matches_empty_query() {
         let s = make_search("", "", false, false);
-        assert_eq!(s.count_matches("anything"), 0);
+        assert_eq!(
+            find_matches("anything", &s.query, s.case_sensitive, s.use_regex)
+                .unwrap()
+                .len(),
+            0
+        );
     }
 
     #[test]
@@ -229,5 +410,66 @@ mod tests {
     fn replace_all_invalid_regex_returns_error() {
         let s = make_search(r"[invalid", "x", true, false);
         assert!(s.replace_all("text").is_err());
+    }
+
+    #[test]
+    fn find_matches_reports_byte_ranges() {
+        let m = find_matches("ab ab", "ab", true, false).unwrap();
+        assert_eq!(m, vec![0..2, 3..5]);
+    }
+
+    #[test]
+    fn find_matches_invalid_regex_is_an_error() {
+        assert!(find_matches("text", "[invalid", false, true).is_err());
+    }
+
+    #[test]
+    fn line_col_to_byte_handles_multibyte_lines() {
+        // '\u{e9}' (é) is 2 bytes, precomposed — spelled out to not depend
+        // on how this source file's own encoding normalizes an "é" literal.
+        let text = format!("caf{}\nworld", '\u{e9}');
+        let text = text.as_str();
+        // 4 chars ("caf" + é) but 5 bytes; column 4 is right after it. Line 1
+        // starts one byte further still, past the '\n'.
+        assert_eq!(line_col_to_byte(text, (0, 4)), 5);
+        assert_eq!(line_col_to_byte(text, (1, 0)), 6);
+        assert_eq!(line_col_to_byte(text, (1, 2)), 8);
+    }
+
+    #[test]
+    fn byte_range_to_line_col_round_trips_with_line_col_to_byte() {
+        let text = format!("one two\nthree caf{} four", '\u{e9}');
+        let text = text.as_str();
+        let start = line_col_to_byte(text, (1, 6)); // start of "café"
+        let len_bytes = "caf\u{e9}".len();
+        let (line, col, len) = byte_range_to_line_col(text, &(start..start + len_bytes));
+        assert_eq!((line, col, len), (1, 6, 4));
+    }
+
+    #[test]
+    fn advance_index_wraps_at_both_ends() {
+        assert_eq!(advance_index(0, 3, true), 1);
+        assert_eq!(advance_index(2, 3, true), 0); // wraps forward
+        assert_eq!(advance_index(0, 3, false), 2); // wraps backward
+        assert_eq!(advance_index(1, 3, false), 0);
+    }
+
+    #[test]
+    fn nearest_match_index_picks_the_closest_match_in_direction() {
+        let matches = [2..3, 4..5, 8..9];
+        assert_eq!(nearest_match_index(&matches, 0, true), 0);
+        assert_eq!(nearest_match_index(&matches, 3, true), 1);
+        assert_eq!(nearest_match_index(&matches, 9, true), 0); // past the end, wraps
+        assert_eq!(nearest_match_index(&matches, 9, false), 2);
+        assert_eq!(nearest_match_index(&matches, 0, false), 2); // before the start, wraps
+    }
+
+    #[test]
+    fn jump_with_no_matches_clears_current() {
+        let mut content = iced::widget::text_editor::Content::with_text("nothing here");
+        let mut s = make_search("xyz", "", false, true);
+        s.jump(&mut content, true);
+        assert_eq!(s.current, None);
+        assert_eq!(s.match_count, 0);
     }
 }

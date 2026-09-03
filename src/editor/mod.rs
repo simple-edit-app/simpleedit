@@ -35,7 +35,7 @@ use iced::{
     Element, Font, Length,
 };
 
-use crate::{app::Message, config::Config};
+use crate::{app::Message, config::Config, search::SearchState};
 
 pub struct EditorState {
     pub content: text_editor::Content,
@@ -73,22 +73,34 @@ impl EditorState {
         });
     }
 
-    pub fn view(&self, config: &Config) -> Element<'_, Message> {
+    pub fn view<'a>(
+        &'a self,
+        config: &Config,
+        search: Option<&SearchState>,
+    ) -> Element<'a, Message> {
         let hl_theme = if config.dark_mode {
             hl::Theme::SolarizedDark
         } else {
             hl::Theme::InspiredGitHub
         };
         let extension = self.language.clone().unwrap_or_default();
+        let (query, case_sensitive, use_regex) = search
+            .map(|s| (s.query.clone(), s.case_sensitive, s.use_regex))
+            .unwrap_or_default();
 
         let editor = text_editor(&self.content)
             .on_action(Message::EditorAction)
-            .highlight::<hl::Highlighter>(
-                hl::Settings {
-                    theme: hl_theme,
-                    extension,
+            .highlight::<highlighter::Highlighter>(
+                highlighter::Settings {
+                    syntax: hl::Settings {
+                        theme: hl_theme,
+                        extension,
+                    },
+                    query,
+                    case_sensitive,
+                    use_regex,
                 },
-                |highlight, _theme| highlight.to_format(),
+                highlighter::to_format,
             )
             .style(iced::theme::TextEditor::Custom(Box::new(
                 crate::theme::EditorStyle {

@@ -1210,6 +1210,14 @@ impl SimpleEditApp {
                 if !matches!(self.overlay, ActiveOverlay::None) {
                     return Command::none();
                 }
+                // Shift+Enter: previous match. Plain Enter is the search
+                // field's own on_submit, which iced correctly scopes to
+                // when that field has focus; this subscription-level
+                // shortcut can't tell which widget is focused, so it's
+                // deliberately narrowed to the modified case only.
+                if self.show_search && shift && key.eq_ignore_ascii_case("return") {
+                    return self.handle(Message::Search(SearchMessage::FindPrevious));
+                }
                 // Match against config shortcuts
                 let sc_check = |s: &ShortcutConfig| -> bool {
                     s.key.eq_ignore_ascii_case(&key)
@@ -1596,15 +1604,16 @@ impl SimpleEditApp {
         mode: ViewMode,
         dark: bool,
     ) -> Element<'_, Message> {
+        let search = self.show_search.then_some(&self.search);
         let Some(kind) = kind else {
-            return self.editor.view(&self.config);
+            return self.editor.view(&self.config, search);
         };
 
         let body: Element<'_, Message> = match mode {
-            ViewMode::Raw => self.editor.view(&self.config),
+            ViewMode::Raw => self.editor.view(&self.config, search),
             ViewMode::Preview => self.preview_view(dark),
             ViewMode::Split => row![
-                container(self.editor.view(&self.config)).width(Length::FillPortion(1)),
+                container(self.editor.view(&self.config, search)).width(Length::FillPortion(1)),
                 container(Space::with_width(1))
                     .height(Length::Fill)
                     .style(se_theme::gutter(dark)),
