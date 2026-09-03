@@ -7,11 +7,15 @@
 use std::collections::HashMap;
 
 use iced::{
-    advanced::widget::{operation, Id as WidgetId, Operation},
+    advanced::{
+        layout, overlay, renderer,
+        widget::{operation, Id as WidgetId, Operation, Tree},
+        Clipboard, Layout, Shell, Widget,
+    },
     alignment::Horizontal,
-    mouse,
+    event, mouse,
     widget::{column, container, mouse_area, row, scrollable, text, Space},
-    Color, Command, Element, Font, Length, Rectangle, Vector,
+    Color, Command, Element, Event, Font, Length, Rectangle, Size, Theme, Vector,
 };
 use iced_aw::{Grid, GridRow};
 
@@ -805,12 +809,158 @@ fn table_view(
         grid = grid.push(grid_row);
     }
 
-    scrollable(container(grid).style(theme::table_border(dark)))
-        .direction(scrollable::Direction::Horizontal(
-            scrollable::Properties::default(),
-        ))
-        .width(Length::Fill)
-        .into()
+    wheel_gate(
+        scrollable(container(grid).style(theme::table_border(dark)))
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Properties::default(),
+            ))
+            .width(Length::Fill),
+    )
+}
+
+/// Lets a wheel-scroll event through to a horizontal-only `scrollable` (used
+/// above for a wide table) only when it's mostly horizontal; a mostly-
+/// vertical one is left `Ignored` instead of being handed to the child at
+/// all, so the preview's own (outer, vertical) scrollable gets it next.
+///
+/// `scrollable` otherwise captures *every* wheel event over its bounds
+/// unconditionally — even one entirely on an axis it doesn't scroll — which
+/// is what made hovering a table block scrolling the rest of the document.
+struct WheelGate<'a> {
+    content: Element<'a, Message>,
+}
+
+fn wheel_gate<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    Element::new(WheelGate {
+        content: content.into(),
+    })
+}
+
+impl<'a> Widget<Message, Theme, iced::Renderer> for WheelGate<'a> {
+    fn tag(&self) -> iced::advanced::widget::tree::Tag {
+        self.content.as_widget().tag()
+    }
+
+    fn state(&self) -> iced::advanced::widget::tree::State {
+        self.content.as_widget().state()
+    }
+
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_ref(&self.content));
+    }
+
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn layout(
+        &self,
+        tree: &mut Tree,
+        renderer: &iced::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+
+    fn operate(
+        &self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn Operation<Message>,
+    ) {
+        self.content
+            .as_widget()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+
+    fn on_event(
+        &mut self,
+        tree: &mut Tree,
+        event: Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &iced::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) -> event::Status {
+        if let Event::Mouse(mouse::Event::WheelScrolled { delta }) = event {
+            let (x, y) = match delta {
+                mouse::ScrollDelta::Lines { x, y } | mouse::ScrollDelta::Pixels { x, y } => (x, y),
+            };
+            if y.abs() >= x.abs() {
+                return event::Status::Ignored;
+            }
+        }
+
+        self.content.as_widget_mut().on_event(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        )
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &iced::Renderer,
+    ) -> mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut iced::Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'_>,
+        renderer: &iced::Renderer,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, Message, Theme, iced::Renderer>> {
+        self.content
+            .as_widget_mut()
+            .overlay(&mut tree.children[0], layout, renderer, translation)
+    }
 }
 
 /// Lays out spans as a wrapping run of words. iced 0.12 has no rich text
