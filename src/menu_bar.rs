@@ -52,13 +52,19 @@ pub fn dropdown_view(
         .into()
 }
 
-/// x offset (px from window left) for each dropdown.
+/// x offset (px from window left) for each dropdown, so it opens flush with
+/// the left edge of the button that triggered it.
+///
+/// iced 0.12 has no way to ask a rendered button for its own position, so
+/// these are measured pixel values for the current English labels at the
+/// bar's font size (13) and button padding ([6, 12], 2px spacing, 10px bar
+/// padding) — retune them if a label or the font ever changes.
 pub fn dropdown_x_offset(menu: TopMenu) -> f32 {
     match menu {
         TopMenu::File => 10.0,
-        TopMenu::Edit => 90.0,
-        TopMenu::View => 170.0,
-        TopMenu::Help => 264.0,
+        TopMenu::Edit => 57.0,
+        TopMenu::View => 105.0,
+        TopMenu::Help => 159.0,
     }
 }
 
