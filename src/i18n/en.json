@@ -124,7 +124,5 @@
   "preview.split": "Split",
   "preview.tree": "Tree",
   "preview.json_error": "Invalid JSON",
-  "preview.truncated": "Document too large — display truncated",
-  "ctx.expand_all": "Expand All",
-  "ctx.collapse_all": "Collapse All"
+  "preview.truncated": "Document too large — display truncated"
 }

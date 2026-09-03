@@ -755,8 +755,25 @@ fn table_view(
         };
         container(spans_view(spans, BODY_SIZE, p.text, dark, font))
             .padding([6, 10])
-            .style(theme::table_cell(dark, is_header))
             .into()
+    };
+
+    // The header/body divider: one hairline `Fill` cell per column, so it
+    // reads as a single rule spanning the table — Grid has no notion of a
+    // cell that spans several columns. Being `Fill`, each one measures as
+    // `f32::INFINITY` and Grid ignores that when sizing columns (same
+    // reasoning as above), so this row rides on the real content rows'
+    // widths without affecting them.
+    let divider_row = || {
+        let mut row = GridRow::new();
+        for _ in 0..columns {
+            let line: Element<'static, Message> = container(Space::with_height(Length::Fixed(1.0)))
+                .width(Length::Fill)
+                .style(theme::gutter(dark))
+                .into();
+            row = row.push(line);
+        }
+        row
     };
 
     let uniform_alignment = alignments
@@ -764,7 +781,10 @@ fn table_view(
         .filter(|first| alignments.iter().all(|a| a == *first))
         .copied();
 
-    let mut grid = Grid::new().column_width(Length::Shrink);
+    let mut grid = Grid::new()
+        .column_width(Length::Shrink)
+        .column_spacing(0.0)
+        .row_spacing(0.0);
     if let Some(align) = uniform_alignment {
         grid = grid.horizontal_alignment(align.into());
     }
@@ -774,7 +794,7 @@ fn table_view(
         let spans = header.get(col).map(Vec::as_slice).unwrap_or(&[]);
         header_row = header_row.push(cell(spans, true));
     }
-    grid = grid.push(header_row);
+    grid = grid.push(header_row).push(divider_row());
 
     for row in rows {
         let mut grid_row = GridRow::new();

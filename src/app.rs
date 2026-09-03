@@ -329,97 +329,70 @@ impl Application for SimpleEditApp {
             ViewMode::Raw
         };
         let editor_widget = self.editor_pane(preview_kind, view_mode, dark);
-        let lbl_select_all = t!("ctx.select_all").to_string();
-        let lbl_cut = t!("ctx.cut").to_string();
-        let lbl_copy = t!("ctx.copy").to_string();
-        let lbl_paste = t!("ctx.paste").to_string();
-        let lbl_delete = t!("ctx.delete").to_string();
-        let lbl_format_sel = t!("ctx.format_selection").to_string();
-        let lbl_format_all = t!("ctx.format_all").to_string();
-        let lbl_expand_all = t!("ctx.expand_all").to_string();
-        let lbl_collapse_all = t!("ctx.collapse_all").to_string();
-        let json_tree_shown =
-            view_mode != ViewMode::Raw && matches!(self.preview, PreviewDoc::Json(_));
-        let has_fmt_ctx = self
-            .editor
-            .language
-            .as_deref()
-            .map(crate::formatter::has_formatter)
-            .unwrap_or(false);
-        let has_sel_ctx = self.editor.content.selection().is_some();
-        let editor_with_context = iced_aw::ContextMenu::new(editor_widget, move || {
-            let item = |label: String, msg: Message| -> Element<'static, Message> {
-                button(text(label).size(13))
-                    .padding([6, 10])
-                    .width(Length::Fixed(200.0))
-                    .on_press(msg)
-                    .style(iced::theme::Button::custom(crate::theme::GhostButton {
-                        dark,
-                        active: false,
-                    }))
-                    .into()
-            };
-            let disabled = |label: String| -> Element<'static, Message> {
-                container(text(label).size(13).style(crate::theme::muted_text(dark)))
-                    .padding([6, 10])
-                    .width(Length::Fixed(200.0))
-                    .into()
-            };
-            // Same as `item`, with the equivalent click gesture spelled out on the right.
-            let item_hint =
-                |label: String, hint: String, msg: Message| -> Element<'static, Message> {
-                    button(
-                        row![
-                            text(label).size(13),
-                            Space::with_width(Length::Fill),
-                            text(hint).size(11).style(crate::theme::muted_text(dark)),
-                        ]
-                        .align_items(Alignment::Center),
-                    )
-                    .padding([6, 10])
-                    .width(Length::Fixed(200.0))
-                    .on_press(msg)
-                    .style(iced::theme::Button::custom(crate::theme::GhostButton {
-                        dark,
-                        active: false,
-                    }))
-                    .into()
+        // The context menu's actions (select/cut/copy/paste/format) all act on
+        // the raw buffer, which isn't what's on screen in Preview mode — right-
+        // clicking the rendered Markdown/JSON tree wouldn't do anything a user
+        // could make sense of, so it's only offered over the raw editor.
+        let editor_with_context: Element<'_, Message> = if view_mode == ViewMode::Preview {
+            editor_widget
+        } else {
+            let lbl_select_all = t!("ctx.select_all").to_string();
+            let lbl_cut = t!("ctx.cut").to_string();
+            let lbl_copy = t!("ctx.copy").to_string();
+            let lbl_paste = t!("ctx.paste").to_string();
+            let lbl_delete = t!("ctx.delete").to_string();
+            let lbl_format_sel = t!("ctx.format_selection").to_string();
+            let lbl_format_all = t!("ctx.format_all").to_string();
+            let has_fmt_ctx = self
+                .editor
+                .language
+                .as_deref()
+                .map(crate::formatter::has_formatter)
+                .unwrap_or(false);
+            let has_sel_ctx = self.editor.content.selection().is_some();
+            iced_aw::ContextMenu::new(editor_widget, move || {
+                let item = |label: String, msg: Message| -> Element<'static, Message> {
+                    button(text(label).size(13))
+                        .padding([6, 10])
+                        .width(Length::Fixed(200.0))
+                        .on_press(msg)
+                        .style(iced::theme::Button::custom(crate::theme::GhostButton {
+                            dark,
+                            active: false,
+                        }))
+                        .into()
                 };
-            let fmt_sel_el: Element<'static, Message> = if has_fmt_ctx && has_sel_ctx {
-                item(lbl_format_sel.clone(), Message::FormatSelection)
-            } else {
-                disabled(lbl_format_sel.clone())
-            };
-            let fmt_all_el: Element<'static, Message> = if has_fmt_ctx {
-                item(lbl_format_all.clone(), Message::FormatFile)
-            } else {
-                disabled(lbl_format_all.clone())
-            };
-            let mut ctx_items: Vec<Element<'static, Message>> = vec![
-                item(lbl_select_all.clone(), Message::SelectAll),
-                item(lbl_cut.clone(), Message::ContextCut),
-                item(lbl_copy.clone(), Message::ContextCopy),
-                item(lbl_paste.clone(), Message::ContextPaste),
-                item(lbl_delete.clone(), Message::ContextDelete),
-                fmt_sel_el,
-                fmt_all_el,
-            ];
-            if json_tree_shown {
-                ctx_items.push(item_hint(
-                    lbl_expand_all.clone(),
-                    "Ctrl+Click".to_string(),
-                    Message::JsonExpandAll,
-                ));
-                ctx_items.push(item_hint(
-                    lbl_collapse_all.clone(),
-                    "Alt+Click".to_string(),
-                    Message::JsonCollapseAll,
-                ));
-            }
-            container(column(ctx_items).spacing(2).padding(6))
-                .style(crate::theme::card(dark))
-                .into()
-        });
+                let disabled = |label: String| -> Element<'static, Message> {
+                    container(text(label).size(13).style(crate::theme::muted_text(dark)))
+                        .padding([6, 10])
+                        .width(Length::Fixed(200.0))
+                        .into()
+                };
+                let fmt_sel_el: Element<'static, Message> = if has_fmt_ctx && has_sel_ctx {
+                    item(lbl_format_sel.clone(), Message::FormatSelection)
+                } else {
+                    disabled(lbl_format_sel.clone())
+                };
+                let fmt_all_el: Element<'static, Message> = if has_fmt_ctx {
+                    item(lbl_format_all.clone(), Message::FormatFile)
+                } else {
+                    disabled(lbl_format_all.clone())
+                };
+                let ctx_items: Vec<Element<'static, Message>> = vec![
+                    item(lbl_select_all.clone(), Message::SelectAll),
+                    item(lbl_cut.clone(), Message::ContextCut),
+                    item(lbl_copy.clone(), Message::ContextCopy),
+                    item(lbl_paste.clone(), Message::ContextPaste),
+                    item(lbl_delete.clone(), Message::ContextDelete),
+                    fmt_sel_el,
+                    fmt_all_el,
+                ];
+                container(column(ctx_items).spacing(2).padding(6))
+                    .style(crate::theme::card(dark))
+                    .into()
+            })
+            .into()
+        };
 
         let search_panel = if self.show_search {
             Some(self.search.view(dark))
@@ -430,7 +403,7 @@ impl Application for SimpleEditApp {
         let editor_area: Element<Message> = if let Some(search) = search_panel {
             column![search, editor_with_context].into()
         } else {
-            editor_with_context.into()
+            editor_with_context
         };
 
         let mut main_row = row![];

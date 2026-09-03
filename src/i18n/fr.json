@@ -124,7 +124,5 @@
   "preview.split": "Divisé",
   "preview.tree": "Arbre",
   "preview.json_error": "JSON invalide",
-  "preview.truncated": "Document trop grand — affichage tronqué",
-  "ctx.expand_all": "Tout déplier",
-  "ctx.collapse_all": "Tout replier"
+  "preview.truncated": "Document trop grand — affichage tronqué"
 }
