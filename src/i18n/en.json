@@ -118,5 +118,13 @@
   "menu.edit_toggle_comment": "Toggle Comment",
   "menu.edit_delete_line": "Delete Line",
   "menu.file_recents": "Recent Files",
-  "menu.file_no_recents": "No recent files"
+  "menu.file_no_recents": "No recent files",
+  "preview.raw": "Raw",
+  "preview.rendered": "Preview",
+  "preview.split": "Split",
+  "preview.tree": "Tree",
+  "preview.json_error": "Invalid JSON",
+  "preview.truncated": "Document too large — display truncated",
+  "ctx.expand_all": "Expand All",
+  "ctx.collapse_all": "Collapse All"
 }

@@ -61,6 +61,18 @@ impl EditorState {
         self.language = extension_to_token(ext).map(|s| s.to_string());
     }
 
+    /// Restores a language remembered for a buffer, falling back to the file
+    /// extension: sessions and the file cache predate the language override and
+    /// may carry `None` for a file that was never the active editor.
+    pub fn restore_language(&mut self, cached: Option<String>, path: &std::path::Path) {
+        self.language = cached.or_else(|| {
+            path.extension()
+                .and_then(|e| e.to_str())
+                .and_then(extension_to_token)
+                .map(str::to_string)
+        });
+    }
+
     pub fn view(&self, config: &Config) -> Element<'_, Message> {
         let hl_theme = if config.dark_mode {
             hl::Theme::SolarizedDark
@@ -296,6 +308,23 @@ mod tests {
         let mut state = EditorState::new();
         state.set_language_by_extension("rs");
         assert_eq!(state.language, Some("rs".to_string()));
+    }
+
+    #[test]
+    fn restore_language_prefers_the_cached_value() {
+        let mut state = EditorState::new();
+        state.restore_language(Some("md".to_string()), std::path::Path::new("/a/b.json"));
+        assert_eq!(state.language, Some("md".to_string()));
+    }
+
+    #[test]
+    fn restore_language_falls_back_to_the_extension() {
+        let mut state = EditorState::new();
+        state.restore_language(None, std::path::Path::new("/a/b.json"));
+        assert_eq!(state.language, Some("json".to_string()));
+
+        state.restore_language(None, std::path::Path::new("/a/b.unknown"));
+        assert!(state.language.is_none());
     }
 
     #[test]

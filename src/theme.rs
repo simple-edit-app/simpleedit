@@ -188,6 +188,36 @@ pub fn gutter(dark: bool) -> impl Fn(&Theme) -> container::Appearance {
     }
 }
 
+/// Fenced code block inside the Markdown preview.
+pub fn code_block(dark: bool) -> impl Fn(&Theme) -> container::Appearance {
+    let p = palette(dark);
+    move |_theme: &Theme| container::Appearance {
+        text_color: Some(p.text),
+        background: Some(Background::Color(p.elevated)),
+        border: Border {
+            color: p.border,
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        shadow: Shadow::default(),
+    }
+}
+
+/// Block quote inside the Markdown preview.
+pub fn quote_block(dark: bool) -> impl Fn(&Theme) -> container::Appearance {
+    let p = palette(dark);
+    move |_theme: &Theme| container::Appearance {
+        text_color: Some(p.muted),
+        background: Some(Background::Color(p.elevated)),
+        border: Border {
+            color: p.accent_soft,
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        shadow: Shadow::default(),
+    }
+}
+
 /// Ghost button used in menu bars, toolbars, and menu items: transparent,
 /// a soft accent wash when active/open, a subtle surface tint on hover.
 pub struct GhostButton {

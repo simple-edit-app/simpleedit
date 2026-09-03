@@ -1,0 +1,630 @@
+//! A small block-level Markdown parser and its iced renderer.
+//!
+//! Deliberately partial: it covers what a text editor preview needs
+//! (headings, paragraphs, lists, quotes, fenced code, rules and the common
+//! inline markers) and renders everything else as plain text.
+
+use iced::{
+    widget::{column, container, row, scrollable, text, Space},
+    Color, Element, Font, Length,
+};
+
+use crate::app::Message;
+use crate::theme;
+
+/// Inline emphasis of a run of text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Style {
+    Plain,
+    Bold,
+    Italic,
+    BoldItalic,
+    Code,
+    Link,
+}
+
+/// A run of text sharing one inline style.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Span {
+    pub text: String,
+    pub style: Style,
+}
+
+impl Span {
+    fn new(text: impl Into<String>, style: Style) -> Self {
+        Self {
+            text: text.into(),
+            style,
+        }
+    }
+}
+
+/// A top-level Markdown block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Block {
+    Heading {
+        level: u8,
+        spans: Vec<Span>,
+    },
+    Paragraph(Vec<Span>),
+    Quote(Vec<Span>),
+    ListItem {
+        depth: usize,
+        marker: String,
+        spans: Vec<Span>,
+    },
+    Code(String),
+    Rule,
+}
+
+// ─── Parsing ────────────────────────────────────────────────────────────────
+
+/// Splits a Markdown document into blocks.
+pub fn parse(src: &str) -> Vec<Block> {
+    let mut blocks: Vec<Block> = Vec::new();
+    let mut para: Vec<String> = Vec::new();
+    let mut quote: Vec<String> = Vec::new();
+    let mut code: Option<Vec<String>> = None;
+
+    for raw in src.lines() {
+        // Inside a fenced block everything is literal until the closing fence.
+        if let Some(buf) = code.as_mut() {
+            if is_fence(raw.trim_start()) {
+                blocks.push(Block::Code(buf.join("\n")));
+                code = None;
+            } else {
+                buf.push(raw.to_string());
+            }
+            continue;
+        }
+
+        let line = raw.trim_end();
+        let trimmed = line.trim_start();
+
+        if is_fence(trimmed) {
+            flush_para(&mut para, &mut blocks);
+            flush_quote(&mut quote, &mut blocks);
+            code = Some(Vec::new());
+        } else if trimmed.is_empty() {
+            flush_para(&mut para, &mut blocks);
+            flush_quote(&mut quote, &mut blocks);
+        } else if is_rule(trimmed) {
+            flush_para(&mut para, &mut blocks);
+            flush_quote(&mut quote, &mut blocks);
+            blocks.push(Block::Rule);
+        } else if let Some((level, rest)) = heading(trimmed) {
+            flush_para(&mut para, &mut blocks);
+            flush_quote(&mut quote, &mut blocks);
+            blocks.push(Block::Heading {
+                level,
+                spans: parse_inline(rest),
+            });
+        } else if let Some(rest) = trimmed.strip_prefix('>') {
+            flush_para(&mut para, &mut blocks);
+            quote.push(rest.trim_start().to_string());
+        } else if let Some((depth, marker, rest)) = list_item(line) {
+            flush_para(&mut para, &mut blocks);
+            flush_quote(&mut quote, &mut blocks);
+            blocks.push(Block::ListItem {
+                depth,
+                marker,
+                spans: parse_inline(rest),
+            });
+        } else {
+            flush_quote(&mut quote, &mut blocks);
+            para.push(trimmed.to_string());
+        }
+    }
+
+    if let Some(buf) = code {
+        blocks.push(Block::Code(buf.join("\n")));
+    }
+    flush_para(&mut para, &mut blocks);
+    flush_quote(&mut quote, &mut blocks);
+    blocks
+}
+
+fn flush_para(para: &mut Vec<String>, blocks: &mut Vec<Block>) {
+    if !para.is_empty() {
+        blocks.push(Block::Paragraph(parse_inline(&para.join(" "))));
+        para.clear();
+    }
+}
+
+fn flush_quote(quote: &mut Vec<String>, blocks: &mut Vec<Block>) {
+    if !quote.is_empty() {
+        blocks.push(Block::Quote(parse_inline(&quote.join(" "))));
+        quote.clear();
+    }
+}
+
+fn is_fence(line: &str) -> bool {
+    line.starts_with("```") || line.starts_with("~~~")
+}
+
+fn is_rule(line: &str) -> bool {
+    let stripped: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+    stripped.len() >= 3
+        && ['-', '*', '_']
+            .iter()
+            .any(|c| stripped.chars().all(|ch| ch == *c))
+}
+
+/// `## Title` → `(2, "Title")`.
+fn heading(line: &str) -> Option<(u8, &str)> {
+    let level = line.chars().take_while(|c| *c == '#').count();
+    if level == 0 || level > 6 {
+        return None;
+    }
+    let rest = &line[level..];
+    if rest.is_empty() {
+        return Some((level as u8, ""));
+    }
+    rest.strip_prefix(' ')
+        .map(|r| (level as u8, r.trim_start()))
+}
+
+/// `  - item` → `(depth, "•", "item")`; `2. item` → `(depth, "2.", "item")`.
+fn list_item(line: &str) -> Option<(usize, String, &str)> {
+    let indent: usize = line
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .map(|c| if c == '\t' { 4 } else { 1 })
+        .sum();
+    let rest = line.trim_start();
+
+    for bullet in ['-', '*', '+'] {
+        if let Some(body) = rest.strip_prefix(bullet).and_then(|r| r.strip_prefix(' ')) {
+            return Some((indent / 2, "•".to_string(), body.trim_start()));
+        }
+    }
+
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() || digits.len() > 9 {
+        return None;
+    }
+    let after = &rest[digits.len()..];
+    for sep in ['.', ')'] {
+        if let Some(body) = after.strip_prefix(sep).and_then(|r| r.strip_prefix(' ')) {
+            return Some((indent / 2, format!("{}{}", digits, sep), body.trim_start()));
+        }
+    }
+    None
+}
+
+/// Splits a line into styled inline spans.
+pub fn parse_inline(src: &str) -> Vec<Span> {
+    let chars: Vec<char> = src.chars().collect();
+    let mut spans: Vec<Span> = Vec::new();
+    let mut buf = String::new();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\\' if i + 1 < chars.len() => {
+                buf.push(chars[i + 1]);
+                i += 2;
+            }
+            '`' => match find(&chars, i + 1, "`") {
+                Some(end) => {
+                    push_plain(&mut spans, &mut buf);
+                    spans.push(Span::new(collect(&chars, i + 1, end), Style::Code));
+                    i = end + 1;
+                }
+                None => {
+                    buf.push(c);
+                    i += 1;
+                }
+            },
+            '*' | '_' => {
+                let run = chars[i..].iter().take_while(|ch| **ch == c).count().min(3);
+                let start = i + run;
+                match emphasis_end(&chars, i, c, run) {
+                    Some(end) => {
+                        push_plain(&mut spans, &mut buf);
+                        let style = match run {
+                            1 => Style::Italic,
+                            2 => Style::Bold,
+                            _ => Style::BoldItalic,
+                        };
+                        spans.push(Span::new(collect(&chars, start, end), style));
+                        i = end + run;
+                    }
+                    None => {
+                        buf.push(c);
+                        i += 1;
+                    }
+                }
+            }
+            '[' | '!' => {
+                let open = if c == '!' { i + 1 } else { i };
+                let is_link = chars.get(open) == Some(&'[');
+                match is_link.then(|| link(&chars, open)).flatten() {
+                    Some((label, end)) => {
+                        push_plain(&mut spans, &mut buf);
+                        spans.push(Span::new(label, Style::Link));
+                        i = end;
+                    }
+                    None => {
+                        buf.push(c);
+                        i += 1;
+                    }
+                }
+            }
+            _ => {
+                buf.push(c);
+                i += 1;
+            }
+        }
+    }
+
+    push_plain(&mut spans, &mut buf);
+    spans
+}
+
+/// Where the emphasis opened at `i` closes, if it does.
+///
+/// Follows the two rules that matter in practice: the delimiters must hug the
+/// emphasized text (so `2 * 3 * 4` stays arithmetic), and `_` only delimits at
+/// a word boundary (so `snake_case_name` stays one word).
+fn emphasis_end(chars: &[char], i: usize, marker: char, run: usize) -> Option<usize> {
+    let start = i + run;
+    if chars.get(start).map_or(true, |c| c.is_whitespace()) {
+        return None;
+    }
+    if marker == '_' && i > 0 && chars[i - 1].is_alphanumeric() {
+        return None;
+    }
+
+    let delim: String = std::iter::repeat(marker).take(run).collect();
+    let mut from = start + 1;
+    while let Some(end) = find(chars, from, &delim) {
+        let closes = !chars[end - 1].is_whitespace()
+            && (marker != '_' || chars.get(end + run).map_or(true, |c| !c.is_alphanumeric()));
+        if closes {
+            return Some(end);
+        }
+        from = end + 1;
+    }
+    None
+}
+
+/// Parses `[label](url)` starting at the `[`; returns the label and the index
+/// just past the closing `)`.
+fn link(chars: &[char], start: usize) -> Option<(String, usize)> {
+    let close = find(chars, start + 1, "]")?;
+    if chars.get(close + 1) != Some(&'(') {
+        return None;
+    }
+    let end = find(chars, close + 2, ")")?;
+    Some((collect(chars, start + 1, close), end + 1))
+}
+
+/// Index of the next occurrence of `needle` at or after `from`.
+fn find(chars: &[char], from: usize, needle: &str) -> Option<usize> {
+    let needle: Vec<char> = needle.chars().collect();
+    if from >= chars.len() || needle.is_empty() {
+        return None;
+    }
+    (from..=chars.len().saturating_sub(needle.len()))
+        .find(|i| chars[*i..*i + needle.len()] == needle[..])
+}
+
+fn collect(chars: &[char], from: usize, to: usize) -> String {
+    chars[from..to].iter().collect()
+}
+
+fn push_plain(spans: &mut Vec<Span>, buf: &mut String) {
+    if !buf.is_empty() {
+        spans.push(Span::new(std::mem::take(buf), Style::Plain));
+    }
+}
+
+// ─── Rendering ──────────────────────────────────────────────────────────────
+
+const BODY_SIZE: f32 = 15.0;
+
+fn heading_size(level: u8) -> f32 {
+    match level {
+        1 => 27.0,
+        2 => 23.0,
+        3 => 20.0,
+        4 => 17.0,
+        5 => 15.0,
+        _ => 14.0,
+    }
+}
+
+fn bold_font() -> Font {
+    Font {
+        weight: iced::font::Weight::Bold,
+        ..Font::DEFAULT
+    }
+}
+
+fn italic_font() -> Font {
+    Font {
+        style: iced::font::Style::Italic,
+        ..Font::DEFAULT
+    }
+}
+
+fn bold_italic_font() -> Font {
+    Font {
+        weight: iced::font::Weight::Bold,
+        style: iced::font::Style::Italic,
+        ..Font::DEFAULT
+    }
+}
+
+/// The rendered document, scrollable.
+pub fn view(blocks: &[Block], dark: bool) -> Element<'static, Message> {
+    let body: Vec<Element<'static, Message>> = blocks.iter().map(|b| block_view(b, dark)).collect();
+
+    scrollable(
+        container(column(body).spacing(12))
+            .width(Length::Fill)
+            .padding([16, 24]),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
+}
+
+fn block_view(block: &Block, dark: bool) -> Element<'static, Message> {
+    let p = theme::palette(dark);
+    match block {
+        Block::Heading { level, spans } => {
+            spans_view(spans, heading_size(*level), p.text, dark, bold_font())
+        }
+        Block::Paragraph(spans) => spans_view(spans, BODY_SIZE, p.text, dark, Font::DEFAULT),
+        Block::Quote(spans) => {
+            container(spans_view(spans, BODY_SIZE, p.muted, dark, italic_font()))
+                .width(Length::Fill)
+                .padding([8, 14])
+                .style(theme::quote_block(dark))
+                .into()
+        }
+        Block::ListItem {
+            depth,
+            marker,
+            spans,
+        } => row![
+            Space::with_width(Length::Fixed(8.0 + *depth as f32 * 18.0)),
+            text(marker.clone())
+                .size(BODY_SIZE)
+                .style(theme::muted_text(dark)),
+            Space::with_width(Length::Fixed(8.0)),
+            spans_view(spans, BODY_SIZE, p.text, dark, Font::DEFAULT),
+        ]
+        .into(),
+        Block::Code(code) => container(
+            text(code.clone())
+                .size(13.0)
+                .font(Font::MONOSPACE)
+                .style(p.text)
+                .shaping(iced::widget::text::Shaping::Advanced),
+        )
+        .width(Length::Fill)
+        .padding([10, 14])
+        .style(theme::code_block(dark))
+        .into(),
+        Block::Rule => container(Space::with_height(1))
+            .width(Length::Fill)
+            .style(theme::gutter(dark))
+            .into(),
+    }
+}
+
+/// Lays out spans as a wrapping run of words. iced 0.12 has no rich text
+/// widget, so each word is its own text widget; fragments that are not
+/// separated by whitespace in the source (`**bold**,`) are grouped into one
+/// unspaced row so the punctuation stays glued to the word.
+fn spans_view(
+    spans: &[Span],
+    size: f32,
+    color: Color,
+    dark: bool,
+    base_font: Font,
+) -> Element<'static, Message> {
+    let accent = theme::accent_color();
+    let muted = theme::muted_text(dark);
+
+    let mut clusters: Vec<Element<'static, Message>> = Vec::new();
+    let mut cluster: Vec<Element<'static, Message>> = Vec::new();
+
+    for span in spans {
+        if span.text.starts_with(char::is_whitespace) && !cluster.is_empty() {
+            clusters.push(row(std::mem::take(&mut cluster)).into());
+        }
+        for (i, word) in span.text.split_whitespace().enumerate() {
+            if i > 0 && !cluster.is_empty() {
+                clusters.push(row(std::mem::take(&mut cluster)).into());
+            }
+            // Advanced shaping is what makes cosmic-text fall back to another
+            // installed font for a glyph missing from `base_font` — emoji chief
+            // among them, which live in a dedicated color-emoji font.
+            let widget = text(word.to_string())
+                .size(size)
+                .shaping(iced::widget::text::Shaping::Advanced);
+            let widget = match span.style {
+                Style::Plain => widget.font(base_font).style(color),
+                Style::Bold => widget.font(bold_font()).style(color),
+                Style::Italic => widget.font(italic_font()).style(color),
+                Style::BoldItalic => widget.font(bold_italic_font()).style(color),
+                Style::Code => widget.font(Font::MONOSPACE).size(size - 1.0).style(muted),
+                Style::Link => widget.font(base_font).style(accent),
+            };
+            cluster.push(widget.into());
+        }
+        if span.text.ends_with(char::is_whitespace) && !cluster.is_empty() {
+            clusters.push(row(std::mem::take(&mut cluster)).into());
+        }
+    }
+    if !cluster.is_empty() {
+        clusters.push(row(cluster).into());
+    }
+
+    iced_aw::Wrap::with_elements(clusters)
+        .spacing(size * 0.28)
+        .line_spacing(5.0)
+        .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plain(text: &str) -> Vec<Span> {
+        vec![Span::new(text, Style::Plain)]
+    }
+
+    #[test]
+    fn parses_headings() {
+        assert_eq!(
+            parse("# Title"),
+            vec![Block::Heading {
+                level: 1,
+                spans: plain("Title")
+            }]
+        );
+        assert_eq!(
+            parse("### Deep"),
+            vec![Block::Heading {
+                level: 3,
+                spans: plain("Deep")
+            }]
+        );
+    }
+
+    #[test]
+    fn hash_without_space_is_not_a_heading() {
+        assert_eq!(parse("#hashtag"), vec![Block::Paragraph(plain("#hashtag"))]);
+    }
+
+    #[test]
+    fn joins_paragraph_lines_and_splits_on_blank() {
+        assert_eq!(
+            parse("one\ntwo\n\nthree"),
+            vec![
+                Block::Paragraph(plain("one two")),
+                Block::Paragraph(plain("three")),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_fenced_code_verbatim() {
+        let blocks = parse("```rust\nlet x = *y;\n```");
+        assert_eq!(blocks, vec![Block::Code("let x = *y;".to_string())]);
+    }
+
+    #[test]
+    fn unclosed_fence_still_yields_a_code_block() {
+        assert_eq!(parse("```\nabc"), vec![Block::Code("abc".to_string())]);
+    }
+
+    #[test]
+    fn parses_lists() {
+        assert_eq!(
+            parse("- a\n  - b\n3. c"),
+            vec![
+                Block::ListItem {
+                    depth: 0,
+                    marker: "•".to_string(),
+                    spans: plain("a")
+                },
+                Block::ListItem {
+                    depth: 1,
+                    marker: "•".to_string(),
+                    spans: plain("b")
+                },
+                Block::ListItem {
+                    depth: 0,
+                    marker: "3.".to_string(),
+                    spans: plain("c")
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_quotes_and_rules() {
+        assert_eq!(
+            parse("> quoted\n> more\n\n---"),
+            vec![Block::Quote(plain("quoted more")), Block::Rule]
+        );
+    }
+
+    #[test]
+    fn dashes_inside_a_list_are_not_a_rule() {
+        assert!(matches!(parse("- a")[0], Block::ListItem { .. }));
+    }
+
+    #[test]
+    fn parses_inline_emphasis() {
+        assert_eq!(
+            parse_inline("a **b** c *d* `e` ***f***"),
+            vec![
+                Span::new("a ", Style::Plain),
+                Span::new("b", Style::Bold),
+                Span::new(" c ", Style::Plain),
+                Span::new("d", Style::Italic),
+                Span::new(" ", Style::Plain),
+                Span::new("e", Style::Code),
+                Span::new(" ", Style::Plain),
+                Span::new("f", Style::BoldItalic),
+            ]
+        );
+    }
+
+    #[test]
+    fn unmatched_markers_stay_literal() {
+        assert_eq!(parse_inline("2 * 3 * 4"), plain("2 * 3 * 4"));
+        assert_eq!(parse_inline("a_b"), plain("a_b"));
+        assert_eq!(parse_inline("*dangling"), plain("*dangling"));
+    }
+
+    #[test]
+    fn underscores_inside_a_word_are_literal() {
+        assert_eq!(parse_inline("snake_case_name"), plain("snake_case_name"));
+        assert_eq!(
+            parse_inline("an _emphasized_ word"),
+            vec![
+                Span::new("an ", Style::Plain),
+                Span::new("emphasized", Style::Italic),
+                Span::new(" word", Style::Plain),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_links_and_images() {
+        assert_eq!(
+            parse_inline("see [docs](http://x) and ![pic](y.png)"),
+            vec![
+                Span::new("see ", Style::Plain),
+                Span::new("docs", Style::Link),
+                Span::new(" and ", Style::Plain),
+                Span::new("pic", Style::Link),
+            ]
+        );
+    }
+
+    #[test]
+    fn bracket_without_url_stays_literal() {
+        assert_eq!(parse_inline("[todo]"), plain("[todo]"));
+    }
+
+    #[test]
+    fn backslash_escapes_markers() {
+        assert_eq!(parse_inline(r"\*not bold\*"), plain("*not bold*"));
+    }
+
+    #[test]
+    fn empty_document_has_no_blocks() {
+        assert!(parse("").is_empty());
+        assert!(parse("\n\n").is_empty());
+    }
+}

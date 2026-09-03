@@ -3,13 +3,14 @@ use iced::{
     widget::{button, column, container, row, scrollable, text, text_editor, text_input, Space},
     Alignment, Application, Command, Element, Length, Theme,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::{
     config::{Config, ShortcutConfig, ShortcutTarget},
     editor::EditorState,
     preferences::{PreferencesMessage, PreferencesState},
+    preview::{self, PreviewKind, ViewMode},
     search::{SearchMessage, SearchState},
     sidebar::{SidebarAction, SidebarMessage, SidebarState},
     theme as se_theme,
@@ -111,6 +112,16 @@ pub enum Message {
     ConfirmInstallUpdate(String),
     UpdateDownloaded(Result<std::path::PathBuf, String>),
     UpdateInstalled(Result<(), String>),
+    // Markdown / JSON preview
+    SetViewMode(ViewMode),
+    JsonToggle(String),
+    JsonExpandAll,
+    JsonCollapseAll,
+    /// Live modifier state, so a chevron click can tell Ctrl+click from Alt+click.
+    ModifiersChanged {
+        ctrl: bool,
+        alt: bool,
+    },
 }
 
 pub struct SimpleEditApp {
@@ -141,6 +152,26 @@ pub struct SimpleEditApp {
     /// Whether the next edit should open a new undo group.
     /// True at start, after whitespace, after a cursor move, after delete.
     undo_new_group: bool,
+    /// How the editor pane renders the buffer (Markdown / JSON files only).
+    view_mode: ViewMode,
+    /// Parsed preview of the buffer, rebuilt only when the text changes.
+    preview: PreviewDoc,
+    /// The buffer `preview` was built from.
+    preview_src: String,
+    /// Folded node paths of the JSON tree.
+    json_collapsed: HashSet<String>,
+    /// Ctrl/Cmd currently held, tracked for Ctrl+click on a chevron.
+    mod_ctrl: bool,
+    /// Alt currently held, tracked for Alt+click on a chevron.
+    mod_alt: bool,
+}
+
+/// The cached parse backing the preview pane.
+enum PreviewDoc {
+    None,
+    Markdown(Vec<crate::preview::markdown::Block>),
+    Json(Box<serde_json::Value>),
+    JsonError(String),
 }
 
 impl Application for SimpleEditApp {
@@ -176,6 +207,12 @@ impl Application for SimpleEditApp {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             undo_new_group: true,
+            view_mode: ViewMode::Raw,
+            preview: PreviewDoc::None,
+            preview_src: String::new(),
+            json_collapsed: HashSet::new(),
+            mod_ctrl: false,
+            mod_alt: false,
             config,
         };
 
@@ -203,6 +240,377 @@ impl Application for SimpleEditApp {
     }
 
     fn update(&mut self, message: Message) -> Command<Message> {
+        let command = self.handle(message);
+        self.refresh_preview();
+        command
+    }
+
+    fn subscription(&self) -> iced::Subscription<Message> {
+        let keys = iced::keyboard::on_key_press(|key, modifiers| {
+            use iced::keyboard::{key::Named, Key};
+
+            if key == Key::Named(Named::Escape) {
+                return Some(Message::EscapePressed);
+            }
+            if key == Key::Named(Named::Tab) {
+                if modifiers.shift() {
+                    return Some(Message::DedentLine);
+                }
+                return Some(Message::InsertTab);
+            }
+
+            let key_str = match key.as_ref() {
+                Key::Character(c) => c.to_lowercase(),
+                Key::Named(Named::Enter) => "Return".to_string(),
+                Key::Named(Named::ArrowUp) => "ArrowUp".to_string(),
+                Key::Named(Named::ArrowDown) => "ArrowDown".to_string(),
+                Key::Named(Named::F1) => "F1".to_string(),
+                Key::Named(Named::F2) => "F2".to_string(),
+                Key::Named(Named::F3) => "F3".to_string(),
+                Key::Named(Named::F4) => "F4".to_string(),
+                Key::Named(Named::F5) => "F5".to_string(),
+                Key::Named(Named::F6) => "F6".to_string(),
+                Key::Named(Named::F7) => "F7".to_string(),
+                Key::Named(Named::F8) => "F8".to_string(),
+                Key::Named(Named::F9) => "F9".to_string(),
+                Key::Named(Named::F10) => "F10".to_string(),
+                Key::Named(Named::F11) => "F11".to_string(),
+                Key::Named(Named::F12) => "F12".to_string(),
+                _ => return None,
+            };
+
+            Some(Message::KeyPressed {
+                key: key_str,
+                ctrl: modifiers.command(),
+                shift: modifiers.shift(),
+                alt: modifiers.alt(),
+            })
+        });
+
+        // Chevron clicks need the modifier state at click time, which a button
+        // press message does not carry.
+        let modifiers = iced::event::listen_with(|event, _status| match event {
+            iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(m)) => {
+                Some(Message::ModifiersChanged {
+                    ctrl: m.command(),
+                    alt: m.alt(),
+                })
+            }
+            _ => None,
+        });
+
+        let autosave =
+            iced::time::every(std::time::Duration::from_secs(5)).map(|_| Message::AutoSave);
+
+        iced::Subscription::batch([keys, modifiers, autosave])
+    }
+
+    fn view(&self) -> Element<'_, Message> {
+        let dark = self.config.dark_mode;
+
+        let menu_bar = crate::menu_bar::view(&self.config, self.open_menu);
+
+        let preview_kind = self.preview_kind();
+        let view_mode = if preview_kind.is_some() {
+            self.view_mode
+        } else {
+            ViewMode::Raw
+        };
+        let editor_widget = self.editor_pane(preview_kind, view_mode, dark);
+        let lbl_select_all = t!("ctx.select_all").to_string();
+        let lbl_cut = t!("ctx.cut").to_string();
+        let lbl_copy = t!("ctx.copy").to_string();
+        let lbl_paste = t!("ctx.paste").to_string();
+        let lbl_delete = t!("ctx.delete").to_string();
+        let lbl_format_sel = t!("ctx.format_selection").to_string();
+        let lbl_format_all = t!("ctx.format_all").to_string();
+        let lbl_expand_all = t!("ctx.expand_all").to_string();
+        let lbl_collapse_all = t!("ctx.collapse_all").to_string();
+        let json_tree_shown =
+            view_mode != ViewMode::Raw && matches!(self.preview, PreviewDoc::Json(_));
+        let has_fmt_ctx = self
+            .editor
+            .language
+            .as_deref()
+            .map(crate::formatter::has_formatter)
+            .unwrap_or(false);
+        let has_sel_ctx = self.editor.content.selection().is_some();
+        let editor_with_context = iced_aw::ContextMenu::new(editor_widget, move || {
+            let item = |label: String, msg: Message| -> Element<'static, Message> {
+                button(text(label).size(13))
+                    .padding([6, 10])
+                    .width(Length::Fixed(200.0))
+                    .on_press(msg)
+                    .style(iced::theme::Button::custom(crate::theme::GhostButton {
+                        dark,
+                        active: false,
+                    }))
+                    .into()
+            };
+            let disabled = |label: String| -> Element<'static, Message> {
+                container(text(label).size(13).style(crate::theme::muted_text(dark)))
+                    .padding([6, 10])
+                    .width(Length::Fixed(200.0))
+                    .into()
+            };
+            // Same as `item`, with the equivalent click gesture spelled out on the right.
+            let item_hint =
+                |label: String, hint: String, msg: Message| -> Element<'static, Message> {
+                    button(
+                        row![
+                            text(label).size(13),
+                            Space::with_width(Length::Fill),
+                            text(hint).size(11).style(crate::theme::muted_text(dark)),
+                        ]
+                        .align_items(Alignment::Center),
+                    )
+                    .padding([6, 10])
+                    .width(Length::Fixed(200.0))
+                    .on_press(msg)
+                    .style(iced::theme::Button::custom(crate::theme::GhostButton {
+                        dark,
+                        active: false,
+                    }))
+                    .into()
+                };
+            let fmt_sel_el: Element<'static, Message> = if has_fmt_ctx && has_sel_ctx {
+                item(lbl_format_sel.clone(), Message::FormatSelection)
+            } else {
+                disabled(lbl_format_sel.clone())
+            };
+            let fmt_all_el: Element<'static, Message> = if has_fmt_ctx {
+                item(lbl_format_all.clone(), Message::FormatFile)
+            } else {
+                disabled(lbl_format_all.clone())
+            };
+            let mut ctx_items: Vec<Element<'static, Message>> = vec![
+                item(lbl_select_all.clone(), Message::SelectAll),
+                item(lbl_cut.clone(), Message::ContextCut),
+                item(lbl_copy.clone(), Message::ContextCopy),
+                item(lbl_paste.clone(), Message::ContextPaste),
+                item(lbl_delete.clone(), Message::ContextDelete),
+                fmt_sel_el,
+                fmt_all_el,
+            ];
+            if json_tree_shown {
+                ctx_items.push(item_hint(
+                    lbl_expand_all.clone(),
+                    "Ctrl+Click".to_string(),
+                    Message::JsonExpandAll,
+                ));
+                ctx_items.push(item_hint(
+                    lbl_collapse_all.clone(),
+                    "Alt+Click".to_string(),
+                    Message::JsonCollapseAll,
+                ));
+            }
+            container(column(ctx_items).spacing(2).padding(6))
+                .style(crate::theme::card(dark))
+                .into()
+        });
+
+        let search_panel = if self.show_search {
+            Some(self.search.view(dark))
+        } else {
+            None
+        };
+
+        let editor_area: Element<Message> = if let Some(search) = search_panel {
+            column![search, editor_with_context].into()
+        } else {
+            editor_with_context.into()
+        };
+
+        let mut main_row = row![];
+        if self.show_sidebar {
+            main_row = main_row.push(self.sidebar.view(dark, &self.current_file));
+        }
+        main_row = main_row.push(editor_area);
+        if self.show_preferences {
+            main_row = main_row.push(self.preferences.view(dark));
+        }
+
+        let cursor = self.editor.content.cursor_position();
+        let selection_info = self.editor.content.selection().map(|s| {
+            let chars = s.chars().count();
+            let lines = s.lines().count();
+            if lines > 1 {
+                format!("{}L {}C", lines, chars)
+            } else {
+                format!("{}C", chars)
+            }
+        });
+        let file_size = self
+            .current_file
+            .as_ref()
+            .filter(|p| !is_untitled(p))
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len());
+        let status_bar = crate::editor::statusbar::view(
+            &self.status_message,
+            &self.current_file,
+            self.is_dirty,
+            dark,
+            cursor,
+            self.status_is_error,
+            self.editor.language.as_deref(),
+            selection_info,
+            file_size,
+        );
+
+        let error_panel: Option<Element<Message>> = if self.show_error_panel {
+            if let Some(err) = &self.format_error {
+                let header = row![
+                    text(t!("panel.errors").to_string())
+                        .size(11)
+                        .style(se_theme::muted_text(dark)),
+                    Space::with_width(Length::Fill),
+                    button(text("✕").size(11).style(se_theme::muted_text(dark)))
+                        .padding([2, 6])
+                        .on_press(Message::CloseErrorPanel)
+                        .style(iced::theme::Button::custom(se_theme::GhostButton {
+                            dark,
+                            active: false,
+                        })),
+                ]
+                .padding([4, 10])
+                .align_items(Alignment::Center);
+
+                let error_color = iced::Color::from_rgb(0.88, 0.27, 0.18);
+                let body = scrollable(
+                    container(
+                        text(err.clone())
+                            .size(12)
+                            .style(error_color)
+                            .font(iced::Font::MONOSPACE),
+                    )
+                    .padding([4, 12, 8, 12])
+                    .width(Length::Fill),
+                )
+                .height(Length::Fixed(100.0));
+
+                Some(
+                    container(column![header, body])
+                        .width(Length::Fill)
+                        .style(se_theme::error_panel(dark))
+                        .into(),
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let mut col = if self.is_formatting {
+            let banner = container(
+                text(t!("status.formatting").to_string())
+                    .size(12)
+                    .style(se_theme::accent_color()),
+            )
+            .width(Length::Fill)
+            .padding([4, 14])
+            .style(se_theme::accent_banner(dark));
+            column![menu_bar, banner, main_row]
+        } else {
+            column![menu_bar, main_row]
+        };
+        if let Some(panel) = error_panel {
+            col = col.push(panel);
+        }
+        let content = col
+            .push(status_bar)
+            .width(Length::Fill)
+            .height(Length::Fill);
+
+        // Base layout wrapped in a container
+        let base: Element<Message> = container(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
+
+        // Floating dropdown (menu bar)
+        let with_dropdown: Element<Message> = if let Some(menu) = self.open_menu {
+            let has_fmt = self
+                .editor
+                .language
+                .as_deref()
+                .map(crate::formatter::has_formatter)
+                .unwrap_or(false);
+            let lang_override_enabled = self.language_picker_enabled();
+            let dropdown =
+                crate::menu_bar::dropdown_view(menu, &self.config, has_fmt, lang_override_enabled);
+            let x = crate::menu_bar::dropdown_x_offset(menu);
+            iced_aw::floating_element::FloatingElement::new(base, dropdown)
+                .anchor(iced_aw::floating_element::Anchor::NorthWest)
+                .offset(iced_aw::floating_element::Offset {
+                    x,
+                    y: crate::menu_bar::BAR_HEIGHT,
+                })
+                .into()
+        } else {
+            base
+        };
+
+        // Modal overlays
+        match &self.overlay {
+            ActiveOverlay::None => with_dropdown,
+            ActiveOverlay::About => {
+                let overlay = self.view_about_overlay(dark);
+                iced_aw::Modal::new(with_dropdown, Some(overlay))
+                    .backdrop(Message::CloseOverlay)
+                    .on_esc(Message::CloseOverlay)
+                    .into()
+            }
+            ActiveOverlay::GotoLine => {
+                let overlay = self.view_goto_line_overlay(dark);
+                iced_aw::Modal::new(with_dropdown, Some(overlay))
+                    .backdrop(Message::CloseOverlay)
+                    .on_esc(Message::CloseOverlay)
+                    .into()
+            }
+            ActiveOverlay::LanguagePicker => {
+                let overlay = self.view_language_picker_overlay(dark);
+                iced_aw::Modal::new(with_dropdown, Some(overlay))
+                    .backdrop(Message::CloseOverlay)
+                    .on_esc(Message::CloseOverlay)
+                    .into()
+            }
+            ActiveOverlay::Shortcuts { capturing } => {
+                let overlay = self.view_shortcuts_overlay(dark, *capturing);
+                iced_aw::Modal::new(with_dropdown, Some(overlay))
+                    .backdrop(Message::CloseOverlay)
+                    .on_esc(Message::CloseOverlay)
+                    .into()
+            }
+            ActiveOverlay::UpdateChecking
+            | ActiveOverlay::UpdateDownloading
+            | ActiveOverlay::UpdateInstalling
+            | ActiveOverlay::UpdateUpToDate
+            | ActiveOverlay::UpdateAvailable(_)
+            | ActiveOverlay::UpdateError(_) => {
+                let overlay = self.view_update_overlay(dark);
+                iced_aw::Modal::new(with_dropdown, Some(overlay))
+                    .backdrop(Message::CloseOverlay)
+                    .on_esc(Message::CloseOverlay)
+                    .into()
+            }
+        }
+    }
+
+    fn theme(&self) -> Theme {
+        if self.config.dark_mode {
+            se_theme::ink_dark()
+        } else {
+            se_theme::ink_light()
+        }
+    }
+}
+
+// ─── Message handling ───────────────────────────────────────────────────────
+
+impl SimpleEditApp {
+    fn handle(&mut self, message: Message) -> Command<Message> {
         if !matches!(&message, Message::ToggleMenu(_)) {
             self.open_menu = None;
         }
@@ -308,7 +716,7 @@ impl Application for SimpleEditApp {
             Message::InsertTab => {
                 if !self.show_search && !self.show_preferences {
                     if self.editor.content.selection().is_some() {
-                        return self.update(Message::IndentSelection);
+                        return self.handle(Message::IndentSelection);
                     }
                     let text = if self.config.use_spaces {
                         " ".repeat(self.config.tab_width)
@@ -355,6 +763,7 @@ impl Application for SimpleEditApp {
                 self.untitled_counter += 1;
                 let path = untitled_path(self.untitled_counter);
                 self.editor = EditorState::new();
+                self.reset_view_mode();
                 self.current_file = Some(path.clone());
                 self.sidebar.add_file(path);
                 self.is_dirty = false;
@@ -369,6 +778,7 @@ impl Application for SimpleEditApp {
                 match result {
                     Ok((path, content)) => {
                         self.editor = EditorState::from_content(&content);
+                        self.reset_view_mode();
                         let ext = path
                             .extension()
                             .and_then(|e| e.to_str())
@@ -435,6 +845,7 @@ impl Application for SimpleEditApp {
             }
             Message::CloseFile => {
                 self.editor = EditorState::new();
+                self.reset_view_mode();
                 self.current_file = None;
                 self.is_dirty = false;
                 self.undo_stack.clear();
@@ -480,7 +891,8 @@ impl Application for SimpleEditApp {
                     self.redo_stack.clear();
                     if let Some((content, language, dirty)) = self.file_cache.get(&path).cloned() {
                         self.editor = EditorState::from_content(&content);
-                        self.editor.language = language;
+                        self.editor.restore_language(language, &path);
+                        self.reset_view_mode();
                         self.current_file = Some(path);
                         self.is_dirty = dirty;
                         self.status_message = t!("status.file_opened").to_string();
@@ -493,6 +905,7 @@ impl Application for SimpleEditApp {
                     if self.current_file.as_ref() == Some(&path) {
                         self.file_cache.remove(&path);
                         self.editor = EditorState::new();
+                        self.reset_view_mode();
                         self.current_file = None;
                         self.is_dirty = false;
                         self.undo_stack.clear();
@@ -721,6 +1134,7 @@ impl Application for SimpleEditApp {
             }
             Message::SetLanguage(ext) => {
                 self.editor.language = if ext.is_empty() { None } else { Some(ext) };
+                self.reset_view_mode();
                 self.overlay = ActiveOverlay::None;
                 Command::none()
             }
@@ -829,7 +1243,7 @@ impl Application for SimpleEditApp {
                     None
                 };
                 if let Some(m) = msg {
-                    self.update(m)
+                    self.handle(m)
                 } else {
                     Command::none()
                 }
@@ -989,7 +1403,8 @@ impl Application for SimpleEditApp {
                 self.sidebar.add_file(path.clone());
                 if let Some((content, language, dirty)) = self.file_cache.get(&path).cloned() {
                     self.editor = EditorState::from_content(&content);
-                    self.editor.language = language;
+                    self.editor.restore_language(language, &path);
+                    self.reset_view_mode();
                     self.current_file = Some(path);
                     self.is_dirty = dirty;
                     self.status_message = t!("status.file_opened").to_string();
@@ -1062,313 +1477,144 @@ impl Application for SimpleEditApp {
                 self.overlay = ActiveOverlay::UpdateError(e);
                 Command::none()
             }
-        }
-    }
-
-    fn subscription(&self) -> iced::Subscription<Message> {
-        let keys = iced::keyboard::on_key_press(|key, modifiers| {
-            use iced::keyboard::{key::Named, Key};
-
-            if key == Key::Named(Named::Escape) {
-                return Some(Message::EscapePressed);
+            Message::SetViewMode(mode) => {
+                self.view_mode = mode;
+                Command::none()
             }
-            if key == Key::Named(Named::Tab) {
-                if modifiers.shift() {
-                    return Some(Message::DedentLine);
+            Message::JsonToggle(path) => {
+                // Ctrl+click opens every node, Alt+click closes every node.
+                if self.mod_ctrl {
+                    self.handle(Message::JsonExpandAll)
+                } else if self.mod_alt {
+                    self.handle(Message::JsonCollapseAll)
+                } else {
+                    if !self.json_collapsed.remove(&path) {
+                        self.json_collapsed.insert(path);
+                    }
+                    Command::none()
                 }
-                return Some(Message::InsertTab);
             }
-
-            let key_str = match key.as_ref() {
-                Key::Character(c) => c.to_lowercase(),
-                Key::Named(Named::Enter) => "Return".to_string(),
-                Key::Named(Named::ArrowUp) => "ArrowUp".to_string(),
-                Key::Named(Named::ArrowDown) => "ArrowDown".to_string(),
-                Key::Named(Named::F1) => "F1".to_string(),
-                Key::Named(Named::F2) => "F2".to_string(),
-                Key::Named(Named::F3) => "F3".to_string(),
-                Key::Named(Named::F4) => "F4".to_string(),
-                Key::Named(Named::F5) => "F5".to_string(),
-                Key::Named(Named::F6) => "F6".to_string(),
-                Key::Named(Named::F7) => "F7".to_string(),
-                Key::Named(Named::F8) => "F8".to_string(),
-                Key::Named(Named::F9) => "F9".to_string(),
-                Key::Named(Named::F10) => "F10".to_string(),
-                Key::Named(Named::F11) => "F11".to_string(),
-                Key::Named(Named::F12) => "F12".to_string(),
-                _ => return None,
-            };
-
-            Some(Message::KeyPressed {
-                key: key_str,
-                ctrl: modifiers.command(),
-                shift: modifiers.shift(),
-                alt: modifiers.alt(),
-            })
-        });
-
-        let autosave =
-            iced::time::every(std::time::Duration::from_secs(5)).map(|_| Message::AutoSave);
-
-        iced::Subscription::batch([keys, autosave])
+            Message::JsonExpandAll => {
+                self.json_collapsed.clear();
+                Command::none()
+            }
+            Message::JsonCollapseAll => {
+                if let PreviewDoc::Json(value) = &self.preview {
+                    self.json_collapsed = crate::preview::json::container_paths(value);
+                }
+                Command::none()
+            }
+            Message::ModifiersChanged { ctrl, alt } => {
+                self.mod_ctrl = ctrl;
+                self.mod_alt = alt;
+                Command::none()
+            }
+        }
     }
 
-    fn view(&self) -> Element<'_, Message> {
-        let dark = self.config.dark_mode;
+    /// The preview offered by the current buffer, if any.
+    fn preview_kind(&self) -> Option<PreviewKind> {
+        preview::kind_for(self.editor.language.as_deref())
+    }
 
-        let menu_bar = crate::menu_bar::view(&self.config, self.open_menu);
+    /// Back to the plain editor: called whenever the buffer is replaced by a
+    /// different file, since folded paths and the mode belong to one document.
+    fn reset_view_mode(&mut self) {
+        self.view_mode = ViewMode::Raw;
+        self.json_collapsed.clear();
+        self.preview = PreviewDoc::None;
+        self.preview_src.clear();
+    }
 
-        let editor_widget = self.editor.view(&self.config);
-        let lbl_select_all = t!("ctx.select_all").to_string();
-        let lbl_cut = t!("ctx.cut").to_string();
-        let lbl_copy = t!("ctx.copy").to_string();
-        let lbl_paste = t!("ctx.paste").to_string();
-        let lbl_delete = t!("ctx.delete").to_string();
-        let lbl_format_sel = t!("ctx.format_selection").to_string();
-        let lbl_format_all = t!("ctx.format_all").to_string();
-        let has_fmt_ctx = self
-            .editor
-            .language
-            .as_deref()
-            .map(crate::formatter::has_formatter)
-            .unwrap_or(false);
-        let has_sel_ctx = self.editor.content.selection().is_some();
-        let editor_with_context = iced_aw::ContextMenu::new(editor_widget, move || {
-            let item = |label: String, msg: Message| -> Element<'static, Message> {
-                button(text(label).size(13))
-                    .padding([6, 10])
-                    .width(Length::Fixed(200.0))
-                    .on_press(msg)
-                    .style(iced::theme::Button::custom(crate::theme::GhostButton {
-                        dark,
-                        active: false,
-                    }))
-                    .into()
-            };
-            let disabled = |label: String| -> Element<'static, Message> {
-                container(text(label).size(13).style(crate::theme::muted_text(dark)))
-                    .padding([6, 10])
-                    .width(Length::Fixed(200.0))
-                    .into()
-            };
-            let fmt_sel_el: Element<'static, Message> = if has_fmt_ctx && has_sel_ctx {
-                item(lbl_format_sel.clone(), Message::FormatSelection)
-            } else {
-                disabled(lbl_format_sel.clone())
-            };
-            let fmt_all_el: Element<'static, Message> = if has_fmt_ctx {
-                item(lbl_format_all.clone(), Message::FormatFile)
-            } else {
-                disabled(lbl_format_all.clone())
-            };
-            let ctx_items: Vec<Element<'static, Message>> = vec![
-                item(lbl_select_all.clone(), Message::SelectAll),
-                item(lbl_cut.clone(), Message::ContextCut),
-                item(lbl_copy.clone(), Message::ContextCopy),
-                item(lbl_paste.clone(), Message::ContextPaste),
-                item(lbl_delete.clone(), Message::ContextDelete),
-                fmt_sel_el,
-                fmt_all_el,
-            ];
-            container(column(ctx_items).spacing(2).padding(6))
-                .style(crate::theme::card(dark))
-                .into()
-        });
-
-        let search_panel = if self.show_search {
-            Some(self.search.view(dark))
-        } else {
-            None
+    /// Reparses the buffer for the preview pane, but only when it is visible
+    /// and its text actually changed since the last parse.
+    fn refresh_preview(&mut self) {
+        let Some(kind) = self.preview_kind() else {
+            self.preview = PreviewDoc::None;
+            self.preview_src.clear();
+            return;
         };
-
-        let editor_area: Element<Message> = if let Some(search) = search_panel {
-            column![search, editor_with_context].into()
-        } else {
-            editor_with_context.into()
-        };
-
-        let mut main_row = row![];
-        if self.show_sidebar {
-            main_row = main_row.push(self.sidebar.view(dark, &self.current_file));
-        }
-        main_row = main_row.push(editor_area);
-        if self.show_preferences {
-            main_row = main_row.push(self.preferences.view(dark));
+        if self.view_mode == ViewMode::Raw {
+            return;
         }
 
-        let cursor = self.editor.content.cursor_position();
-        let selection_info = self.editor.content.selection().map(|s| {
-            let chars = s.chars().count();
-            let lines = s.lines().count();
-            if lines > 1 {
-                format!("{}L {}C", lines, chars)
-            } else {
-                format!("{}C", chars)
+        let src = self.editor.content.text();
+        if matches!(self.preview, PreviewDoc::None) || src != self.preview_src {
+            self.preview = match kind {
+                PreviewKind::Markdown => {
+                    PreviewDoc::Markdown(crate::preview::markdown::parse(&src))
+                }
+                PreviewKind::Json => match crate::preview::json::parse(&src) {
+                    Ok(value) => PreviewDoc::Json(Box::new(value)),
+                    Err(e) => PreviewDoc::JsonError(e),
+                },
+            };
+            self.preview_src = src;
+        }
+    }
+}
+
+// ─── Editor pane ────────────────────────────────────────────────────────────
+
+impl SimpleEditApp {
+    /// The editor pane: the text editor alone, or the mode toolbar above the
+    /// editor, the preview, or both side by side.
+    fn editor_pane(
+        &self,
+        kind: Option<PreviewKind>,
+        mode: ViewMode,
+        dark: bool,
+    ) -> Element<'_, Message> {
+        let Some(kind) = kind else {
+            return self.editor.view(&self.config);
+        };
+
+        let body: Element<'_, Message> = match mode {
+            ViewMode::Raw => self.editor.view(&self.config),
+            ViewMode::Preview => self.preview_view(dark),
+            ViewMode::Split => row![
+                container(self.editor.view(&self.config)).width(Length::FillPortion(1)),
+                container(Space::with_width(1))
+                    .height(Length::Fill)
+                    .style(se_theme::gutter(dark)),
+                container(self.preview_view(dark)).width(Length::FillPortion(1)),
+            ]
+            .height(Length::Fill)
+            .into(),
+        };
+
+        column![crate::preview::toolbar(kind, mode, dark), body]
+            .height(Length::Fill)
+            .into()
+    }
+
+    /// The rendered document, or the parser error when the JSON is invalid.
+    fn preview_view(&self, dark: bool) -> Element<'_, Message> {
+        match &self.preview {
+            PreviewDoc::Markdown(blocks) => crate::preview::markdown::view(blocks, dark),
+            PreviewDoc::Json(value) => {
+                crate::preview::json::view(value, &self.json_collapsed, dark)
             }
-        });
-        let file_size = self
-            .current_file
-            .as_ref()
-            .filter(|p| !is_untitled(p))
-            .and_then(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len());
-        let status_bar = crate::editor::statusbar::view(
-            &self.status_message,
-            &self.current_file,
-            self.is_dirty,
-            dark,
-            cursor,
-            self.status_is_error,
-            self.editor.language.as_deref(),
-            selection_info,
-            file_size,
-        );
-
-        let error_panel: Option<Element<Message>> = if self.show_error_panel {
-            if let Some(err) = &self.format_error {
-                let header = row![
-                    text(t!("panel.errors").to_string())
-                        .size(11)
+            PreviewDoc::JsonError(err) => container(
+                column![
+                    text(t!("preview.json_error").to_string())
+                        .size(13)
+                        .style(iced::Color::from_rgb(0.88, 0.27, 0.18)),
+                    text(err.clone())
+                        .size(12)
+                        .font(iced::Font::MONOSPACE)
                         .style(se_theme::muted_text(dark)),
-                    Space::with_width(Length::Fill),
-                    button(text("✕").size(11).style(se_theme::muted_text(dark)))
-                        .padding([2, 6])
-                        .on_press(Message::CloseErrorPanel)
-                        .style(iced::theme::Button::custom(se_theme::GhostButton {
-                            dark,
-                            active: false,
-                        })),
                 ]
-                .padding([4, 10])
-                .align_items(Alignment::Center);
-
-                let error_color = iced::Color::from_rgb(0.88, 0.27, 0.18);
-                let body = scrollable(
-                    container(
-                        text(err.clone())
-                            .size(12)
-                            .style(error_color)
-                            .font(iced::Font::MONOSPACE),
-                    )
-                    .padding([4, 12, 8, 12])
-                    .width(Length::Fill),
-                )
-                .height(Length::Fixed(100.0));
-
-                Some(
-                    container(column![header, body])
-                        .width(Length::Fill)
-                        .style(se_theme::error_panel(dark))
-                        .into(),
-                )
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let mut col = if self.is_formatting {
-            let banner = container(
-                text(t!("status.formatting").to_string())
-                    .size(12)
-                    .style(se_theme::accent_color()),
+                .spacing(6),
             )
             .width(Length::Fill)
-            .padding([4, 14])
-            .style(se_theme::accent_banner(dark));
-            column![menu_bar, banner, main_row]
-        } else {
-            column![menu_bar, main_row]
-        };
-        if let Some(panel) = error_panel {
-            col = col.push(panel);
-        }
-        let content = col
-            .push(status_bar)
-            .width(Length::Fill)
-            .height(Length::Fill);
-
-        // Base layout wrapped in a container
-        let base: Element<Message> = container(content)
-            .width(Length::Fill)
             .height(Length::Fill)
-            .into();
-
-        // Floating dropdown (menu bar)
-        let with_dropdown: Element<Message> = if let Some(menu) = self.open_menu {
-            let has_fmt = self
-                .editor
-                .language
-                .as_deref()
-                .map(crate::formatter::has_formatter)
-                .unwrap_or(false);
-            let lang_override_enabled = self.language_picker_enabled();
-            let dropdown =
-                crate::menu_bar::dropdown_view(menu, &self.config, has_fmt, lang_override_enabled);
-            let x = crate::menu_bar::dropdown_x_offset(menu);
-            iced_aw::floating_element::FloatingElement::new(base, dropdown)
-                .anchor(iced_aw::floating_element::Anchor::NorthWest)
-                .offset(iced_aw::floating_element::Offset {
-                    x,
-                    y: crate::menu_bar::BAR_HEIGHT,
-                })
-                .into()
-        } else {
-            base
-        };
-
-        // Modal overlays
-        match &self.overlay {
-            ActiveOverlay::None => with_dropdown,
-            ActiveOverlay::About => {
-                let overlay = self.view_about_overlay(dark);
-                iced_aw::Modal::new(with_dropdown, Some(overlay))
-                    .backdrop(Message::CloseOverlay)
-                    .on_esc(Message::CloseOverlay)
-                    .into()
-            }
-            ActiveOverlay::GotoLine => {
-                let overlay = self.view_goto_line_overlay(dark);
-                iced_aw::Modal::new(with_dropdown, Some(overlay))
-                    .backdrop(Message::CloseOverlay)
-                    .on_esc(Message::CloseOverlay)
-                    .into()
-            }
-            ActiveOverlay::LanguagePicker => {
-                let overlay = self.view_language_picker_overlay(dark);
-                iced_aw::Modal::new(with_dropdown, Some(overlay))
-                    .backdrop(Message::CloseOverlay)
-                    .on_esc(Message::CloseOverlay)
-                    .into()
-            }
-            ActiveOverlay::Shortcuts { capturing } => {
-                let overlay = self.view_shortcuts_overlay(dark, *capturing);
-                iced_aw::Modal::new(with_dropdown, Some(overlay))
-                    .backdrop(Message::CloseOverlay)
-                    .on_esc(Message::CloseOverlay)
-                    .into()
-            }
-            ActiveOverlay::UpdateChecking
-            | ActiveOverlay::UpdateDownloading
-            | ActiveOverlay::UpdateInstalling
-            | ActiveOverlay::UpdateUpToDate
-            | ActiveOverlay::UpdateAvailable(_)
-            | ActiveOverlay::UpdateError(_) => {
-                let overlay = self.view_update_overlay(dark);
-                iced_aw::Modal::new(with_dropdown, Some(overlay))
-                    .backdrop(Message::CloseOverlay)
-                    .on_esc(Message::CloseOverlay)
-                    .into()
-            }
-        }
-    }
-
-    fn theme(&self) -> Theme {
-        if self.config.dark_mode {
-            se_theme::ink_dark()
-        } else {
-            se_theme::ink_light()
+            .padding([16, 20])
+            .into(),
+            PreviewDoc::None => container(Space::with_height(0))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
         }
     }
 }
@@ -1902,7 +2148,7 @@ impl SimpleEditApp {
         if let Some(path) = active_path {
             if let Some((content, language, dirty)) = self.file_cache.remove(&path) {
                 self.editor = EditorState::from_content(&content);
-                self.editor.language = language;
+                self.editor.restore_language(language, &path);
                 self.is_dirty = dirty;
                 self.current_file = Some(path);
             }

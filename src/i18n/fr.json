@@ -118,5 +118,13 @@
   "menu.edit_toggle_comment": "Commenter/décommenter",
   "menu.edit_delete_line": "Supprimer la ligne",
   "menu.file_recents": "Fichiers récents",
-  "menu.file_no_recents": "Aucun fichier récent"
+  "menu.file_no_recents": "Aucun fichier récent",
+  "preview.raw": "Brut",
+  "preview.rendered": "Aperçu",
+  "preview.split": "Divisé",
+  "preview.tree": "Arbre",
+  "preview.json_error": "JSON invalide",
+  "preview.truncated": "Document trop grand — affichage tronqué",
+  "ctx.expand_all": "Tout déplier",
+  "ctx.collapse_all": "Tout replier"
 }
