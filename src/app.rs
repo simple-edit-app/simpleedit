@@ -59,6 +59,9 @@ pub enum Message {
     ThemeChanged(bool),
     InsertTab,
     ToggleMenu(TopMenu),
+    /// Resolves the on-screen position of an open top menu's button, so its
+    /// dropdown can be anchored under it regardless of label/font/DPI.
+    MenuBounds(TopMenu, Option<iced::Rectangle>),
     SelectAll,
     Quit,
     About,
@@ -134,6 +137,9 @@ pub struct SimpleEditApp {
     show_sidebar: bool,
     show_preferences: bool,
     open_menu: Option<TopMenu>,
+    /// Screen position of `open_menu`'s button, once resolved; `None` closes
+    /// the dropdown one frame rather than anchor it somewhere wrong.
+    open_menu_bounds: Option<iced::Rectangle>,
     current_file: Option<PathBuf>,
     is_dirty: bool,
     is_formatting: bool,
@@ -193,6 +199,7 @@ impl Application for SimpleEditApp {
             show_sidebar: true,
             show_preferences: false,
             open_menu: None,
+            open_menu_bounds: None,
             current_file: None,
             is_dirty: false,
             is_formatting: false,
@@ -530,7 +537,12 @@ impl Application for SimpleEditApp {
             .into();
 
         // Floating dropdown (menu bar)
-        let with_dropdown: Element<Message> = if let Some(menu) = self.open_menu {
+        // Bounds resolve one update cycle after the menu opens (see
+        // Message::ToggleMenu); until then, render nothing rather than a
+        // dropdown anchored at a stale or wrong position.
+        let with_dropdown: Element<Message> = if let (Some(menu), Some(bounds)) =
+            (self.open_menu, self.open_menu_bounds)
+        {
             let has_fmt = self
                 .editor
                 .language
@@ -540,12 +552,11 @@ impl Application for SimpleEditApp {
             let lang_override_enabled = self.language_picker_enabled();
             let dropdown =
                 crate::menu_bar::dropdown_view(menu, &self.config, has_fmt, lang_override_enabled);
-            let x = crate::menu_bar::dropdown_x_offset(menu);
             iced_aw::floating_element::FloatingElement::new(base, dropdown)
                 .anchor(iced_aw::floating_element::Anchor::NorthWest)
                 .offset(iced_aw::floating_element::Offset {
-                    x,
-                    y: crate::menu_bar::BAR_HEIGHT,
+                    x: bounds.x,
+                    y: bounds.y + bounds.height,
                 })
                 .into()
         } else {
@@ -613,10 +624,14 @@ impl SimpleEditApp {
     fn handle(&mut self, message: Message) -> Command<Message> {
         // Passive/background messages must not close an open dropdown: X11
         // fires a spurious ModifiersChanged right after the very click that
-        // opens the menu, and AutoSave ticks every 5s regardless of the UI.
+        // opens the menu, AutoSave ticks every 5s regardless of the UI, and
+        // MenuBounds is this same open answering its own position query.
         let closes_menu = !matches!(
             &message,
-            Message::ToggleMenu(_) | Message::ModifiersChanged { .. } | Message::AutoSave
+            Message::ToggleMenu(_)
+                | Message::MenuBounds(..)
+                | Message::ModifiersChanged { .. }
+                | Message::AutoSave
         );
         if closes_menu {
             self.open_menu = None;
@@ -754,6 +769,21 @@ impl SimpleEditApp {
                 } else {
                     Some(menu)
                 };
+                // The dropdown can't be positioned until we know where its
+                // button actually rendered; see Message::MenuBounds below.
+                self.open_menu_bounds = None;
+                match self.open_menu {
+                    Some(m) => iced::widget::container::visible_bounds(crate::menu_bar::menu_id(m))
+                        .map(move |bounds| Message::MenuBounds(m, bounds)),
+                    None => Command::none(),
+                }
+            }
+            Message::MenuBounds(menu, bounds) => {
+                // The menu may have changed (or closed) while this was in
+                // flight; only apply it if it's still the one that's open.
+                if self.open_menu == Some(menu) {
+                    self.open_menu_bounds = bounds;
+                }
                 Command::none()
             }
             Message::NewFile => {

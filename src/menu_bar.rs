@@ -14,14 +14,21 @@ use crate::theme;
 pub fn view(config: &Config, open: Option<TopMenu>) -> Element<'static, Message> {
     let dark = config.dark_mode;
 
+    // Each button sits in its own `container` carrying a stable `Id`, so its
+    // dropdown can be anchored to the button's actual rendered position
+    // (queried via `container::visible_bounds`) instead of a hardcoded pixel
+    // offset that only happened to fit one language's label widths.
     let top_button = |label: String, menu: TopMenu| {
-        button(text(label).size(13))
-            .padding([6, 12])
-            .on_press(Message::ToggleMenu(menu))
-            .style(iced::theme::Button::custom(theme::GhostButton {
-                dark,
-                active: open == Some(menu),
-            }))
+        container(
+            button(text(label).size(13))
+                .padding([6, 12])
+                .on_press(Message::ToggleMenu(menu))
+                .style(iced::theme::Button::custom(theme::GhostButton {
+                    dark,
+                    active: open == Some(menu),
+                })),
+        )
+        .id(menu_id(menu))
     };
 
     let bar = row![
@@ -52,23 +59,17 @@ pub fn dropdown_view(
         .into()
 }
 
-/// x offset (px from window left) for each dropdown, so it opens flush with
-/// the left edge of the button that triggered it.
-///
-/// iced 0.12 has no way to ask a rendered button for its own position, so
-/// these are measured pixel values for the current English labels at the
-/// bar's font size (13) and button padding ([6, 12], 2px spacing, 10px bar
-/// padding) — retune them if a label or the font ever changes.
-pub fn dropdown_x_offset(menu: TopMenu) -> f32 {
+/// The stable `Id` of a top menu button's wrapping container, so its
+/// dropdown can be anchored to wherever that button actually renders —
+/// independent of label length, font, or DPI.
+pub fn menu_id(menu: TopMenu) -> container::Id {
     match menu {
-        TopMenu::File => 10.0,
-        TopMenu::Edit => 57.0,
-        TopMenu::View => 105.0,
-        TopMenu::Help => 159.0,
+        TopMenu::File => container::Id::new("menu-file"),
+        TopMenu::Edit => container::Id::new("menu-edit"),
+        TopMenu::View => container::Id::new("menu-view"),
+        TopMenu::Help => container::Id::new("menu-help"),
     }
 }
-
-pub const BAR_HEIGHT: f32 = 38.0;
 
 /// A clickable menu item with an optional shortcut hint on the right.
 fn item(
