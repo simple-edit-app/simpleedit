@@ -218,6 +218,39 @@ pub fn quote_block(dark: bool) -> impl Fn(&Theme) -> container::Appearance {
     }
 }
 
+/// A table's outer border in the Markdown preview: a 1px frame in the border
+/// color, showing through the grid's own row/column spacing as gridlines.
+pub fn table_border(dark: bool) -> impl Fn(&Theme) -> container::Appearance {
+    let p = palette(dark);
+    move |_theme: &Theme| container::Appearance {
+        text_color: Some(p.text),
+        background: Some(Background::Color(p.border)),
+        border: Border {
+            color: p.border,
+            width: 1.0,
+            radius: 4.0.into(),
+        },
+        shadow: Shadow::default(),
+    }
+}
+
+/// One table cell in the Markdown preview; the header row gets a distinct
+/// tint from the body so it reads apart at a glance.
+pub fn table_cell(dark: bool, is_header: bool) -> impl Fn(&Theme) -> container::Appearance {
+    let p = palette(dark);
+    let background = if is_header { p.elevated } else { p.bg };
+    move |_theme: &Theme| container::Appearance {
+        text_color: Some(p.text),
+        background: Some(Background::Color(background)),
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: 0.0.into(),
+        },
+        shadow: Shadow::default(),
+    }
+}
+
 /// Ghost button used in menu bars, toolbars, and menu items: transparent,
 /// a soft accent wash when active/open, a subtle surface tint on hover.
 pub struct GhostButton {

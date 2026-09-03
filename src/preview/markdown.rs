@@ -8,10 +8,12 @@ use std::collections::HashMap;
 
 use iced::{
     advanced::widget::{operation, Id as WidgetId, Operation},
+    alignment::Horizontal,
     mouse,
     widget::{column, container, mouse_area, row, scrollable, text, Space},
     Color, Command, Element, Font, Length, Rectangle, Vector,
 };
+use iced_aw::{Grid, GridRow};
 
 use crate::app::Message;
 use crate::theme;
@@ -55,6 +57,25 @@ impl Span {
     }
 }
 
+/// A GFM table column's declared alignment (from its separator cell, e.g.
+/// `:---:`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Align {
+    Left,
+    Center,
+    Right,
+}
+
+impl From<Align> for Horizontal {
+    fn from(align: Align) -> Self {
+        match align {
+            Align::Left => Horizontal::Left,
+            Align::Center => Horizontal::Center,
+            Align::Right => Horizontal::Right,
+        }
+    }
+}
+
 /// A top-level Markdown block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Block {
@@ -71,6 +92,11 @@ pub enum Block {
     },
     Code(String),
     Rule,
+    Table {
+        alignments: Vec<Align>,
+        header: Vec<Vec<Span>>,
+        rows: Vec<Vec<Vec<Span>>>,
+    },
 }
 
 // ─── Parsing ────────────────────────────────────────────────────────────────
@@ -82,7 +108,15 @@ pub fn parse(src: &str) -> Vec<Block> {
     let mut quote: Vec<String> = Vec::new();
     let mut code: Option<Vec<String>> = None;
 
-    for raw in src.lines() {
+    // A table's second line (the separator) is what confirms the first line
+    // was a header, not a paragraph — indexed access lets us peek ahead for
+    // it and then consume as many further rows as belong to the table.
+    let lines: Vec<&str> = src.lines().collect();
+    let mut idx = 0;
+
+    while idx < lines.len() {
+        let raw = lines[idx];
+
         // Inside a fenced block everything is literal until the closing fence.
         if let Some(buf) = code.as_mut() {
             if is_fence(raw.trim_start()) {
@@ -91,6 +125,7 @@ pub fn parse(src: &str) -> Vec<Block> {
             } else {
                 buf.push(raw.to_string());
             }
+            idx += 1;
             continue;
         }
 
@@ -101,13 +136,16 @@ pub fn parse(src: &str) -> Vec<Block> {
             flush_para(&mut para, &mut blocks);
             flush_quote(&mut quote, &mut blocks);
             code = Some(Vec::new());
+            idx += 1;
         } else if trimmed.is_empty() {
             flush_para(&mut para, &mut blocks);
             flush_quote(&mut quote, &mut blocks);
+            idx += 1;
         } else if is_rule(trimmed) {
             flush_para(&mut para, &mut blocks);
             flush_quote(&mut quote, &mut blocks);
             blocks.push(Block::Rule);
+            idx += 1;
         } else if let Some((level, rest)) = heading(trimmed) {
             flush_para(&mut para, &mut blocks);
             flush_quote(&mut quote, &mut blocks);
@@ -115,9 +153,44 @@ pub fn parse(src: &str) -> Vec<Block> {
                 level,
                 spans: parse_inline(rest),
             });
+            idx += 1;
         } else if let Some(rest) = trimmed.strip_prefix('>') {
             flush_para(&mut para, &mut blocks);
             quote.push(rest.trim_start().to_string());
+            idx += 1;
+        } else if is_table_row(trimmed)
+            && lines
+                .get(idx + 1)
+                .is_some_and(|next| table_separator(next).is_some())
+        {
+            flush_para(&mut para, &mut blocks);
+            flush_quote(&mut quote, &mut blocks);
+            let alignments = table_separator(lines[idx + 1]).unwrap_or_default();
+            let header = table_cells(trimmed)
+                .iter()
+                .map(|cell| parse_inline(cell))
+                .collect();
+            idx += 2;
+
+            let mut rows = Vec::new();
+            while idx < lines.len() {
+                let row = lines[idx].trim();
+                if row.is_empty() || !is_table_row(row) {
+                    break;
+                }
+                rows.push(
+                    table_cells(row)
+                        .iter()
+                        .map(|cell| parse_inline(cell))
+                        .collect(),
+                );
+                idx += 1;
+            }
+            blocks.push(Block::Table {
+                alignments,
+                header,
+                rows,
+            });
         } else if let Some((depth, marker, rest)) = list_item(line) {
             flush_para(&mut para, &mut blocks);
             flush_quote(&mut quote, &mut blocks);
@@ -126,9 +199,11 @@ pub fn parse(src: &str) -> Vec<Block> {
                 marker,
                 spans: parse_inline(rest),
             });
+            idx += 1;
         } else {
             flush_quote(&mut quote, &mut blocks);
             para.push(trimmed.to_string());
+            idx += 1;
         }
     }
 
@@ -206,6 +281,84 @@ fn list_item(line: &str) -> Option<(usize, String, &str)> {
         }
     }
     None
+}
+
+/// A line that could plausibly be a table row — the real test is whether the
+/// *next* line is a valid separator (see [`table_separator`]).
+fn is_table_row(line: &str) -> bool {
+    line.contains('|')
+}
+
+/// `| :--- | ---: | :---: |` → one [`Align`] per column; `None` if the line
+/// isn't a valid separator row (each cell must be dashes, optionally with a
+/// leading and/or trailing colon).
+fn table_separator(line: &str) -> Option<Vec<Align>> {
+    if !is_table_row(line) {
+        return None;
+    }
+    let cells = table_cells(line);
+    if cells.is_empty() {
+        return None;
+    }
+    cells
+        .iter()
+        .map(|cell| {
+            let left = cell.starts_with(':');
+            let right = cell.ends_with(':');
+            let dashes = cell.trim_matches(':');
+            (!dashes.is_empty() && dashes.chars().all(|c| c == '-')).then_some(
+                match (left, right) {
+                    (true, true) => Align::Center,
+                    (false, true) => Align::Right,
+                    _ => Align::Left,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Splits a table row into its cell texts: drops one leading/trailing `|`
+/// (the conventional outer pipes), and keeps a `|` from splitting the row
+/// when it's escaped (`\|`) or inside a `` `code span` ``.
+fn table_cells(line: &str) -> Vec<String> {
+    let trimmed = line.trim();
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut in_code = false;
+    let mut i = 0;
+
+    while i < chars.len() {
+        match chars[i] {
+            '\\' if i + 1 < chars.len() && chars[i + 1] == '|' => {
+                cell.push('|');
+                i += 2;
+            }
+            '`' => {
+                in_code = !in_code;
+                cell.push('`');
+                i += 1;
+            }
+            '|' if !in_code => {
+                cells.push(cell.trim().to_string());
+                cell.clear();
+                i += 1;
+            }
+            c => {
+                cell.push(c);
+                i += 1;
+            }
+        }
+    }
+    cells.push(cell.trim().to_string());
+
+    if trimmed.starts_with('|') && cells.first().is_some_and(String::is_empty) {
+        cells.remove(0);
+    }
+    if trimmed.ends_with('|') && cells.last().is_some_and(String::is_empty) {
+        cells.pop();
+    }
+    cells
 }
 
 /// Splits a line into styled inline spans.
@@ -563,7 +716,69 @@ fn block_view(block: &Block, dark: bool, slug: Option<&str>) -> Element<'static,
             .width(Length::Fill)
             .style(theme::gutter(dark))
             .into(),
+        Block::Table {
+            alignments,
+            header,
+            rows,
+        } => table_view(alignments, header, rows, dark),
     }
+}
+
+/// A GFM table. Cells size to their own content (not stretched to fill the
+/// pane, matching how these render elsewhere), so a wide table scrolls
+/// horizontally rather than forcing every column down to an unreadable
+/// width.
+fn table_view(
+    alignments: &[Align],
+    header: &[Vec<Span>],
+    rows: &[Vec<Vec<Span>>],
+    dark: bool,
+) -> Element<'static, Message> {
+    let p = theme::palette(dark);
+    let columns = header
+        .len()
+        .max(rows.iter().map(Vec::len).max().unwrap_or(0));
+
+    let align_of = |col: usize| alignments.get(col).copied().unwrap_or(Align::Left).into();
+
+    let cell = |spans: &[Span], col: usize, is_header: bool| -> Element<'static, Message> {
+        let font = if is_header {
+            bold_font()
+        } else {
+            Font::DEFAULT
+        };
+        container(spans_view(spans, BODY_SIZE, p.text, dark, font))
+            .width(Length::Fill)
+            .align_x(align_of(col))
+            .padding([6, 10])
+            .style(theme::table_cell(dark, is_header))
+            .into()
+    };
+
+    let mut grid = Grid::new().column_width(Length::Shrink);
+
+    let mut header_row = GridRow::new();
+    for col in 0..columns {
+        let spans = header.get(col).map(Vec::as_slice).unwrap_or(&[]);
+        header_row = header_row.push(cell(spans, col, true));
+    }
+    grid = grid.push(header_row);
+
+    for row in rows {
+        let mut grid_row = GridRow::new();
+        for col in 0..columns {
+            let spans = row.get(col).map(Vec::as_slice).unwrap_or(&[]);
+            grid_row = grid_row.push(cell(spans, col, false));
+        }
+        grid = grid.push(grid_row);
+    }
+
+    scrollable(container(grid).style(theme::table_border(dark)))
+        .direction(scrollable::Direction::Horizontal(
+            scrollable::Properties::default(),
+        ))
+        .width(Length::Fill)
+        .into()
 }
 
 /// Lays out spans as a wrapping run of words. iced 0.12 has no rich text
@@ -784,6 +999,78 @@ mod tests {
     fn empty_document_has_no_blocks() {
         assert!(parse("").is_empty());
         assert!(parse("\n\n").is_empty());
+    }
+
+    #[test]
+    fn parses_a_table() {
+        let blocks = parse("| A | B |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |");
+        assert_eq!(
+            blocks,
+            vec![Block::Table {
+                alignments: vec![Align::Left, Align::Left],
+                header: vec![plain("A"), plain("B")],
+                rows: vec![vec![plain("1"), plain("2")], vec![plain("3"), plain("4")],],
+            }]
+        );
+    }
+
+    #[test]
+    fn table_survives_without_outer_pipes() {
+        let blocks = parse("A | B\n--- | ---\n1 | 2");
+        assert_eq!(
+            blocks,
+            vec![Block::Table {
+                alignments: vec![Align::Left, Align::Left],
+                header: vec![plain("A"), plain("B")],
+                rows: vec![vec![plain("1"), plain("2")]],
+            }]
+        );
+    }
+
+    #[test]
+    fn table_reads_column_alignment() {
+        let blocks = parse("| L | C | R |\n| :--- | :---: | ---: |\n| a | b | c |");
+        let Block::Table { alignments, .. } = &blocks[0] else {
+            panic!("expected a table");
+        };
+        assert_eq!(alignments, &[Align::Left, Align::Center, Align::Right]);
+    }
+
+    #[test]
+    fn table_stops_at_a_blank_line() {
+        let blocks = parse("| A |\n| --- |\n| 1 |\n\nafter");
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(blocks[0], Block::Table { .. }));
+        assert_eq!(blocks[1], Block::Paragraph(plain("after")));
+    }
+
+    #[test]
+    fn a_lone_pipe_row_without_a_separator_stays_a_paragraph() {
+        let blocks = parse("A | B\nnot a separator");
+        assert_eq!(
+            blocks,
+            vec![Block::Paragraph(parse_inline("A | B not a separator"))]
+        );
+    }
+
+    #[test]
+    fn table_cells_split_on_unescaped_pipes_only() {
+        assert_eq!(
+            table_cells(r"| `a|b` | c\|d |"),
+            vec!["`a|b`".to_string(), r"c|d".to_string()]
+        );
+    }
+
+    #[test]
+    fn ragged_rows_are_kept_as_parsed_not_padded() {
+        // table_view pads/truncates these to the header's column count at
+        // render time; the parser just records what's actually there.
+        let blocks = parse("| A | B |\n| --- | --- |\n| 1 |\n| 2 | 3 | 4 |");
+        let Block::Table { rows, .. } = &blocks[0] else {
+            panic!("expected a table");
+        };
+        assert_eq!(rows[0], vec![plain("1")]);
+        assert_eq!(rows[1], vec![plain("2"), plain("3"), plain("4")]);
     }
 
     #[test]
