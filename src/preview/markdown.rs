@@ -4,9 +4,13 @@
 //! (headings, paragraphs, lists, quotes, fenced code, rules and the common
 //! inline markers) and renders everything else as plain text.
 
+use std::collections::HashMap;
+
 use iced::{
-    widget::{column, container, row, scrollable, text, Space},
-    Color, Element, Font, Length,
+    advanced::widget::{operation, Id as WidgetId, Operation},
+    mouse,
+    widget::{column, container, mouse_area, row, scrollable, text, Space},
+    Color, Command, Element, Font, Length, Rectangle, Vector,
 };
 
 use crate::app::Message;
@@ -28,6 +32,9 @@ pub enum Style {
 pub struct Span {
     pub text: String,
     pub style: Style,
+    /// The `(url)` half of a `[label](url)` link; `None` for every other
+    /// style.
+    pub href: Option<String>,
 }
 
 impl Span {
@@ -35,6 +42,15 @@ impl Span {
         Self {
             text: text.into(),
             style,
+            href: None,
+        }
+    }
+
+    fn link(text: impl Into<String>, href: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            style: Style::Link,
+            href: Some(href.into()),
         }
     }
 }
@@ -241,9 +257,9 @@ pub fn parse_inline(src: &str) -> Vec<Span> {
                 let open = if c == '!' { i + 1 } else { i };
                 let is_link = chars.get(open) == Some(&'[');
                 match is_link.then(|| link(&chars, open)).flatten() {
-                    Some((label, end)) => {
+                    Some((label, href, end)) => {
                         push_plain(&mut spans, &mut buf);
-                        spans.push(Span::new(label, Style::Link));
+                        spans.push(Span::link(label, href));
                         i = end;
                     }
                     None => {
@@ -290,15 +306,19 @@ fn emphasis_end(chars: &[char], i: usize, marker: char, run: usize) -> Option<us
     None
 }
 
-/// Parses `[label](url)` starting at the `[`; returns the label and the index
-/// just past the closing `)`.
-fn link(chars: &[char], start: usize) -> Option<(String, usize)> {
+/// Parses `[label](url)` starting at the `[`; returns the label, the url,
+/// and the index just past the closing `)`.
+fn link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
     let close = find(chars, start + 1, "]")?;
     if chars.get(close + 1) != Some(&'(') {
         return None;
     }
     let end = find(chars, close + 2, ")")?;
-    Some((collect(chars, start + 1, close), end + 1))
+    Some((
+        collect(chars, start + 1, close),
+        collect(chars, close + 2, end),
+        end + 1,
+    ))
 }
 
 /// Index of the next occurrence of `needle` at or after `from`.
@@ -319,6 +339,125 @@ fn push_plain(spans: &mut Vec<Span>, buf: &mut String) {
     if !buf.is_empty() {
         spans.push(Span::new(std::mem::take(buf), Style::Plain));
     }
+}
+
+// ─── Anchors ────────────────────────────────────────────────────────────────
+//
+// A TOC link like `[Bugs](#4-bugs-fonctionnels)` targets a heading by a slug
+// GitHub derives from its text. We regenerate the same slugs from our parsed
+// headings and, on click, scroll the preview's own `scrollable` to whichever
+// one matches.
+
+/// GitHub's heading-to-anchor algorithm: lowercase, drop anything but
+/// letters/digits/spaces/hyphens, turn spaces into hyphens.
+fn slugify(text: &str) -> String {
+    let mut slug = String::new();
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            slug.extend(c.to_lowercase());
+        } else if c == ' ' || c == '-' {
+            slug.push('-');
+        }
+    }
+    slug
+}
+
+/// The plain text of a heading's spans, markers already stripped by the
+/// inline parser — exactly what GitHub slugifies.
+fn heading_text(spans: &[Span]) -> String {
+    spans.iter().map(|s| s.text.as_str()).collect()
+}
+
+/// One slug per block — `Some` only for headings — with GitHub's collision
+/// rule: a slug repeated later in the document gets `-1`, `-2`, ... appended.
+fn assign_slugs(blocks: &[Block]) -> Vec<Option<String>> {
+    let mut seen: HashMap<String, u32> = HashMap::new();
+    blocks
+        .iter()
+        .map(|block| {
+            let Block::Heading { spans, .. } = block else {
+                return None;
+            };
+            let base = slugify(&heading_text(spans));
+            let count = seen.entry(base.clone()).or_insert(0);
+            let slug = if *count == 0 {
+                base
+            } else {
+                format!("{base}-{count}")
+            };
+            *count += 1;
+            Some(slug)
+        })
+        .collect()
+}
+
+/// Stable id of the preview's own scrollable, so a link click can scroll it.
+pub fn scrollable_id() -> scrollable::Id {
+    scrollable::Id::new("markdown-preview")
+}
+
+fn anchor_id(slug: &str) -> container::Id {
+    container::Id::new(format!("md-anchor-{slug}"))
+}
+
+/// Walks the widget tree to find how far a heading's anchor sits below the
+/// top of the preview's scrollable content — the `y` a `scrollable::scroll_to`
+/// needs. Container/scrollable bounds from `Operation::container` /
+/// `::scrollable` are given in unscrolled content space, so this is a plain
+/// subtraction; no need to know the current scroll position at all.
+struct FindHeadingOffset {
+    scrollable_id: WidgetId,
+    target_id: WidgetId,
+    scrollable_top: Option<f32>,
+    offset: Option<f32>,
+}
+
+impl Operation<Option<f32>> for FindHeadingOffset {
+    fn container(
+        &mut self,
+        id: Option<&WidgetId>,
+        bounds: Rectangle,
+        operate_on_children: &mut dyn FnMut(&mut dyn Operation<Option<f32>>),
+    ) {
+        if self.offset.is_some() {
+            return;
+        }
+        if id == Some(&self.target_id) {
+            if let Some(top) = self.scrollable_top {
+                self.offset = Some(bounds.y - top);
+            }
+            return;
+        }
+        operate_on_children(self);
+    }
+
+    fn scrollable(
+        &mut self,
+        _state: &mut dyn operation::Scrollable,
+        id: Option<&WidgetId>,
+        bounds: Rectangle,
+        _translation: Vector,
+    ) {
+        if id == Some(&self.scrollable_id) {
+            self.scrollable_top = Some(bounds.y);
+        }
+    }
+
+    fn finish(&self) -> operation::Outcome<Option<f32>> {
+        operation::Outcome::Some(self.offset)
+    }
+}
+
+/// A `Command` resolving to the target heading's offset for `href`
+/// (`#some-slug`), or `None` if it names no heading in the current document.
+pub fn find_offset_command(href: &str) -> Command<Option<f32>> {
+    let slug = href.trim_start_matches('#').to_lowercase();
+    Command::widget(FindHeadingOffset {
+        scrollable_id: scrollable_id().into(),
+        target_id: anchor_id(&slug).into(),
+        scrollable_top: None,
+        offset: None,
+    })
 }
 
 // ─── Rendering ──────────────────────────────────────────────────────────────
@@ -360,23 +499,33 @@ fn bold_italic_font() -> Font {
 
 /// The rendered document, scrollable.
 pub fn view(blocks: &[Block], dark: bool) -> Element<'static, Message> {
-    let body: Vec<Element<'static, Message>> = blocks.iter().map(|b| block_view(b, dark)).collect();
+    let slugs = assign_slugs(blocks);
+    let body: Vec<Element<'static, Message>> = blocks
+        .iter()
+        .zip(slugs.iter())
+        .map(|(b, slug)| block_view(b, dark, slug.as_deref()))
+        .collect();
 
     scrollable(
         container(column(body).spacing(12))
             .width(Length::Fill)
             .padding([16, 24]),
     )
+    .id(scrollable_id())
     .width(Length::Fill)
     .height(Length::Fill)
     .into()
 }
 
-fn block_view(block: &Block, dark: bool) -> Element<'static, Message> {
+fn block_view(block: &Block, dark: bool, slug: Option<&str>) -> Element<'static, Message> {
     let p = theme::palette(dark);
     match block {
         Block::Heading { level, spans } => {
-            spans_view(spans, heading_size(*level), p.text, dark, bold_font())
+            let heading = spans_view(spans, heading_size(*level), p.text, dark, bold_font());
+            match slug {
+                Some(slug) => container(heading).id(anchor_id(slug)).into(),
+                None => heading,
+            }
         }
         Block::Paragraph(spans) => spans_view(spans, BODY_SIZE, p.text, dark, Font::DEFAULT),
         Block::Quote(spans) => {
@@ -456,7 +605,16 @@ fn spans_view(
                 Style::Code => widget.font(Font::MONOSPACE).size(size - 1.0).style(muted),
                 Style::Link => widget.font(base_font).style(accent),
             };
-            cluster.push(widget.into());
+            // Only in-document anchors (`#slug`) are wired up to jump
+            // anywhere; an external link stays styled but inert.
+            let element: Element<'static, Message> = match &span.href {
+                Some(href) if href.starts_with('#') => mouse_area(widget)
+                    .interaction(mouse::Interaction::Pointer)
+                    .on_press(Message::MarkdownLinkClicked(href.clone()))
+                    .into(),
+                _ => widget.into(),
+            };
+            cluster.push(element);
         }
         if span.text.ends_with(char::is_whitespace) && !cluster.is_empty() {
             clusters.push(row(std::mem::take(&mut cluster)).into());
@@ -605,9 +763,9 @@ mod tests {
             parse_inline("see [docs](http://x) and ![pic](y.png)"),
             vec![
                 Span::new("see ", Style::Plain),
-                Span::new("docs", Style::Link),
+                Span::link("docs", "http://x"),
                 Span::new(" and ", Style::Plain),
-                Span::new("pic", Style::Link),
+                Span::link("pic", "y.png"),
             ]
         );
     }
@@ -626,5 +784,30 @@ mod tests {
     fn empty_document_has_no_blocks() {
         assert!(parse("").is_empty());
         assert!(parse("\n\n").is_empty());
+    }
+
+    #[test]
+    fn slugify_matches_github() {
+        assert_eq!(slugify("Bugs fonctionnels"), "bugs-fonctionnels");
+        assert_eq!(
+            slugify("1. Inventaire et santé mesurée"),
+            "1-inventaire-et-santé-mesurée"
+        );
+        assert_eq!(slugify("Qualité, tests, CI"), "qualité-tests-ci");
+    }
+
+    #[test]
+    fn assign_slugs_only_tags_headings() {
+        let blocks = parse("# Title\n\ntext\n\n## Title");
+        let slugs = assign_slugs(&blocks);
+        assert_eq!(
+            slugs,
+            vec![
+                Some("title".to_string()),
+                None,
+                // GitHub's collision rule: repeated slugs get -1, -2, ...
+                Some("title-1".to_string()),
+            ]
+        );
     }
 }

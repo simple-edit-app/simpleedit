@@ -125,6 +125,11 @@ pub enum Message {
         ctrl: bool,
         alt: bool,
     },
+    /// An in-document anchor link (`#slug`) was clicked in the Markdown
+    /// preview.
+    MarkdownLinkClicked(String),
+    /// Resolves the position of the heading `MarkdownLinkClicked` targeted.
+    PreviewScrollTo(Option<f32>),
 }
 
 pub struct SimpleEditApp {
@@ -1546,6 +1551,19 @@ impl SimpleEditApp {
                 self.mod_alt = alt;
                 Command::none()
             }
+            Message::MarkdownLinkClicked(href) => {
+                crate::preview::markdown::find_offset_command(&href).map(Message::PreviewScrollTo)
+            }
+            Message::PreviewScrollTo(Some(y)) => iced::widget::scrollable::scroll_to(
+                crate::preview::markdown::scrollable_id(),
+                iced::widget::scrollable::AbsoluteOffset {
+                    x: 0.0,
+                    // A little breathing room above the heading, clamped so
+                    // targets near the top don't ask for a negative scroll.
+                    y: (y - 12.0).max(0.0),
+                },
+            ),
+            Message::PreviewScrollTo(None) => Command::none(),
         }
     }
 
