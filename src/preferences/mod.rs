@@ -135,9 +135,6 @@ impl PreferencesState {
                     text(format!("{:.0}px", self.font_size)).size(12),
                 ]
                 .spacing(8),
-                text(t!("prefs.restart_hint").to_string())
-                    .size(11)
-                    .style(muted),
                 row![
                     text(t!("prefs.tab_width")).size(12),
                     tab_button(2),

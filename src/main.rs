@@ -1,7 +1,7 @@
 #[macro_use]
 extern crate rust_i18n;
 
-use iced::{window, Application, Pixels, Settings, Size};
+use iced::{window, Application, Settings, Size};
 
 fn load_icon() -> Option<window::Icon> {
     let bytes = include_bytes!("assets/icon.png");
@@ -11,6 +11,7 @@ fn load_icon() -> Option<window::Icon> {
 }
 
 mod app;
+mod code_editor;
 mod config;
 mod editor;
 mod formatter;
@@ -48,7 +49,6 @@ fn main() -> iced::Result {
 
     app::SimpleEditApp::run(Settings {
         flags: file_arg,
-        default_text_size: Pixels(config::apply_font_size(config.font_size)),
         window: window::Settings {
             // Closing the window goes through the app (Message::Quit) so the
             // session is saved first.

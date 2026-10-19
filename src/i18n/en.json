@@ -62,7 +62,6 @@
   "prefs.auto_indent": "Auto indent",
   "prefs.autocomplete_brackets": "Autocomplete brackets",
   "prefs.autocomplete_quotes": "Autocomplete quotes",
-  "prefs.restart_hint": "Takes effect after restart",
   "prefs.language": "Language",
   "ctx.select_all": "Select All",
   "ctx.cut": "Cut",

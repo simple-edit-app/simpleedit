@@ -24,18 +24,6 @@ pub enum ShortcutTarget {
     DeleteLine,
 }
 
-/// The editor text size the running process actually uses (set once at
-/// startup from the config; the slider only affects the next launch).
-static APPLIED_FONT_SIZE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-
-pub fn applied_font_size() -> f32 {
-    *APPLIED_FONT_SIZE.get().unwrap_or(&16.0)
-}
-
-pub fn apply_font_size(size: f32) -> f32 {
-    *APPLIED_FONT_SIZE.get_or_init(|| size.clamp(8.0, 32.0))
-}
-
 /// A single keyboard binding stored as display-friendly strings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShortcutConfig {
@@ -217,8 +205,7 @@ impl Default for Shortcuts {
 #[serde(default)]
 pub struct Config {
     pub dark_mode: bool,
-    /// Editor text size. Applied at startup: iced 0.12 can't resize the
-    /// editor's text on the fly.
+    /// Editor text size, in pixels.
     pub font_size: f32,
     pub tab_width: usize,
     pub use_spaces: bool,

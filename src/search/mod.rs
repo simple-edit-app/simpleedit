@@ -136,7 +136,7 @@ impl SearchState {
     pub fn update(
         &mut self,
         msg: SearchMessage,
-        content: &mut iced::widget::text_editor::Content,
+        content: &mut crate::code_editor::Content,
     ) -> Command<Message> {
         match msg {
             SearchMessage::QueryChanged(q) => {
@@ -172,7 +172,7 @@ impl SearchState {
                 let text = content.text();
                 match self.replace_all(&text) {
                     Ok(new_text) => {
-                        *content = iced::widget::text_editor::Content::with_text(&new_text);
+                        *content = crate::code_editor::Content::with_text(&new_text);
                     }
                     Err(e) => self.last_error = Some(e),
                 }
@@ -195,11 +195,7 @@ impl SearchState {
     }
 
     /// Whether the editor's selection is exactly the text of the current match.
-    fn current_is_selected(
-        &self,
-        content: &iced::widget::text_editor::Content,
-        text: &str,
-    ) -> bool {
+    fn current_is_selected(&self, content: &crate::code_editor::Content, text: &str) -> bool {
         match (self.current, content.selection()) {
             (Some(i), Some(sel)) => {
                 self.matches.get(i).and_then(|r| text.get(r.clone())) == Some(sel.as_str())
@@ -216,10 +212,7 @@ impl SearchState {
     /// changed since), this is the same as a first `Find`: it only jumps,
     /// same as pressing Enter — replacing nothing was ever selected would be
     /// a surprise, not a convenience.
-    fn replace_current(
-        &mut self,
-        content: &mut iced::widget::text_editor::Content,
-    ) -> Command<Message> {
+    fn replace_current(&mut self, content: &mut crate::code_editor::Content) -> Command<Message> {
         let text = content.text();
         if self.matches.is_empty() || !self.current_is_selected(content, &text) {
             self.current = None;
@@ -268,7 +261,7 @@ impl SearchState {
     /// (Re)finds every match, then selects the next one (`forward`) or the
     /// previous one, wrapping around either end. The very first jump after a
     /// fresh search starts from whichever match is nearest the cursor.
-    fn jump(&mut self, content: &mut iced::widget::text_editor::Content, forward: bool) {
+    fn jump(&mut self, content: &mut crate::code_editor::Content, forward: bool) {
         let text = content.text();
         // `current` only counts while the editor still has that match
         // selected; a click elsewhere or an edit makes it stale.
@@ -588,9 +581,11 @@ fn byte_range_to_line_local(text: &str, range: &Range<usize>) -> (usize, Range<u
 /// `Motion::Down` steps one *visual* row, which differs from a logical line
 /// when long lines wrap, so progress is read back from the cursor instead of
 /// counted. Stops early if the cursor stops moving (e.g. an unshaped buffer).
-pub fn goto_line_start(content: &mut iced::widget::text_editor::Content, target: usize) {
+pub fn goto_line_start(content: &mut crate::code_editor::Content, target: usize) {
     use iced::widget::text_editor::{Action, Motion};
 
+    // Motions across lines edited since the last layout would panic.
+    content.settle();
     content.perform(Action::Move(Motion::DocumentStart));
     let mut last = content.cursor_position();
     while last.0 < target {
@@ -607,7 +602,7 @@ pub fn goto_line_start(content: &mut iced::widget::text_editor::Content, target:
 /// Selects `range` in the editor. `text_editor` has no "select this byte
 /// range" action, only relative motions — same approach as jumping to a
 /// line in the Go to Line dialog.
-fn select_range(content: &mut iced::widget::text_editor::Content, text: &str, range: Range<usize>) {
+fn select_range(content: &mut crate::code_editor::Content, text: &str, range: Range<usize>) {
     use iced::widget::text_editor::{Action, Motion};
 
     let (line, col, len) = byte_range_to_line_col(text, &range);
@@ -796,7 +791,7 @@ mod tests {
 
     #[test]
     fn jump_with_no_matches_clears_current() {
-        let mut content = iced::widget::text_editor::Content::with_text("nothing here");
+        let mut content = crate::code_editor::Content::with_text("nothing here");
         let mut s = make_search("xyz", "", false, true);
         s.jump(&mut content, true);
         assert_eq!(s.current, None);

@@ -104,8 +104,6 @@ pub enum Message {
     SetLanguage(String),
     OpenShortcuts,
     StartCaptureShortcut(ShortcutTarget),
-    // Deferred cursor move after autocomplete pair insertion (layout must run first to shape buffer)
-    MoveCursorLeft,
     // Line-level editing
     DuplicateLine,
     MoveLineUp,
@@ -116,11 +114,6 @@ pub enum Message {
     DedentLine,
     // Recent files
     OpenRecentFile(PathBuf),
-    // Deferred cursor restore (line, byte column) after with_text() (layout must run first)
-    RestoreCursor(usize, usize),
-    /// A message re-sent after a short delay because the editor had edits
-    /// not yet laid out (see `layout_stale`); the count bounds the retries.
-    Deferred(Box<Message>, u8),
     /// Whether a search field had focus when an editor shortcut was pressed.
     ShortcutChecked(Box<Message>, bool),
     /// The user confirmed closing a tab that has unsaved changes.
@@ -180,11 +173,6 @@ pub struct SimpleEditApp {
     redo_stack: Vec<Snapshot>,
     /// Undo/redo history of the tabs that aren't the active one.
     undo_cache: HashMap<PathBuf, (Vec<Snapshot>, Vec<Snapshot>)>,
-    /// Set whenever the buffer may have been edited, cleared when `view` runs
-    /// (the layout that shapes the edited lines follows it). Motions across
-    /// unshaped lines panic inside cosmic-text, so operations that move the
-    /// cursor wait for it to be clear.
-    layout_stale: std::cell::Cell<bool>,
     /// Preference changes are written out on the next autosave tick, not on
     /// every slider movement.
     config_dirty: bool,
@@ -286,7 +274,6 @@ impl Application for SimpleEditApp {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             undo_cache: HashMap::new(),
-            layout_stale: std::cell::Cell::new(false),
             config_dirty: false,
             last_session: String::new(),
             disk_mtime: None,
@@ -328,7 +315,7 @@ impl Application for SimpleEditApp {
     }
 
     fn update(&mut self, message: Message) -> Command<Message> {
-        let command = self.dispatch(message, 0);
+        let command = self.handle(message);
         self.refresh_preview();
         self.refresh_file_size();
         command
@@ -406,8 +393,6 @@ impl Application for SimpleEditApp {
     }
 
     fn view(&self) -> Element<'_, Message> {
-        // The layout pass right after this shapes whatever was edited.
-        self.layout_stale.set(false);
         let dark = self.config.dark_mode;
 
         let menu_bar = crate::menu_bar::view(&self.config, self.open_menu);
@@ -699,31 +684,6 @@ impl Application for SimpleEditApp {
 // ─── Message handling ───────────────────────────────────────────────────────
 
 impl Message {
-    /// Whether handling this moves the editor cursor, which is only safe once
-    /// the editor has laid out its latest edits.
-    fn needs_layout(&self) -> bool {
-        matches!(
-            self,
-            Message::Undo
-                | Message::Redo
-                | Message::DuplicateLine
-                | Message::MoveLineUp
-                | Message::MoveLineDown
-                | Message::ToggleComment
-                | Message::DeleteLine
-                | Message::IndentSelection
-                | Message::DedentLine
-                | Message::FileFormatted(_)
-                | Message::GotoLineSubmit
-                | Message::RestoreCursor(..)
-                | Message::MoveCursorLeft
-                | Message::SelectAll
-                | Message::Search(
-                    SearchMessage::Find | SearchMessage::FindPrevious | SearchMessage::Replace
-                )
-        )
-    }
-
     /// Shortcuts that act on the buffer and so shouldn't fire while a
     /// text field is being typed in.
     fn is_editor_shortcut(&self) -> bool {
@@ -739,44 +699,9 @@ impl Message {
                 | Message::DeleteLine
         )
     }
-
-    /// Messages that can't have touched the buffer.
-    fn is_passive(&self) -> bool {
-        matches!(
-            self,
-            Message::ToggleMenu(_)
-                | Message::HoverMenu(_)
-                | Message::MenuBounds(..)
-                | Message::ModifiersChanged { .. }
-                | Message::AutoSave
-                | Message::Deferred(..)
-                | Message::ShortcutChecked(..)
-        )
-    }
 }
 
 impl SimpleEditApp {
-    /// Runs a message, first waiting out any not-yet-laid-out edit if the
-    /// message needs the cursor to move.
-    fn dispatch(&mut self, message: Message, tries: u8) -> Command<Message> {
-        let message = match message {
-            Message::Deferred(inner, n) => return self.dispatch(*inner, n),
-            m => m,
-        };
-        if self.layout_stale.get() && message.needs_layout() && tries < 10 {
-            return Command::perform(
-                async { tokio::time::sleep(std::time::Duration::from_millis(20)).await },
-                move |_| Message::Deferred(Box::new(message), tries + 1),
-            );
-        }
-        let passive = message.is_passive();
-        let command = self.handle(message);
-        if !passive {
-            self.layout_stale.set(true);
-        }
-        command
-    }
-
     fn handle(&mut self, message: Message) -> Command<Message> {
         // Passive/background messages must not close an open dropdown: X11
         // fires a spurious ModifiersChanged right after the very click that
@@ -870,7 +795,7 @@ impl SimpleEditApp {
             Message::InsertTab => {
                 if !self.editing_blocked() {
                     if self.selection_lines().is_some() {
-                        return self.dispatch(Message::IndentSelection, 0);
+                        return self.handle(Message::IndentSelection);
                     }
                     // With a single-line selection this replaces it, as
                     // in most editors.
@@ -1058,7 +983,7 @@ impl SimpleEditApp {
                 SidebarAction::OpenFile(path) => self.activate(path),
                 SidebarAction::CloseFile(path) => self.request_close(path),
                 // Only offered for the active file.
-                SidebarAction::SaveFile => self.dispatch(Message::SaveFile, 0),
+                SidebarAction::SaveFile => self.handle(Message::SaveFile),
                 SidebarAction::SaveFileAs => save_command(
                     self.current_file.clone(),
                     save_file_as(crate::editor::buffer_text(&self.editor.content)),
@@ -1249,12 +1174,6 @@ impl SimpleEditApp {
                 self.save_session();
                 self.check_external_change()
             }
-            Message::MoveCursorLeft => {
-                self.editor
-                    .content
-                    .perform(text_editor::Action::Move(text_editor::Motion::Left));
-                Command::none()
-            }
             // --- Overlays ---
             Message::CloseOverlay => {
                 self.overlay = ActiveOverlay::None;
@@ -1346,7 +1265,7 @@ impl SimpleEditApp {
                 // shortcut can't tell which widget is focused, so it's
                 // deliberately narrowed to the modified case only.
                 if self.show_search && shift && key.eq_ignore_ascii_case("return") {
-                    return self.dispatch(Message::Search(SearchMessage::FindPrevious), 0);
+                    return self.handle(Message::Search(SearchMessage::FindPrevious));
                 }
                 // Match against config shortcuts. A symbol key (`/`) may need
                 // Shift on some layouts (AZERTY), so Shift doesn't count
@@ -1393,7 +1312,7 @@ impl SimpleEditApp {
                             Message::ShortcutChecked(Box::new(m.clone()), focused)
                         })
                     }
-                    Some(m) => self.dispatch(m, 0),
+                    Some(m) => self.handle(m),
                     None => Command::none(),
                 }
             }
@@ -1482,36 +1401,12 @@ impl SimpleEditApp {
                 self.sidebar.add_file(path.clone());
                 self.activate(path)
             }
-            Message::Deferred(inner, _) => self.handle(*inner),
             Message::ShortcutChecked(inner, focused) => {
                 if focused {
                     Command::none()
                 } else {
-                    self.dispatch(*inner, 0)
+                    self.handle(*inner)
                 }
-            }
-            Message::RestoreCursor(line, col) => {
-                let target = line.min(self.editor.content.line_count().saturating_sub(1));
-                crate::search::goto_line_start(&mut self.editor.content, target);
-                // `col` is a byte index; Motion::Right steps over characters.
-                let steps = self
-                    .editor
-                    .content
-                    .line(target)
-                    .map(|l| {
-                        let mut end = col.min(l.len());
-                        while !l.is_char_boundary(end) {
-                            end -= 1;
-                        }
-                        l[..end].chars().count()
-                    })
-                    .unwrap_or(0);
-                for _ in 0..steps {
-                    self.editor
-                        .content
-                        .perform(text_editor::Action::Move(text_editor::Motion::Right));
-                }
-                Command::none()
             }
             Message::EscapePressed => {
                 if !matches!(self.overlay, ActiveOverlay::None) {
@@ -1658,15 +1553,38 @@ impl SimpleEditApp {
         self.redo_stack.clear();
     }
 
+    /// Puts the cursor at (`line`, byte column `col`), clamped to the buffer.
+    fn restore_cursor(&mut self, line: usize, col: usize) {
+        let target = line.min(self.editor.content.line_count().saturating_sub(1));
+        crate::search::goto_line_start(&mut self.editor.content, target);
+        // `col` is a byte index; Motion::Right steps over characters.
+        let steps = self
+            .editor
+            .content
+            .line(target)
+            .map(|l| {
+                let mut end = col.min(l.len());
+                while !l.is_char_boundary(end) {
+                    end -= 1;
+                }
+                l[..end].chars().count()
+            })
+            .unwrap_or(0);
+        for _ in 0..steps {
+            self.editor
+                .content
+                .perform(text_editor::Action::Move(text_editor::Motion::Right));
+        }
+    }
+
     /// Replaces the buffer with a history snapshot and puts the cursor back.
     fn restore_snapshot(&mut self, snap: Snapshot) -> Command<Message> {
         let (line, col) = snap.cursor;
         self.is_dirty = true;
         self.undo_new_group = true;
         self.replace_buffer_text(&snap.text);
-        Command::perform(async move { (line, col) }, |(l, c)| {
-            Message::RestoreCursor(l, c)
-        })
+        self.restore_cursor(line, col);
+        Command::none()
     }
 
     /// Applies a whole-buffer text transformation as one undo step and moves
@@ -1679,9 +1597,8 @@ impl SimpleEditApp {
         self.is_dirty = true;
         self.undo_new_group = true;
         self.replace_buffer_text(&new_text);
-        Command::perform(async move { (line, col) }, |(l, c)| {
-            Message::RestoreCursor(l, c)
-        })
+        self.restore_cursor(line, col);
+        Command::none()
     }
 
     fn replace_buffer_text(&mut self, new_text: &str) {
@@ -1758,7 +1675,10 @@ impl SimpleEditApp {
 
         // Typing the closing character that is already there steps over it.
         if (is_closer || is_quote) && selection.is_none() && after == Some(ch) {
-            self.editor.content.perform(Action::Move(Motion::Right));
+            // Replace the character with itself rather than moving the
+            // cursor: a motion over a line just typed on would panic.
+            self.editor.content.perform(Action::Edit(Edit::Delete));
+            self.editor.content.perform(Action::Edit(Edit::Insert(ch)));
             return Some(Command::none());
         }
         if is_closer {
@@ -1794,9 +1714,10 @@ impl SimpleEditApp {
             .content
             .perform(Action::Edit(Edit::Insert(close)));
         self.is_dirty = true;
-        // Motion::Left is a no-op on unshaped lines (cosmic_text bug).
-        // Defer to the next update cycle so layout() shapes the buffer first.
-        Some(Command::perform(async {}, |_| Message::MoveCursorLeft))
+        // Motion::Left does nothing on unshaped lines, so shape them first.
+        self.editor.content.settle();
+        self.editor.content.perform(Action::Move(Motion::Left));
+        Some(Command::none())
     }
 
     /// Whether the tab for `path` holds unsaved changes.

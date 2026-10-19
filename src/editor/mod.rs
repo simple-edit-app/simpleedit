@@ -30,17 +30,14 @@ pub const SUPPORTED_LANGUAGES: &[(&str, &str)] = &[
 ];
 
 use iced::highlighter as hl;
-use iced::{
-    widget::{container, row, text, text_editor},
-    Element, Font, Length,
-};
+use iced::{Element, Length};
 
 use crate::{app::Message, config::Config, search::SearchState};
 
 /// The buffer's text, exactly. `Content::text()` always ends in a newline but
 /// drops a final empty line; this keeps every line and ends in one newline
 /// (none for an empty buffer).
-pub fn buffer_text(content: &iced::widget::text_editor::Content) -> String {
+pub fn buffer_text(content: &crate::code_editor::Content) -> String {
     let mut text = content
         .lines()
         .enumerate()
@@ -110,7 +107,7 @@ pub fn line_replacement(old: &str, new: &str) -> Option<LineReplacement> {
 /// cosmic-text panics ("layout not found") when a motion crosses a line that
 /// was edited since the last layout. The app guarantees that by deferring
 /// such operations until after a redraw (see `layout_stale` in `app.rs`).
-pub fn set_buffer_text(content: &mut iced::widget::text_editor::Content, new_text: &str) {
+pub fn set_buffer_text(content: &mut crate::code_editor::Content, new_text: &str) {
     use iced::widget::text_editor::{Action, Edit, Motion};
 
     let old = buffer_text(content);
@@ -134,25 +131,25 @@ pub fn set_buffer_text(content: &mut iced::widget::text_editor::Content, new_tex
             return;
         }
     }
-    *content = iced::widget::text_editor::Content::with_text(new_text);
+    *content = crate::code_editor::Content::with_text(new_text);
 }
 
 pub struct EditorState {
-    pub content: text_editor::Content,
+    pub content: crate::code_editor::Content,
     pub language: Option<String>,
 }
 
 impl EditorState {
     pub fn new() -> Self {
         Self {
-            content: text_editor::Content::new(),
+            content: crate::code_editor::Content::new(),
             language: None,
         }
     }
 
     pub fn from_content(text: &str) -> Self {
         Self {
-            content: text_editor::Content::with_text(text),
+            content: crate::code_editor::Content::with_text(text),
             language: None,
         }
     }
@@ -193,7 +190,9 @@ impl EditorState {
             .unwrap_or_default();
         let current = search.and_then(SearchState::current_match_line);
 
-        let editor = text_editor(&self.content)
+        let p = crate::theme::palette(config.dark_mode);
+        let mut editor = crate::code_editor::CodeEditor::new(&self.content)
+            .size(config.font_size.clamp(8.0, 32.0))
             .on_action(Message::EditorAction)
             .highlight::<highlighter::Highlighter>(
                 highlighter::Settings {
@@ -215,47 +214,26 @@ impl EditorState {
             )))
             .height(Length::Fill);
 
-        if config.show_line_numbers {
-            // The buffer's own line count, which already includes the empty
-            // line after a trailing '\n' — no need to rebuild the text per frame.
-            let line_count = self.content.line_count().max(1);
-
-            let numbers: String = (1..=line_count)
-                .map(|n| format!("{:>4}", n))
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            // text_editor internal top padding = 5px, container top = 8px → total = 13px.
-            // Use line_height 1.3 to match cosmic-text default used by text_editor.
-            let gutter = container(
-                text(numbers)
-                    .size(crate::config::applied_font_size())
-                    .line_height(1.3_f32)
-                    .font(Font::MONOSPACE)
-                    .style(crate::theme::muted_text(config.dark_mode)),
-            )
-            .padding(iced::Padding {
-                top: 13.0,
-                right: 6.0,
-                bottom: 8.0,
-                left: 8.0,
-            })
-            .height(Length::Fill)
-            .style(crate::theme::gutter(config.dark_mode));
-
-            row![
-                gutter,
-                container(editor).width(Length::Fill).padding([8, 14]),
-            ]
-            .height(Length::Fill)
-            .into()
+        // The gutter is drawn by the editor itself, from its own row layout,
+        // so numbers stay aligned with wrapped lines and while scrolling.
+        let left = if config.show_line_numbers {
+            editor = editor.gutter(crate::code_editor::Gutter {
+                background: p.surface,
+                text: p.muted,
+                border: p.border,
+            });
+            0.0
         } else {
-            container(editor)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .padding([8, 14])
-                .into()
-        }
+            14.0
+        };
+        editor
+            .padding(iced::Padding {
+                top: 8.0,
+                right: 14.0,
+                bottom: 8.0,
+                left,
+            })
+            .into()
     }
 }
 

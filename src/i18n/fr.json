@@ -62,7 +62,6 @@
   "prefs.auto_indent": "Indentation automatique",
   "prefs.autocomplete_brackets": "Complétion des accolades",
   "prefs.autocomplete_quotes": "Complétion des guillemets",
-  "prefs.restart_hint": "Pris en compte au redémarrage",
   "prefs.language": "Langue",
   "ctx.select_all": "Sélectionner tout",
   "ctx.cut": "Couper",
