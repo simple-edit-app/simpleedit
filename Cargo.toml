@@ -32,6 +32,11 @@ ed25519-dalek = { version = "2", default-features = false }
 tempfile = "3"
 
 
+# Text shaping and syntax highlighting are very slow unoptimized: jumping
+# to the middle of a 3 000-line file took 30 s in a debug build.
+[profile.dev.package."*"]
+opt-level = 3
+
 [profile.release]
 opt-level = 3
 lto = true

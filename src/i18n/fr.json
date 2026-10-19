@@ -164,6 +164,7 @@
   "prefs.updates": "Mises à jour",
   "prefs.highlight_current_line": "Surligner la ligne courante",
   "prefs.show_page_guide": "Afficher le guide de page",
+  "prefs.show_minimap": "Afficher la minimap",
   "palette.title": "Commandes",
   "palette.placeholder": "Saisissez une commande…",
   "palette.no_results": "Aucune commande correspondante",

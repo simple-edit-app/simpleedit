@@ -427,8 +427,18 @@ impl Application for SimpleEditApp {
 
         // The search card floats over the top-right corner of the editor.
         let body: Element<'_, Message> = if self.show_search {
-            crate::floating::TopRight::new(editor_with_context, self.search.view(dark), 12.0, 16.0)
-                .into()
+            crate::floating::TopRight::new(
+                editor_with_context,
+                self.search.view(dark),
+                12.0,
+                // Clear of the minimap.
+                16.0 + if self.config.show_minimap && view_mode != ViewMode::Preview {
+                    crate::code_editor::MINIMAP_WIDTH
+                } else {
+                    0.0
+                },
+            )
+            .into()
         } else {
             editor_with_context
         };
@@ -2837,12 +2847,24 @@ fn short_dir(dir: &Path) -> String {
         Some(rest) => format!("~/{}", rest.display()),
         None => dir.display().to_string(),
     };
-    if shown.ends_with('/') {
+    let shown = if shown.ends_with('/') {
         shown
     } else {
         format!("{shown}/")
+    };
+    // The toolbar has one line: keep the end of a long path (the folder the
+    // file is in matters most).
+    let count = shown.chars().count();
+    if count > MAX_DIR_CHARS {
+        let tail: String = shown.chars().skip(count - (MAX_DIR_CHARS - 1)).collect();
+        format!("…{tail}")
+    } else {
+        shown
     }
 }
+
+/// Longest folder path shown in the toolbar, in characters.
+const MAX_DIR_CHARS: usize = 56;
 
 fn goto_line_id() -> text_input::Id {
     text_input::Id::new("goto-line")
@@ -3121,5 +3143,26 @@ mod text_ops_tests {
         assert_eq!(comment_style(Some("html")), Some(("<!-- ", " -->")));
         assert_eq!(comment_style(Some("json")), None);
         assert_eq!(comment_style(None), Some(("// ", "")));
+    }
+}
+
+#[cfg(test)]
+mod short_dir_tests {
+    use super::*;
+
+    #[test]
+    fn a_long_folder_keeps_its_end_within_the_limit() {
+        let dir = Path::new("/very/long/folder/name")
+            .join("x".repeat(80))
+            .join("project");
+        let shown = short_dir(&dir);
+        assert_eq!(shown.chars().count(), MAX_DIR_CHARS);
+        assert!(shown.starts_with('…'));
+        assert!(shown.ends_with("/project/"));
+    }
+
+    #[test]
+    fn a_short_folder_is_left_alone() {
+        assert_eq!(short_dir(Path::new("/tmp/a")), "/tmp/a/");
     }
 }

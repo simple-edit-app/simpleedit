@@ -251,6 +251,8 @@ pub struct Config {
     /// A vertical guide at `page_guide_column`.
     pub show_page_guide: bool,
     pub page_guide_column: usize,
+    /// A miniature of the whole file along the editor's right edge.
+    pub show_minimap: bool,
     pub locale: String,
     pub shortcuts: Shortcuts,
     pub recent_files: Vec<String>,
@@ -270,6 +272,7 @@ impl Default for Config {
             highlight_current_line: true,
             show_page_guide: false,
             page_guide_column: 80,
+            show_minimap: true,
             locale: "en".to_string(),
             shortcuts: Shortcuts::default(),
             recent_files: Vec::new(),

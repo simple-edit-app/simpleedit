@@ -164,6 +164,7 @@
   "prefs.updates": "Updates",
   "prefs.highlight_current_line": "Highlight current line",
   "prefs.show_page_guide": "Show page guide",
+  "prefs.show_minimap": "Show minimap",
   "palette.title": "Commands",
   "palette.placeholder": "Type a command…",
   "palette.no_results": "No matching command",

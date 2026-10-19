@@ -69,6 +69,57 @@ pub struct SearchPaint {
     pub current_border: Color,
 }
 
+/// Colors of the minimap: a miniature of the whole file along the right edge.
+#[derive(Debug, Clone, Copy)]
+pub struct Minimap {
+    /// The miniature lines.
+    pub bar: Color,
+    /// Wash over the part of the file on screen.
+    pub viewport: Color,
+    /// Outline of that part.
+    pub viewport_border: Color,
+    /// Marker for search matches.
+    pub marker: Color,
+}
+
+/// Width of the minimap.
+pub const MINIMAP_WIDTH: f32 = 84.0;
+/// Space above and below the miniature.
+const MINIMAP_INSET: f32 = 8.0;
+/// Width of a miniature character.
+const MINIMAP_CHAR: f32 = 0.8;
+/// Beyond this many lines the search markers aren't computed (they would
+/// cost a scan of the whole file on every redraw).
+const MINIMAP_MAX_MARKED_LINES: usize = 20_000;
+
+/// Height of one line of the miniature: 2px, less when the file is too
+/// tall to fit.
+fn minimap_scale(lines: usize, height: f32) -> f32 {
+    let room = (height - 2.0 * MINIMAP_INSET).max(1.0);
+    (room / lines.max(1) as f32).min(2.0)
+}
+
+/// The line under `y` (relative to the minimap's top).
+fn minimap_line_at(y: f32, scale: f32, lines: usize) -> usize {
+    (((y - MINIMAP_INSET) / scale).max(0.0) as usize).min(lines.saturating_sub(1))
+}
+
+/// Where a line's miniature starts and how long it is, in characters:
+/// indentation counts for its width, trailing space doesn't. `None` for a
+/// blank line.
+fn minimap_span(line: &str) -> Option<(usize, usize)> {
+    let mut start = 0;
+    for c in line.chars() {
+        match c {
+            ' ' => start += 1,
+            '\t' => start += 4,
+            _ => break,
+        }
+    }
+    let body = line.trim();
+    (!body.is_empty()).then(|| (start, body.chars().count()))
+}
+
 /// Space between the gutter and the text.
 const GUTTER_GAP: f32 = 6.0;
 
@@ -76,6 +127,16 @@ const GUTTER_GAP: f32 = 6.0;
 fn gutter_width(size: f32, lines: usize) -> f32 {
     let digits = lines.max(1).to_string().len().max(2);
     (digits as f32 * size * 0.6 + 26.0).max(46.0)
+}
+
+/// The minimap's strip along the right edge of the widget.
+fn minimap_rect(bounds: Rectangle) -> Rectangle {
+    Rectangle {
+        x: bounds.x + bounds.width - MINIMAP_WIDTH,
+        y: bounds.y,
+        width: MINIMAP_WIDTH,
+        height: bounds.height,
+    }
 }
 
 /// Byte ranges of the matches of `paint` in one line of text.
@@ -124,6 +185,7 @@ where
     search: Option<SearchPaint>,
     /// Column and color of a vertical page guide.
     guide: Option<(usize, Color)>,
+    minimap: Option<Minimap>,
     style: Theme::Style,
     on_edit: Option<Box<dyn Fn(Action) -> Message + 'a>>,
     highlighter_settings: Highlighter::Settings,
@@ -147,6 +209,7 @@ where
             line_highlight: None,
             search: None,
             guide: None,
+            minimap: None,
             style: Default::default(),
             on_edit: None,
             highlighter_settings: (),
@@ -216,6 +279,13 @@ where
         self
     }
 
+    /// Shows a miniature of the whole file on the right; dragging in it
+    /// scrolls the text.
+    pub fn minimap(mut self, minimap: Minimap) -> Self {
+        self.minimap = Some(minimap);
+        self
+    }
+
     pub fn highlight<H: text::Highlighter>(
         self,
         settings: H::Settings,
@@ -233,6 +303,7 @@ where
             line_highlight: self.line_highlight,
             search: self.search,
             guide: self.guide,
+            minimap: self.minimap,
             style: self.style,
             on_edit: self.on_edit,
             highlighter_settings: settings,
@@ -243,6 +314,151 @@ where
     pub fn style(mut self, style: impl Into<Theme::Style>) -> Self {
         self.style = style.into();
         self
+    }
+
+    /// How many rows to scroll so that the line at `y` (from the minimap's
+    /// top) ends up in the middle of the screen.
+    fn minimap_scroll(&self, y: f32, height: f32) -> Option<i32> {
+        let internal = self.content.0.borrow();
+        let buffer = internal.editor.buffer();
+        let lines = buffer.lines.len();
+        let (first, last) =
+            buffer
+                .layout_runs()
+                .fold(None, |range: Option<(usize, usize)>, run| {
+                    Some(match range {
+                        Some((a, b)) => (a.min(run.line_i), b.max(run.line_i)),
+                        None => (run.line_i, run.line_i),
+                    })
+                })?;
+        let wanted = minimap_line_at(y, minimap_scale(lines, height), lines);
+        let target = wanted.saturating_sub((last - first).div_ceil(2));
+        // Rows, not lines: a wrapped line takes several (1 if not laid out yet).
+        let rows = |from: usize, to: usize| -> i32 {
+            buffer.lines[from..to]
+                .iter()
+                .map(|l| l.layout_opt().as_ref().map_or(1, |v| v.len().max(1)) as i32)
+                .sum()
+        };
+        let delta = if target >= first {
+            rows(first, target)
+        } else {
+            -rows(target, first)
+        };
+        (delta != 0).then_some(delta)
+    }
+
+    fn draw_minimap(
+        &self,
+        renderer: &mut iced::Renderer,
+        editor: &Editor,
+        rect: Rectangle,
+        minimap: Minimap,
+        regex: Option<&regex::Regex>,
+    ) {
+        let buffer = editor.buffer();
+        let lines = buffer.lines.len();
+        let scale = minimap_scale(lines, rect.height);
+        let top = rect.y + MINIMAP_INSET;
+        let quad = |renderer: &mut iced::Renderer, x, y, width, height, color| {
+            let bounds = Rectangle {
+                x,
+                y,
+                width,
+                height,
+            };
+            if let Some(bounds) = rect.intersection(&bounds) {
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds,
+                        ..renderer::Quad::default()
+                    },
+                    color,
+                );
+            }
+        };
+
+        // The part of the file on screen.
+        let range = buffer
+            .layout_runs()
+            .fold(None, |range: Option<(usize, usize)>, run| {
+                Some(match range {
+                    Some((a, b)) => (a.min(run.line_i), b.max(run.line_i)),
+                    None => (run.line_i, run.line_i),
+                })
+            });
+        if let Some((first, last)) = range {
+            let band = Rectangle {
+                x: rect.x + 0.5,
+                y: top + first as f32 * scale,
+                width: rect.width - 1.0,
+                height: ((last - first + 1) as f32 * scale).max(6.0),
+            };
+            if let Some(bounds) = rect.intersection(&band) {
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds,
+                        border: iced::Border {
+                            color: minimap.viewport_border,
+                            width: 1.0,
+                            radius: 3.0.into(),
+                        },
+                        ..renderer::Quad::default()
+                    },
+                    minimap.viewport,
+                );
+            }
+        }
+
+        // The lines: one bar each, or one per pixel row when they don't fit
+        // (the longest of the lines that share it).
+        let group = (1.0 / scale).ceil().max(1.0) as usize;
+        let step = group as f32 * scale;
+        let max_width = rect.width - 12.0;
+        for (row, first) in (0..lines).step_by(group).enumerate() {
+            let span = buffer.lines[first..(first + group).min(lines)]
+                .iter()
+                .filter_map(|l| minimap_span(l.text()))
+                .fold(None, |acc: Option<(usize, usize)>, (start, len)| {
+                    Some(match acc {
+                        Some((s, end)) => (s.min(start), end.max(start + len)),
+                        None => (start, start + len),
+                    })
+                });
+            let Some((start, end)) = span else { continue };
+            let x = start as f32 * MINIMAP_CHAR;
+            if x >= max_width {
+                continue;
+            }
+            quad(
+                renderer,
+                rect.x + 6.0 + x,
+                top + row as f32 * step,
+                ((end - start) as f32 * MINIMAP_CHAR).clamp(1.5, max_width - x),
+                (step * 0.7).max(1.0),
+                minimap.bar,
+            );
+        }
+
+        // Search matches: a tick on the right edge.
+        if let Some(paint) = self
+            .search
+            .as_ref()
+            .filter(|_| lines <= MINIMAP_MAX_MARKED_LINES)
+        {
+            for (i, line) in buffer.lines.iter().enumerate() {
+                if !line_matches(line.text(), paint, regex).is_empty() {
+                    quad(
+                        renderer,
+                        rect.x + rect.width - 4.0,
+                        top + i as f32 * scale,
+                        4.0,
+                        scale.max(2.0),
+                        minimap.marker,
+                    );
+                }
+            }
+        }
     }
 
     fn size_px(&self, renderer: &iced::Renderer) -> f32 {
@@ -258,6 +474,12 @@ where
         };
         Padding {
             left: self.padding.left + gutter + if gutter > 0.0 { GUTTER_GAP } else { 0.0 },
+            right: self.padding.right
+                + if self.minimap.is_some() {
+                    MINIMAP_WIDTH
+                } else {
+                    0.0
+                },
             ..self.padding
         }
     }
@@ -421,6 +643,8 @@ struct State<Highlighter: text::Highlighter> {
     last_click: Option<mouse::Click>,
     drag_click: Option<mouse::click::Kind>,
     partial_scroll: f32,
+    /// A drag that started in the minimap.
+    minimap_drag: bool,
     highlighter: RefCell<Highlighter>,
     highlighter_settings: Highlighter::Settings,
     highlighter_format_address: usize,
@@ -444,6 +668,7 @@ where
             last_click: None,
             drag_click: None,
             partial_scroll: 0.0,
+            minimap_drag: false,
             highlighter: RefCell::new(Highlighter::new(&self.highlighter_settings)),
             highlighter_settings: self.highlighter_settings.clone(),
             highlighter_format_address: self.highlighter_format as usize,
@@ -542,6 +767,34 @@ where
 
         let state = tree.state.downcast_mut::<State<Highlighter>>();
         let padding = self.text_padding(renderer, self.content.line_count());
+
+        if self.minimap.is_some() {
+            let rect = minimap_rect(layout.bounds());
+            let target = match event {
+                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                    if cursor.is_over(rect) =>
+                {
+                    state.minimap_drag = true;
+                    cursor.position().map(|p| p.y)
+                }
+                Event::Mouse(mouse::Event::CursorMoved { position }) if state.minimap_drag => {
+                    Some(position.y)
+                }
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+                    if state.minimap_drag =>
+                {
+                    state.minimap_drag = false;
+                    return event::Status::Captured;
+                }
+                _ => None,
+            };
+            if let Some(y) = target {
+                if let Some(lines) = self.minimap_scroll(y - rect.y, rect.height) {
+                    shell.publish(on_edit(Action::Scroll { lines }));
+                }
+                return event::Status::Captured;
+            }
+        }
 
         let Some(update) = Update::from_event(event, state, layout.bounds(), padding, cursor)
         else {
@@ -683,7 +936,13 @@ where
                 let band = Rectangle {
                     x: left,
                     y: top,
-                    width: bounds.x + bounds.width - left,
+                    width: bounds.x + bounds.width
+                        - if self.minimap.is_some() {
+                            MINIMAP_WIDTH
+                        } else {
+                            0.0
+                        }
+                        - left,
                     height: row_height,
                 };
                 if let Some(band) = bounds.intersection(&band) {
@@ -836,6 +1095,16 @@ where
                 );
             }
         }
+
+        if let Some(minimap) = self.minimap {
+            self.draw_minimap(
+                renderer,
+                &internal.editor,
+                minimap_rect(bounds),
+                minimap,
+                regex.as_ref(),
+            );
+        }
     }
 
     fn mouse_interaction(
@@ -848,7 +1117,9 @@ where
     ) -> mouse::Interaction {
         let is_disabled = self.on_edit.is_none();
 
-        if cursor.is_over(layout.bounds()) {
+        if self.minimap.is_some() && cursor.is_over(minimap_rect(layout.bounds())) {
+            mouse::Interaction::Pointer
+        } else if cursor.is_over(layout.bounds()) {
             if is_disabled {
                 mouse::Interaction::NotAllowed
             } else {
@@ -1038,6 +1309,33 @@ mod tests {
         content.perform(Action::Move(Motion::Down));
         content.perform(Action::Move(Motion::Home));
         assert_eq!(content.cursor_position(), (2, 0));
+    }
+
+    #[test]
+    fn minimap_lines_fit_the_height_but_never_exceed_two_pixels() {
+        assert_eq!(minimap_scale(10, 800.0), 2.0);
+        // 1000 lines in 800 - 16 px.
+        assert!((minimap_scale(1000, 800.0) - 0.784).abs() < 1e-3);
+        assert!(minimap_scale(0, 800.0) > 0.0);
+    }
+
+    #[test]
+    fn minimap_position_maps_back_to_a_line() {
+        let scale = minimap_scale(1000, 800.0);
+        assert_eq!(minimap_line_at(0.0, scale, 1000), 0);
+        assert_eq!(minimap_line_at(800.0, scale, 1000), 999);
+        let y = MINIMAP_INSET + 500.0 * scale + 0.1;
+        assert_eq!(minimap_line_at(y, scale, 1000), 500);
+        assert_eq!(minimap_line_at(5.0, 2.0, 0), 0);
+    }
+
+    #[test]
+    fn minimap_span_counts_indentation_but_not_blank_lines() {
+        assert_eq!(minimap_span("fn main() {"), Some((0, 11)));
+        assert_eq!(minimap_span("    let x = 1;  "), Some((4, 10)));
+        assert_eq!(minimap_span("\tx"), Some((4, 1)));
+        assert_eq!(minimap_span("   "), None);
+        assert_eq!(minimap_span(""), None);
     }
 
     #[test]

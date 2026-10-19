@@ -222,6 +222,16 @@ impl EditorState {
             editor = editor.page_guide(config.page_guide_column, p.border);
         }
 
+        if config.show_minimap {
+            let with_alpha = |color: iced::Color, a: f32| iced::Color { a, ..color };
+            editor = editor.minimap(crate::code_editor::Minimap {
+                bar: with_alpha(p.muted, 0.45),
+                viewport: with_alpha(p.accent, 0.16),
+                viewport_border: with_alpha(p.accent, 0.75),
+                marker: p.accent,
+            });
+        }
+
         // The gutter is drawn by the editor itself, from its own row layout,
         // so numbers stay aligned with wrapped lines and while scrolling.
         let left = if config.show_line_numbers {

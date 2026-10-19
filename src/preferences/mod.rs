@@ -24,6 +24,7 @@ pub enum PreferencesMessage {
     AutocompleteQuotesToggled(bool),
     HighlightCurrentLineToggled(bool),
     ShowPageGuideToggled(bool),
+    ShowMinimapToggled(bool),
     LocaleChanged(String),
 }
 
@@ -101,6 +102,7 @@ pub struct PreferencesState {
     pub autocomplete_quotes: bool,
     pub highlight_current_line: bool,
     pub show_page_guide: bool,
+    pub show_minimap: bool,
     pub locale: String,
 }
 
@@ -117,6 +119,7 @@ impl PreferencesState {
             autocomplete_quotes: config.autocomplete_quotes,
             highlight_current_line: config.highlight_current_line,
             show_page_guide: config.show_page_guide,
+            show_minimap: config.show_minimap,
             locale: config.locale.clone(),
         }
     }
@@ -164,6 +167,10 @@ impl PreferencesState {
             PreferencesMessage::ShowPageGuideToggled(v) => {
                 self.show_page_guide = v;
                 config.show_page_guide = v;
+            }
+            PreferencesMessage::ShowMinimapToggled(v) => {
+                self.show_minimap = v;
+                config.show_minimap = v;
             }
             PreferencesMessage::LocaleChanged(v) => {
                 self.locale = v.clone();
@@ -366,6 +373,11 @@ impl PreferencesState {
                 t!("prefs.show_page_guide").to_string(),
                 self.show_page_guide,
                 PreferencesMessage::ShowPageGuideToggled,
+            ),
+            toggle(
+                t!("prefs.show_minimap").to_string(),
+                self.show_minimap,
+                PreferencesMessage::ShowMinimapToggled,
             ),
         ];
 
@@ -640,6 +652,7 @@ mod tests {
         assert_eq!(prefs.locale, "en");
         assert!(prefs.highlight_current_line);
         assert!(!prefs.show_page_guide);
+        assert!(prefs.show_minimap);
     }
 
     #[test]
@@ -682,10 +695,12 @@ mod tests {
             &mut config,
         );
         prefs.update(PreferencesMessage::ShowPageGuideToggled(true), &mut config);
+        prefs.update(PreferencesMessage::ShowMinimapToggled(false), &mut config);
         assert_eq!(config.tab_width, 2);
         assert!(!config.use_spaces);
         assert!(!config.highlight_current_line);
         assert!(config.show_page_guide);
+        assert!(!config.show_minimap);
     }
 
     #[test]
