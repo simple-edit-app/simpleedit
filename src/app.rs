@@ -114,6 +114,13 @@ pub enum Message {
     MoveLineDown,
     ToggleComment,
     DeleteLine,
+    // Bookmarks
+    ToggleBookmark,
+    NextBookmark,
+    PrevBookmark,
+    ClearBookmarks,
+    /// A right click over the text, relative to the editor.
+    EditorRightClick(iced::Point),
     IndentSelection,
     DedentLine,
     // Recent files
@@ -149,6 +156,8 @@ pub enum Message {
 
 pub struct SimpleEditApp {
     config: Config,
+    /// Marked lines of every file, saved between runs.
+    bookmarks: crate::bookmarks::Bookmarks,
     editor: EditorState,
     sidebar: SidebarState,
     search: SearchState,
@@ -259,6 +268,7 @@ impl Application for SimpleEditApp {
         let session = crate::session::Session::load();
 
         let mut app = Self {
+            bookmarks: crate::bookmarks::Bookmarks::load(),
             editor: EditorState::new(),
             sidebar: SidebarState::new(),
             search: SearchState::new(),
@@ -571,8 +581,13 @@ impl Application for SimpleEditApp {
                 .map(crate::formatter::has_formatter)
                 .unwrap_or(false);
             let lang_override_enabled = self.language_picker_enabled();
-            let dropdown =
-                crate::menu_bar::dropdown_view(menu, &self.config, has_fmt, lang_override_enabled);
+            let dropdown = crate::menu_bar::dropdown_view(
+                menu,
+                &self.config,
+                has_fmt,
+                lang_override_enabled,
+                self.bookmark_state(),
+            );
             iced_aw::floating_element::FloatingElement::new(base, dropdown)
                 .anchor(iced_aw::floating_element::Anchor::NorthWest)
                 .offset(iced_aw::floating_element::Offset {
@@ -703,76 +718,13 @@ impl SimpleEditApp {
 
         match message {
             Message::EditorAction(action) => {
-                let is_edit = action.is_edit();
-
-                if is_edit {
-                    if let text_editor::Action::Edit(edit) = &action {
-                        match edit {
-                            text_editor::Edit::Insert(ch) => {
-                                if ch.is_whitespace() {
-                                    // Whitespace ends the current word group; next non-ws starts a new one
-                                    self.undo_new_group = true;
-                                } else if self.undo_new_group {
-                                    // First non-whitespace of a new group: snapshot now
-                                    self.push_undo();
-                                    self.undo_new_group = false;
-                                }
-                                // else: mid-word, stay in current group
-                            }
-                            _ => {
-                                // Backspace, Delete, Enter, Paste: always their own undo point
-                                self.push_undo();
-                                self.undo_new_group = true;
-                            }
-                        }
-                    }
-                } else {
-                    // Motion action: next edit opens a new group
-                    self.undo_new_group = true;
+                // Lines added or removed by an edit move the bookmarks below.
+                let probe = action.is_edit().then(|| self.edit_probe());
+                let command = self.editor_action(action);
+                if let Some((count, top)) = probe {
+                    self.shift_bookmarks(count, top);
                 }
-
-                // Auto-indent: replicate leading whitespace of current line on Enter
-                if self.config.auto_indent {
-                    if let text_editor::Action::Edit(text_editor::Edit::Enter) = &action {
-                        let (line_idx, col) = self.editor.content.cursor_position();
-                        // Only the whitespace before the cursor: pressing Enter
-                        // inside the indentation must not duplicate all of it.
-                        let indent: String = self
-                            .editor
-                            .content
-                            .line(line_idx)
-                            .map(|l| {
-                                l.chars()
-                                    .take_while(|c| *c == ' ' || *c == '\t')
-                                    .collect::<String>()
-                            })
-                            .unwrap_or_default();
-                        let indent = indent[..indent.len().min(col)].to_string();
-                        self.editor
-                            .content
-                            .perform(text_editor::Action::Edit(text_editor::Edit::Enter));
-                        if !indent.is_empty() {
-                            self.editor.content.perform(text_editor::Action::Edit(
-                                text_editor::Edit::Paste(std::sync::Arc::new(indent)),
-                            ));
-                        }
-                        self.is_dirty = true;
-                        return Command::none();
-                    }
-                }
-
-                // Auto-pairing of brackets and quotes
-                if let text_editor::Action::Edit(text_editor::Edit::Insert(ch)) = &action {
-                    if let Some(command) = self.autopair(*ch, &action) {
-                        return command;
-                    }
-                }
-
-                self.editor.content.perform(action);
-                if is_edit {
-                    self.is_dirty = true;
-                }
-                Command::none()
+                command
             }
             Message::InsertTab => {
                 if !self.editing_blocked() {
@@ -893,6 +845,7 @@ impl SimpleEditApp {
                         let from_current = origin == self.current_file;
                         if let Some(old) = origin.as_ref().filter(|o| is_untitled(o)) {
                             self.sidebar.rename_file(old, path.clone());
+                            self.bookmarks.rename(old, &path);
                             if !from_current {
                                 if let Some(entry) = self.file_cache.remove(old) {
                                     self.file_cache.insert(path.clone(), entry);
@@ -1305,7 +1258,7 @@ impl SimpleEditApp {
                 };
                 let sh = &self.config.shortcuts;
                 // Order matters: Ctrl+Shift+S must be tried before Ctrl+S.
-                let bindings: [(&ShortcutConfig, Message); 18] = [
+                let bindings: [(&ShortcutConfig, Message); 21] = [
                     (&sh.undo, Message::Undo),
                     (&sh.redo, Message::Redo),
                     (&sh.duplicate_line, Message::DuplicateLine),
@@ -1313,6 +1266,9 @@ impl SimpleEditApp {
                     (&sh.move_line_down, Message::MoveLineDown),
                     (&sh.toggle_comment, Message::ToggleComment),
                     (&sh.delete_line, Message::DeleteLine),
+                    (&sh.toggle_bookmark, Message::ToggleBookmark),
+                    (&sh.prev_bookmark, Message::PrevBookmark),
+                    (&sh.next_bookmark, Message::NextBookmark),
                     (&sh.save_as, Message::SaveFileAs),
                     (&sh.new_file, Message::NewFile),
                     (&sh.save_file, Message::SaveFile),
@@ -1391,6 +1347,44 @@ impl SimpleEditApp {
                 let (line, _) = self.editor.content.cursor_position();
                 let (new_text, new_line) = delete_line_op(&text, line);
                 self.apply_text_edit(new_text, new_line, 0)
+            }
+            Message::ToggleBookmark => {
+                let Some(path) = self.current_file.clone() else {
+                    return Command::none();
+                };
+                let (line, _) = self.editor.content.cursor_position();
+                let added = self.bookmarks.toggle(&path, line);
+                self.status_message = if added {
+                    t!("status.bookmark_added")
+                } else {
+                    t!("status.bookmark_removed")
+                }
+                .to_string();
+                self.status_is_error = false;
+                Command::none()
+            }
+            Message::EditorRightClick(at) => {
+                // The context menu acts on the clicked line: move the caret
+                // there, unless there is a selection to act on.
+                if self.editor.content.selection().is_none() {
+                    let origin =
+                        crate::editor::text_origin(&self.config, self.editor.content.line_count());
+                    self.editor
+                        .content
+                        .perform(text_editor::Action::Click(at - origin));
+                    self.undo_new_group = true;
+                }
+                Command::none()
+            }
+            Message::NextBookmark => self.jump_to_bookmark(true),
+            Message::PrevBookmark => self.jump_to_bookmark(false),
+            Message::ClearBookmarks => {
+                if let Some(path) = self.current_file.clone() {
+                    self.bookmarks.clear(&path);
+                    self.status_message = t!("status.bookmarks_cleared").to_string();
+                    self.status_is_error = false;
+                }
+                Command::none()
             }
             Message::IndentSelection => {
                 if self.editing_blocked() {
@@ -1573,6 +1567,148 @@ impl SimpleEditApp {
         }
     }
 
+    /// An action in the text area: undo grouping, auto-indent, auto-pairing,
+    /// then the action itself.
+    fn editor_action(&mut self, action: text_editor::Action) -> Command<Message> {
+        let is_edit = action.is_edit();
+
+        if is_edit {
+            if let text_editor::Action::Edit(edit) = &action {
+                match edit {
+                    text_editor::Edit::Insert(ch) => {
+                        if ch.is_whitespace() {
+                            // Whitespace ends the current word group; next non-ws starts a new one
+                            self.undo_new_group = true;
+                        } else if self.undo_new_group {
+                            // First non-whitespace of a new group: snapshot now
+                            self.push_undo();
+                            self.undo_new_group = false;
+                        }
+                        // else: mid-word, stay in current group
+                    }
+                    _ => {
+                        // Backspace, Delete, Enter, Paste: always their own undo point
+                        self.push_undo();
+                        self.undo_new_group = true;
+                    }
+                }
+            }
+        } else {
+            // Motion action: next edit opens a new group
+            self.undo_new_group = true;
+        }
+
+        // Auto-indent: replicate leading whitespace of current line on Enter
+        if self.config.auto_indent {
+            if let text_editor::Action::Edit(text_editor::Edit::Enter) = &action {
+                let (line_idx, col) = self.editor.content.cursor_position();
+                // Only the whitespace before the cursor: pressing Enter
+                // inside the indentation must not duplicate all of it.
+                let indent: String = self
+                    .editor
+                    .content
+                    .line(line_idx)
+                    .map(|l| {
+                        l.chars()
+                            .take_while(|c| *c == ' ' || *c == '\t')
+                            .collect::<String>()
+                    })
+                    .unwrap_or_default();
+                let indent = indent[..indent.len().min(col)].to_string();
+                self.editor
+                    .content
+                    .perform(text_editor::Action::Edit(text_editor::Edit::Enter));
+                if !indent.is_empty() {
+                    self.editor.content.perform(text_editor::Action::Edit(
+                        text_editor::Edit::Paste(std::sync::Arc::new(indent)),
+                    ));
+                }
+                self.is_dirty = true;
+                return Command::none();
+            }
+        }
+
+        // Auto-pairing of brackets and quotes
+        if let text_editor::Action::Edit(text_editor::Edit::Insert(ch)) = &action {
+            if let Some(command) = self.autopair(*ch, &action) {
+                return command;
+            }
+        }
+
+        self.editor.content.perform(action);
+        if is_edit {
+            self.is_dirty = true;
+        }
+        Command::none()
+    }
+
+    /// (line count, topmost line an edit may touch), taken before an edit.
+    fn edit_probe(&self) -> (usize, usize) {
+        let (line, _) = self.editor.content.cursor_position();
+        let above = self
+            .editor
+            .content
+            .selection()
+            .map_or(0, |s| s.matches('\n').count());
+        (self.editor.content.line_count(), line.saturating_sub(above))
+    }
+
+    /// Moves the current file's bookmarks after an edit that changed the line
+    /// count (see `edit_probe`).
+    fn shift_bookmarks(&mut self, count_before: usize, top_before: usize) {
+        let (Some(path), count) = (&self.current_file, self.editor.content.line_count()) else {
+            return;
+        };
+        if count == count_before {
+            return;
+        }
+        let top = top_before.min(self.editor.content.cursor_position().0);
+        self.bookmarks
+            .shift(path, top, count as isize - count_before as isize);
+    }
+
+    fn bookmark_lines(&self) -> &[usize] {
+        self.current_file
+            .as_deref()
+            .map_or(&[], |path| self.bookmarks.lines(path))
+    }
+
+    fn bookmark_state(&self) -> crate::menu_bar::BookmarkState {
+        let line = self.editor.content.cursor_position().0;
+        crate::menu_bar::BookmarkState {
+            on_line: self
+                .current_file
+                .as_deref()
+                .is_some_and(|path| self.bookmarks.has(path, line)),
+            any: !self.bookmark_lines().is_empty(),
+        }
+    }
+
+    /// Moves the cursor to the next (or previous) bookmark of the file.
+    fn jump_to_bookmark(&mut self, forward: bool) -> Command<Message> {
+        let Some(path) = self.current_file.clone() else {
+            return Command::none();
+        };
+        let (line, _) = self.editor.content.cursor_position();
+        let total = self.editor.content.line_count();
+        let target = if forward {
+            self.bookmarks.next(&path, line, total)
+        } else {
+            self.bookmarks.previous(&path, line, total)
+        };
+        match target {
+            Some(target) => {
+                crate::search::goto_line_start(&mut self.editor.content, target);
+                self.undo_new_group = true;
+            }
+            None => {
+                self.status_message = t!("status.no_bookmarks").to_string();
+                self.status_is_error = false;
+            }
+        }
+        Command::none()
+    }
+
     fn snapshot(&self) -> Snapshot {
         Snapshot {
             text: crate::editor::buffer_text(&self.editor.content),
@@ -1636,6 +1772,12 @@ impl SimpleEditApp {
     }
 
     fn replace_buffer_text(&mut self, new_text: &str) {
+        if let Some(path) = &self.current_file {
+            if !self.bookmarks.lines(path).is_empty() {
+                let old = crate::editor::buffer_text(&self.editor.content);
+                self.bookmarks.remap(path, &old, new_text);
+            }
+        }
         crate::editor::set_buffer_text(&mut self.editor.content, new_text);
     }
 
@@ -1779,6 +1921,11 @@ impl SimpleEditApp {
         self.file_cache.remove(&path);
         self.undo_cache.remove(&path);
         self.sidebar.remove_path(&path);
+        // An untitled file is gone for good once closed; a saved one keeps
+        // its bookmarks for the next time it is opened.
+        if is_untitled(&path) {
+            self.bookmarks.clear(&path);
+        }
 
         let mut command = Command::none();
         if self.current_file.as_ref() == Some(&path) {
@@ -1959,15 +2106,17 @@ impl SimpleEditApp {
         dark: bool,
     ) -> Element<'_, Message> {
         let search = self.show_search.then_some(&self.search);
+        let marks = self.bookmark_lines();
         if kind.is_none() {
-            return self.editor.view(&self.config, search);
+            return self.editor.view(&self.config, search, marks);
         }
 
         match mode {
-            ViewMode::Raw => self.editor.view(&self.config, search),
+            ViewMode::Raw => self.editor.view(&self.config, search, marks),
             ViewMode::Preview => self.preview_view(dark),
             ViewMode::Split => row![
-                container(self.editor.view(&self.config, search)).width(Length::FillPortion(54)),
+                container(self.editor.view(&self.config, search, marks))
+                    .width(Length::FillPortion(54)),
                 container(Space::with_width(1))
                     .height(Length::Fill)
                     .style(se_theme::rule(dark)),
@@ -2059,8 +2208,15 @@ impl SimpleEditApp {
             }
         };
         let (sh_cut, sh_copy, sh_paste) = (clip("X"), clip("C"), clip("V"));
+        let bookmark_state = self.bookmark_state();
+        let sh_bookmark = self.config.shortcuts.toggle_bookmark.display();
 
-        iced_aw::ContextMenu::new(editor_widget, move || {
+        let minimap_width = if self.config.show_minimap {
+            crate::code_editor::MINIMAP_WIDTH
+        } else {
+            0.0
+        };
+        let menu = iced_aw::ContextMenu::new(editor_widget, move || {
             use crate::menu_bar::{disabled_item, item, separator};
             let fmt_sel_el: Element<'static, Message> = if has_fmt_ctx && has_sel_ctx {
                 item(lbl_format_sel.clone(), None, dark, Message::FormatSelection)
@@ -2106,17 +2262,24 @@ impl SimpleEditApp {
                 separator(dark),
                 fmt_sel_el,
                 fmt_all_el,
+                separator(dark),
             ];
+            let mut ctx_items = ctx_items;
+            ctx_items.extend(crate::menu_bar::bookmark_items(
+                bookmark_state,
+                dark,
+                Some(sh_bookmark.clone()),
+            ));
             container(
                 column(ctx_items)
                     .spacing(1)
                     .padding(6)
-                    .width(Length::Fixed(232.0)),
+                    .width(Length::Fixed(264.0)),
             )
             .style(crate::theme::card(dark))
             .into()
-        })
-        .into()
+        });
+        crate::floating::RightClick::new(menu, minimap_width, Message::EditorRightClick).into()
     }
 
     /// Open files with unsaved changes (the dot in the sidebar).
@@ -2533,6 +2696,7 @@ impl SimpleEditApp {
 
     fn save_session(&mut self) {
         use crate::session::{FileSession, Session};
+        self.bookmarks.save();
         let files: Vec<FileSession> = self
             .sidebar
             .files()

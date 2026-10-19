@@ -23,6 +23,9 @@ pub enum ShortcutTarget {
     MoveLineDown,
     ToggleComment,
     DeleteLine,
+    ToggleBookmark,
+    NextBookmark,
+    PrevBookmark,
 }
 
 /// A single keyboard binding stored as display-friendly strings.
@@ -47,6 +50,22 @@ impl ShortcutConfig {
     fn ctrl_shift(key: &str) -> Self {
         Self {
             ctrl: true,
+            shift: true,
+            alt: false,
+            key: key.to_string(),
+        }
+    }
+    fn plain(key: &str) -> Self {
+        Self {
+            ctrl: false,
+            shift: false,
+            alt: false,
+            key: key.to_string(),
+        }
+    }
+    fn shift(key: &str) -> Self {
+        Self {
+            ctrl: false,
             shift: true,
             alt: false,
             key: key.to_string(),
@@ -131,6 +150,9 @@ pub struct Shortcuts {
     pub move_line_down: ShortcutConfig,
     pub toggle_comment: ShortcutConfig,
     pub delete_line: ShortcutConfig,
+    pub toggle_bookmark: ShortcutConfig,
+    pub next_bookmark: ShortcutConfig,
+    pub prev_bookmark: ShortcutConfig,
 }
 
 fn default_duplicate_line() -> ShortcutConfig {
@@ -172,6 +194,9 @@ impl Shortcuts {
             ShortcutTarget::MoveLineDown => &mut self.move_line_down,
             ShortcutTarget::ToggleComment => &mut self.toggle_comment,
             ShortcutTarget::DeleteLine => &mut self.delete_line,
+            ShortcutTarget::ToggleBookmark => &mut self.toggle_bookmark,
+            ShortcutTarget::NextBookmark => &mut self.next_bookmark,
+            ShortcutTarget::PrevBookmark => &mut self.prev_bookmark,
         }
     }
 
@@ -184,7 +209,7 @@ impl Shortcuts {
     }
 }
 
-const ALL_TARGETS: [ShortcutTarget; 19] = [
+const ALL_TARGETS: [ShortcutTarget; 22] = [
     ShortcutTarget::NewFile,
     ShortcutTarget::OpenFile,
     ShortcutTarget::SaveFile,
@@ -204,6 +229,9 @@ const ALL_TARGETS: [ShortcutTarget; 19] = [
     ShortcutTarget::MoveLineDown,
     ShortcutTarget::ToggleComment,
     ShortcutTarget::DeleteLine,
+    ShortcutTarget::ToggleBookmark,
+    ShortcutTarget::NextBookmark,
+    ShortcutTarget::PrevBookmark,
 ];
 
 impl Default for Shortcuts {
@@ -228,6 +256,9 @@ impl Default for Shortcuts {
             move_line_down: default_move_line_down(),
             toggle_comment: default_toggle_comment(),
             delete_line: default_delete_line(),
+            toggle_bookmark: ShortcutConfig::ctrl("F2"),
+            next_bookmark: ShortcutConfig::plain("F2"),
+            prev_bookmark: ShortcutConfig::shift("F2"),
         }
     }
 }
@@ -429,6 +460,18 @@ mod tests {
         assert!(!cfg.dark_mode);
         assert_eq!(cfg.tab_width, 4);
         assert_eq!(cfg.shortcuts.undo, ShortcutConfig::ctrl("z"));
+    }
+
+    #[test]
+    fn default_shortcuts_never_collide() {
+        let mut sh = Shortcuts::default();
+        for target in ALL_TARGETS {
+            let own = sh.slot_mut(target).clone();
+            assert!(!sh.conflicts(target, &own), "{target:?} collides");
+        }
+        assert_eq!(sh.toggle_bookmark.display(), "Ctrl+F2");
+        assert_eq!(sh.next_bookmark.display(), "F2");
+        assert_eq!(sh.prev_bookmark.display(), "Shift+F2");
     }
 
     #[test]

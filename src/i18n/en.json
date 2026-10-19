@@ -176,5 +176,17 @@
   "palette.set_language": "Set language…",
   "palette.toggle_sidebar": "Show/hide panel",
   "shortcuts.command_palette": "Command palette",
-  "menu.view_palette": "Command palette..."
+  "menu.view_palette": "Command palette...",
+  "menu.bookmark_add": "Add Bookmark",
+  "menu.bookmark_remove": "Remove Bookmark",
+  "menu.bookmark_clear": "Remove All Bookmarks",
+  "menu.bookmark_next": "Next Bookmark",
+  "menu.bookmark_prev": "Previous Bookmark",
+  "shortcuts.toggle_bookmark": "Add / remove bookmark",
+  "shortcuts.next_bookmark": "Next bookmark",
+  "shortcuts.prev_bookmark": "Previous bookmark",
+  "status.no_bookmarks": "No bookmarks in this file",
+  "status.bookmark_added": "Bookmark added",
+  "status.bookmark_removed": "Bookmark removed",
+  "status.bookmarks_cleared": "Bookmarks removed"
 }

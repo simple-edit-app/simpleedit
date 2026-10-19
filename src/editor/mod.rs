@@ -177,6 +177,7 @@ impl EditorState {
         &'a self,
         config: &Config,
         search: Option<&SearchState>,
+        bookmarks: &[usize],
     ) -> Element<'a, Message> {
         let dark = config.dark_mode;
         let p = crate::theme::palette(dark);
@@ -222,6 +223,12 @@ impl EditorState {
             editor = editor.page_guide(config.page_guide_column, p.border);
         }
 
+        if !bookmarks.is_empty() {
+            editor = editor.bookmarks(crate::code_editor::BookmarkPaint {
+                lines: bookmarks.to_vec(),
+                color: crate::theme::syntax(dark).function,
+            });
+        }
         if config.show_minimap {
             let with_alpha = |color: iced::Color, a: f32| iced::Color { a, ..color };
             editor = editor.minimap(crate::code_editor::Minimap {
@@ -234,24 +241,34 @@ impl EditorState {
 
         // The gutter is drawn by the editor itself, from its own row layout,
         // so numbers stay aligned with wrapped lines and while scrolling.
-        let left = if config.show_line_numbers {
+        if config.show_line_numbers {
             editor = editor.gutter(crate::code_editor::Gutter {
                 text: p.gutter,
                 current: p.text,
             });
-            0.0
-        } else {
-            16.0
-        };
-        editor
-            .padding(iced::Padding {
-                top: 10.0,
-                right: 14.0,
-                bottom: 8.0,
-                left,
-            })
-            .into()
+        }
+        editor.padding(padding(config)).into()
     }
+}
+
+/// The editor's own padding (the gutter and the minimap come on top).
+fn padding(config: &Config) -> iced::Padding {
+    iced::Padding {
+        top: 10.0,
+        right: 14.0,
+        bottom: 8.0,
+        // The line numbers give the text its left margin; without them it
+        // needs one of its own.
+        left: if config.show_line_numbers { 0.0 } else { 16.0 },
+    }
+}
+
+/// Where the text starts inside the editor widget (top-left corner of the
+/// first character), to turn a position over the widget into a click on
+/// the text.
+pub fn text_origin(config: &Config, lines: usize) -> iced::Vector {
+    let size = config.font_size.clamp(8.0, 32.0);
+    crate::code_editor::text_origin(size, lines, config.show_line_numbers, padding(config))
 }
 
 /// Row height relative to the text size (the design: 22px for 12.5px code).

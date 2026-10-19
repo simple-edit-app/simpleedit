@@ -537,6 +537,21 @@ pub fn shortcuts_list(
             sc.delete_line.display(),
         ),
         (
+            ShortcutTarget::ToggleBookmark,
+            t!("shortcuts.toggle_bookmark").to_string(),
+            sc.toggle_bookmark.display(),
+        ),
+        (
+            ShortcutTarget::NextBookmark,
+            t!("shortcuts.next_bookmark").to_string(),
+            sc.next_bookmark.display(),
+        ),
+        (
+            ShortcutTarget::PrevBookmark,
+            t!("shortcuts.prev_bookmark").to_string(),
+            sc.prev_bookmark.display(),
+        ),
+        (
             ShortcutTarget::NewFile,
             t!("shortcuts.new_file").to_string(),
             sc.new_file.display(),

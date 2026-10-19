@@ -87,14 +87,57 @@ pub fn view(config: &Config, open: Option<TopMenu>) -> Element<'static, Message>
         .into()
 }
 
+/// What the bookmark entries need to know about the active file.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BookmarkState {
+    /// The cursor's line is bookmarked.
+    pub on_line: bool,
+    /// The file has at least one bookmark.
+    pub any: bool,
+}
+
+/// The bookmark entries shared by the Edit menu and the context menu: add or
+/// remove the cursor line's bookmark, and remove them all.
+pub fn bookmark_items(
+    state: BookmarkState,
+    dark: bool,
+    toggle_hint: Option<String>,
+) -> Vec<Element<'static, Message>> {
+    let toggle_label = if state.on_line {
+        t!("menu.bookmark_remove")
+    } else {
+        t!("menu.bookmark_add")
+    };
+    let clear: Element<'static, Message> = if state.any {
+        item(
+            t!("menu.bookmark_clear").to_string(),
+            None,
+            dark,
+            Message::ClearBookmarks,
+        )
+    } else {
+        disabled_item(t!("menu.bookmark_clear").to_string(), dark)
+    };
+    vec![
+        item(
+            toggle_label.to_string(),
+            toggle_hint,
+            dark,
+            Message::ToggleBookmark,
+        ),
+        clear,
+    ]
+}
+
 /// The floating dropdown panel for the active menu.
 pub fn dropdown_view(
     menu: TopMenu,
     config: &Config,
     has_formatter: bool,
     lang_picker_enabled: bool,
+    bookmarks: BookmarkState,
 ) -> Element<'static, Message> {
-    let items = menu_items(menu, config, has_formatter, lang_picker_enabled);
+    let items = menu_items(menu, config, has_formatter, lang_picker_enabled, bookmarks);
     container(column(items).spacing(1).padding(6).width(260))
         .style(theme::card(config.dark_mode))
         .into()
@@ -170,6 +213,7 @@ fn menu_items(
     config: &Config,
     has_formatter: bool,
     lang_picker_enabled: bool,
+    bookmarks: BookmarkState,
 ) -> Vec<Element<'static, Message>> {
     let dark = config.dark_mode;
     let sh = &config.shortcuts;
@@ -242,7 +286,7 @@ fn menu_items(
             } else {
                 disabled_item(t!("menu.edit_format").to_string(), dark)
             };
-            vec![
+            let mut items = vec![
                 item(
                     t!("menu.edit_undo").to_string(),
                     sc(&sh.undo),
@@ -305,6 +349,29 @@ fn menu_items(
                     dark,
                     Message::OpenGotoLine,
                 ),
+                separator(dark),
+            ];
+            items.extend(bookmark_items(bookmarks, dark, sc(&sh.toggle_bookmark)));
+            for (label, shortcut, message) in [
+                (
+                    t!("menu.bookmark_next"),
+                    &sh.next_bookmark,
+                    Message::NextBookmark,
+                ),
+                (
+                    t!("menu.bookmark_prev"),
+                    &sh.prev_bookmark,
+                    Message::PrevBookmark,
+                ),
+            ] {
+                items.push(if bookmarks.any {
+                    item(label.to_string(), sc(shortcut), dark, message)
+                } else {
+                    disabled_item(label.to_string(), dark)
+                });
+            }
+            items.extend([
+                separator(dark),
                 format_item,
                 item(
                     t!("menu.edit_preferences").to_string(),
@@ -312,7 +379,8 @@ fn menu_items(
                     dark,
                     Message::TogglePreferences,
                 ),
-            ]
+            ]);
+            items
         }
         TopMenu::View => {
             let lang_item: Element<'static, Message> = if lang_picker_enabled {

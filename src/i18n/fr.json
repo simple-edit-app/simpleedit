@@ -176,5 +176,17 @@
   "palette.set_language": "Définir le langage…",
   "palette.toggle_sidebar": "Afficher/masquer le panneau",
   "shortcuts.command_palette": "Palette de commandes",
-  "menu.view_palette": "Palette de commandes..."
+  "menu.view_palette": "Palette de commandes...",
+  "menu.bookmark_add": "Ajouter un marque-page",
+  "menu.bookmark_remove": "Supprimer le marque-page",
+  "menu.bookmark_clear": "Supprimer tous les marque-pages",
+  "menu.bookmark_next": "Marque-page suivant",
+  "menu.bookmark_prev": "Marque-page précédent",
+  "shortcuts.toggle_bookmark": "Ajouter / supprimer un marque-page",
+  "shortcuts.next_bookmark": "Marque-page suivant",
+  "shortcuts.prev_bookmark": "Marque-page précédent",
+  "status.no_bookmarks": "Aucun marque-page dans ce fichier",
+  "status.bookmark_added": "Marque-page ajouté",
+  "status.bookmark_removed": "Marque-page supprimé",
+  "status.bookmarks_cleared": "Marque-pages supprimés"
 }

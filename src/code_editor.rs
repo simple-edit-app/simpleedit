@@ -82,6 +82,14 @@ pub struct Minimap {
     pub marker: Color,
 }
 
+/// Bookmarked lines: a flag in the gutter and a tick in the minimap.
+#[derive(Debug, Clone)]
+pub struct BookmarkPaint {
+    /// 0-based, sorted.
+    pub lines: Vec<usize>,
+    pub color: Color,
+}
+
 /// Width of the minimap.
 pub const MINIMAP_WIDTH: f32 = 84.0;
 /// Space above and below the miniature.
@@ -127,6 +135,17 @@ const GUTTER_GAP: f32 = 6.0;
 fn gutter_width(size: f32, lines: usize) -> f32 {
     let digits = lines.max(1).to_string().len().max(2);
     (digits as f32 * size * 0.6 + 26.0).max(46.0)
+}
+
+/// Where the text starts, from the widget's top-left corner: past the
+/// padding and the gutter.
+pub fn text_origin(size: f32, lines: usize, gutter: bool, padding: Padding) -> Vector {
+    let gutter = if gutter {
+        gutter_width(size, lines) + GUTTER_GAP
+    } else {
+        0.0
+    };
+    Vector::new(padding.left + gutter, padding.top)
 }
 
 /// The minimap's strip along the right edge of the widget.
@@ -186,6 +205,7 @@ where
     /// Column and color of a vertical page guide.
     guide: Option<(usize, Color)>,
     minimap: Option<Minimap>,
+    bookmarks: Option<BookmarkPaint>,
     style: Theme::Style,
     on_edit: Option<Box<dyn Fn(Action) -> Message + 'a>>,
     highlighter_settings: Highlighter::Settings,
@@ -210,6 +230,7 @@ where
             search: None,
             guide: None,
             minimap: None,
+            bookmarks: None,
             style: Default::default(),
             on_edit: None,
             highlighter_settings: (),
@@ -286,6 +307,12 @@ where
         self
     }
 
+    /// Marks lines (see [`BookmarkPaint`]).
+    pub fn bookmarks(mut self, bookmarks: BookmarkPaint) -> Self {
+        self.bookmarks = Some(bookmarks);
+        self
+    }
+
     pub fn highlight<H: text::Highlighter>(
         self,
         settings: H::Settings,
@@ -304,6 +331,7 @@ where
             search: self.search,
             guide: self.guide,
             minimap: self.minimap,
+            bookmarks: self.bookmarks,
             style: self.style,
             on_edit: self.on_edit,
             highlighter_settings: settings,
@@ -440,6 +468,32 @@ where
             );
         }
 
+        // Bookmarks: a line across the minimap, and a tick on the left edge.
+        if let Some(marks) = &self.bookmarks {
+            for &line in marks.lines.iter().filter(|l| **l < lines) {
+                let y = top + line as f32 * scale;
+                quad(
+                    renderer,
+                    rect.x,
+                    y + (scale.max(3.0) - 2.0) / 2.0,
+                    rect.width,
+                    2.0,
+                    Color {
+                        a: marks.color.a * 0.8,
+                        ..marks.color
+                    },
+                );
+                quad(
+                    renderer,
+                    rect.x,
+                    top + line as f32 * scale,
+                    5.0,
+                    scale.max(3.0),
+                    marks.color,
+                );
+            }
+        }
+
         // Search matches: a tick on the right edge.
         if let Some(paint) = self
             .search
@@ -467,13 +521,14 @@ where
 
     /// The padding around the text proper: the user's padding plus the gutter.
     fn text_padding(&self, renderer: &iced::Renderer, lines: usize) -> Padding {
-        let gutter = if self.gutter.is_some() {
-            gutter_width(self.size_px(renderer), lines)
-        } else {
-            0.0
-        };
+        let origin = text_origin(
+            self.size_px(renderer),
+            lines,
+            self.gutter.is_some(),
+            self.padding,
+        );
         Padding {
-            left: self.padding.left + gutter + if gutter > 0.0 { GUTTER_GAP } else { 0.0 },
+            left: origin.x,
             right: self.padding.right
                 + if self.minimap.is_some() {
                     MINIMAP_WIDTH
@@ -1093,6 +1148,42 @@ where
                     },
                     clip,
                 );
+            }
+        }
+
+        if let Some(marks) = &self.bookmarks {
+            // A small flag at the left edge of the gutter (or of the text,
+            // without line numbers), on the first row of each marked line.
+            let x = bounds.x + self.padding.left + 6.0;
+            let mut previous = None;
+            for run in internal.editor.buffer().layout_runs() {
+                if previous == Some(run.line_i) {
+                    continue;
+                }
+                previous = Some(run.line_i);
+                if marks.lines.binary_search(&run.line_i).is_err() {
+                    continue;
+                }
+                let height = 11.0_f32.min(row_height);
+                let flag = Rectangle {
+                    x,
+                    y: bounds.y + padding.top + run.line_top + (row_height - height) / 2.0,
+                    width: 7.0,
+                    height,
+                };
+                if let Some(flag) = bounds.intersection(&flag) {
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: flag,
+                            border: iced::Border {
+                                radius: [2.0, 2.0, 1.0, 1.0].into(),
+                                ..iced::Border::default()
+                            },
+                            ..renderer::Quad::default()
+                        },
+                        marks.color,
+                    );
+                }
             }
         }
 
