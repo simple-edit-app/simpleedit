@@ -12,6 +12,7 @@ fn load_icon() -> Option<window::Icon> {
 
 mod app;
 mod bookmarks;
+mod changelog;
 mod code_editor;
 mod config;
 mod editor;

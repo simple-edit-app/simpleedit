@@ -18,7 +18,7 @@ const MAX_DOWNLOAD: usize = 300 * 1024 * 1024;
 /// Strict `MAJOR.MINOR.PATCH`. Anything else — pre-releases, path
 /// separators, garbage from a tampered API response — is rejected, so a
 /// version string can't be used to build a hostile URL or file name.
-fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
+pub fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
     let mut parts = s.split('.');
     let mut next = || {
         let p = parts.next()?;
@@ -45,7 +45,42 @@ fn client(timeout: Duration) -> Result<reqwest::Client, String> {
         .map_err(|e| e.to_string())
 }
 
-pub async fn check_for_update() -> Result<Option<String>, String> {
+/// Largest changelog worth reading; anything bigger is ignored.
+const MAX_CHANGELOG: usize = 512 * 1024;
+
+/// What changed between this version and `latest`, from the changelog
+/// published with that release. Best effort: the update is still offered
+/// when the notes can't be fetched.
+async fn release_notes(latest: &str) -> Vec<crate::changelog::Entry> {
+    let url = format!(
+        "https://raw.githubusercontent.com/{REPO}/v{latest}/{}",
+        crate::changelog::file_name(&rust_i18n::locale())
+    );
+    let fetched = async {
+        let res = client(Duration::from_secs(15))?
+            .get(url)
+            .send()
+            .await
+            .and_then(|r| r.error_for_status())
+            .map_err(|e| e.to_string())?;
+        let bytes = res.bytes().await.map_err(|e| e.to_string())?;
+        if bytes.len() > MAX_CHANGELOG {
+            return Err(String::new());
+        }
+        Ok::<_, String>(String::from_utf8_lossy(&bytes).into_owned())
+    };
+    let Ok(text) = fetched.await else {
+        return Vec::new();
+    };
+    crate::changelog::between(
+        crate::changelog::parse(&text),
+        env!("CARGO_PKG_VERSION"),
+        latest,
+    )
+}
+
+/// The newer version and what it changes, if there is one.
+pub async fn check_for_update() -> Result<Option<(String, Vec<crate::changelog::Entry>)>, String> {
     let json: serde_json::Value = client(Duration::from_secs(15))?
         .get(RELEASES_API)
         .send()
@@ -66,7 +101,7 @@ pub async fn check_for_update() -> Result<Option<String>, String> {
     }
 
     if is_newer(latest, env!("CARGO_PKG_VERSION")) {
-        Ok(Some(latest.to_string()))
+        Ok(Some((latest.to_string(), release_notes(latest).await)))
     } else {
         Ok(None)
     }

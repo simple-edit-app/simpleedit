@@ -29,13 +29,18 @@ pub enum TopMenu {
 pub enum ActiveOverlay {
     None,
     About,
+    /// Every release.
+    Changelog,
+    /// The releases since the given version, shown after an update.
+    WhatsNew(String),
     GotoLine,
     LanguagePicker,
     Shortcuts,
     Palette,
     UpdateChecking,
     UpdateUpToDate,
-    UpdateAvailable(String),
+    /// The new version, and what it changes.
+    UpdateAvailable(String, Vec<crate::changelog::Entry>),
     UpdateDownloading,
     UpdateInstalling,
     UpdateError(String),
@@ -133,7 +138,8 @@ pub enum Message {
     ConfirmOverwrite,
     // Updater
     CheckForUpdate,
-    UpdateChecked(Result<Option<String>, String>),
+    UpdateChecked(Result<Option<(String, Vec<crate::changelog::Entry>)>, String>),
+    OpenChangelog,
     ConfirmInstallUpdate(String),
     UpdateDownloaded(Result<std::path::PathBuf, String>),
     UpdateInstalled(Result<(), String>),
@@ -313,6 +319,7 @@ impl Application for SimpleEditApp {
         };
 
         app.restore_session(session);
+        app.announce_new_version();
 
         // If a file path was given on the command line, open it on top of the session
         let cmd = if let Some(path) = flags {
@@ -649,6 +656,14 @@ impl Application for SimpleEditApp {
             other => {
                 let overlay = match other {
                     ActiveOverlay::About => self.view_about_overlay(dark),
+                    ActiveOverlay::Changelog => {
+                        self.changelog_card(dark, t!("changelog.title").to_string(), None)
+                    }
+                    ActiveOverlay::WhatsNew(previous) => self.changelog_card(
+                        dark,
+                        t!("changelog.whats_new", version = env!("CARGO_PKG_VERSION")).to_string(),
+                        Some(previous.as_str()),
+                    ),
                     ActiveOverlay::GotoLine => self.view_goto_line_overlay(dark),
                     ActiveOverlay::LanguagePicker => self.view_language_picker_overlay(dark),
                     ActiveOverlay::Shortcuts => self.view_shortcuts_overlay(dark),
@@ -1446,8 +1461,13 @@ impl SimpleEditApp {
                 self.overlay = ActiveOverlay::UpdateChecking;
                 Command::perform(crate::updater::check_for_update(), Message::UpdateChecked)
             }
-            Message::UpdateChecked(Ok(Some(version))) => {
-                self.overlay = ActiveOverlay::UpdateAvailable(version);
+            Message::OpenChangelog => {
+                self.open_menu = None;
+                self.overlay = ActiveOverlay::Changelog;
+                Command::none()
+            }
+            Message::UpdateChecked(Ok(Some((version, notes)))) => {
+                self.overlay = ActiveOverlay::UpdateAvailable(version, notes);
                 Command::none()
             }
             Message::UpdateChecked(Ok(None)) => {
@@ -2436,12 +2456,24 @@ impl SimpleEditApp {
             .width(Length::Fill)
             .into(),
 
-            ActiveOverlay::UpdateAvailable(version) => {
+            ActiveOverlay::UpdateAvailable(version, notes) => {
                 let version = version.clone();
-                column![
-                    text(t!("update.available", version = version.as_str()).to_string())
-                        .size(16)
-                        .style(p.accent),
+                let mut body =
+                    column![
+                        text(t!("update.available", version = version.as_str()).to_string())
+                            .size(16)
+                            .style(p.accent)
+                    ]
+                    .spacing(16)
+                    .align_items(Alignment::Center);
+                if !notes.is_empty() {
+                    body = body.push(
+                        scrollable(changelog_list(dark, notes))
+                            .height(Length::Fixed(260.0))
+                            .width(Length::Fill),
+                    );
+                }
+                body.push(
                     row![
                         button(text(t!("about.close").to_string()).size(13))
                             .padding([8, 20])
@@ -2459,10 +2491,8 @@ impl SimpleEditApp {
                             })),
                     ]
                     .spacing(12),
-                ]
-                .spacing(16)
-                .align_items(Alignment::Center)
-                .padding(36)
+                )
+                .padding(28)
                 .width(Length::Fill)
                 .into()
             }
@@ -2507,10 +2537,70 @@ impl SimpleEditApp {
             _ => unreachable!(),
         };
 
+        let width = if matches!(&self.overlay, ActiveOverlay::UpdateAvailable(_, n) if !n.is_empty())
+        {
+            480
+        } else {
+            360
+        };
         container(content)
-            .width(360)
+            .width(width)
             .style(se_theme::card(dark))
             .into()
+    }
+
+    /// Records the running version; right after an update, opens the notes
+    /// of what it brought.
+    fn announce_new_version(&mut self) {
+        let current = env!("CARGO_PKG_VERSION");
+        let previous = std::mem::replace(&mut self.config.last_version, current.to_string());
+        if previous == current {
+            return;
+        }
+        self.config_dirty = true;
+        let upgraded = !previous.is_empty()
+            && !crate::changelog::between(crate::changelog::embedded(), &previous, current)
+                .is_empty();
+        if upgraded && self.overlay == ActiveOverlay::None {
+            self.overlay = ActiveOverlay::WhatsNew(previous);
+        }
+    }
+
+    /// The changelog in a card; `since` limits it to the releases after that
+    /// version.
+    fn changelog_card(
+        &self,
+        dark: bool,
+        title: String,
+        since: Option<&str>,
+    ) -> Element<'_, Message> {
+        let p = se_theme::palette(dark);
+        let mut entries = crate::changelog::embedded();
+        if let Some(since) = since {
+            entries = crate::changelog::between(entries, since, env!("CARGO_PKG_VERSION"));
+        }
+        container(
+            column![
+                text(title).size(18).style(p.accent),
+                scrollable(changelog_list(dark, &entries))
+                    .height(Length::Fixed(380.0))
+                    .width(Length::Fill),
+                button(text(t!("about.close").to_string()).size(13))
+                    .padding([8, 24])
+                    .on_press(Message::CloseOverlay)
+                    .style(iced::theme::Button::custom(se_theme::GhostButton {
+                        dark,
+                        active: true,
+                    })),
+            ]
+            .spacing(16)
+            .align_items(Alignment::Center)
+            .padding(28)
+            .width(Length::Fill),
+        )
+        .width(520)
+        .style(se_theme::card(dark))
+        .into()
     }
 
     fn view_confirm_overlay(&self, dark: bool, path: &Path) -> Element<'_, Message> {
@@ -3329,4 +3419,29 @@ mod short_dir_tests {
     fn a_short_folder_is_left_alone() {
         assert_eq!(short_dir(Path::new("/tmp/a")), "/tmp/a/");
     }
+}
+
+/// Releases as a column: version and date, then each section and its changes.
+fn changelog_list<'a>(dark: bool, entries: &[crate::changelog::Entry]) -> Element<'a, Message> {
+    let p = se_theme::palette(dark);
+    let mut list = column![]
+        .spacing(6)
+        .width(Length::Fill)
+        .padding([0, 12, 0, 0]);
+    for entry in entries {
+        list = list.push(Space::with_height(8));
+        let head = if entry.date.is_empty() {
+            format!("v{}", entry.version)
+        } else {
+            format!("v{} · {}", entry.version, entry.date)
+        };
+        list = list.push(text(head).size(15).style(p.text));
+        for (title, changes) in &entry.sections {
+            list = list.push(text(title.clone()).size(12).style(p.accent));
+            for change in changes {
+                list = list.push(text(format!("•  {change}")).size(13).style(p.muted));
+            }
+        }
+    }
+    list.into()
 }

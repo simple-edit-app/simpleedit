@@ -188,5 +188,8 @@
   "status.no_bookmarks": "Aucun marque-page dans ce fichier",
   "status.bookmark_added": "Marque-page ajouté",
   "status.bookmark_removed": "Marque-page supprimé",
-  "status.bookmarks_cleared": "Marque-pages supprimés"
+  "status.bookmarks_cleared": "Marque-pages supprimés",
+  "menu.help_changelog": "Nouveautés...",
+  "changelog.title": "Journal des modifications",
+  "changelog.whats_new": "Nouveautés de la v%{version}"
 }

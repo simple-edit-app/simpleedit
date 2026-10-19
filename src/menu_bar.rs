@@ -445,6 +445,12 @@ fn menu_items(
                 Message::OpenShortcuts,
             ),
             item(
+                t!("menu.help_changelog").to_string(),
+                None,
+                dark,
+                Message::OpenChangelog,
+            ),
+            item(
                 t!("menu.help_check_updates").to_string(),
                 None,
                 dark,

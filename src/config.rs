@@ -285,6 +285,8 @@ pub struct Config {
     /// A miniature of the whole file along the editor's right edge.
     pub show_minimap: bool,
     pub locale: String,
+    /// The version that last ran, to show what's new after an update.
+    pub last_version: String,
     pub shortcuts: Shortcuts,
     pub recent_files: Vec<String>,
 }
@@ -305,6 +307,7 @@ impl Default for Config {
             page_guide_column: 80,
             show_minimap: true,
             locale: "en".to_string(),
+            last_version: String::new(),
             shortcuts: Shortcuts::default(),
             recent_files: Vec::new(),
         }

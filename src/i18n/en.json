@@ -188,5 +188,8 @@
   "status.no_bookmarks": "No bookmarks in this file",
   "status.bookmark_added": "Bookmark added",
   "status.bookmark_removed": "Bookmark removed",
-  "status.bookmarks_cleared": "Bookmarks removed"
+  "status.bookmarks_cleared": "Bookmarks removed",
+  "menu.help_changelog": "What's new...",
+  "changelog.title": "Changelog",
+  "changelog.whats_new": "What's new in v%{version}"
 }
