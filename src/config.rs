@@ -444,12 +444,14 @@ mod tests {
 
     #[test]
     fn shortcut_display() {
-        let sc = ShortcutConfig::ctrl("n");
-        assert_eq!(sc.display(), "Ctrl+N");
-        let sc2 = ShortcutConfig::ctrl_shift("s");
-        assert_eq!(sc2.display(), "Ctrl+Shift+S");
-        let sc3 = ShortcutConfig::alt("ArrowUp");
-        assert_eq!(sc3.display(), "Alt+ArrowUp");
+        let (n, s, up) = if cfg!(target_os = "macos") {
+            ("⌘N", "⇧⌘S", "⌥↑")
+        } else {
+            ("Ctrl+N", "Ctrl+Shift+S", "Alt+ArrowUp")
+        };
+        assert_eq!(ShortcutConfig::ctrl("n").display(), n);
+        assert_eq!(ShortcutConfig::ctrl_shift("s").display(), s);
+        assert_eq!(ShortcutConfig::alt("ArrowUp").display(), up);
     }
 
     #[test]

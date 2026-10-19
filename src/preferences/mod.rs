@@ -300,7 +300,7 @@ impl PreferencesState {
             slider(8.0..=32.0, self.font_size, |v| {
                 Message::Preferences(PreferencesMessage::FontSizeChanged(v.round()))
             })
-            .step(1.0)
+            .step(1.0_f32)
             .width(140)
             .style(iced::theme::Slider::Custom(Box::new(theme::Slider {
                 dark
