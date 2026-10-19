@@ -471,9 +471,9 @@ mod tests {
             let own = sh.slot_mut(target).clone();
             assert!(!sh.conflicts(target, &own), "{target:?} collides");
         }
-        assert_eq!(sh.toggle_bookmark.display(), "Ctrl+F2");
-        assert_eq!(sh.next_bookmark.display(), "F2");
-        assert_eq!(sh.prev_bookmark.display(), "Shift+F2");
+        assert_eq!(sh.toggle_bookmark, ShortcutConfig::ctrl("F2"));
+        assert_eq!(sh.next_bookmark, ShortcutConfig::plain("F2"));
+        assert_eq!(sh.prev_bookmark, ShortcutConfig::shift("F2"));
     }
 
     #[test]
