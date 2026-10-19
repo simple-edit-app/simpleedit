@@ -3,466 +3,618 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>SimpleEdit — Fast, cross-platform text editor</title>
+  <title>SimpleEdit — A fast, clean, cross-platform text editor</title>
+  <meta name="description" content="SimpleEdit is a fast, clean text editor written in Rust for macOS and Linux." />
+  <meta name="color-scheme" content="dark light" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
   <style>
+    /* SimpleEdit — "Nocturne" design tokens (see design/tokens/tokens.css) */
     :root {
-      --bg: #0d1117;
-      --surface: #161b22;
-      --border: #30363d;
-      --accent: #58a6ff;
-      --text: #c9d1d9;
-      --text-dim: #8b949e;
-      --green: #3fb950;
-      --radius: 8px;
+      --font-ui: 'Instrument Sans', system-ui, sans-serif;
+      --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+
+      --r-panel: 14px;  /* feature cards, code boxes */
+      --r-big: 18px;    /* editor mock-up */
+      --r-row: 10px;    /* buttons, inputs */
+      --r-sm: 8px;      /* logo, chips */
+      --r-pill: 99px;
     }
+
+    /* Dark (default) */
+    :root, [data-theme='dark'] {
+      --bg: #07090E;
+      --side: #0F121B;
+      --panel: #121622;
+      --elev: #1A1F2E;
+      --line: #222839;
+      --line-2: #2D3550;
+      --text: #E9ECF4;
+      --mute: #8089A0;
+      --gutter: #444C64;
+      --acc: #FF9B6B;
+      --acc-ink: #1A0C05;
+      --acc-soft: rgba(255,155,107,.14);
+      --shadow-float: 0 18px 50px rgba(0,0,0,.5);
+
+      --syn-keyword: #FF9B6B;
+      --syn-string: #9BE3A4;
+      --syn-function: #7CB6FF;
+      --syn-number: #F5D07A;
+      --syn-comment: #566079;
+      --syn-type: #C4A6FF;
+    }
+
+    /* Light: follows the system unless forced with data-theme */
+    @media (prefers-color-scheme: light) {
+      :root:not([data-theme]) {
+        --bg: #E9ECF3;
+        --side: #F7F8FB;
+        --panel: #FFFFFF;
+        --elev: #FFFFFF;
+        --line: #DDE1EA;
+        --line-2: #C9CFDC;
+        --text: #131724;
+        --mute: #6B7388;
+        --gutter: #B3B9C8;
+        --acc: #D2561F;
+        --acc-ink: #FFFFFF;
+        --acc-soft: rgba(210,86,31,.10);
+        --shadow-float: 0 14px 40px rgba(30,30,50,.14);
+
+        --syn-keyword: #D2561F;
+        --syn-string: #1E8A4A;
+        --syn-function: #2563C9;
+        --syn-number: #A5780B;
+        --syn-comment: #9AA2B5;
+        --syn-type: #7A4FD0;
+      }
+    }
+    [data-theme='light'] {
+      --bg: #E9ECF3;
+      --side: #F7F8FB;
+      --panel: #FFFFFF;
+      --elev: #FFFFFF;
+      --line: #DDE1EA;
+      --line-2: #C9CFDC;
+      --text: #131724;
+      --mute: #6B7388;
+      --gutter: #B3B9C8;
+      --acc: #D2561F;
+      --acc-ink: #FFFFFF;
+      --acc-soft: rgba(210,86,31,.10);
+      --shadow-float: 0 14px 40px rgba(30,30,50,.14);
+
+      --syn-keyword: #D2561F;
+      --syn-string: #1E8A4A;
+      --syn-function: #2563C9;
+      --syn-number: #A5780B;
+      --syn-comment: #9AA2B5;
+      --syn-type: #7A4FD0;
+    }
+
+    /* Traffic lights (both themes) */
+    :root { --tl-close: #FF5F57; --tl-min: #FEBC2E; --tl-max: #28C840; }
+
     * { box-sizing: border-box; margin: 0; padding: 0; }
     html { scroll-behavior: smooth; }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-family: var(--font-ui);
+      font-size: 13px;
+      line-height: 1.5;
       background: var(--bg);
       color: var(--text);
-      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
     }
-    header {
-      border-bottom: 1px solid var(--border);
-      padding: 1rem 2rem;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-    header .logo { font-size: 1.4rem; font-weight: 700; color: var(--accent); }
-    header nav a {
-      color: var(--text-dim);
-      text-decoration: none;
-      margin-left: 1.5rem;
-      font-size: 0.9rem;
-    }
-    header nav a:hover { color: var(--text); }
+    a { color: inherit; text-decoration: none; }
+    code { font-family: var(--font-mono); }
 
+    /* Language: every text exists in both languages; the page's lang picks one. */
+    html[lang='fr'] [data-lang='en'],
+    html[lang='en'] [data-lang='fr'] { display: none !important; }
+
+    /* ── Nav ─────────────────────────────────────────────── */
+    .nav {
+      display: flex;
+      align-items: center;
+      gap: 28px;
+      padding: 22px 56px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 700;
+      font-size: 17px;
+    }
+    .brand-mark {
+      width: 26px;
+      height: 26px;
+      border-radius: var(--r-sm);
+      background: var(--acc);
+      color: var(--acc-ink);
+      display: grid;
+      place-items: center;
+      font-size: 14px;
+    }
+    .nav-spacer { flex: 1; }
+    .nav a.link { color: var(--mute); font-size: 13px; transition: color 120ms ease; }
+    .nav a.link:hover { color: var(--text); }
     .lang-switch {
       display: flex;
-      gap: 0.5rem;
-      align-items: center;
+      padding: 2px;
+      gap: 2px;
+      background: var(--elev);
+      border: 1px solid var(--line);
+      border-radius: var(--r-pill);
+      font-size: 12px;
     }
     .lang-btn {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      color: var(--text-dim);
-      padding: 4px 10px;
-      border-radius: 4px;
+      font: inherit;
+      color: var(--mute);
+      background: none;
+      border: none;
+      padding: 3px 10px;
+      border-radius: var(--r-pill);
       cursor: pointer;
-      font-size: 0.8rem;
+      transition: background 120ms ease, color 120ms ease;
     }
-    .lang-btn.active { border-color: var(--accent); color: var(--accent); }
+    .lang-btn:hover { color: var(--text); }
+    .lang-btn.active { background: var(--acc-soft); color: var(--acc); }
+    .btn-pill {
+      padding: 8px 16px;
+      border-radius: var(--r-pill);
+      background: var(--text);
+      color: var(--bg);
+      font-weight: 600;
+      transition: opacity 120ms ease;
+    }
+    .btn-pill:hover { opacity: .88; }
 
+    /* ── Hero ────────────────────────────────────────────── */
     .hero {
+      padding: 46px 56px 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
       text-align: center;
-      padding: 5rem 2rem 3rem;
+      gap: 20px;
+    }
+    .pill-badge {
+      padding: 5px 12px;
+      border: 1px solid var(--line-2);
+      border-radius: var(--r-pill);
+      color: var(--mute);
+      font-size: 12px;
     }
     .hero h1 {
-      font-size: 3rem;
-      font-weight: 800;
-      color: #fff;
-      margin-bottom: 1rem;
+      font-size: 58px;
+      line-height: 1.02;
+      font-weight: 700;
+      letter-spacing: -.035em;
+      max-width: 820px;
+      text-wrap: balance;
     }
-    .hero h1 span { color: var(--accent); }
-    .hero p {
-      font-size: 1.15rem;
-      color: var(--text-dim);
-      max-width: 600px;
-      margin: 0 auto 2rem;
-    }
-    .cta-group {
-      display: flex;
-      gap: 1rem;
-      justify-content: center;
-      flex-wrap: wrap;
-    }
-    .btn {
-      display: inline-flex;
-      align-items: center;
-      gap: 0.5rem;
-      padding: 0.75rem 1.5rem;
-      border-radius: var(--radius);
-      text-decoration: none;
-      font-weight: 600;
-      font-size: 0.95rem;
-      transition: opacity 0.2s;
-    }
-    .btn:hover { opacity: 0.85; }
-    .btn-primary { background: var(--accent); color: #0d1117; }
-    .btn-secondary { background: var(--surface); color: var(--text); border: 1px solid var(--border); }
-
-
-    .install-block {
-      max-width: 620px;
-      margin: 0 auto 2rem;
-      padding: 0 2rem;
-    }
-    .install-note {
-      font-size: 0.85rem;
+    .hero .lead {
+      font-size: 17px;
+      color: var(--mute);
+      max-width: 560px;
       line-height: 1.5;
-      color: var(--text-dim);
-      margin-top: 0.75rem;
     }
-    .install-note code {
-      font-size: 0.8rem;
+    .cta { display: flex; gap: 10px; margin-top: 6px; flex-wrap: wrap; justify-content: center; }
+    .btn {
+      display: inline-block;
+      padding: 12px 20px;
+      border-radius: var(--r-row);
+      font-weight: 500;
+      font-size: 13px;
+      transition: background 120ms ease, border-color 120ms ease, opacity 120ms ease;
     }
-    .install-label {
-      color: var(--text-dim);
-      font-size: 0.85rem;
-      margin-bottom: 0.5rem;
+    .btn-primary { background: var(--acc); color: var(--acc-ink); font-weight: 600; }
+    .btn-primary:hover { opacity: .9; }
+    .btn-outline { border: 1px solid var(--line-2); }
+    .btn-outline:hover { background: var(--acc-soft); border-color: var(--acc); }
+
+    /* A command in a mono box, with its copy button */
+    .cmd {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      max-width: 100%;
+      font-family: var(--font-mono);
+      font-size: 12.5px;
+      padding: 11px 16px;
+      border-radius: var(--r-row);
+      background: var(--panel);
+      border: 1px solid var(--line);
+      color: var(--mute);
       text-align: left;
     }
-    .code-block {
-      position: relative;
-      display: flex;
-      align-items: center;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 0.75rem 1rem;
-      gap: 0.75rem;
-    }
-    .code-block code {
+    .cmd .prompt { color: var(--acc); flex: none; }
+    .cmd code {
       flex: 1;
-      font-family: "SF Mono", "Consolas", monospace;
-      font-size: 0.85rem;
-      color: var(--green);
+      min-width: 0;
+      font-size: inherit;
+      color: inherit;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
     }
     .copy-btn {
-      flex-shrink: 0;
-      background: var(--bg);
-      border: 1px solid var(--border);
-      border-radius: 5px;
+      flex: none;
+      font: inherit;
+      font-family: var(--font-ui);
+      font-size: 11.5px;
+      color: var(--mute);
+      background: none;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 3px 9px;
       cursor: pointer;
-      color: var(--text-dim);
-      padding: 0.3rem 0.65rem;
-      font-size: 0.8rem;
-      font-family: inherit;
-      transition: color 0.15s, border-color 0.15s;
       white-space: nowrap;
+      transition: color 120ms ease, border-color 120ms ease, background 120ms ease;
     }
-    .copy-btn:hover { color: var(--text); border-color: var(--text-dim); }
-    .copy-btn.copied { color: var(--green); border-color: var(--green); }
-    .download-row {
+    .copy-btn:hover { color: var(--text); border-color: var(--line-2); background: var(--acc-soft); }
+    .copy-btn.copied { color: var(--acc); border-color: var(--acc); }
+
+    /* ── Editor mock-up ──────────────────────────────────── */
+    .mock {
+      margin: 40px 56px 0;
+      border: 1px solid var(--line-2);
+      border-bottom: none;
+      border-radius: var(--r-big) var(--r-big) 0 0;
+      background: var(--panel);
+      height: 250px;
+      overflow: hidden;
+      box-shadow: var(--shadow-float);
+    }
+    .mock-bar {
+      height: 36px;
       display: flex;
-      gap: 1rem;
-      justify-content: center;
-      flex-wrap: wrap;
-      padding: 0 2rem 2rem;
+      align-items: center;
+      gap: 7px;
+      padding: 0 14px;
+      border-bottom: 1px solid var(--line);
     }
+    .mock-bar i { width: 10px; height: 10px; border-radius: 50%; display: block; }
+    .mock-bar .name { margin-left: 14px; color: var(--mute); font-size: 12px; }
+    .mock-code {
+      display: flex;
+      padding-top: 8px;
+      font-family: var(--font-mono);
+      font-size: 12.5px;
+      line-height: 22px;
+      font-variant-ligatures: none;
+    }
+    .mock-nums { width: 46px; text-align: right; padding-right: 14px; color: var(--gutter); flex: none; }
+    .mock-lines { white-space: pre; overflow: hidden; }
+    .k { color: var(--syn-keyword); }
+    .s { color: var(--syn-string); }
+    .f { color: var(--syn-function); }
+    .n { color: var(--syn-number); }
+    .c { color: var(--syn-comment); }
+    .t { color: var(--syn-type); }
 
-    .features {
-      max-width: 900px;
-      margin: 3rem auto;
-      padding: 0 2rem;
+    /* ── Sections ────────────────────────────────────────── */
+    .section {
+      padding: 60px 56px;
+      background: var(--side);
+      border-top: 1px solid var(--line);
     }
-    .features h2 {
-      text-align: center;
-      font-size: 1.8rem;
-      color: #fff;
-      margin-bottom: 2rem;
-    }
-    .feature-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-      gap: 1.25rem;
-    }
-    .feature-item {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 1.25rem;
-    }
-    .feature-item h4 { color: var(--accent); margin-bottom: 0.4rem; font-size: 0.95rem; }
-    .feature-item p { color: var(--text-dim); font-size: 0.88rem; }
-
-    footer {
-      text-align: center;
-      padding: 2rem;
-      color: var(--text-dim);
-      font-size: 0.85rem;
-      border-top: 1px solid var(--border);
-      margin-top: 3rem;
-    }
-    footer a { color: var(--accent); text-decoration: none; }
-
-    .badge {
-      display: inline-block;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 999px;
-      padding: 3px 10px;
-      font-size: 0.75rem;
-      color: var(--text-dim);
-      margin: 0 3px;
-    }
-    .badges { margin-bottom: 1.5rem; }
-
-    .badge-recommended {
-      display: inline-block;
-      background: var(--accent);
-      color: var(--bg);
-      border-radius: 999px;
-      padding: 2px 9px;
-      font-size: 0.7rem;
+    .section h2 {
+      font-size: 22px;
       font-weight: 700;
-      margin-left: 0.5rem;
-      vertical-align: middle;
+      letter-spacing: -.01em;
+      margin-bottom: 22px;
     }
+    .features {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+    }
+    .feature {
+      padding: 22px;
+      border: 1px solid var(--line);
+      border-radius: var(--r-panel);
+      background: var(--panel);
+    }
+    .feature .num { font-family: var(--font-mono); font-size: 11px; color: var(--acc); margin-bottom: 12px; }
+    .feature h3 { font-weight: 600; font-size: 16px; margin-bottom: 6px; }
+    .feature p { color: var(--mute); line-height: 1.5; }
 
-    [lang-content] { display: none; }
-    [lang-content].active { display: block; }
-    .lang-inline { display: none; }
-    .lang-inline.active { display: inline; }
+    .install { background: var(--bg); }
+    .install-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      align-items: start;
+    }
+    .install-block {
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: var(--r-panel);
+      background: var(--panel);
+    }
+    .install-block.wide { grid-column: 1 / -1; }
+    .install-label {
+      color: var(--text);
+      font-weight: 600;
+      font-size: 13px;
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .install-block .cmd { background: var(--bg); }
+    /* Long install commands wrap instead of being cut off. */
+    .install-block .cmd code { white-space: normal; word-break: break-all; }
+    .badge-recommended {
+      padding: 2px 9px;
+      border-radius: var(--r-pill);
+      background: var(--acc-soft);
+      color: var(--acc);
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .install-note { color: var(--mute); font-size: 12px; line-height: 1.5; margin-top: 10px; }
+    .install-note code {
+      font-size: 11.5px;
+      background: var(--bg);
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      padding: 1px 5px;
+    }
+    .downloads { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 18px; }
+
+    /* ── Footer ──────────────────────────────────────────── */
+    footer {
+      padding: 22px 56px;
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+      color: var(--mute);
+      font-size: 12px;
+      border-top: 1px solid var(--line);
+    }
+    footer .grow { flex: 1; }
+    footer a { transition: color 120ms ease; }
+    footer a:hover { color: var(--text); }
+
+    /* ── Small screens ───────────────────────────────────── */
+    @media (max-width: 900px) {
+      .nav { padding: 18px 24px; gap: 16px; flex-wrap: wrap; }
+      .nav a.link { display: none; }
+      .hero { padding: 36px 24px 0; }
+      .hero h1 { font-size: 40px; }
+      .mock { margin: 32px 24px 0; }
+      .section { padding: 44px 24px; }
+      .features, .install-grid { grid-template-columns: 1fr; }
+      footer { padding: 20px 24px; }
+    }
+    @media (max-width: 520px) {
+      .hero h1 { font-size: 32px; }
+      .hero .lead { font-size: 15px; }
+    }
   </style>
 </head>
 <body>
 
-<header>
-  <div class="logo">&#9999; SimpleEdit</div>
-  <nav>
-    <a href="https://github.com/simple-edit-app/simpleedit">GitHub</a>
-    <a href="https://github.com/simple-edit-app/simpleedit/releases">Releases</a>
-    <a href="https://github.com/simple-edit-app/simpleedit/issues">Issues</a>
-  </nav>
-  <div class="lang-switch">
-    <button class="lang-btn active" onclick="setLang('en')">EN</button>
-    <button class="lang-btn" onclick="setLang('fr')">FR</button>
+<header class="nav">
+  <a class="brand" href="#top"><span class="brand-mark">S</span>SimpleEdit</a>
+  <div class="nav-spacer"></div>
+  <a class="link" href="#features"><span data-lang="en">Features</span><span data-lang="fr">Fonctionnalités</span></a>
+  <a class="link" href="#install">Installation</a>
+  <a class="link" href="https://github.com/simple-edit-app/simpleedit">GitHub</a>
+  <div class="lang-switch" role="group" aria-label="Language">
+    <button class="lang-btn" data-set-lang="en" onclick="setLang('en')">EN</button>
+    <button class="lang-btn" data-set-lang="fr" onclick="setLang('fr')">FR</button>
   </div>
+  <a class="btn-pill" href="#install"><span data-lang="en">Download</span><span data-lang="fr">Télécharger</span></a>
 </header>
 
+<main id="top">
 <section class="hero">
-  <div class="badges">
-    <img alt="CI" src="https://github.com/simple-edit-app/simpleedit/actions/workflows/ci.yml/badge.svg" />
-    <span class="badge">MIT License</span>
-    <span class="badge">Rust</span>
-    <span class="badge">macOS &middot; Linux</span>
+  <span class="pill-badge">Open source · MIT · macOS &amp; Linux</span>
+  <h1>
+    <span data-lang="en">A fast, clean, cross-platform text editor</span>
+    <span data-lang="fr">Un éditeur de texte rapide, propre et multiplateforme</span>
+  </h1>
+  <p class="lead">
+    <span data-lang="en">Written in Rust. Syntax highlighting for 60+ languages, regex search, Markdown preview.</span>
+    <span data-lang="fr">Écrit en Rust. Coloration syntaxique pour plus de 60 langages, recherche avec regex, aperçu Markdown.</span>
+  </p>
+  <div class="cta">
+    <a class="btn btn-primary" href="https://github.com/simple-edit-app/simpleedit/releases/latest"><span data-lang="en">Download for macOS</span><span data-lang="fr">Télécharger pour macOS</span></a>
+    <a class="btn btn-outline" href="https://github.com/simple-edit-app/simpleedit/releases/latest">Linux x86_64</a>
   </div>
-  <h1><span>SimpleEdit</span></h1>
-
-  <div lang-content="en" class="active">
-    <p>A fast, stable text editor for macOS and Linux. Syntax highlighting for 60+ languages, built with Rust.</p>
-  </div>
-  <div lang-content="fr">
-    <p>Un &eacute;diteur de texte rapide et stable pour macOS et Linux. Coloration syntaxique pour 60+ langages, construit en Rust.</p>
-  </div>
-
-  <div class="cta-group">
-    <a class="btn btn-primary" href="#install">
-      &#8595; <span class="lang-inline active" data-lang="en">Download latest</span><span class="lang-inline" data-lang="fr">T&eacute;l&eacute;charger</span>
-    </a>
-    <a class="btn btn-secondary" href="https://github.com/simple-edit-app/simpleedit">
-      &#9733; <span class="lang-inline active" data-lang="en">View on GitHub</span><span class="lang-inline" data-lang="fr">Voir sur GitHub</span>
-    </a>
+  <div class="cmd">
+    <span class="prompt">$</span>
+    <code>curl -fsSL https://raw.githubusercontent.com/simple-edit-app/simpleedit/main/install.sh | bash</code>
+    <button class="copy-btn" onclick="copyCode(this)"><span data-lang="en">Copy</span><span data-lang="fr">Copier</span></button>
   </div>
 </section>
 
-<section id="install">
-  <div class="install-block">
-    <p class="install-label">
-      <span class="lang-inline active" data-lang="en">Install (macOS &amp; Linux):</span>
-      <span class="lang-inline" data-lang="fr">Installer (macOS &amp; Linux) :</span>
-      <span class="badge-recommended">
-        <span class="lang-inline active" data-lang="en">Recommended</span>
-        <span class="lang-inline" data-lang="fr">Recommand&eacute;</span>
-      </span>
-    </p>
-    <div class="code-block">
-      <code>curl -fsSL https://raw.githubusercontent.com/simple-edit-app/simpleedit/main/install.sh | bash</code>
-      <button class="copy-btn" onclick="copyCode(this)">
-        <span class="lang-inline active" data-lang="en">Copy</span>
-        <span class="lang-inline" data-lang="fr">Copier</span>
-      </button>
-    </div>
+<div class="mock" aria-hidden="true">
+  <div class="mock-bar">
+    <i style="background:var(--tl-close)"></i><i style="background:var(--tl-min)"></i><i style="background:var(--tl-max)"></i>
+    <span class="name">theme.rs</span>
   </div>
-  <div class="install-block">
-    <p class="install-label">
-      <span class="lang-inline active" data-lang="en">macOS &mdash; Homebrew:</span>
-      <span class="lang-inline" data-lang="fr">macOS &mdash; Homebrew :</span>
-    </p>
-    <div class="code-block">
-      <code>brew install --cask simple-edit-app/tap/simpleedit</code>
-      <button class="copy-btn" onclick="copyCode(this)">
-        <span class="lang-inline active" data-lang="en">Copy</span>
-        <span class="lang-inline" data-lang="fr">Copier</span>
-      </button>
-    </div>
-  </div>
+  <div class="mock-code">
+    <div class="mock-nums">1<br>2<br>3<br>4<br>5<br>6<br>7<br>8<br>9<br>10</div>
+    <div class="mock-lines"><span class="c">// Palette de couleurs</span>
+<span class="k">pub struct </span><span class="t">Palette</span> {
+    <span class="k">pub </span>bg: <span class="t">Color</span>,
+    <span class="k">pub </span>accent: <span class="t">Color</span>,
+}
 
-  <div class="install-block">
-    <p class="install-label">
-      <span class="lang-inline active" data-lang="en">Linux &mdash; .deb (install):</span>
-      <span class="lang-inline" data-lang="fr">Linux &mdash; .deb (installer) :</span>
-    </p>
-    <div class="code-block">
-      <code>curl -L -o simpleedit.deb "$(curl -s https://api.github.com/repos/simple-edit-app/simpleedit/releases/latest | grep -oP '"browser_download_url":\s*"\K[^"]+\.deb')" &amp;&amp; sudo apt install ./simpleedit.deb</code>
-      <button class="copy-btn" onclick="copyCode(this)">
-        <span class="lang-inline active" data-lang="en">Copy</span>
-        <span class="lang-inline" data-lang="fr">Copier</span>
-      </button>
-    </div>
+<span class="k">pub fn </span><span class="f">palette</span>(dark: <span class="t">bool</span>) -&gt; <span class="t">Palette</span> {
+    <span class="k">if </span>dark {
+        <span class="t">Palette</span> {
+            bg: <span class="f">rgb</span>(<span class="n">0x14</span>, <span class="n">0x15</span>, <span class="n">0x1A</span>),</div>
   </div>
+</div>
+</main>
 
-  <div class="install-block">
-    <p class="install-label">
-      <span class="lang-inline active" data-lang="en">Linux &mdash; AppImage (install):</span>
-      <span class="lang-inline" data-lang="fr">Linux &mdash; AppImage (installer) :</span>
-    </p>
-    <div class="code-block">
-      <code>curl -L -o simpleedit.AppImage "$(curl -s https://api.github.com/repos/simple-edit-app/simpleedit/releases/latest | grep -oP '"browser_download_url":\s*"\K[^"]+\.AppImage')" &amp;&amp; chmod +x simpleedit.AppImage &amp;&amp; ./simpleedit.AppImage</code>
-      <button class="copy-btn" onclick="copyCode(this)">
-        <span class="lang-inline active" data-lang="en">Copy</span>
-        <span class="lang-inline" data-lang="fr">Copier</span>
-      </button>
+<section class="section" id="features">
+  <h2 style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)"><span data-lang="en">Features</span><span data-lang="fr">Fonctionnalités</span></h2>
+  <div class="features">
+    <div class="feature">
+      <div class="num">01</div>
+      <h3><span data-lang="en">Syntax highlighting</span><span data-lang="fr">Coloration syntaxique</span></h3>
+      <p><span data-lang="en">60+ languages via TextMate grammars.</span><span data-lang="fr">60+ langages via des grammaires TextMate.</span></p>
     </div>
-    <p class="install-note">
-      <span lang-content="en" class="active">Portable &mdash; no installation needed. To add it to your app menu, move it into <code>~/.local/bin</code> and drop a <code>.desktop</code> entry (or use a tool like AppImageLauncher).</span>
-      <span lang-content="fr">Portable &mdash; aucune installation requise. Pour l&rsquo;ajouter &agrave; votre menu d&rsquo;applications, d&eacute;placez-le dans <code>~/.local/bin</code> et ajoutez une entr&eacute;e <code>.desktop</code> (ou utilisez un outil comme AppImageLauncher).</span>
-    </p>
-  </div>
-
-  <div class="install-block">
-    <p class="install-label">
-      <span class="lang-inline active" data-lang="en">Uninstall (macOS &amp; Linux):</span>
-      <span class="lang-inline" data-lang="fr">D&eacute;sinstaller (macOS &amp; Linux) :</span>
-    </p>
-    <div class="code-block">
-      <code>curl -fsSL https://raw.githubusercontent.com/simple-edit-app/simpleedit/main/uninstall.sh | bash</code>
-      <button class="copy-btn" onclick="copyCode(this)">
-        <span class="lang-inline active" data-lang="en">Copy</span>
-        <span class="lang-inline" data-lang="fr">Copier</span>
-      </button>
+    <div class="feature">
+      <div class="num">02</div>
+      <h3><span data-lang="en">Search and replace</span><span data-lang="fr">Recherche et remplacement</span></h3>
+      <p><span data-lang="en">Regular expressions, case sensitivity.</span><span data-lang="fr">Expressions régulières, sensibilité à la casse.</span></p>
     </div>
-    <p class="install-note">
-      <span lang-content="en" class="active">Detects how SimpleEdit was installed &mdash; Homebrew cask, <code>.deb</code> package or plain binary &mdash; and removes it. Your settings are left untouched &mdash; delete <code>~/.config/simpleedit</code> on Linux, or <code>~/Library/Application&nbsp;Support/simpleedit</code> on macOS, to remove them too.</span>
-      <span lang-content="fr">D&eacute;tecte le mode d&rsquo;installation &mdash; cask Homebrew, paquet <code>.deb</code> ou binaire simple &mdash; et le supprime. Vos r&eacute;glages sont conserv&eacute;s &mdash; supprimez <code>~/.config/simpleedit</code> sous Linux, ou <code>~/Library/Application&nbsp;Support/simpleedit</code> sous macOS, pour les effacer aussi.</span>
-    </p>
-  </div>
-
-  <div class="install-block">
-    <p class="install-label">
-      <span class="lang-inline active" data-lang="en">macOS &mdash; Homebrew (uninstall):</span>
-      <span class="lang-inline" data-lang="fr">macOS &mdash; Homebrew (d&eacute;sinstaller) :</span>
-    </p>
-    <div class="code-block">
-      <code>brew uninstall --cask simpleedit</code>
-      <button class="copy-btn" onclick="copyCode(this)">
-        <span class="lang-inline active" data-lang="en">Copy</span>
-        <span class="lang-inline" data-lang="fr">Copier</span>
-      </button>
+    <div class="feature">
+      <div class="num">03</div>
+      <h3><span data-lang="en">Dark and light</span><span data-lang="fr">Sombre et clair</span></h3>
+      <p><span data-lang="en">Two themes, remembered between launches.</span><span data-lang="fr">Deux thèmes, réglage mémorisé entre les lancements.</span></p>
     </div>
-    <p class="install-note">
-      <span lang-content="en" class="active">Also drop your settings: <code>brew uninstall --zap --cask simpleedit</code></span>
-      <span lang-content="fr">Pour aussi supprimer vos r&eacute;glages : <code>brew uninstall --zap --cask simpleedit</code></span>
-    </p>
-  </div>
-
-  <div class="install-block">
-    <p class="install-label">
-      <span class="lang-inline active" data-lang="en">Linux &mdash; .deb (uninstall):</span>
-      <span class="lang-inline" data-lang="fr">Linux &mdash; .deb (d&eacute;sinstaller) :</span>
-    </p>
-    <div class="code-block">
-      <code>sudo apt remove simpleedit</code>
-      <button class="copy-btn" onclick="copyCode(this)">
-        <span class="lang-inline active" data-lang="en">Copy</span>
-        <span class="lang-inline" data-lang="fr">Copier</span>
-      </button>
+    <div class="feature">
+      <div class="num">04</div>
+      <h3><span data-lang="en">English and French</span><span data-lang="fr">Français et English</span></h3>
+      <p><span data-lang="en">Language selectable in the preferences.</span><span data-lang="fr">Langue modifiable dans les préférences.</span></p>
     </div>
-    <p class="install-note">
-      <span lang-content="en" class="active">No apt? Use <code>sudo dpkg -r simpleedit</code> instead.</span>
-      <span lang-content="fr">Pas d&rsquo;apt ? Utilisez <code>sudo dpkg -r simpleedit</code> &agrave; la place.</span>
-    </p>
-  </div>
-
-  <div class="install-block">
-    <p class="install-label">
-      <span class="lang-inline active" data-lang="en">Linux &mdash; AppImage (uninstall):</span>
-      <span class="lang-inline" data-lang="fr">Linux &mdash; AppImage (d&eacute;sinstaller) :</span>
-    </p>
-    <div class="code-block">
-      <code>rm -f simpleedit.AppImage ~/.local/bin/simpleedit.AppImage ~/.local/share/applications/simpleedit.desktop</code>
-      <button class="copy-btn" onclick="copyCode(this)">
-        <span class="lang-inline active" data-lang="en">Copy</span>
-        <span class="lang-inline" data-lang="fr">Copier</span>
-      </button>
+    <div class="feature">
+      <div class="num">05</div>
+      <h3><span data-lang="en">Code formatting</span><span data-lang="fr">Formatage du code</span></h3>
+      <p><span data-lang="en">prettier, rustfmt and other external tools.</span><span data-lang="fr">prettier, rustfmt et autres outils externes.</span></p>
     </div>
-    <p class="install-note">
-      <span lang-content="en" class="active">Removes the AppImage from the current directory and, if you integrated it, from <code>~/.local/bin</code> and your app menu.</span>
-      <span lang-content="fr">Supprime l&rsquo;AppImage du dossier courant et, si vous l&rsquo;aviez int&eacute;gr&eacute;, de <code>~/.local/bin</code> et de votre menu d&rsquo;applications.</span>
-    </p>
-  </div>
-
-  <div class="download-row">
-    <a class="btn btn-secondary" href="https://github.com/simple-edit-app/simpleedit/releases/latest">
-      &#127822; <span class="lang-inline active" data-lang="en">Download .tar.gz (macOS)</span><span class="lang-inline" data-lang="fr">T&eacute;l&eacute;charger .tar.gz (macOS)</span>
-    </a>
-    <a class="btn btn-secondary" href="https://github.com/simple-edit-app/simpleedit/releases/latest">
-      &#127823; <span class="lang-inline active" data-lang="en">Download .deb (Linux)</span><span class="lang-inline" data-lang="fr">T&eacute;l&eacute;charger .deb (Linux)</span>
-    </a>
-    <a class="btn btn-secondary" href="https://github.com/simple-edit-app/simpleedit/releases/latest">
-      &#128230; <span class="lang-inline active" data-lang="en">Download .AppImage (Linux)</span><span class="lang-inline" data-lang="fr">T&eacute;l&eacute;charger .AppImage (Linux)</span>
-    </a>
+    <div class="feature">
+      <div class="num">06</div>
+      <h3><span data-lang="en">Native binaries</span><span data-lang="fr">Binaires natifs</span></h3>
+      <p><span data-lang="en">macOS (Apple Silicon) and Linux x86_64.</span><span data-lang="fr">macOS (Apple Silicon) et Linux x86_64.</span></p>
+    </div>
   </div>
 </section>
 
-<section class="features">
-  <h2>
-    <span class="lang-inline active" data-lang="en">Features</span>
-    <span class="lang-inline" data-lang="fr">Fonctionnalit&eacute;s</span>
-  </h2>
-  <div class="feature-grid">
-    <div class="feature-item">
-      <h4>&#127912; <span class="lang-inline active" data-lang="en">Syntax Highlighting</span><span class="lang-inline" data-lang="fr">Coloration syntaxique</span></h4>
-      <p><span lang-content="en" class="active">60+ languages powered by TextMate grammars. Rust, Python, JavaScript, Go, C/C++, and more.</span><span lang-content="fr">60+ langages via les grammaires TextMate. Rust, Python, JavaScript, Go, C/C++, et plus.</span></p>
+<section class="section install" id="install">
+  <h2>Installation</h2>
+  <div class="install-grid">
+
+    <div class="install-block wide">
+      <p class="install-label">
+        <span data-lang="en">Install (macOS &amp; Linux):</span><span data-lang="fr">Installer (macOS &amp; Linux) :</span>
+        <span class="badge-recommended"><span data-lang="en">Recommended</span><span data-lang="fr">Recommandé</span></span>
+      </p>
+      <div class="cmd">
+        <span class="prompt">$</span>
+        <code>curl -fsSL https://raw.githubusercontent.com/simple-edit-app/simpleedit/main/install.sh | bash</code>
+        <button class="copy-btn" onclick="copyCode(this)"><span data-lang="en">Copy</span><span data-lang="fr">Copier</span></button>
+      </div>
     </div>
-    <div class="feature-item">
-      <h4>&#128269; <span class="lang-inline active" data-lang="en">Search &amp; Replace</span><span class="lang-inline" data-lang="fr">Recherche &amp; Remplacement</span></h4>
-      <p><span lang-content="en" class="active">Full regex support, case-sensitive and case-insensitive modes.</span><span lang-content="fr">Support regex complet, modes sensible et insensible &agrave; la casse.</span></p>
+
+    <div class="install-block">
+      <p class="install-label"><span data-lang="en">macOS — Homebrew:</span><span data-lang="fr">macOS — Homebrew :</span></p>
+      <div class="cmd">
+        <span class="prompt">$</span>
+        <code>brew install --cask simple-edit-app/tap/simpleedit</code>
+        <button class="copy-btn" onclick="copyCode(this)"><span data-lang="en">Copy</span><span data-lang="fr">Copier</span></button>
+      </div>
     </div>
-    <div class="feature-item">
-      <h4>&#128193; <span class="lang-inline active" data-lang="en">File Sidebar</span><span class="lang-inline" data-lang="fr">Panneau de fichiers</span></h4>
-      <p><span lang-content="en" class="active">Open multiple files at once and switch between them instantly.</span><span lang-content="fr">Ouvrez plusieurs fichiers et naviguez entre eux instantan&eacute;ment.</span></p>
+
+    <div class="install-block">
+      <p class="install-label"><span data-lang="en">Linux — .deb (install):</span><span data-lang="fr">Linux — .deb (installer) :</span></p>
+      <div class="cmd">
+        <span class="prompt">$</span>
+        <code>curl -L -o simpleedit.deb "$(curl -s https://api.github.com/repos/simple-edit-app/simpleedit/releases/latest | grep -oP '"browser_download_url":\s*"\K[^"]+\.deb')" &amp;&amp; sudo apt install ./simpleedit.deb</code>
+        <button class="copy-btn" onclick="copyCode(this)"><span data-lang="en">Copy</span><span data-lang="fr">Copier</span></button>
+      </div>
     </div>
-    <div class="feature-item">
-      <h4>&#127769; <span class="lang-inline active" data-lang="en">Dark &amp; Light Themes</span><span class="lang-inline" data-lang="fr">Th&egrave;mes clair &amp; sombre</span></h4>
-      <p><span lang-content="en" class="active">Switch between dark and light mode with one click.</span><span lang-content="fr">Basculez entre mode sombre et clair en un clic.</span></p>
+
+    <div class="install-block wide">
+      <p class="install-label"><span data-lang="en">Linux — AppImage (install):</span><span data-lang="fr">Linux — AppImage (installer) :</span></p>
+      <div class="cmd">
+        <span class="prompt">$</span>
+        <code>curl -L -o simpleedit.AppImage "$(curl -s https://api.github.com/repos/simple-edit-app/simpleedit/releases/latest | grep -oP '"browser_download_url":\s*"\K[^"]+\.AppImage')" &amp;&amp; chmod +x simpleedit.AppImage &amp;&amp; ./simpleedit.AppImage</code>
+        <button class="copy-btn" onclick="copyCode(this)"><span data-lang="en">Copy</span><span data-lang="fr">Copier</span></button>
+      </div>
+      <p class="install-note">
+        <span data-lang="en">Portable — no installation needed. To add it to your app menu, move it into <code>~/.local/bin</code> and drop a <code>.desktop</code> entry (or use a tool like AppImageLauncher).</span>
+        <span data-lang="fr">Portable — aucune installation requise. Pour l’ajouter à votre menu d’applications, déplacez-le dans <code>~/.local/bin</code> et ajoutez une entrée <code>.desktop</code> (ou utilisez un outil comme AppImageLauncher).</span>
+      </p>
     </div>
-    <div class="feature-item">
-      <h4>&#127757; <span class="lang-inline active" data-lang="en">English &amp; French</span><span class="lang-inline" data-lang="fr">Anglais &amp; Fran&ccedil;ais</span></h4>
-      <p><span lang-content="en" class="active">Full interface in English and French. Pick your language in Preferences &mdash; the choice is saved between sessions.</span><span lang-content="fr">Interface compl&egrave;te en anglais et fran&ccedil;ais. Choisissez votre langue dans les Pr&eacute;f&eacute;rences &mdash; le choix est conserv&eacute; d&rsquo;une session &agrave; l&rsquo;autre.</span></p>
+
+    <div class="install-block wide">
+      <p class="install-label"><span data-lang="en">Uninstall (macOS &amp; Linux):</span><span data-lang="fr">Désinstaller (macOS &amp; Linux) :</span></p>
+      <div class="cmd">
+        <span class="prompt">$</span>
+        <code>curl -fsSL https://raw.githubusercontent.com/simple-edit-app/simpleedit/main/uninstall.sh | bash</code>
+        <button class="copy-btn" onclick="copyCode(this)"><span data-lang="en">Copy</span><span data-lang="fr">Copier</span></button>
+      </div>
+      <p class="install-note">
+        <span data-lang="en">Detects how SimpleEdit was installed — Homebrew cask, <code>.deb</code> package or plain binary — and removes it. Your settings are left untouched — delete <code>~/.config/simpleedit</code> on Linux, or <code>~/Library/Application&nbsp;Support/simpleedit</code> on macOS, to remove them too.</span>
+        <span data-lang="fr">Détecte le mode d’installation — cask Homebrew, paquet <code>.deb</code> ou binaire simple — et le supprime. Vos réglages sont conservés — supprimez <code>~/.config/simpleedit</code> sous Linux, ou <code>~/Library/Application&nbsp;Support/simpleedit</code> sous macOS, pour les effacer aussi.</span>
+      </p>
     </div>
-    <div class="feature-item">
-      <h4>&#9889; <span class="lang-inline active" data-lang="en">Fast &amp; Lightweight</span><span class="lang-inline" data-lang="fr">Rapide &amp; L&eacute;ger</span></h4>
-      <p><span lang-content="en" class="active">Built in Rust with GPU rendering via iced. Starts in milliseconds.</span><span lang-content="fr">Construit en Rust avec rendu GPU via iced. D&eacute;marre en quelques millisecondes.</span></p>
+
+    <div class="install-block">
+      <p class="install-label"><span data-lang="en">macOS — Homebrew (uninstall):</span><span data-lang="fr">macOS — Homebrew (désinstaller) :</span></p>
+      <div class="cmd">
+        <span class="prompt">$</span>
+        <code>brew uninstall --cask simpleedit</code>
+        <button class="copy-btn" onclick="copyCode(this)"><span data-lang="en">Copy</span><span data-lang="fr">Copier</span></button>
+      </div>
+      <p class="install-note">
+        <span data-lang="en">Also drop your settings: <code>brew uninstall --zap --cask simpleedit</code></span>
+        <span data-lang="fr">Pour aussi supprimer vos réglages : <code>brew uninstall --zap --cask simpleedit</code></span>
+      </p>
     </div>
-    <div class="feature-item">
-      <h4>&#128295; <span class="lang-inline active" data-lang="en">Customizable</span><span class="lang-inline" data-lang="fr">Personnalisable</span></h4>
-      <p><span lang-content="en" class="active">Font size, tab width, word wrap, auto-indent, bracket completion and more.</span><span lang-content="fr">Taille de police, largeur de tab, retour &agrave; la ligne, indentation auto, et plus.</span></p>
+
+    <div class="install-block">
+      <p class="install-label"><span data-lang="en">Linux — .deb (uninstall):</span><span data-lang="fr">Linux — .deb (désinstaller) :</span></p>
+      <div class="cmd">
+        <span class="prompt">$</span>
+        <code>sudo apt remove simpleedit</code>
+        <button class="copy-btn" onclick="copyCode(this)"><span data-lang="en">Copy</span><span data-lang="fr">Copier</span></button>
+      </div>
+      <p class="install-note">
+        <span data-lang="en">No apt? Use <code>sudo dpkg -r simpleedit</code> instead.</span>
+        <span data-lang="fr">Pas d’apt ? Utilisez <code>sudo dpkg -r simpleedit</code> à la place.</span>
+      </p>
     </div>
-    <div class="feature-item">
-      <h4>&#128421;&#65039; <span class="lang-inline active" data-lang="en">Cross-platform</span><span class="lang-inline" data-lang="fr">Multi-plateforme</span></h4>
-      <p><span lang-content="en" class="active">Native binaries for macOS (Intel &amp; Apple Silicon) and Linux (x86_64).</span><span lang-content="fr">Binaires natifs pour macOS (Intel &amp; Apple Silicon) et Linux (x86_64).</span></p>
+
+    <div class="install-block wide">
+      <p class="install-label"><span data-lang="en">Linux — AppImage (uninstall):</span><span data-lang="fr">Linux — AppImage (désinstaller) :</span></p>
+      <div class="cmd">
+        <span class="prompt">$</span>
+        <code>rm -f simpleedit.AppImage ~/.local/bin/simpleedit.AppImage ~/.local/share/applications/simpleedit.desktop</code>
+        <button class="copy-btn" onclick="copyCode(this)"><span data-lang="en">Copy</span><span data-lang="fr">Copier</span></button>
+      </div>
+      <p class="install-note">
+        <span data-lang="en">Removes the AppImage from the current directory and, if you integrated it, from <code>~/.local/bin</code> and your app menu.</span>
+        <span data-lang="fr">Supprime l’AppImage du dossier courant et, si vous l’aviez intégré, de <code>~/.local/bin</code> et de votre menu d’applications.</span>
+      </p>
     </div>
+
+  </div>
+
+  <div class="downloads">
+    <a class="btn btn-outline" href="https://github.com/simple-edit-app/simpleedit/releases/latest"><span data-lang="en">Download .tar.gz (macOS)</span><span data-lang="fr">Télécharger .tar.gz (macOS)</span></a>
+    <a class="btn btn-outline" href="https://github.com/simple-edit-app/simpleedit/releases/latest"><span data-lang="en">Download .deb (Linux)</span><span data-lang="fr">Télécharger .deb (Linux)</span></a>
+    <a class="btn btn-outline" href="https://github.com/simple-edit-app/simpleedit/releases/latest"><span data-lang="en">Download .AppImage (Linux)</span><span data-lang="fr">Télécharger .AppImage (Linux)</span></a>
   </div>
 </section>
 
 <footer>
-  <p>
-    SimpleEdit &mdash; MIT License &mdash;
-    <a href="https://github.com/simple-edit-app/simpleedit">GitHub</a>
-  </p>
+  <span class="grow">© SimpleEdit · <span data-lang="en">MIT License</span><span data-lang="fr">Licence MIT</span></span>
+  <span>
+    <a href="https://github.com/simple-edit-app/simpleedit">GitHub</a> ·
+    <a href="https://github.com/simple-edit-app/simpleedit/releases">Releases</a> ·
+    <a href="https://github.com/simple-edit-app/simpleedit/issues">Issues</a> ·
+    <a href="https://github.com/simple-edit-app/homebrew-tap">Homebrew</a>
+  </span>
 </footer>
 
 <script>
   function copyCode(btn) {
-    const text = btn.previousElementSibling.textContent;
-    navigator.clipboard.writeText(text).then(() => {
+    const code = btn.parentElement.querySelector('code');
+    navigator.clipboard.writeText(code.textContent).then(() => {
       const label = btn.innerHTML;
       btn.textContent = '✓';
       btn.classList.add('copied');
@@ -471,17 +623,22 @@
   }
 
   function setLang(lang) {
-    document.querySelectorAll('[lang-content]').forEach(el => {
-      el.classList.toggle('active', el.getAttribute('lang-content') === lang);
-    });
-    document.querySelectorAll('.lang-inline').forEach(el => {
-      el.classList.toggle('active', el.getAttribute('data-lang') === lang);
-    });
-    document.querySelectorAll('.lang-btn').forEach(btn => {
-      btn.classList.toggle('active', btn.textContent.toLowerCase() === lang);
-    });
     document.documentElement.lang = lang;
+    document.querySelectorAll('[data-set-lang]').forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.setLang === lang);
+    });
+    try { localStorage.setItem('lang', lang); } catch (e) {}
   }
+
+  // The visitor's last choice, else the browser's language (French or English).
+  (function () {
+    let lang = null;
+    try { lang = localStorage.getItem('lang'); } catch (e) {}
+    if (lang !== 'fr' && lang !== 'en') {
+      lang = (navigator.language || 'en').toLowerCase().startsWith('fr') ? 'fr' : 'en';
+    }
+    setLang(lang);
+  })();
 </script>
 
 </body>

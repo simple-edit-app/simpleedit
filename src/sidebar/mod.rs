@@ -1,7 +1,8 @@
 use iced::{
-    widget::{button, column, container, scrollable, text},
-    Element, Length,
+    widget::{button, column, container, row, scrollable, text, Space},
+    Alignment, Element, Length,
 };
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use crate::app::Message;
@@ -86,17 +87,25 @@ impl SidebarState {
         }
     }
 
-    pub fn view(&self, dark: bool, current_file: &Option<PathBuf>) -> Element<'_, Message> {
+    /// The file list. `dirty` holds the open files with unsaved changes.
+    pub fn view(
+        &self,
+        dark: bool,
+        current_file: &Option<PathBuf>,
+        dirty: &HashSet<PathBuf>,
+    ) -> Element<'_, Message> {
         let lbl_close = t!("sidebar.close").to_string();
         let lbl_save = t!("sidebar.save").to_string();
         let lbl_save_as = t!("sidebar.save_as").to_string();
+        let p = theme::palette(dark);
 
         let items: Vec<Element<Message>> = self
             .files
             .iter()
             .enumerate()
             .map(|(i, path)| {
-                let name = if crate::app::is_untitled(path) {
+                let untitled = crate::app::is_untitled(path);
+                let name = if untitled {
                     let n = path
                         .to_str()
                         .unwrap_or("")
@@ -108,18 +117,49 @@ impl SidebarState {
                         .unwrap_or("?")
                         .to_string()
                 };
+                // Short extension in mono, e.g. "rs", "json".
+                let ext = if untitled {
+                    String::new()
+                } else {
+                    path.extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("")
+                        .to_lowercase()
+                };
                 let is_selected = self.selected == Some(i);
                 let is_active = current_file.as_ref() == Some(path);
+                let is_dirty = dirty.contains(path);
                 let path_clone = path.clone();
 
-                let row_button = button(text(name).size(13))
-                    .on_press(Message::Sidebar(SidebarMessage::OpenFile(path_clone)))
-                    .width(Length::Fill)
-                    .padding([6, 10])
-                    .style(iced::theme::Button::custom(theme::SidebarRow {
-                        dark,
-                        selected: is_selected,
-                    }));
+                let ext_color = if is_selected { p.accent } else { p.muted };
+                let marker: Element<Message> = if is_dirty {
+                    container(Space::new(6, 6))
+                        .style(theme::dot(p.accent))
+                        .into()
+                } else {
+                    Space::new(6, 6).into()
+                };
+
+                let row_button = button(
+                    row![
+                        text(ext)
+                            .size(9.5)
+                            .font(theme::MONO)
+                            .style(ext_color)
+                            .width(20),
+                        text(name).size(13).width(Length::Fill),
+                        marker,
+                    ]
+                    .spacing(8)
+                    .align_items(Alignment::Center),
+                )
+                .on_press(Message::Sidebar(SidebarMessage::OpenFile(path_clone)))
+                .width(Length::Fill)
+                .padding([7, 8])
+                .style(iced::theme::Button::custom(theme::SidebarRow {
+                    dark,
+                    selected: is_selected,
+                }));
 
                 // Build context menu labels (owned Strings for 'static closure)
                 let lbl_close = lbl_close.clone();
@@ -130,11 +170,12 @@ impl SidebarState {
                     let ctx_item =
                         |label: String, msg: Option<Message>| -> Element<'static, Message> {
                             let mut btn = button(text(label).size(13))
-                                .padding([6, 10])
-                                .width(Length::Fixed(160.0))
-                                .style(iced::theme::Button::custom(theme::GhostButton {
+                                .padding([7, 10])
+                                .width(Length::Fixed(176.0))
+                                .style(iced::theme::Button::custom(theme::MenuItem {
                                     dark,
-                                    active: false,
+                                    radius: theme::R_SM,
+                                    highlighted: false,
                                 }));
                             if let Some(m) = msg {
                                 btn = btn.on_press(m);
@@ -158,7 +199,7 @@ impl SidebarState {
                                     .then_some(Message::Sidebar(SidebarMessage::RequestSaveAs)),
                             ),
                         ]
-                        .spacing(2)
+                        .spacing(1)
                         .padding(6),
                     )
                     .style(theme::card(dark))
@@ -168,28 +209,42 @@ impl SidebarState {
             })
             .collect();
 
-        let file_list = if items.is_empty() {
-            column![text(t!("sidebar.no_files"))
+        let file_list: Element<Message> = if items.is_empty() {
+            text(t!("sidebar.no_files"))
                 .size(12)
-                .style(theme::muted_text(dark))]
+                .style(theme::muted_text(dark))
+                .into()
         } else {
-            column(items).spacing(2)
+            column(items).spacing(2).into()
+        };
+
+        let count = self.files.len();
+        let footer = if count == 1 {
+            t!("sidebar.open_one").to_string()
+        } else {
+            t!("sidebar.open_many", n = count).to_string()
         };
 
         container(
-            scrollable(
-                column![
-                    text(t!("sidebar.files"))
-                        .size(11)
-                        .style(theme::muted_text(dark)),
-                    file_list,
-                ]
-                .spacing(10)
-                .padding(10),
-            )
-            .height(Length::Fill),
+            column![
+                container(
+                    text(t!("sidebar.files").to_uppercase())
+                        .size(10.5)
+                        .style(theme::muted_text(dark))
+                        .font(theme::UI_MEDIUM)
+                )
+                .padding([0, 8]),
+                scrollable(file_list)
+                    .style(iced::theme::Scrollable::Custom(Box::new(
+                        theme::Scrollbar { dark }
+                    )))
+                    .height(Length::Fill),
+                container(text(footer).size(11.5).style(theme::muted_text(dark))).padding(8),
+            ]
+            .spacing(10),
         )
-        .width(220)
+        .padding([14, 10])
+        .width(208)
         .height(Length::Fill)
         .style(theme::panel(dark))
         .into()

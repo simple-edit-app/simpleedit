@@ -7,8 +7,8 @@ pub mod json;
 pub mod markdown;
 
 use iced::{
-    widget::{button, container, row, text, tooltip, Space},
-    Alignment, Element, Length,
+    widget::{button, container, row, text},
+    Alignment, Element,
 };
 
 use crate::app::Message;
@@ -58,59 +58,29 @@ impl PreviewKind {
             (_, ViewMode::Split) => t!("preview.split").to_string(),
         }
     }
-
-    /// Stacked lines for the source, a pilcrow for the rendered document, a
-    /// split square for the side-by-side view, literal braces for the JSON
-    /// tree — chosen so every one of them is a plain, unambiguous glyph
-    /// rather than a symbol that depends on a particular font's coverage.
-    fn icon(self, mode: ViewMode) -> &'static str {
-        match (self, mode) {
-            (_, ViewMode::Raw) => "\u{2261}",
-            (PreviewKind::Markdown, ViewMode::Preview) => "\u{00B6}",
-            (PreviewKind::Json, ViewMode::Preview) => "{}",
-            (_, ViewMode::Split) => "\u{25EB}",
-        }
-    }
 }
 
-/// Height of the mode toolbar, kept in sync with its padding.
-pub const TOOLBAR_HEIGHT: f32 = 28.0;
-
-/// The small right-aligned mode switcher shown at the top of the editor pane.
-pub fn toolbar(kind: PreviewKind, mode: ViewMode, dark: bool) -> Element<'static, Message> {
-    let mut bar = row![Space::with_width(Length::Fill)].spacing(2);
+/// The segmented control that switches the editor pane between Raw, Preview
+/// and Split (or Raw and Tree for JSON); it sits at the right of the
+/// editor's toolbar.
+pub fn segmented(kind: PreviewKind, mode: ViewMode, dark: bool) -> Element<'static, Message> {
+    let mut bar = row![].spacing(2).align_items(Alignment::Center);
 
     for m in kind.modes() {
-        // Advanced shaping: the same fix as the preview's own emoji glyphs,
-        // in case one of these symbols isn't in whatever font the button
-        // ends up resolving on a given system.
-        let icon = button(
-            text(kind.icon(*m))
-                .size(15)
-                .shaping(iced::widget::text::Shaping::Advanced),
-        )
-        .padding([1, 7])
-        .on_press(Message::SetViewMode(*m))
-        .style(iced::theme::Button::custom(theme::GhostButton {
-            dark,
-            active: mode == *m,
-        }));
-
         bar = bar.push(
-            tooltip(
-                icon,
-                text(kind.label(*m)).size(11),
-                tooltip::Position::Bottom,
-            )
-            .gap(4)
-            .padding(6)
-            .style(theme::card(dark)),
+            button(text(kind.label(*m)).size(12))
+                .padding([3, 10])
+                .on_press(Message::SetViewMode(*m))
+                .style(iced::theme::Button::custom(theme::Segment {
+                    dark,
+                    active: mode == *m,
+                    radius: theme::R_SM,
+                })),
         );
     }
 
-    container(bar.align_items(Alignment::Center).padding([2, 8]))
-        .width(Length::Fill)
-        .height(Length::Fixed(TOOLBAR_HEIGHT))
-        .style(theme::bar(dark))
+    container(bar)
+        .padding(2)
+        .style(theme::field(dark, false, theme::R_ROW))
         .into()
 }

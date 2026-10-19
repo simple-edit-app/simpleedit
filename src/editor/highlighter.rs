@@ -1,373 +1,412 @@
-//! Wraps the syntax highlighter with a second pass that recolors whatever
-//! the current search query matches, so occurrences are visible without
-//! losing syntax colors.
+//! Syntax highlighting with the app's own palette.
 //!
-//! `iced`'s text-highlighting API can only recolor/re-font a range of text —
-//! there is no per-range background — and, separately, `text_editor` only
-//! draws its selection highlight while it holds keyboard focus, which the
-//! search field does instead while searching. So neither the "all matches"
-//! nor the "current match" indication can lean on the editor's own
-//! selection; both go through this highlighter, driven by data (the query,
-//! and the current match's position) rather than focus or a real
-//! background.
+//! This is `iced_highlighter` re-done on top of `syntect` with a theme built
+//! from the design tokens (keyword, string, function, number, comment, type),
+//! instead of one of syntect's bundled themes. Search matches are not styled
+//! here: they get a background, which the editor widget draws itself.
 
 use std::ops::Range;
+use std::str::FromStr;
 
 use iced::advanced::text::{self, highlighter::Format};
-use iced::{highlighter as syntax, Color, Font};
-use regex::Regex;
+use iced::{Color, Font};
+use once_cell::sync::Lazy;
+use syntect::highlighting::{
+    self, Color as SynColor, ScopeSelectors, StyleModifier, ThemeItem, ThemeSettings,
+};
+use syntect::parsing;
 
-/// Settings for the combined highlighter: the underlying syntax settings,
-/// the live search query driving the second pass, and — if a search is
-/// active and has a current match — that match's position, so it can be
-/// styled apart from the others.
+static SYNTAXES: Lazy<parsing::SyntaxSet> = Lazy::new(parsing::SyntaxSet::load_defaults_nonewlines);
+
+static DARK: Lazy<highlighting::Theme> = Lazy::new(|| build_theme(true));
+static LIGHT: Lazy<highlighting::Theme> = Lazy::new(|| build_theme(false));
+
+const LINES_PER_SNAPSHOT: usize = 50;
+
+fn syn_color(c: Color) -> SynColor {
+    let byte = |v: f32| (v * 255.0).round().clamp(0.0, 255.0) as u8;
+    SynColor {
+        r: byte(c.r),
+        g: byte(c.g),
+        b: byte(c.b),
+        a: 255,
+    }
+}
+
+/// The syntect theme for a mode: scope selectors mapped to the design's six
+/// syntax colors. Later, more specific selectors win.
+fn build_theme(dark: bool) -> highlighting::Theme {
+    let s = crate::theme::syntax(dark);
+    let rule = |selectors: &str, color: Color| ThemeItem {
+        scope: ScopeSelectors::from_str(selectors).expect("valid scope selectors"),
+        style: StyleModifier {
+            foreground: Some(syn_color(color)),
+            background: None,
+            font_style: None,
+        },
+    };
+    highlighting::Theme {
+        name: Some(if dark { "Nocturne" } else { "Nocturne Light" }.to_string()),
+        author: None,
+        settings: ThemeSettings::default(),
+        scopes: vec![
+            rule("keyword, storage, entity.name.tag, markup.heading, punctuation.definition.heading", s.keyword),
+            rule("string, markup.bold, markup.inline.raw, punctuation.definition.string", s.string),
+            rule("entity.name.function, support.function, variable.function, meta.function-call, markup.list punctuation.definition, punctuation.definition.list_item", s.function),
+            rule("constant.numeric, constant.language, constant.character.escape, support.constant", s.number),
+            rule("comment, punctuation.definition.comment, punctuation.definition.raw, constant.other.language-name", s.comment),
+            rule("entity.name.type, entity.name.class, entity.name.struct, entity.name.enum, entity.name.trait, entity.other.inherited-class, support.type, support.class, storage.type.primitive, storage.type.rust, storage.type.js, entity.other.attribute-name", s.type_),
+        ],
+    }
+}
+
+/// Settings of the highlighter: which grammar, and which mode's colors.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
-    pub syntax: syntax::Settings,
-    pub query: String,
-    pub case_sensitive: bool,
-    pub use_regex: bool,
-    /// (line index, byte range within that line) of the current match.
-    pub current: Option<(usize, Range<usize>)>,
+    pub dark: bool,
+    pub extension: String,
 }
 
-/// Whether a highlighted span is a search match, and if so, whether it's the
-/// one the search bar is currently on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MatchKind {
-    None,
-    Match,
-    Current,
-}
+/// A highlighted span: just its text color (`None` = the default text color).
+pub struct Highlight(Option<Color>);
 
-/// One highlighted span: the syntax format underneath, and whether/how a
-/// search match covers it.
-#[derive(Debug, Clone, Copy)]
-pub struct Highlight {
-    format: Format<Font>,
-    kind: MatchKind,
-}
-
-/// Bold + a saturated "highlighter" color is the most `Format` (color and
-/// font, nothing else) can do to stand in for a real highlighter-pen
-/// background — picked bright enough, and different enough from the app's
-/// own violet accent used all over the rest of the UI, to actually read as
-/// "this is a search match" at a glance. Two tones per role: `Theme::palette`
-/// gives `to_format` enough to tell dark from light without Settings having
-/// to carry it separately.
-fn match_color(dark: bool) -> Color {
-    if dark {
-        Color::from_rgb(0.95, 0.80, 0.20) // warm gold
-    } else {
-        Color::from_rgb(0.62, 0.46, 0.02) // deep amber, readable on pale paper
-    }
-}
-
-/// The current match's color — distinct from every other match's gold, not
-/// just bolder.
-fn current_match_color(dark: bool) -> Color {
-    if dark {
-        Color::from_rgb(1.0, 0.42, 0.30) // vivid coral
-    } else {
-        Color::from_rgb(0.78, 0.20, 0.10) // brick red
-    }
-}
-
-fn is_dark(theme: &iced::Theme) -> bool {
-    let bg = theme.palette().background;
-    let luminance = 0.299 * bg.r + 0.587 * bg.g + 0.114 * bg.b;
-    luminance < 0.5
-}
-
-fn bold() -> Font {
-    Font {
-        weight: iced::font::Weight::Bold,
-        ..Font::DEFAULT
-    }
-}
-
-/// The `to_format` callback `text_editor::highlight` expects — a bare `fn`,
-/// so this styling has to be hardcoded here rather than threaded through as
-/// data.
-pub fn to_format(highlight: &Highlight, theme: &iced::Theme) -> Format<Font> {
-    let dark = is_dark(theme);
-    match highlight.kind {
-        MatchKind::Current => Format {
-            color: Some(current_match_color(dark)),
-            font: Some(bold()),
-        },
-        MatchKind::Match => Format {
-            color: Some(match_color(dark)),
-            font: Some(bold()),
-        },
-        MatchKind::None => highlight.format,
+/// The `to_format` callback `text_editor::highlight` expects.
+pub fn to_format(highlight: &Highlight, _theme: &iced::Theme) -> Format<Font> {
+    Format {
+        color: highlight.0,
+        font: None,
     }
 }
 
 pub struct Highlighter {
-    inner: syntax::Highlighter,
-    syntax_settings: syntax::Settings,
-    query: String,
-    case_sensitive: bool,
-    use_regex: bool,
-    current: Option<(usize, Range<usize>)>,
-    /// Compiled once per `update`, not per line — `None` when the query
-    /// isn't in use, is empty, or (regex mode) doesn't compile.
-    regex: Option<Regex>,
+    /// Whether to also color what the grammar leaves unscoped (see
+    /// `refine`): PascalCase names as types, `name(` as calls.
+    refine: bool,
+    function: Color,
+    type_: Color,
+    syntax: &'static parsing::SyntaxReference,
+    highlighter: highlighting::Highlighter<'static>,
+    caches: Vec<(parsing::ParseState, parsing::ScopeStack)>,
+    current_line: usize,
 }
 
-impl Highlighter {
-    /// Every match on `line`, each flagged with whether it's the current one
-    /// — `line_idx` is which line this is, matched against `self.current`.
-    fn line_matches(&self, line: &str, line_idx: usize) -> Vec<(Range<usize>, bool)> {
-        if self.query.is_empty() {
-            return Vec::new();
-        }
-        let ranges: Vec<Range<usize>> = if self.use_regex {
-            match &self.regex {
-                Some(re) => re
-                    .find_iter(line)
-                    .filter(|m| !m.is_empty())
-                    .map(|m| m.start()..m.end())
-                    .collect(),
-                None => Vec::new(),
-            }
-        } else if self.case_sensitive {
-            line.match_indices(self.query.as_str())
-                .map(|(i, m)| i..i + m.len())
-                .collect()
-        } else {
-            crate::search::find_literal_ci(line, &self.query)
-        };
-
-        let current = self
-            .current
-            .as_ref()
-            .filter(|(l, _)| *l == line_idx)
-            .map(|(_, r)| r.clone());
-
-        ranges
-            .into_iter()
-            .map(|r| {
-                let is_current = current.as_ref() == Some(&r);
-                (r, is_current)
-            })
-            .collect()
-    }
+fn syntax_for(extension: &str) -> &'static parsing::SyntaxReference {
+    SYNTAXES
+        .find_syntax_by_token(extension)
+        .unwrap_or_else(|| SYNTAXES.find_syntax_plain_text())
 }
 
-fn compile_regex(settings: &Settings) -> Option<Regex> {
-    if !settings.use_regex || settings.query.is_empty() {
-        return None;
+fn theme_for(dark: bool) -> &'static highlighting::Theme {
+    if dark {
+        &DARK
+    } else {
+        &LIGHT
     }
-    crate::search::build_regex(&settings.query, settings.case_sensitive).ok()
 }
 
 impl text::Highlighter for Highlighter {
     type Settings = Settings;
     type Highlight = Highlight;
-    type Iterator<'a> = std::vec::IntoIter<(Range<usize>, Highlight)>;
+
+    type Iterator<'a> = Box<dyn Iterator<Item = (Range<usize>, Self::Highlight)> + 'a>;
 
     fn new(settings: &Self::Settings) -> Self {
-        Self {
-            inner: <syntax::Highlighter as text::Highlighter>::new(&settings.syntax),
-            syntax_settings: settings.syntax.clone(),
-            query: settings.query.clone(),
-            case_sensitive: settings.case_sensitive,
-            use_regex: settings.use_regex,
-            current: settings.current.clone(),
-            regex: compile_regex(settings),
+        let syntax = syntax_for(&settings.extension);
+
+        let colors = crate::theme::syntax(settings.dark);
+        Highlighter {
+            refine: refines(&settings.extension),
+            function: colors.function,
+            type_: colors.type_,
+            syntax,
+            highlighter: highlighting::Highlighter::new(theme_for(settings.dark)),
+            caches: vec![(parsing::ParseState::new(syntax), parsing::ScopeStack::new())],
+            current_line: 0,
         }
     }
 
-    fn update(&mut self, settings: &Self::Settings) {
-        // `update` is only called when `Settings` actually changed (the
-        // widget compares by PartialEq), and — since `SearchState` only
-        // hands the query over once a search has actually run, not on every
-        // keystroke — that's now a real action (Find/Next/Previous/Replace,
-        // or a file/theme switch), not something that fires on every
-        // keystroke. So there's no need to guard the inner update: even
-        // when only the search overlay changed, every already-shaped line
-        // needs telling its *effective* highlight may have changed, and
-        // `iced_highlighter::Highlighter::update` is what does that (it
-        // resets to line 0 internally) — re-deriving the same syntax/theme
-        // it already has is a rounding error next to that.
-        self.inner.update(&settings.syntax);
-        self.syntax_settings = settings.syntax.clone();
-        self.query = settings.query.clone();
-        self.case_sensitive = settings.case_sensitive;
-        self.use_regex = settings.use_regex;
-        self.current = settings.current.clone();
-        self.regex = compile_regex(settings);
+    fn update(&mut self, new_settings: &Self::Settings) {
+        self.syntax = syntax_for(&new_settings.extension);
+        self.highlighter = highlighting::Highlighter::new(theme_for(new_settings.dark));
+        let colors = crate::theme::syntax(new_settings.dark);
+        self.refine = refines(&new_settings.extension);
+        self.function = colors.function;
+        self.type_ = colors.type_;
+
+        // Restart the highlighter
+        self.change_line(0);
     }
 
     fn change_line(&mut self, line: usize) {
-        self.inner.change_line(line);
+        let snapshot = line / LINES_PER_SNAPSHOT;
+
+        if snapshot <= self.caches.len() {
+            self.caches.truncate(snapshot);
+            self.current_line = snapshot * LINES_PER_SNAPSHOT;
+        } else {
+            self.caches.truncate(1);
+            self.current_line = 0;
+        }
+
+        let (parser, stack) = self.caches.last().cloned().unwrap_or_else(|| {
+            (
+                parsing::ParseState::new(self.syntax),
+                parsing::ScopeStack::new(),
+            )
+        });
+
+        self.caches.push((parser, stack));
     }
 
     fn highlight_line(&mut self, line: &str) -> Self::Iterator<'_> {
-        // current_line() is the index of the line about to be processed —
-        // highlight_line() below advances it, so this has to be read first.
-        let line_idx = self.inner.current_line();
+        if self.current_line / LINES_PER_SNAPSHOT >= self.caches.len() {
+            let (parser, stack) = self.caches.last().expect("Caches must not be empty");
 
-        let base: Vec<(Range<usize>, Format<Font>)> = self
-            .inner
-            .highlight_line(line)
-            .map(|(range, highlight)| (range, highlight.to_format()))
-            .collect();
+            self.caches.push((parser.clone(), stack.clone()));
+        }
 
-        let matches = self.line_matches(line, line_idx);
-        overlay_matches(base, &matches)
-            .into_iter()
-            .map(|(range, format, kind)| (range, Highlight { format, kind }))
-            .collect::<Vec<_>>()
-            .into_iter()
+        self.current_line += 1;
+
+        let (parser, stack) = self.caches.last_mut().expect("Caches must not be empty");
+
+        let ops = parser.parse_line(line, &SYNTAXES).unwrap_or_default();
+
+        let highlighter = &self.highlighter;
+
+        let spans: Vec<(Range<usize>, Highlight)> = ScopeRangeIterator {
+            ops,
+            line_length: line.len(),
+            index: 0,
+            last_str_index: 0,
+        }
+        .filter_map(|(range, scope)| {
+            let _ = stack.apply(&scope);
+
+            if range.is_empty() {
+                None
+            } else {
+                let color = highlighter
+                    .style_mod_for_stack(&stack.scopes)
+                    .foreground
+                    .map(|c| Color::from_rgb8(c.r, c.g, c.b));
+                Some((range, Highlight(color)))
+            }
+        })
+        .collect();
+
+        if self.refine {
+            Box::new(refine(line, spans, self.function, self.type_).into_iter())
+        } else {
+            Box::new(spans.into_iter())
+        }
     }
 
     fn current_line(&self) -> usize {
-        self.inner.current_line()
+        self.current_line
     }
 }
 
-/// Splits `base` (ranges tiling a line, each carrying a `T`) at every
-/// boundary in `matches` (non-overlapping ranges into the same line, each
-/// flagged with whether it's the current match), producing the minimal set
-/// of sub-ranges needed to tag each one with its underlying `T` and its
-/// [`MatchKind`].
-fn overlay_matches<T: Copy>(
-    base: Vec<(Range<usize>, T)>,
-    matches: &[(Range<usize>, bool)],
-) -> Vec<(Range<usize>, T, MatchKind)> {
-    if matches.is_empty() {
-        return base
-            .into_iter()
-            .map(|(range, t)| (range, t, MatchKind::None))
-            .collect();
-    }
+/// Whether a language gets the `refine` pass: programming languages whose
+/// grammars leave type names and calls unscoped. Markup, data and shell
+/// formats don't.
+fn refines(extension: &str) -> bool {
+    !matches!(
+        extension,
+        "" | "md"
+            | "markdown"
+            | "json"
+            | "yaml"
+            | "yml"
+            | "toml"
+            | "xml"
+            | "html"
+            | "css"
+            | "sql"
+            | "sh"
+            | "bash"
+            | "txt"
+    )
+}
 
-    let mut cuts: Vec<usize> = base.iter().flat_map(|(r, _)| [r.start, r.end]).collect();
-    cuts.extend(matches.iter().flat_map(|(r, _)| [r.start, r.end]));
-    cuts.sort_unstable();
-    cuts.dedup();
-
-    let mut out = Vec::with_capacity(cuts.len());
-    for pair in cuts.windows(2) {
-        let (a, b) = (pair[0], pair[1]);
-        if a >= b {
+/// Colors what the grammar left plain: a PascalCase word (at least one
+/// lowercase letter, so constants like `ACCENT` stay as they are) is a type,
+/// and a word right before `(` is a call.
+fn refine(
+    line: &str,
+    spans: Vec<(Range<usize>, Highlight)>,
+    function: Color,
+    type_: Color,
+) -> Vec<(Range<usize>, Highlight)> {
+    let mut out = Vec::with_capacity(spans.len());
+    for (range, highlight) in spans {
+        if highlight.0.is_some() {
+            out.push((range, highlight));
             continue;
         }
-        let Some(&(_, t)) = base.iter().find(|(r, _)| r.start <= a && a < r.end) else {
-            continue;
+        let text = &line[range.clone()];
+        let mut last = 0;
+        let mut word_start: Option<usize> = None;
+        let push = |from: usize, to: usize, color: Option<Color>, out: &mut Vec<_>| {
+            if from < to {
+                out.push((range.start + from..range.start + to, Highlight(color)));
+            }
         };
-        let kind = match matches.iter().find(|(r, _)| r.start <= a && a < r.end) {
-            Some((_, true)) => MatchKind::Current,
-            Some((_, false)) => MatchKind::Match,
-            None => MatchKind::None,
-        };
-        out.push((a..b, t, kind));
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        for (i, c) in text
+            .char_indices()
+            .chain(std::iter::once((text.len(), ' ')))
+        {
+            match (word_start, is_word(c)) {
+                (None, true) => word_start = Some(i),
+                (Some(start), false) => {
+                    let word = &text[start..i];
+                    let first = word.chars().next().unwrap_or(' ');
+                    let color = if first.is_uppercase() && word.chars().any(char::is_lowercase) {
+                        Some(type_)
+                    } else if first.is_alphabetic() || first == '_' {
+                        // A call: the next character *in the line* is `(`.
+                        let after = line[range.start + i..].chars().next();
+                        (after == Some('(')).then_some(function)
+                    } else {
+                        None
+                    };
+                    if color.is_some() {
+                        push(last, start, None, &mut out);
+                        push(start, i, color, &mut out);
+                        last = i;
+                    }
+                    word_start = None;
+                }
+                _ => {}
+            }
+        }
+        push(last, text.len(), None, &mut out);
     }
     out
 }
 
+/// Turns syntect's scope-stack operations into (byte range, op) pairs that
+/// tile the line.
+struct ScopeRangeIterator {
+    ops: Vec<(usize, parsing::ScopeStackOp)>,
+    line_length: usize,
+    index: usize,
+    last_str_index: usize,
+}
+
+impl Iterator for ScopeRangeIterator {
+    type Item = (Range<usize>, parsing::ScopeStackOp);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index > self.ops.len() {
+            return None;
+        }
+
+        let next_str_i = if self.index == self.ops.len() {
+            self.line_length
+        } else {
+            self.ops[self.index].0
+        };
+
+        let range = self.last_str_index..next_str_i;
+        self.last_str_index = next_str_i;
+
+        let op = if self.index == 0 {
+            parsing::ScopeStackOp::Noop
+        } else {
+            self.ops[self.index - 1].1.clone()
+        };
+
+        self.index += 1;
+        Some((range, op))
+    }
+}
+
 #[cfg(test)]
-#[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::*;
+    use text::Highlighter as _;
 
-    fn fmt(n: u8) -> Format<Font> {
-        Format {
-            color: Some(iced::Color::from_rgb8(n, n, n)),
-            font: None,
+    fn colors(ext: &str, line: &str, dark: bool) -> Vec<(String, Option<Color>)> {
+        let mut h = Highlighter::new(&Settings {
+            dark,
+            extension: ext.to_string(),
+        });
+        h.highlight_line(line)
+            .map(|(r, hl)| (line[r].to_string(), hl.0))
+            .collect()
+    }
+
+    fn color_of(spans: &[(String, Option<Color>)], needle: &str) -> Option<Color> {
+        spans
+            .iter()
+            .find(|(t, _)| t.contains(needle))
+            .and_then(|(_, c)| *c)
+    }
+
+    #[test]
+    fn rust_tokens_use_the_design_palette() {
+        let s = crate::theme::syntax(true);
+        let kw = colors("rs", "pub struct Palette {", true);
+        assert_eq!(color_of(&kw, "pub"), Some(s.keyword));
+        assert_eq!(color_of(&kw, "struct"), Some(s.keyword));
+        assert_eq!(color_of(&kw, "Palette"), Some(s.type_));
+
+        let field = colors("rs", "    pub bg: Color,", true);
+        assert_eq!(color_of(&field, "Color"), Some(s.type_));
+
+        let sig = colors("rs", "pub fn palette(dark: bool) -> Palette {", true);
+        assert_eq!(color_of(&sig, "palette"), Some(s.function));
+        assert_eq!(color_of(&sig, "bool"), Some(s.type_));
+        assert_eq!(color_of(&sig, "Palette"), Some(s.type_));
+
+        let call = colors("rs", "let x = rgb(0x14, \"abc\");", true);
+        assert_eq!(color_of(&call, "rgb"), Some(s.function));
+        assert_eq!(color_of(&call, "0x14"), Some(s.number));
+        assert_eq!(color_of(&call, "abc"), Some(s.string));
+
+        let comment = colors("rs", "// Palette de couleurs", true);
+        assert_eq!(color_of(&comment, "Palette"), Some(s.comment));
+    }
+
+    #[test]
+    fn constants_and_plain_words_stay_plain() {
+        let spans = colors("rs", "    accent: ACCENT,", true);
+        assert_eq!(color_of(&spans, "ACCENT"), None);
+        assert_eq!(color_of(&spans, "accent"), None);
+    }
+
+    #[test]
+    fn markdown_is_not_refined_but_uses_the_palette() {
+        let s = crate::theme::syntax(true);
+        let heading = colors("md", "# SimpleEdit", true);
+        assert_eq!(color_of(&heading, "SimpleEdit"), Some(s.keyword));
+        let bold = colors("md", "Un texte **rapide**, propre", true);
+        assert_eq!(color_of(&bold, "rapide"), Some(s.string));
+        // PascalCase in prose is not a type.
+        let prose = colors("md", "Voir SimpleEdit ici", true);
+        assert_eq!(color_of(&prose, "SimpleEdit"), None);
+    }
+
+    #[test]
+    fn light_mode_uses_light_colors() {
+        let d = colors("rs", "// c", true);
+        let l = colors("rs", "// c", false);
+        assert_ne!(color_of(&d, "c"), color_of(&l, "c"));
+    }
+
+    #[test]
+    fn refined_spans_still_tile_the_line() {
+        let line = "    let v = Vec::new(Foo, bar(1));";
+        let mut h = Highlighter::new(&Settings {
+            dark: true,
+            extension: "rs".to_string(),
+        });
+        let mut at = 0;
+        for (r, _) in h.highlight_line(line) {
+            assert_eq!(r.start, at, "gap before {r:?}");
+            at = r.end;
         }
-    }
-
-    #[test]
-    fn no_matches_leaves_base_ranges_untouched() {
-        let base = vec![(0..3, fmt(1)), (3..6, fmt(2))];
-        let out = overlay_matches(base.clone(), &[]);
-        assert_eq!(
-            out,
-            vec![
-                (0..3, fmt(1), MatchKind::None),
-                (3..6, fmt(2), MatchKind::None)
-            ]
-        );
-    }
-
-    #[test]
-    fn a_match_splits_the_base_range_it_falls_within() {
-        // "let x = 1" — one base range (plain text, no real syntax spans),
-        // with a match on "x" at 4..5.
-        let base = vec![(0..9, fmt(1))];
-        let out = overlay_matches(base, &[(4..5, false)]);
-        assert_eq!(
-            out,
-            vec![
-                (0..4, fmt(1), MatchKind::None),
-                (4..5, fmt(1), MatchKind::Match),
-                (5..9, fmt(1), MatchKind::None)
-            ]
-        );
-    }
-
-    #[test]
-    fn a_match_spanning_two_base_ranges_splits_both() {
-        let base = vec![(0..3, fmt(1)), (3..6, fmt(2))];
-        let out = overlay_matches(base, &[(2..4, false)]);
-        assert_eq!(
-            out,
-            vec![
-                (0..2, fmt(1), MatchKind::None),
-                (2..3, fmt(1), MatchKind::Match),
-                (3..4, fmt(2), MatchKind::Match),
-                (4..6, fmt(2), MatchKind::None)
-            ]
-        );
-    }
-
-    #[test]
-    fn a_match_exactly_covering_a_base_range_needs_no_split() {
-        let base = vec![(0..3, fmt(1)), (3..6, fmt(2))];
-        let out = overlay_matches(base, &[(3..6, false)]);
-        assert_eq!(
-            out,
-            vec![
-                (0..3, fmt(1), MatchKind::None),
-                (3..6, fmt(2), MatchKind::Match)
-            ]
-        );
-    }
-
-    #[test]
-    fn the_current_match_is_tagged_separately_from_the_others() {
-        let base = vec![(0..9, fmt(1))];
-        let out = overlay_matches(base, &[(0..1, false), (4..5, true)]);
-        assert_eq!(
-            out,
-            vec![
-                (0..1, fmt(1), MatchKind::Match),
-                (1..4, fmt(1), MatchKind::None),
-                (4..5, fmt(1), MatchKind::Current),
-                (5..9, fmt(1), MatchKind::None),
-            ]
-        );
-    }
-
-    #[test]
-    fn compile_regex_is_none_outside_regex_mode_or_when_empty() {
-        let s = |query: &str, use_regex: bool| Settings {
-            syntax: syntax::Settings {
-                theme: syntax::Theme::SolarizedDark,
-                extension: String::new(),
-            },
-            query: query.to_string(),
-            case_sensitive: false,
-            use_regex,
-            current: None,
-        };
-        assert!(compile_regex(&s("abc", false)).is_none());
-        assert!(compile_regex(&s("", true)).is_none());
-        assert!(compile_regex(&s(r"\d+", true)).is_some());
-        assert!(compile_regex(&s(r"[invalid", true)).is_none());
+        assert_eq!(at, line.len());
     }
 }

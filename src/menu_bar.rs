@@ -10,7 +10,8 @@ use crate::config::{Config, ShortcutConfig};
 use crate::preferences::PreferencesMessage;
 use crate::theme;
 
-/// Just the menu bar row — no dropdown, no layout side effects.
+/// The title bar: the menus on the left and the Dark/Light switch on the
+/// right. No layout side effects; the dropdown is drawn separately.
 pub fn view(config: &Config, open: Option<TopMenu>) -> Element<'static, Message> {
     let dark = config.dark_mode;
 
@@ -24,11 +25,11 @@ pub fn view(config: &Config, open: Option<TopMenu>) -> Element<'static, Message>
         mouse_area(
             container(
                 button(text(label).size(13))
-                    .padding([6, 12])
+                    .padding([5, 9])
                     .on_press(Message::ToggleMenu(menu))
-                    .style(iced::theme::Button::custom(theme::GhostButton {
+                    .style(iced::theme::Button::custom(theme::MenuTitle {
                         dark,
-                        active: open == Some(menu),
+                        open: open == Some(menu),
                     })),
             )
             .id(menu_id(menu)),
@@ -36,14 +37,49 @@ pub fn view(config: &Config, open: Option<TopMenu>) -> Element<'static, Message>
         .on_enter(Message::HoverMenu(menu))
     };
 
+    // Sombre | Clair, a pill: the active side wears the accent wash.
+    let side = |label: String, is_dark: bool| {
+        button(text(label).size(12))
+            .padding([3, 10])
+            .on_press(Message::ThemeChanged(is_dark))
+            .style(iced::theme::Button::custom(theme::Segment {
+                dark,
+                active: dark == is_dark,
+                radius: theme::R_PILL,
+            }))
+    };
+    let p = theme::palette(dark);
+    let theme_switch = container(
+        row![
+            side(t!("toolbar.dark").to_string(), true),
+            side(t!("toolbar.light").to_string(), false),
+        ]
+        .spacing(2),
+    )
+    .padding(2)
+    .style(move |_: &iced::Theme| container::Appearance {
+        text_color: Some(p.text),
+        background: Some(iced::Background::Color(p.elevated)),
+        border: iced::Border {
+            color: p.border,
+            width: 1.0,
+            radius: theme::R_PILL.into(),
+        },
+        shadow: iced::Shadow::default(),
+    });
+
     let bar = row![
         top_button(t!("menu.file").to_string(), TopMenu::File),
         top_button(t!("menu.edit").to_string(), TopMenu::Edit),
         top_button(t!("menu.view").to_string(), TopMenu::View),
         top_button(t!("menu.help").to_string(), TopMenu::Help),
+        Space::with_width(Length::Fill),
+        theme_switch,
     ]
     .spacing(2)
-    .padding([4, 10]);
+    .padding([0, 14])
+    .height(42)
+    .align_items(Alignment::Center);
 
     container(bar)
         .width(Length::Fill)
@@ -59,7 +95,7 @@ pub fn dropdown_view(
     lang_picker_enabled: bool,
 ) -> Element<'static, Message> {
     let items = menu_items(menu, config, has_formatter, lang_picker_enabled);
-    container(column(items).spacing(2).padding(6).width(260))
+    container(column(items).spacing(1).padding(6).width(260))
         .style(theme::card(config.dark_mode))
         .into()
 }
@@ -77,7 +113,7 @@ pub fn menu_id(menu: TopMenu) -> container::Id {
 }
 
 /// A clickable menu item with an optional shortcut hint on the right.
-fn item(
+pub fn item(
     label: String,
     shortcut: Option<String>,
     dark: bool,
@@ -87,7 +123,7 @@ fn item(
         row![
             text(label).size(13),
             Space::with_width(Length::Fill),
-            text(sc).size(11).style(theme::muted_text(dark)),
+            text(sc).size(11.5).style(theme::muted_text(dark)),
         ]
         .align_items(Alignment::Center)
         .into()
@@ -96,29 +132,33 @@ fn item(
     };
 
     button(content)
-        .padding([6, 10])
+        .padding([7, 10])
         .width(Length::Fill)
         .on_press(message)
-        .style(iced::theme::Button::custom(theme::GhostButton {
+        .style(iced::theme::Button::custom(theme::MenuItem {
             dark,
-            active: false,
+            radius: theme::R_SM,
+            highlighted: false,
         }))
         .into()
 }
 
-fn disabled_item(label: String, dark: bool) -> Element<'static, Message> {
+pub fn disabled_item(label: String, dark: bool) -> Element<'static, Message> {
     container(text(label).size(13).style(theme::muted_text(dark)))
-        .padding([6, 10])
+        .padding([7, 10])
         .width(Length::Fill)
         .into()
 }
 
-fn separator(dark: bool) -> Element<'static, Message> {
-    container(Space::with_height(1))
-        .padding([2, 8])
-        .width(Length::Fill)
-        .style(theme::gutter(dark))
-        .into()
+pub fn separator(dark: bool) -> Element<'static, Message> {
+    container(
+        container(Space::with_height(1))
+            .width(Length::Fill)
+            .style(theme::rule(dark)),
+    )
+    .padding([3, 4])
+    .width(Length::Fill)
+    .into()
 }
 
 fn sc(sc: &ShortcutConfig) -> Option<String> {
@@ -286,6 +326,12 @@ fn menu_items(
                 disabled_item(t!("menu.view_language").to_string(), dark)
             };
             vec![
+                item(
+                    t!("menu.view_palette").to_string(),
+                    sc(&sh.command_palette),
+                    dark,
+                    Message::OpenPalette,
+                ),
                 item(
                     t!("menu.view_sidebar").to_string(),
                     sc(&sh.toggle_sidebar),

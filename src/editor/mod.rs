@@ -29,7 +29,6 @@ pub const SUPPORTED_LANGUAGES: &[(&str, &str)] = &[
     ("r", "R"),
 ];
 
-use iced::highlighter as hl;
 use iced::{Element, Length};
 
 use crate::{app::Message, config::Config, search::SearchState};
@@ -179,56 +178,64 @@ impl EditorState {
         config: &Config,
         search: Option<&SearchState>,
     ) -> Element<'a, Message> {
-        let hl_theme = if config.dark_mode {
-            hl::Theme::SolarizedDark
-        } else {
-            hl::Theme::InspiredGitHub
-        };
+        let dark = config.dark_mode;
+        let p = crate::theme::palette(dark);
         let extension = self.language.clone().unwrap_or_default();
-        let (query, case_sensitive, use_regex) = search
-            .and_then(SearchState::highlight_query)
-            .unwrap_or_default();
-        let current = search.and_then(SearchState::current_match_line);
 
-        let p = crate::theme::palette(config.dark_mode);
         let mut editor = crate::code_editor::CodeEditor::new(&self.content)
             .size(config.font_size.clamp(8.0, 32.0))
+            .font(crate::theme::MONO)
+            .line_height(iced::advanced::text::LineHeight::Relative(LINE_HEIGHT))
             .on_action(Message::EditorAction)
             .highlight::<highlighter::Highlighter>(
-                highlighter::Settings {
-                    syntax: hl::Settings {
-                        theme: hl_theme,
-                        extension,
-                    },
-                    query,
-                    case_sensitive,
-                    use_regex,
-                    current,
-                },
+                highlighter::Settings { dark, extension },
                 highlighter::to_format,
             )
             .style(iced::theme::TextEditor::Custom(Box::new(
-                crate::theme::EditorStyle {
-                    dark: config.dark_mode,
-                },
+                crate::theme::EditorStyle { dark },
             )))
             .height(Length::Fill);
+
+        if let Some((query, case_sensitive, use_regex)) =
+            search.and_then(SearchState::highlight_query)
+        {
+            editor = editor.search(crate::code_editor::SearchPaint {
+                query,
+                case_sensitive,
+                use_regex,
+                current: search.and_then(SearchState::current_match_line),
+                color: p.search_match,
+                current_color: iced::Color {
+                    a: (p.search_match.a * 1.7).min(0.85),
+                    ..p.search_match
+                },
+                current_border: p.accent,
+            });
+        }
+        if config.highlight_current_line {
+            editor = editor.line_highlight(crate::code_editor::LineHighlight {
+                background: p.current_line,
+                bar: p.accent,
+            });
+        }
+        if config.show_page_guide {
+            editor = editor.page_guide(config.page_guide_column, p.border);
+        }
 
         // The gutter is drawn by the editor itself, from its own row layout,
         // so numbers stay aligned with wrapped lines and while scrolling.
         let left = if config.show_line_numbers {
             editor = editor.gutter(crate::code_editor::Gutter {
-                background: p.surface,
-                text: p.muted,
-                border: p.border,
+                text: p.gutter,
+                current: p.text,
             });
             0.0
         } else {
-            14.0
+            16.0
         };
         editor
             .padding(iced::Padding {
-                top: 8.0,
+                top: 10.0,
                 right: 14.0,
                 bottom: 8.0,
                 left,
@@ -236,6 +243,9 @@ impl EditorState {
             .into()
     }
 }
+
+/// Row height relative to the text size (the design: 22px for 12.5px code).
+const LINE_HEIGHT: f32 = 1.7;
 
 fn extension_to_token(ext: &str) -> Option<&'static str> {
     match ext {
@@ -268,91 +278,106 @@ fn extension_to_token(ext: &str) -> Option<&'static str> {
 
 pub mod statusbar {
     use iced::{
-        widget::{container, row, text, Space},
-        Element, Length,
+        widget::{column, container, row, text, Space},
+        Alignment, Element, Length,
     };
 
     use crate::app::Message;
     use crate::theme;
-    use std::path::PathBuf;
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn view<'a>(
-        status: &'a str,
-        current_file: &'a Option<PathBuf>,
-        is_dirty: bool,
-        dark: bool,
-        cursor: (usize, usize),
-        is_error: bool,
-        language: Option<&'a str>,
-        selection_info: Option<String>,
-        file_size: Option<u64>,
-    ) -> Element<'a, Message> {
-        let file_info = current_file
-            .as_ref()
-            .and_then(|p| p.to_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| t!("status.no_file").to_string());
+    /// What the status bar shows.
+    pub struct Info<'a> {
+        pub status: &'a str,
+        pub is_error: bool,
+        pub dark: bool,
+        /// Cursor as (line, byte column).
+        pub cursor: (usize, usize),
+        pub language: Option<&'a str>,
+        pub selection: Option<String>,
+        pub file_size: Option<u64>,
+        pub use_spaces: bool,
+        pub tab_width: usize,
+    }
 
-        let dirty_indicator = if is_dirty { " •" } else { "" };
+    fn size_label(b: u64) -> String {
+        if b < 1024 {
+            format!("{}B", b)
+        } else if b < 1024 * 1024 {
+            format!("{}KB", b / 1024)
+        } else {
+            format!("{}MB", b / (1024 * 1024))
+        }
+    }
+
+    /// A hairline, then a 30px row: state dot and message on the left,
+    /// position, indentation, encoding and language on the right.
+    pub fn view<'a>(info: Info<'a>) -> Element<'a, Message> {
+        let dark = info.dark;
+        let p = theme::palette(dark);
         let muted = theme::muted_text(dark);
 
-        let (line, col) = cursor;
-        let cursor_text = t!("status.cursor", line = line + 1, col = col + 1).to_string();
-
-        let status_color = if is_error {
-            iced::Color::from_rgb(0.88, 0.27, 0.18)
-        } else {
-            muted
-        };
+        let (line, col) = info.cursor;
 
         // Resolve language token → display name
-        let lang_label = language
+        let lang_label = info
+            .language
             .and_then(|tok| {
                 crate::editor::SUPPORTED_LANGUAGES
                     .iter()
                     .find(|(t, _)| *t == tok)
-                    .map(|(_, name)| *name)
+                    .map(|(_, name)| name.to_string())
             })
-            .unwrap_or("");
+            .unwrap_or_else(|| t!("status.plain_text").to_string());
 
-        let sel_text = selection_info
-            .map(|s| format!("{}  ", s))
-            .unwrap_or_default();
+        let indent = if info.use_spaces {
+            t!("status.spaces", n = info.tab_width).to_string()
+        } else {
+            t!("status.tabs", n = info.tab_width).to_string()
+        };
 
-        let size_text = file_size
-            .map(|b| {
-                if b < 1024 {
-                    format!("  {}B", b)
-                } else if b < 1024 * 1024 {
-                    format!("  {}KB", b / 1024)
-                } else {
-                    format!("  {}MB", b / (1024 * 1024))
-                }
-            })
-            .unwrap_or_default();
+        let dot_color = if info.is_error {
+            theme::error_color(dark)
+        } else {
+            p.accent
+        };
+
+        let mut right = row![].spacing(18).align_items(Alignment::Center);
+        if let Some(sel) = info.selection {
+            right = right.push(text(sel).size(11.5).style(muted));
+        }
+        if let Some(bytes) = info.file_size {
+            right = right.push(text(size_label(bytes)).size(11.5).style(muted));
+        }
+        right = right
+            .push(
+                text(t!("status.cursor", line = line + 1, col = col + 1).to_string())
+                    .size(11.5)
+                    .style(muted),
+            )
+            .push(text(indent).size(11.5).style(muted))
+            .push(text("UTF-8").size(11.5).style(muted))
+            .push(text(lang_label).size(11.5).style(p.text));
 
         let bar = row![
-            text(status).size(11).style(status_color),
+            container(Space::new(6, 6)).style(theme::dot(dot_color)),
+            text(info.status)
+                .size(11.5)
+                .style(if info.is_error { dot_color } else { muted }),
             Space::with_width(Length::Fill),
-            text(sel_text).size(11).style(muted),
-            text(lang_label).size(11).style(muted),
-            text(format!("  {}", cursor_text)).size(11).style(muted),
-            text(size_text).size(11).style(muted),
-            text(format!("  {}{}", file_info, dirty_indicator))
-                .size(11)
-                .style(if is_dirty {
-                    theme::accent_color()
-                } else {
-                    muted
-                }),
+            right,
         ]
-        .padding([5, 10]);
+        .spacing(6)
+        .padding([0, 14])
+        .height(30)
+        .align_items(Alignment::Center);
 
-        container(bar)
-            .width(Length::Fill)
-            .style(theme::bar(dark))
-            .into()
+        column![
+            container(Space::with_height(1))
+                .width(Length::Fill)
+                .style(theme::rule(dark)),
+            bar
+        ]
+        .into()
     }
 }
 

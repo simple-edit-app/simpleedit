@@ -2,8 +2,8 @@ use std::ops::Range;
 
 use iced::advanced::widget::{operation, Id as WidgetId, Operation};
 use iced::{
-    widget::{button, container, row, text, text_input, tooltip, Space},
-    Command, Element, Length,
+    widget::{button, column, container, row, text, text_input, tooltip},
+    Alignment, Command, Element, Length,
 };
 use regex::Regex;
 
@@ -328,6 +328,8 @@ impl SearchState {
         }
     }
 
+    /// The floating search card: find field with its match counter and the
+    /// regex / case chips, then the replace field with its two actions.
     pub fn view(&self, dark: bool) -> Element<'_, Message> {
         let count_label = if let Some(ref e) = self.last_error {
             e.clone()
@@ -339,90 +341,102 @@ impl SearchState {
         } else {
             String::new()
         };
+        let p = theme::palette(dark);
         let find_placeholder = t!("search.find_placeholder").to_string();
         let replace_placeholder = t!("search.replace_placeholder").to_string();
-        let find_label = t!("search.find").to_string();
         let replace_label = t!("search.replace").to_string();
         let replace_all_label = t!("search.replace_all").to_string();
         let case_sensitive_label = t!("search.case_sensitive").to_string();
         let regex_label = t!("search.regex").to_string();
 
-        let action = |label: String, message: Message| {
-            button(text(label).size(12))
-                .padding([4, 10])
+        // A toggle chip with its full label as a hover tooltip.
+        let chip = |label: &'static str, hint: String, active: bool, message: Message| {
+            let btn = button(text(label).size(11.5).font(theme::MONO))
+                .padding([5, 8])
                 .on_press(message)
-                .style(iced::theme::Button::custom(theme::GhostButton {
-                    dark,
-                    active: false,
-                }))
-        };
-        let nav = |label: &str, message: Message| {
-            button(text(label.to_string()).size(12))
-                .padding([4, 8])
-                .on_press(message)
-                .style(iced::theme::Button::custom(theme::GhostButton {
-                    dark,
-                    active: false,
-                }))
-        };
-        // A toggle button with its full label as a hover tooltip — same
-        // pattern as the preview pane's mode-switcher icons.
-        let toggle = |label: &'static str, hint: String, active: bool, message: Message| {
-            let btn = button(text(label).size(12))
-                .padding([4, 8])
-                .on_press(message)
-                .style(iced::theme::Button::custom(theme::GhostButton {
-                    dark,
-                    active,
-                }));
+                .style(iced::theme::Button::custom(theme::Chip { dark, active }));
             tooltip(btn, text(hint).size(11), tooltip::Position::Bottom)
                 .gap(4)
                 .padding(6)
-                .style(theme::card(dark))
+                .style(theme::tooltip(dark))
         };
 
-        let bar = row![
-            text_input(find_placeholder.as_str(), &self.query)
-                .id(find_field_id())
-                .on_input(|v| Message::Search(SearchMessage::QueryChanged(v)))
-                .on_submit(Message::Search(SearchMessage::Find))
-                .size(13)
-                .width(220),
-            toggle(
-                "Aa",
-                case_sensitive_label,
-                self.case_sensitive,
-                Message::Search(SearchMessage::ToggleCaseSensitive),
-            ),
-            toggle(
+        // The find field is always drawn focused (accent border): it is the
+        // card's primary input. Its counter sits inside, on the right.
+        let find_field = container(
+            row![
+                text_input(find_placeholder.as_str(), &self.query)
+                    .id(find_field_id())
+                    .on_input(|v| Message::Search(SearchMessage::QueryChanged(v)))
+                    .on_submit(Message::Search(SearchMessage::Find))
+                    .size(13)
+                    .padding(0)
+                    .style(iced::theme::TextInput::Custom(Box::new(theme::BareField {
+                        dark
+                    }))),
+                text(count_label).size(11.5).style(p.muted),
+            ]
+            .spacing(8)
+            .align_items(Alignment::Center),
+        )
+        .padding([0, 10])
+        .width(Length::Fill)
+        .height(30)
+        .center_y()
+        .style(theme::field(dark, true, theme::R_ROW));
+
+        let find_row = row![
+            find_field,
+            chip(
                 ".*",
                 regex_label,
                 self.use_regex,
                 Message::Search(SearchMessage::ToggleRegex),
             ),
-            nav("↑", Message::Search(SearchMessage::FindPrevious)),
-            nav("↓", Message::Search(SearchMessage::Find)),
+            chip(
+                "Aa",
+                case_sensitive_label,
+                self.case_sensitive,
+                Message::Search(SearchMessage::ToggleCaseSensitive),
+            ),
+        ]
+        .spacing(6)
+        .align_items(Alignment::Center);
+
+        let replace_field = container(
             text_input(replace_placeholder.as_str(), &self.replacement)
                 .id(replace_field_id())
                 .on_input(|v| Message::Search(SearchMessage::ReplaceChanged(v)))
                 .size(13)
-                .width(220),
-            action(find_label, Message::Search(SearchMessage::Find)),
-            action(replace_label, Message::Search(SearchMessage::Replace)),
-            action(
-                replace_all_label,
-                Message::Search(SearchMessage::ReplaceAll)
-            ),
-            text(count_label).size(12).style(theme::muted_text(dark)),
-            Space::with_width(Length::Fill),
-            action("✕".to_string(), Message::ToggleSearch),
-        ]
-        .spacing(8)
-        .padding([6, 10]);
+                .padding(0)
+                .style(iced::theme::TextInput::Custom(Box::new(theme::BareField {
+                    dark,
+                }))),
+        )
+        .padding([0, 10])
+        .width(Length::Fill)
+        .height(30)
+        .center_y()
+        .style(theme::field(dark, false, theme::R_ROW));
 
-        container(bar)
-            .width(Length::Fill)
-            .style(theme::bar(dark))
+        let replace_row = row![
+            replace_field,
+            button(text(replace_label).size(12))
+                .padding([6, 10])
+                .on_press(Message::Search(SearchMessage::Replace))
+                .style(iced::theme::Button::custom(theme::Outline { dark })),
+            button(text(replace_all_label).size(12).font(theme::UI_SEMIBOLD))
+                .padding([6, 10])
+                .on_press(Message::Search(SearchMessage::ReplaceAll))
+                .style(iced::theme::Button::custom(theme::Primary { dark })),
+        ]
+        .spacing(6)
+        .align_items(Alignment::Center);
+
+        container(column![find_row, replace_row].spacing(8))
+            .padding(10)
+            .width(392)
+            .style(theme::card(dark))
             .into()
     }
 }

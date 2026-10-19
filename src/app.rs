@@ -31,9 +31,8 @@ pub enum ActiveOverlay {
     About,
     GotoLine,
     LanguagePicker,
-    Shortcuts {
-        capturing: Option<ShortcutTarget>,
-    },
+    Shortcuts,
+    Palette,
     UpdateChecking,
     UpdateUpToDate,
     UpdateAvailable(String),
@@ -104,6 +103,11 @@ pub enum Message {
     SetLanguage(String),
     OpenShortcuts,
     StartCaptureShortcut(ShortcutTarget),
+    // Command palette
+    OpenPalette,
+    PaletteQueryChanged(String),
+    PaletteSubmit,
+    PaletteRun(crate::palette::PaletteCommand),
     // Line-level editing
     DuplicateLine,
     MoveLineUp,
@@ -152,6 +156,10 @@ pub struct SimpleEditApp {
     show_search: bool,
     show_sidebar: bool,
     show_preferences: bool,
+    /// The shortcut being rebound, while waiting for its new key.
+    capturing: Option<ShortcutTarget>,
+    palette_query: String,
+    palette_selected: usize,
     open_menu: Option<TopMenu>,
     /// Last known screen position of each menu button. Reused while a fresh
     /// query is in flight so switching menus doesn't flicker.
@@ -258,6 +266,9 @@ impl Application for SimpleEditApp {
             show_search: false,
             show_sidebar: true,
             show_preferences: false,
+            capturing: None,
+            palette_query: String::new(),
+            palette_selected: 0,
             open_menu: None,
             menu_bounds: HashMap::new(),
             current_file: None,
@@ -395,7 +406,7 @@ impl Application for SimpleEditApp {
     fn view(&self) -> Element<'_, Message> {
         let dark = self.config.dark_mode;
 
-        let menu_bar = crate::menu_bar::view(&self.config, self.open_menu);
+        let title_bar = crate::menu_bar::view(&self.config, self.open_menu);
 
         let preview_kind = self.preview_kind();
         let view_mode = if preview_kind.is_some() {
@@ -411,84 +422,16 @@ impl Application for SimpleEditApp {
         let editor_with_context: Element<'_, Message> = if view_mode == ViewMode::Preview {
             editor_widget
         } else {
-            let lbl_select_all = t!("ctx.select_all").to_string();
-            let lbl_cut = t!("ctx.cut").to_string();
-            let lbl_copy = t!("ctx.copy").to_string();
-            let lbl_paste = t!("ctx.paste").to_string();
-            let lbl_delete = t!("ctx.delete").to_string();
-            let lbl_format_sel = t!("ctx.format_selection").to_string();
-            let lbl_format_all = t!("ctx.format_all").to_string();
-            let has_fmt_ctx = self
-                .editor
-                .language
-                .as_deref()
-                .map(crate::formatter::has_formatter)
-                .unwrap_or(false);
-            let has_sel_ctx = self.editor.content.selection().is_some();
-            iced_aw::ContextMenu::new(editor_widget, move || {
-                let item = |label: String, msg: Message| -> Element<'static, Message> {
-                    button(text(label).size(13))
-                        .padding([6, 10])
-                        .width(Length::Fixed(200.0))
-                        .on_press(msg)
-                        .style(iced::theme::Button::custom(crate::theme::GhostButton {
-                            dark,
-                            active: false,
-                        }))
-                        .into()
-                };
-                let disabled = |label: String| -> Element<'static, Message> {
-                    container(text(label).size(13).style(crate::theme::muted_text(dark)))
-                        .padding([6, 10])
-                        .width(Length::Fixed(200.0))
-                        .into()
-                };
-                let fmt_sel_el: Element<'static, Message> = if has_fmt_ctx && has_sel_ctx {
-                    item(lbl_format_sel.clone(), Message::FormatSelection)
-                } else {
-                    disabled(lbl_format_sel.clone())
-                };
-                let fmt_all_el: Element<'static, Message> = if has_fmt_ctx {
-                    item(lbl_format_all.clone(), Message::FormatFile)
-                } else {
-                    disabled(lbl_format_all.clone())
-                };
-                let ctx_items: Vec<Element<'static, Message>> = vec![
-                    item(lbl_select_all.clone(), Message::SelectAll),
-                    item(lbl_cut.clone(), Message::ContextCut),
-                    item(lbl_copy.clone(), Message::ContextCopy),
-                    item(lbl_paste.clone(), Message::ContextPaste),
-                    item(lbl_delete.clone(), Message::ContextDelete),
-                    fmt_sel_el,
-                    fmt_all_el,
-                ];
-                container(column(ctx_items).spacing(2).padding(6))
-                    .style(crate::theme::card(dark))
-                    .into()
-            })
-            .into()
+            self.with_context_menu(editor_widget, dark)
         };
 
-        let search_panel = if self.show_search {
-            Some(self.search.view(dark))
-        } else {
-            None
-        };
-
-        let editor_area: Element<Message> = if let Some(search) = search_panel {
-            column![search, editor_with_context].into()
+        // The search card floats over the top-right corner of the editor.
+        let body: Element<'_, Message> = if self.show_search {
+            crate::floating::TopRight::new(editor_with_context, self.search.view(dark), 12.0, 16.0)
+                .into()
         } else {
             editor_with_context
         };
-
-        let mut main_row = row![];
-        if self.show_sidebar {
-            main_row = main_row.push(self.sidebar.view(dark, &self.current_file));
-        }
-        main_row = main_row.push(editor_area);
-        if self.show_preferences {
-            main_row = main_row.push(self.preferences.view(dark));
-        }
 
         let cursor = self.editor.content.cursor_position();
         let selection_info = self.editor.content.selection().map(|s| {
@@ -500,27 +443,27 @@ impl Application for SimpleEditApp {
                 format!("{}C", chars)
             }
         });
-        let file_size = self.file_size;
-        let status_bar = crate::editor::statusbar::view(
-            &self.status_message,
-            &self.current_file,
-            self.is_dirty,
+        let status_bar = crate::editor::statusbar::view(crate::editor::statusbar::Info {
+            status: &self.status_message,
+            is_error: self.status_is_error,
             dark,
             cursor,
-            self.status_is_error,
-            self.editor.language.as_deref(),
-            selection_info,
-            file_size,
-        );
+            language: self.editor.language.as_deref(),
+            selection: selection_info,
+            file_size: self.file_size,
+            use_spaces: self.config.use_spaces,
+            tab_width: self.config.tab_width,
+        });
 
         let error_panel: Option<Element<Message>> = if self.show_error_panel {
-            if let Some(err) = &self.format_error {
+            self.format_error.as_ref().map(|err| {
                 let header = row![
                     text(t!("panel.errors").to_string())
-                        .size(11)
+                        .size(10.5)
+                        .font(se_theme::UI_MEDIUM)
                         .style(se_theme::muted_text(dark)),
                     Space::with_width(Length::Fill),
-                    button(text("✕").size(11).style(se_theme::muted_text(dark)))
+                    button(text("×").size(16).style(se_theme::muted_text(dark)))
                         .padding([2, 6])
                         .on_press(Message::CloseErrorPanel)
                         .style(iced::theme::Button::custom(se_theme::GhostButton {
@@ -528,60 +471,79 @@ impl Application for SimpleEditApp {
                             active: false,
                         })),
                 ]
-                .padding([4, 10])
+                .padding([4, 14])
                 .align_items(Alignment::Center);
 
-                let error_color = iced::Color::from_rgb(0.88, 0.27, 0.18);
                 let body = scrollable(
                     container(
                         text(err.clone())
                             .size(12)
-                            .style(error_color)
-                            .font(iced::Font::MONOSPACE),
+                            .style(se_theme::error_color(dark))
+                            .font(se_theme::MONO),
                     )
-                    .padding([4, 12, 8, 12])
+                    .padding([4, 14, 8, 14])
                     .width(Length::Fill),
                 )
+                .style(iced::theme::Scrollable::Custom(Box::new(
+                    se_theme::Scrollbar { dark },
+                )))
                 .height(Length::Fixed(100.0));
 
-                Some(
-                    container(column![header, body])
-                        .width(Length::Fill)
-                        .style(se_theme::error_panel(dark))
-                        .into(),
-                )
-            } else {
-                None
-            }
+                container(column![rule(dark), header, body])
+                    .width(Length::Fill)
+                    .style(se_theme::error_panel(dark))
+                    .into()
+            })
         } else {
             None
         };
 
-        let mut col = if self.is_formatting {
-            let banner = container(
-                text(t!("status.formatting").to_string())
-                    .size(12)
-                    .style(se_theme::accent_color()),
-            )
-            .width(Length::Fill)
-            .padding([4, 14])
-            .style(se_theme::accent_banner(dark));
-            column![menu_bar, banner, main_row]
-        } else {
-            column![menu_bar, main_row]
-        };
-        if let Some(panel) = error_panel {
-            col = col.push(panel);
+        // The editor panel: toolbar, (formatting banner), body, (errors), status.
+        let mut panel = column![self.toolbar_view(preview_kind, view_mode, dark), rule(dark)];
+        if self.is_formatting {
+            panel = panel.push(
+                container(
+                    text(t!("status.formatting").to_string())
+                        .size(12)
+                        .style(se_theme::accent_color(dark)),
+                )
+                .width(Length::Fill)
+                .padding([4, 14])
+                .style(se_theme::accent_banner(dark)),
+            );
         }
-        let content = col
-            .push(status_bar)
-            .width(Length::Fill)
-            .height(Length::Fill);
-
-        // Base layout wrapped in a container
-        let base: Element<Message> = container(content)
+        panel = panel.push(body);
+        if let Some(errors) = error_panel {
+            panel = panel.push(errors);
+        }
+        let editor_panel = container(panel.push(status_bar))
             .width(Length::Fill)
             .height(Length::Fill)
+            .style(se_theme::editor_panel(dark));
+
+        // The floating panels, separated by a gap, on the window background.
+        let mut main_row = row![]
+            .spacing(se_theme::PANEL_GAP)
+            .padding(iced::Padding {
+                top: 0.0,
+                right: se_theme::PANEL_GAP,
+                bottom: se_theme::PANEL_GAP,
+                left: se_theme::PANEL_GAP,
+            })
+            .height(Length::Fill);
+        if self.show_sidebar {
+            main_row = main_row.push(self.sidebar.view(
+                dark,
+                &self.current_file,
+                &self.dirty_files(),
+            ));
+        }
+        main_row = main_row.push(editor_panel);
+
+        let base: Element<Message> = container(column![title_bar, main_row])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(se_theme::window(dark))
             .into();
 
         // Floating dropdown (menu bar)
@@ -612,61 +574,71 @@ impl Application for SimpleEditApp {
             base
         };
 
+        // The Preferences window floats over everything but the dialogs.
+        let with_prefs: Element<Message> = if self.show_preferences {
+            let window = container(self.preferences.view(&self.config, self.capturing))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .max_width(900)
+                .max_height(640);
+            iced_aw::Modal::new(
+                with_dropdown,
+                Some(
+                    container(window)
+                        .padding(40)
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .center_x()
+                        .center_y(),
+                ),
+            )
+            .backdrop(Message::TogglePreferences)
+            .on_esc(Message::EscapePressed)
+            .style(iced_aw::style::modal::ModalStyles::custom(
+                se_theme::Scrim { dark },
+            ))
+            .into()
+        } else {
+            with_dropdown
+        };
+
         // Modal overlays
         match &self.overlay {
-            ActiveOverlay::None => with_dropdown,
-            ActiveOverlay::About => {
-                let overlay = self.view_about_overlay(dark);
-                iced_aw::Modal::new(with_dropdown, Some(overlay))
-                    .backdrop(Message::CloseOverlay)
-                    .on_esc(Message::CloseOverlay)
-                    .into()
+            ActiveOverlay::None => with_prefs,
+            ActiveOverlay::Palette => {
+                let shown = self.palette_entries();
+                let card =
+                    crate::palette::view(dark, &self.palette_query, &shown, self.palette_selected);
+                iced_aw::Modal::new(
+                    with_prefs,
+                    Some(column![Space::with_height(84), card].align_items(Alignment::Center)),
+                )
+                .backdrop(Message::CloseOverlay)
+                .on_esc(Message::CloseOverlay)
+                .align_y(iced::alignment::Vertical::Top)
+                .style(iced_aw::style::modal::ModalStyles::custom(
+                    se_theme::Scrim { dark },
+                ))
+                .into()
             }
-            ActiveOverlay::GotoLine => {
-                let overlay = self.view_goto_line_overlay(dark);
-                iced_aw::Modal::new(with_dropdown, Some(overlay))
+            other => {
+                let overlay = match other {
+                    ActiveOverlay::About => self.view_about_overlay(dark),
+                    ActiveOverlay::GotoLine => self.view_goto_line_overlay(dark),
+                    ActiveOverlay::LanguagePicker => self.view_language_picker_overlay(dark),
+                    ActiveOverlay::Shortcuts => self.view_shortcuts_overlay(dark),
+                    ActiveOverlay::ConfirmOverwrite(path) => {
+                        self.view_overwrite_overlay(dark, path)
+                    }
+                    ActiveOverlay::ConfirmClose(path) => self.view_confirm_overlay(dark, path),
+                    _ => self.view_update_overlay(dark),
+                };
+                iced_aw::Modal::new(with_prefs, Some(overlay))
                     .backdrop(Message::CloseOverlay)
                     .on_esc(Message::CloseOverlay)
-                    .into()
-            }
-            ActiveOverlay::LanguagePicker => {
-                let overlay = self.view_language_picker_overlay(dark);
-                iced_aw::Modal::new(with_dropdown, Some(overlay))
-                    .backdrop(Message::CloseOverlay)
-                    .on_esc(Message::CloseOverlay)
-                    .into()
-            }
-            ActiveOverlay::Shortcuts { capturing } => {
-                let overlay = self.view_shortcuts_overlay(dark, *capturing);
-                iced_aw::Modal::new(with_dropdown, Some(overlay))
-                    .backdrop(Message::CloseOverlay)
-                    .on_esc(Message::CloseOverlay)
-                    .into()
-            }
-            ActiveOverlay::ConfirmOverwrite(path) => {
-                let overlay = self.view_overwrite_overlay(dark, path);
-                iced_aw::Modal::new(with_dropdown, Some(overlay))
-                    .backdrop(Message::CloseOverlay)
-                    .on_esc(Message::CloseOverlay)
-                    .into()
-            }
-            ActiveOverlay::ConfirmClose(path) => {
-                let overlay = self.view_confirm_overlay(dark, path);
-                iced_aw::Modal::new(with_dropdown, Some(overlay))
-                    .backdrop(Message::CloseOverlay)
-                    .on_esc(Message::CloseOverlay)
-                    .into()
-            }
-            ActiveOverlay::UpdateChecking
-            | ActiveOverlay::UpdateDownloading
-            | ActiveOverlay::UpdateInstalling
-            | ActiveOverlay::UpdateUpToDate
-            | ActiveOverlay::UpdateAvailable(_)
-            | ActiveOverlay::UpdateError(_) => {
-                let overlay = self.view_update_overlay(dark);
-                iced_aw::Modal::new(with_dropdown, Some(overlay))
-                    .backdrop(Message::CloseOverlay)
-                    .on_esc(Message::CloseOverlay)
+                    .style(iced_aw::style::modal::ModalStyles::custom(
+                        se_theme::Scrim { dark },
+                    ))
                     .into()
             }
         }
@@ -964,7 +936,12 @@ impl SimpleEditApp {
             }
             Message::ToggleSearch => {
                 self.show_search = !self.show_search;
-                Command::none()
+                if self.show_search {
+                    // Ready to type, as the card opens.
+                    text_input::focus(crate::search::find_field_id())
+                } else {
+                    Command::none()
+                }
             }
             Message::ToggleSidebar => {
                 self.show_sidebar = !self.show_sidebar;
@@ -1007,8 +984,9 @@ impl SimpleEditApp {
                 command
             }
             Message::Preferences(msg) => {
-                self.preferences.update(msg, &mut self.config);
-                self.config_dirty = true;
+                if self.preferences.update(msg, &mut self.config) {
+                    self.config_dirty = true;
+                }
                 Command::none()
             }
             Message::About => {
@@ -1176,6 +1154,7 @@ impl SimpleEditApp {
             }
             // --- Overlays ---
             Message::CloseOverlay => {
+                self.capturing = None;
                 self.overlay = ActiveOverlay::None;
                 Command::none()
             }
@@ -1209,14 +1188,38 @@ impl SimpleEditApp {
                 Command::none()
             }
             Message::OpenShortcuts => {
-                self.overlay = ActiveOverlay::Shortcuts { capturing: None };
+                self.capturing = None;
+                self.overlay = ActiveOverlay::Shortcuts;
                 Command::none()
             }
             Message::StartCaptureShortcut(target) => {
-                self.overlay = ActiveOverlay::Shortcuts {
-                    capturing: Some(target),
-                };
+                self.capturing = Some(target);
                 Command::none()
+            }
+            Message::OpenPalette => {
+                self.palette_query.clear();
+                self.palette_selected = 0;
+                self.overlay = ActiveOverlay::Palette;
+                text_input::focus(crate::palette::input_id())
+            }
+            Message::PaletteQueryChanged(query) => {
+                self.palette_query = query;
+                self.palette_selected = 0;
+                Command::none()
+            }
+            Message::PaletteSubmit => {
+                let shown = self.palette_entries();
+                match shown.get(self.palette_selected) {
+                    Some(entry) if entry.enabled => {
+                        let command = entry.command;
+                        self.handle(Message::PaletteRun(command))
+                    }
+                    _ => Command::none(),
+                }
+            }
+            Message::PaletteRun(command) => {
+                self.overlay = ActiveOverlay::None;
+                self.handle(command.message())
             }
             // Raw key forwarded from the subscription fn pointer
             Message::KeyPressed {
@@ -1226,11 +1229,7 @@ impl SimpleEditApp {
                 alt,
             } => {
                 // In shortcut capture mode: save the new binding
-                if let ActiveOverlay::Shortcuts {
-                    capturing: Some(target),
-                } = &self.overlay
-                {
-                    let target = *target;
+                if let Some(target) = self.capturing {
                     let sc = ShortcutConfig {
                         ctrl,
                         shift,
@@ -1252,11 +1251,27 @@ impl SimpleEditApp {
                     }
                     *self.config.shortcuts.slot_mut(target) = sc;
                     self.config.save();
-                    self.overlay = ActiveOverlay::Shortcuts { capturing: None };
+                    self.capturing = None;
                     return Command::none();
                 }
-                // Don't fire shortcuts while any overlay is open
-                if !matches!(self.overlay, ActiveOverlay::None) {
+                // The palette: arrows move the selection (Enter is the
+                // field's own submit, Escape closes).
+                if self.overlay == ActiveOverlay::Palette {
+                    let delta = match key.as_str() {
+                        "ArrowDown" => 1,
+                        "ArrowUp" => -1,
+                        _ => 0,
+                    };
+                    if delta != 0 {
+                        let len = self.palette_entries().len();
+                        self.palette_selected =
+                            crate::palette::step(self.palette_selected, delta, len);
+                    }
+                    return Command::none();
+                }
+                // Don't fire shortcuts while any overlay or the Preferences
+                // window is open
+                if !matches!(self.overlay, ActiveOverlay::None) || self.show_preferences {
                     return Command::none();
                 }
                 // Shift+Enter: previous match. Plain Enter is the search
@@ -1280,7 +1295,7 @@ impl SimpleEditApp {
                 };
                 let sh = &self.config.shortcuts;
                 // Order matters: Ctrl+Shift+S must be tried before Ctrl+S.
-                let bindings: [(&ShortcutConfig, Message); 17] = [
+                let bindings: [(&ShortcutConfig, Message); 18] = [
                     (&sh.undo, Message::Undo),
                     (&sh.redo, Message::Redo),
                     (&sh.duplicate_line, Message::DuplicateLine),
@@ -1297,6 +1312,7 @@ impl SimpleEditApp {
                     (&sh.select_all, Message::SelectAll),
                     (&sh.format_code, Message::FormatFile),
                     (&sh.goto_line, Message::OpenGotoLine),
+                    (&sh.command_palette, Message::OpenPalette),
                     (&sh.toggle_sidebar, Message::ToggleSidebar),
                 ];
                 let msg = bindings
@@ -1409,8 +1425,16 @@ impl SimpleEditApp {
                 }
             }
             Message::EscapePressed => {
-                if !matches!(self.overlay, ActiveOverlay::None) {
+                // Innermost first: a pending rebind, a dialog, the
+                // Preferences window, the search card.
+                if self.capturing.is_some() {
+                    self.capturing = None;
+                } else if !matches!(self.overlay, ActiveOverlay::None) {
                     self.overlay = ActiveOverlay::None;
+                } else if self.show_preferences {
+                    self.show_preferences = false;
+                } else if self.show_search {
+                    self.show_search = false;
                 }
                 Command::none()
             }
@@ -1916,8 +1940,8 @@ impl SimpleEditApp {
 // ─── Editor pane ────────────────────────────────────────────────────────────
 
 impl SimpleEditApp {
-    /// The editor pane: the text editor alone, or the mode toolbar above the
-    /// editor, the preview, or both side by side.
+    /// The editor pane: the text editor alone, the preview, or both side by
+    /// side (the mode switch lives in the panel's toolbar).
     fn editor_pane(
         &self,
         kind: Option<PreviewKind>,
@@ -1925,27 +1949,191 @@ impl SimpleEditApp {
         dark: bool,
     ) -> Element<'_, Message> {
         let search = self.show_search.then_some(&self.search);
-        let Some(kind) = kind else {
+        if kind.is_none() {
             return self.editor.view(&self.config, search);
-        };
+        }
 
-        let body: Element<'_, Message> = match mode {
+        match mode {
             ViewMode::Raw => self.editor.view(&self.config, search),
             ViewMode::Preview => self.preview_view(dark),
             ViewMode::Split => row![
-                container(self.editor.view(&self.config, search)).width(Length::FillPortion(1)),
+                container(self.editor.view(&self.config, search)).width(Length::FillPortion(54)),
                 container(Space::with_width(1))
                     .height(Length::Fill)
-                    .style(se_theme::gutter(dark)),
-                container(self.preview_view(dark)).width(Length::FillPortion(1)),
+                    .style(se_theme::rule(dark)),
+                container(self.preview_view(dark)).width(Length::FillPortion(46)),
             ]
             .height(Length::Fill)
             .into(),
+        }
+    }
+
+    /// The 40px bar above the editor: file name and folder on the left, the
+    /// Raw/Preview/Split switch (Markdown, JSON) or Format button on the right.
+    fn toolbar_view(
+        &self,
+        kind: Option<PreviewKind>,
+        mode: ViewMode,
+        dark: bool,
+    ) -> Element<'_, Message> {
+        let name = self
+            .current_file
+            .as_deref()
+            .map(file_label)
+            .unwrap_or_else(|| t!("app.untitled").to_string());
+        let dir = self
+            .current_file
+            .as_deref()
+            .filter(|p| !is_untitled(p))
+            .and_then(Path::parent)
+            .map(short_dir)
+            .unwrap_or_default();
+
+        let right: Element<Message> = match kind {
+            Some(kind) => crate::preview::segmented(kind, mode, dark),
+            None => {
+                let has_formatter = self
+                    .editor
+                    .language
+                    .as_deref()
+                    .is_some_and(crate::formatter::has_formatter);
+                button(text(t!("menu.edit_format").to_string()).size(12))
+                    .padding([5, 11])
+                    .on_press_maybe(has_formatter.then_some(Message::FormatFile))
+                    .style(iced::theme::Button::custom(se_theme::Outline { dark }))
+                    .into()
+            }
         };
 
-        column![crate::preview::toolbar(kind, mode, dark), body]
-            .height(Length::Fill)
+        row![
+            text(name).size(13).font(se_theme::UI_SEMIBOLD),
+            text(dir).size(12).style(se_theme::muted_text(dark)),
+            Space::with_width(Length::Fill),
+            right,
+        ]
+        .spacing(10)
+        .padding([0, 14])
+        .height(40)
+        .align_items(Alignment::Center)
+        .into()
+    }
+
+    /// Wraps the editor with the right-click menu.
+    fn with_context_menu<'a>(
+        &self,
+        editor_widget: Element<'a, Message>,
+        dark: bool,
+    ) -> Element<'a, Message> {
+        let lbl_select_all = t!("ctx.select_all").to_string();
+        let lbl_cut = t!("ctx.cut").to_string();
+        let lbl_copy = t!("ctx.copy").to_string();
+        let lbl_paste = t!("ctx.paste").to_string();
+        let lbl_delete = t!("ctx.delete").to_string();
+        let lbl_format_sel = t!("ctx.format_selection").to_string();
+        let lbl_format_all = t!("ctx.format_all").to_string();
+        let has_fmt_ctx = self
+            .editor
+            .language
+            .as_deref()
+            .map(crate::formatter::has_formatter)
+            .unwrap_or(false);
+        let has_sel_ctx = self.editor.content.selection().is_some();
+        let sh_select_all = self.config.shortcuts.select_all.display();
+        let sh_format_all = self.config.shortcuts.format_code.display();
+        // Cut/Copy/Paste are the platform's own keys, not configurable.
+        let clip = |letter: &str| {
+            if cfg!(target_os = "macos") {
+                format!("⌘{letter}")
+            } else {
+                format!("Ctrl+{letter}")
+            }
+        };
+        let (sh_cut, sh_copy, sh_paste) = (clip("X"), clip("C"), clip("V"));
+
+        iced_aw::ContextMenu::new(editor_widget, move || {
+            use crate::menu_bar::{disabled_item, item, separator};
+            let fmt_sel_el: Element<'static, Message> = if has_fmt_ctx && has_sel_ctx {
+                item(lbl_format_sel.clone(), None, dark, Message::FormatSelection)
+            } else {
+                disabled_item(lbl_format_sel.clone(), dark)
+            };
+            let fmt_all_el: Element<'static, Message> = if has_fmt_ctx {
+                item(
+                    lbl_format_all.clone(),
+                    Some(sh_format_all.clone()),
+                    dark,
+                    Message::FormatFile,
+                )
+            } else {
+                disabled_item(lbl_format_all.clone(), dark)
+            };
+            let ctx_items: Vec<Element<'static, Message>> = vec![
+                item(
+                    lbl_cut.clone(),
+                    Some(sh_cut.clone()),
+                    dark,
+                    Message::ContextCut,
+                ),
+                item(
+                    lbl_copy.clone(),
+                    Some(sh_copy.clone()),
+                    dark,
+                    Message::ContextCopy,
+                ),
+                item(
+                    lbl_paste.clone(),
+                    Some(sh_paste.clone()),
+                    dark,
+                    Message::ContextPaste,
+                ),
+                item(lbl_delete.clone(), None, dark, Message::ContextDelete),
+                item(
+                    lbl_select_all.clone(),
+                    Some(sh_select_all.clone()),
+                    dark,
+                    Message::SelectAll,
+                ),
+                separator(dark),
+                fmt_sel_el,
+                fmt_all_el,
+            ];
+            container(
+                column(ctx_items)
+                    .spacing(1)
+                    .padding(6)
+                    .width(Length::Fixed(232.0)),
+            )
+            .style(crate::theme::card(dark))
             .into()
+        })
+        .into()
+    }
+
+    /// Open files with unsaved changes (the dot in the sidebar).
+    fn dirty_files(&self) -> HashSet<PathBuf> {
+        let mut dirty: HashSet<PathBuf> = self
+            .file_cache
+            .iter()
+            .filter(|(_, entry)| entry.2)
+            .map(|(path, _)| path.clone())
+            .collect();
+        if let (true, Some(current)) = (self.is_dirty, &self.current_file) {
+            dirty.insert(current.clone());
+        }
+        dirty
+    }
+
+    /// The command palette's rows for the current query.
+    fn palette_entries(&self) -> Vec<crate::palette::Entry> {
+        let has_formatter = self
+            .editor
+            .language
+            .as_deref()
+            .is_some_and(crate::formatter::has_formatter);
+        crate::palette::filter(
+            crate::palette::entries(&self.config, has_formatter, self.language_picker_enabled()),
+            &self.palette_query,
+        )
     }
 
     /// The rendered document, or the parser error when the JSON is invalid.
@@ -1955,26 +2143,32 @@ impl SimpleEditApp {
             // rebuilding up to 20 000 JSON rows on every frame is wasteful.
             PreviewDoc::Markdown(blocks) => {
                 let blocks = blocks.clone();
-                iced::widget::lazy((self.preview_rev, dark), move |_| {
+                // The wrapper gives `lazy` (which reports a shrink size) the
+                // full pane.
+                container(iced::widget::lazy((self.preview_rev, dark), move |_| {
                     crate::preview::markdown::view(&blocks, dark)
-                })
+                }))
+                .width(Length::Fill)
+                .height(Length::Fill)
                 .into()
             }
             PreviewDoc::Json(value) => {
                 let (value, collapsed) = (value.clone(), self.json_collapsed.clone());
-                iced::widget::lazy((self.preview_rev, dark), move |_| {
+                container(iced::widget::lazy((self.preview_rev, dark), move |_| {
                     crate::preview::json::view(&value, &collapsed, dark)
-                })
+                }))
+                .width(Length::Fill)
+                .height(Length::Fill)
                 .into()
             }
             PreviewDoc::JsonError(err) => container(
                 column![
                     text(t!("preview.json_error").to_string())
                         .size(13)
-                        .style(iced::Color::from_rgb(0.88, 0.27, 0.18)),
+                        .style(se_theme::error_color(dark)),
                     text(err.clone())
                         .size(12)
-                        .font(iced::Font::MONOSPACE)
+                        .font(se_theme::MONO)
                         .style(se_theme::muted_text(dark)),
                 ]
                 .spacing(6),
@@ -2030,7 +2224,8 @@ impl SimpleEditApp {
             ]
             .spacing(12)
             .align_items(Alignment::Center)
-            .padding(36),
+            .padding(36)
+            .width(Length::Fill),
         )
         .width(320)
         .style(se_theme::card(dark))
@@ -2047,6 +2242,7 @@ impl SimpleEditApp {
             .spacing(12)
             .align_items(Alignment::Center)
             .padding(36)
+            .width(Length::Fill)
             .into(),
 
             ActiveOverlay::UpdateUpToDate => column![
@@ -2064,6 +2260,7 @@ impl SimpleEditApp {
             .spacing(12)
             .align_items(Alignment::Center)
             .padding(36)
+            .width(Length::Fill)
             .into(),
 
             ActiveOverlay::UpdateAvailable(version) => {
@@ -2093,6 +2290,7 @@ impl SimpleEditApp {
                 .spacing(16)
                 .align_items(Alignment::Center)
                 .padding(36)
+                .width(Length::Fill)
                 .into()
             }
 
@@ -2102,6 +2300,7 @@ impl SimpleEditApp {
             .spacing(12)
             .align_items(Alignment::Center)
             .padding(36)
+            .width(Length::Fill)
             .into(),
 
             ActiveOverlay::UpdateInstalling => column![text(t!("update.installing").to_string())
@@ -2110,6 +2309,7 @@ impl SimpleEditApp {
             .spacing(12)
             .align_items(Alignment::Center)
             .padding(36)
+            .width(Length::Fill)
             .into(),
 
             ActiveOverlay::UpdateError(e) => column![
@@ -2128,6 +2328,7 @@ impl SimpleEditApp {
             .spacing(12)
             .align_items(Alignment::Center)
             .padding(36)
+            .width(Length::Fill)
             .into(),
 
             _ => unreachable!(),
@@ -2172,8 +2373,11 @@ impl SimpleEditApp {
                     .id(goto_line_id())
                     .on_input(Message::GotoLineInputChanged)
                     .on_submit(Message::GotoLineSubmit)
-                    .padding(8)
-                    .size(14),
+                    .padding([8, 10])
+                    .size(14)
+                    .style(iced::theme::TextInput::Custom(Box::new(
+                        se_theme::Field::new(dark),
+                    ))),
                 row![
                     button(text(t!("goto_line.cancel").to_string()).size(13))
                         .padding([7, 16])
@@ -2212,7 +2416,10 @@ impl SimpleEditApp {
                     text(t!("language.auto").to_string()).size(13),
                     Space::with_width(Length::Fill),
                     if current_lang.is_empty() {
-                        text("✓").size(13).style(p.accent)
+                        text("✓")
+                            .size(13)
+                            .style(p.accent)
+                            .shaping(iced::widget::text::Shaping::Advanced)
                     } else {
                         text("").size(13)
                     },
@@ -2237,7 +2444,10 @@ impl SimpleEditApp {
                         text(*name).size(13),
                         Space::with_width(Length::Fill),
                         if is_current {
-                            text("✓").size(13).style(p.accent)
+                            text("✓")
+                                .size(13)
+                                .style(p.accent)
+                                .shaping(iced::widget::text::Shaping::Advanced)
                         } else {
                             text("").size(13)
                         },
@@ -2270,167 +2480,19 @@ impl SimpleEditApp {
         .into()
     }
 
-    fn view_shortcuts_overlay(
-        &self,
-        dark: bool,
-        capturing: Option<ShortcutTarget>,
-    ) -> Element<'_, Message> {
+    /// Help > Configure shortcuts: the same list as the Preferences page.
+    fn view_shortcuts_overlay(&self, dark: bool) -> Element<'_, Message> {
         let p = se_theme::palette(dark);
-        let sc = &self.config.shortcuts;
-
-        let rows_data: Vec<(ShortcutTarget, String, &crate::config::ShortcutConfig)> = vec![
-            (
-                ShortcutTarget::Undo,
-                t!("shortcuts.undo").to_string(),
-                &sc.undo,
-            ),
-            (
-                ShortcutTarget::Redo,
-                t!("shortcuts.redo").to_string(),
-                &sc.redo,
-            ),
-            (
-                ShortcutTarget::DuplicateLine,
-                t!("shortcuts.duplicate_line").to_string(),
-                &sc.duplicate_line,
-            ),
-            (
-                ShortcutTarget::MoveLineUp,
-                t!("shortcuts.move_line_up").to_string(),
-                &sc.move_line_up,
-            ),
-            (
-                ShortcutTarget::MoveLineDown,
-                t!("shortcuts.move_line_down").to_string(),
-                &sc.move_line_down,
-            ),
-            (
-                ShortcutTarget::ToggleComment,
-                t!("shortcuts.toggle_comment").to_string(),
-                &sc.toggle_comment,
-            ),
-            (
-                ShortcutTarget::DeleteLine,
-                t!("shortcuts.delete_line").to_string(),
-                &sc.delete_line,
-            ),
-            (
-                ShortcutTarget::NewFile,
-                t!("shortcuts.new_file").to_string(),
-                &sc.new_file,
-            ),
-            (
-                ShortcutTarget::OpenFile,
-                t!("shortcuts.open_file").to_string(),
-                &sc.open_file,
-            ),
-            (
-                ShortcutTarget::SaveFile,
-                t!("shortcuts.save_file").to_string(),
-                &sc.save_file,
-            ),
-            (
-                ShortcutTarget::SaveAs,
-                t!("shortcuts.save_as").to_string(),
-                &sc.save_as,
-            ),
-            (
-                ShortcutTarget::CloseFile,
-                t!("shortcuts.close_file").to_string(),
-                &sc.close_file,
-            ),
-            (
-                ShortcutTarget::Find,
-                t!("shortcuts.find").to_string(),
-                &sc.find,
-            ),
-            (
-                ShortcutTarget::SelectAll,
-                t!("shortcuts.select_all").to_string(),
-                &sc.select_all,
-            ),
-            (
-                ShortcutTarget::FormatCode,
-                t!("shortcuts.format_code").to_string(),
-                &sc.format_code,
-            ),
-            (
-                ShortcutTarget::GotoLine,
-                t!("shortcuts.goto_line").to_string(),
-                &sc.goto_line,
-            ),
-            (
-                ShortcutTarget::ToggleSidebar,
-                t!("shortcuts.toggle_sidebar").to_string(),
-                &sc.toggle_sidebar,
-            ),
-            (
-                ShortcutTarget::Quit,
-                t!("shortcuts.quit").to_string(),
-                &sc.quit,
-            ),
-        ];
-
-        let mut rows: Vec<Element<Message>> = vec![row![
-            text(t!("shortcuts.action").to_string())
-                .size(11)
-                .style(p.muted),
-            Space::with_width(Length::Fill),
-            text(t!("shortcuts.key").to_string())
-                .size(11)
-                .style(p.muted),
-        ]
-        .padding([4, 12])
-        .into()];
-
-        for (target, label_str, shortcut) in &rows_data {
-            let target = *target;
-            let is_capturing = capturing == Some(target);
-            let key_label = if is_capturing {
-                t!("shortcuts.capturing").to_string()
-            } else {
-                shortcut.display()
-            };
-
-            let sc_btn = button(
-                text(key_label)
-                    .size(12)
-                    .style(if is_capturing { p.accent } else { p.text })
-                    .font(iced::Font::MONOSPACE),
-            )
-            .padding([4, 10])
-            .on_press(Message::StartCaptureShortcut(target))
-            .style(iced::theme::Button::custom(se_theme::GhostButton {
-                dark,
-                active: is_capturing,
-            }));
-
-            rows.push(
-                row![
-                    text(label_str.clone()).size(13).style(p.text),
-                    Space::with_width(Length::Fill),
-                    sc_btn,
-                ]
-                .padding([3, 12])
-                .align_items(Alignment::Center)
-                .into(),
-            );
-        }
-
-        let hint = if capturing.is_some() {
-            t!("shortcuts.capturing").to_string()
-        } else {
-            t!("shortcuts.click_to_rebind").to_string()
-        };
 
         container(
             column![
                 row![
                     text(t!("shortcuts.title").to_string())
                         .size(14)
+                        .font(se_theme::UI_SEMIBOLD)
                         .style(p.text),
                     Space::with_width(Length::Fill),
-                    button(text("✕").size(12))
+                    button(text("×").size(17))
                         .padding([4, 8])
                         .on_press(Message::CloseOverlay)
                         .style(iced::theme::Button::custom(se_theme::GhostButton {
@@ -2439,13 +2501,20 @@ impl SimpleEditApp {
                         })),
                 ]
                 .align_items(Alignment::Center),
-                scrollable(column(rows).spacing(2)).height(Length::Fixed(380.0)),
-                text(hint).size(11).style(p.muted),
+                scrollable(crate::preferences::shortcuts_list(
+                    dark,
+                    &self.config,
+                    self.capturing,
+                ))
+                .style(iced::theme::Scrollable::Custom(Box::new(
+                    se_theme::Scrollbar { dark },
+                )))
+                .height(Length::Fixed(420.0)),
             ]
-            .spacing(10)
+            .spacing(12)
             .padding(20),
         )
-        .width(400)
+        .width(460)
         .style(se_theme::card(dark))
         .into()
     }
@@ -2748,6 +2817,31 @@ fn confirm_card(
     .width(360)
     .style(se_theme::card(dark))
     .into()
+}
+
+/// A 1px horizontal hairline.
+fn rule<'a>(dark: bool) -> Element<'a, Message> {
+    container(Space::with_height(1))
+        .width(Length::Fill)
+        .style(se_theme::rule(dark))
+        .into()
+}
+
+/// A folder for the toolbar: the home directory shown as `~`, with a
+/// trailing slash.
+fn short_dir(dir: &Path) -> String {
+    let shown = match dirs::home_dir()
+        .and_then(|home| dir.strip_prefix(&home).ok().map(Path::to_path_buf))
+    {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => dir.display().to_string(),
+    };
+    if shown.ends_with('/') {
+        shown
+    } else {
+        format!("{shown}/")
+    }
 }
 
 fn goto_line_id() -> text_input::Id {

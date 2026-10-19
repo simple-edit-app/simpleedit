@@ -8,7 +8,7 @@ use std::collections::HashSet;
 
 use iced::{
     widget::{button, column, container, row, scrollable, text, Space},
-    Alignment, Color, Element, Font, Length,
+    Alignment, Color, Element, Length,
 };
 use serde_json::Value;
 
@@ -81,27 +81,15 @@ fn brackets(value: &Value) -> (&'static str, &'static str, usize) {
 // ─── Rendering ──────────────────────────────────────────────────────────────
 
 fn string_color(dark: bool) -> Color {
-    if dark {
-        Color::from_rgb(0.30, 0.75, 0.56)
-    } else {
-        Color::from_rgb(0.13, 0.45, 0.32)
-    }
+    theme::syntax(dark).string
 }
 
 fn number_color(dark: bool) -> Color {
-    if dark {
-        Color::from_rgb(0.90, 0.66, 0.38)
-    } else {
-        Color::from_rgb(0.66, 0.38, 0.13)
-    }
+    theme::syntax(dark).number
 }
 
 fn literal_color(dark: bool) -> Color {
-    if dark {
-        Color::from_rgb(0.78, 0.60, 0.92)
-    } else {
-        Color::from_rgb(0.51, 0.29, 0.71)
-    }
+    theme::syntax(dark).type_
 }
 
 fn scalar_color(value: &Value, dark: bool) -> Color {
@@ -122,7 +110,7 @@ fn mono(content: String, size: f32, color: Color) -> iced::widget::Text<'static>
     // string value, chiefly) falls back to another installed font.
     text(content)
         .size(size)
-        .font(Font::MONOSPACE)
+        .font(theme::MONO)
         .style(color)
         .shaping(iced::widget::text::Shaping::Advanced)
 }
@@ -155,10 +143,13 @@ pub fn view(value: &Value, collapsed: &HashSet<String>, dark: bool) -> Element<'
     }
 
     scrollable(
-        container(column(rows).spacing(1))
+        container(column(rows).spacing(2))
             .width(Length::Fill)
-            .padding([12, 16]),
+            .padding([22, 28]),
     )
+    .style(iced::theme::Scrollable::Custom(Box::new(
+        theme::Scrollbar { dark },
+    )))
     .width(Length::Fill)
     .height(Length::Fill)
     .into()
@@ -198,7 +189,7 @@ fn push_node(
         rows.push(
             line(depth)
                 .push(Space::with_width(Length::Fixed(CHEVRON_WIDTH)))
-                .push(key_label(key))
+                .push(key_label(key, dark))
                 .push(mono(format!("{}{}", value_text, tail), SIZE, color))
                 .into(),
         );
@@ -212,7 +203,7 @@ fn push_node(
         rows.push(
             line(depth)
                 .push(chevron(path.to_string(), false, dark))
-                .push(key_label(key))
+                .push(key_label(key, dark))
                 .push(mono(format!("{} … {}{}", open, close, tail), SIZE, muted))
                 .push(mono(format!("  ({})", count), SIZE - 1.0, muted))
                 .into(),
@@ -223,7 +214,7 @@ fn push_node(
     rows.push(
         line(depth)
             .push(chevron(path.to_string(), true, dark))
-            .push(key_label(key))
+            .push(key_label(key, dark))
             .push(mono(open.to_string(), SIZE, muted))
             .into(),
     );
@@ -279,12 +270,12 @@ fn line(depth: usize) -> iced::widget::Row<'static, Message> {
     row![Space::with_width(Length::Fixed(depth as f32 * INDENT))].align_items(Alignment::Center)
 }
 
-fn key_label(key: Option<&str>) -> Element<'static, Message> {
+fn key_label(key: Option<&str>, dark: bool) -> Element<'static, Message> {
     match key {
         Some(k) => mono(
             format!("{}: ", scalar_text(&Value::String(k.to_string()))),
             SIZE,
-            theme::accent_color(),
+            theme::syntax(dark).function,
         )
         .into(),
         None => Space::with_width(Length::Fixed(0.0)).into(),
@@ -294,6 +285,9 @@ fn key_label(key: Option<&str>) -> Element<'static, Message> {
 fn chevron(path: String, open: bool, dark: bool) -> Element<'static, Message> {
     button(
         text(if open { "▼" } else { "▶" })
+            // Advanced shaping lets cosmic-text fall back to a system font
+            // for these arrows, which the UI font doesn't have.
+            .shaping(iced::widget::text::Shaping::Advanced)
             .size(9)
             .style(theme::muted_text(dark)),
     )

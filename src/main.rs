@@ -14,10 +14,12 @@ mod app;
 mod code_editor;
 mod config;
 mod editor;
+mod floating;
 mod formatter;
 mod fsutil;
 mod i18n;
 mod menu_bar;
+mod palette;
 mod preferences;
 mod preview;
 mod search;
@@ -49,6 +51,8 @@ fn main() -> iced::Result {
 
     app::SimpleEditApp::run(Settings {
         flags: file_arg,
+        fonts: theme::font_files(),
+        default_font: theme::UI,
         window: window::Settings {
             // Closing the window goes through the app (Message::Quit) so the
             // session is saved first.

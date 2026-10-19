@@ -627,39 +627,36 @@ pub fn find_offset_command(href: &str) -> Command<Option<f32>> {
 
 // ─── Rendering ──────────────────────────────────────────────────────────────
 
-const BODY_SIZE: f32 = 15.0;
+const BODY_SIZE: f32 = 14.0;
 
 fn heading_size(level: u8) -> f32 {
     match level {
-        1 => 27.0,
-        2 => 23.0,
-        3 => 20.0,
-        4 => 17.0,
-        5 => 15.0,
+        1 => 28.0,
+        2 => 17.0,
+        3 => 15.0,
         _ => 14.0,
     }
 }
 
-fn bold_font() -> Font {
-    Font {
-        weight: iced::font::Weight::Bold,
-        ..Font::DEFAULT
+/// The title is bold, the other headings semibold.
+fn heading_font(level: u8) -> Font {
+    if level == 1 {
+        theme::UI_BOLD
+    } else {
+        theme::UI_SEMIBOLD
     }
+}
+
+fn bold_font() -> Font {
+    theme::UI_BOLD
 }
 
 fn italic_font() -> Font {
-    Font {
-        style: iced::font::Style::Italic,
-        ..Font::DEFAULT
-    }
+    theme::UI_ITALIC
 }
 
 fn bold_italic_font() -> Font {
-    Font {
-        weight: iced::font::Weight::Bold,
-        style: iced::font::Style::Italic,
-        ..Font::DEFAULT
-    }
+    theme::UI_BOLD_ITALIC
 }
 
 /// The rendered document, scrollable.
@@ -674,8 +671,11 @@ pub fn view(blocks: &[Block], dark: bool) -> Element<'static, Message> {
     scrollable(
         container(column(body).spacing(12))
             .width(Length::Fill)
-            .padding([16, 24]),
+            .padding([22, 28]),
     )
+    .style(iced::theme::Scrollable::Custom(Box::new(
+        theme::Scrollbar { dark },
+    )))
     .id(scrollable_id())
     .width(Length::Fill)
     .height(Length::Fill)
@@ -686,47 +686,67 @@ fn block_view(block: &Block, dark: bool, slug: Option<&str>) -> Element<'static,
     let p = theme::palette(dark);
     match block {
         Block::Heading { level, spans } => {
-            let heading = spans_view(spans, heading_size(*level), p.text, dark, bold_font());
+            let heading = spans_view(
+                spans,
+                heading_size(*level),
+                p.text,
+                dark,
+                heading_font(*level),
+            );
             match slug {
                 Some(slug) => container(heading).id(anchor_id(slug)).into(),
                 None => heading,
             }
         }
-        Block::Paragraph(spans) => spans_view(spans, BODY_SIZE, p.text, dark, Font::DEFAULT),
-        Block::Quote(spans) => {
-            container(spans_view(spans, BODY_SIZE, p.muted, dark, italic_font()))
-                .width(Length::Fill)
-                .padding([8, 14])
-                .style(theme::quote_block(dark))
-                .into()
-        }
+        Block::Paragraph(spans) => spans_view(spans, BODY_SIZE, p.text, dark, theme::UI),
+        Block::Quote(spans) => container(spans_view(spans, BODY_SIZE, p.text, dark, theme::UI))
+            .width(Length::Fill)
+            .padding([10, 14])
+            .style(theme::quote_block(dark))
+            .into(),
         Block::ListItem {
             depth,
             marker,
             spans,
-        } => row![
-            Space::with_width(Length::Fixed(8.0 + *depth as f32 * 18.0)),
-            text(marker.clone())
-                .size(BODY_SIZE)
-                .style(theme::muted_text(dark)),
-            Space::with_width(Length::Fixed(8.0)),
-            spans_view(spans, BODY_SIZE, p.text, dark, Font::DEFAULT),
-        ]
-        .into(),
+        } => {
+            // Bullets are a small accent dot; numbers stay muted text.
+            let marker: Element<'static, Message> = if marker == "•" {
+                container(container(Space::new(5, 5)).style(theme::dot(p.accent)))
+                    .padding(iced::Padding {
+                        top: 8.0,
+                        right: 0.0,
+                        bottom: 0.0,
+                        left: 0.0,
+                    })
+                    .into()
+            } else {
+                text(marker.clone())
+                    .size(BODY_SIZE)
+                    .style(theme::muted_text(dark))
+                    .into()
+            };
+            row![
+                Space::with_width(Length::Fixed(*depth as f32 * 18.0)),
+                marker,
+                Space::with_width(Length::Fixed(10.0)),
+                spans_view(spans, BODY_SIZE, p.text, dark, theme::UI),
+            ]
+            .into()
+        }
         Block::Code(code) => container(
             text(code.clone())
-                .size(13.0)
-                .font(Font::MONOSPACE)
+                .size(12.0)
+                .font(theme::MONO)
                 .style(p.text)
                 .shaping(iced::widget::text::Shaping::Advanced),
         )
         .width(Length::Fill)
-        .padding([10, 14])
+        .padding([12, 14])
         .style(theme::code_block(dark))
         .into(),
         Block::Rule => container(Space::with_height(1))
             .width(Length::Fill)
-            .style(theme::gutter(dark))
+            .style(theme::rule(dark))
             .into(),
         Block::Table {
             alignments,
@@ -760,11 +780,7 @@ fn table_view(
     // it's Grid's own single, table-wide `horizontal_alignment` instead,
     // applied only when every column actually agrees on one.
     let cell = |spans: &[Span], is_header: bool| -> Element<'static, Message> {
-        let font = if is_header {
-            bold_font()
-        } else {
-            Font::DEFAULT
-        };
+        let font = if is_header { bold_font() } else { theme::UI };
         container(spans_view(spans, BODY_SIZE, p.text, dark, font))
             .padding([6, 10])
             .into()
@@ -781,7 +797,7 @@ fn table_view(
         for _ in 0..columns {
             let line: Element<'static, Message> = container(Space::with_height(Length::Fixed(1.0)))
                 .width(Length::Fill)
-                .style(theme::gutter(dark))
+                .style(theme::rule(dark))
                 .into();
             row = row.push(line);
         }
@@ -982,9 +998,7 @@ fn spans_view(
     dark: bool,
     base_font: Font,
 ) -> Element<'static, Message> {
-    let accent = theme::accent_color();
-    let muted = theme::muted_text(dark);
-
+    let accent = theme::accent_color(dark);
     let mut clusters: Vec<Element<'static, Message>> = Vec::new();
     let mut cluster: Vec<Element<'static, Message>> = Vec::new();
 
@@ -1007,7 +1021,7 @@ fn spans_view(
                 Style::Bold => widget.font(bold_font()).style(color),
                 Style::Italic => widget.font(italic_font()).style(color),
                 Style::BoldItalic => widget.font(bold_italic_font()).style(color),
-                Style::Code => widget.font(Font::MONOSPACE).size(size - 1.0).style(muted),
+                Style::Code => widget.font(theme::MONO).size(size - 1.5).style(color),
                 Style::Link => widget.font(base_font).style(accent),
             };
             // Only in-document anchors (`#slug`) are wired up to jump

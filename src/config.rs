@@ -13,6 +13,7 @@ pub enum ShortcutTarget {
     SelectAll,
     FormatCode,
     GotoLine,
+    CommandPalette,
     ToggleSidebar,
     Quit,
     Undo,
@@ -60,7 +61,12 @@ impl ShortcutConfig {
         }
     }
 
+    /// How the binding is shown: `Ctrl+Shift+S` (or `Cmd`-style glyphs on
+    /// macOS, in the platform's order: ⌥⇧⌘S).
     pub fn display(&self) -> String {
+        if cfg!(target_os = "macos") {
+            return self.display_mac();
+        }
         let mut s = String::new();
         if self.ctrl {
             s.push_str("Ctrl+");
@@ -78,6 +84,29 @@ impl ShortcutConfig {
         }
         s
     }
+
+    fn display_mac(&self) -> String {
+        let mut s = String::new();
+        if self.alt {
+            s.push('⌥');
+        }
+        if self.shift {
+            s.push('⇧');
+        }
+        if self.ctrl {
+            s.push('⌘');
+        }
+        s.push_str(&match self.key.as_str() {
+            "ArrowUp" => "↑".to_string(),
+            "ArrowDown" => "↓".to_string(),
+            "ArrowLeft" => "←".to_string(),
+            "ArrowRight" => "→".to_string(),
+            "Return" => "↩".to_string(),
+            k if k.len() == 1 => k.to_uppercase(),
+            k => k.to_string(),
+        });
+        s
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +121,7 @@ pub struct Shortcuts {
     pub select_all: ShortcutConfig,
     pub format_code: ShortcutConfig,
     pub goto_line: ShortcutConfig,
+    pub command_palette: ShortcutConfig,
     pub toggle_sidebar: ShortcutConfig,
     pub quit: ShortcutConfig,
     pub undo: ShortcutConfig,
@@ -132,6 +162,7 @@ impl Shortcuts {
             ShortcutTarget::SelectAll => &mut self.select_all,
             ShortcutTarget::FormatCode => &mut self.format_code,
             ShortcutTarget::GotoLine => &mut self.goto_line,
+            ShortcutTarget::CommandPalette => &mut self.command_palette,
             ShortcutTarget::ToggleSidebar => &mut self.toggle_sidebar,
             ShortcutTarget::Quit => &mut self.quit,
             ShortcutTarget::Undo => &mut self.undo,
@@ -153,7 +184,7 @@ impl Shortcuts {
     }
 }
 
-const ALL_TARGETS: [ShortcutTarget; 18] = [
+const ALL_TARGETS: [ShortcutTarget; 19] = [
     ShortcutTarget::NewFile,
     ShortcutTarget::OpenFile,
     ShortcutTarget::SaveFile,
@@ -163,6 +194,7 @@ const ALL_TARGETS: [ShortcutTarget; 18] = [
     ShortcutTarget::SelectAll,
     ShortcutTarget::FormatCode,
     ShortcutTarget::GotoLine,
+    ShortcutTarget::CommandPalette,
     ShortcutTarget::ToggleSidebar,
     ShortcutTarget::Quit,
     ShortcutTarget::Undo,
@@ -186,6 +218,7 @@ impl Default for Shortcuts {
             select_all: ShortcutConfig::ctrl("a"),
             format_code: ShortcutConfig::ctrl_shift("f"),
             goto_line: ShortcutConfig::ctrl("g"),
+            command_palette: ShortcutConfig::ctrl_shift("p"),
             toggle_sidebar: ShortcutConfig::ctrl("b"),
             quit: ShortcutConfig::ctrl("q"),
             undo: ShortcutConfig::ctrl("z"),
@@ -213,6 +246,11 @@ pub struct Config {
     pub auto_indent: bool,
     pub autocomplete_brackets: bool,
     pub autocomplete_quotes: bool,
+    /// Wash over the line the cursor is on.
+    pub highlight_current_line: bool,
+    /// A vertical guide at `page_guide_column`.
+    pub show_page_guide: bool,
+    pub page_guide_column: usize,
     pub locale: String,
     pub shortcuts: Shortcuts,
     pub recent_files: Vec<String>,
@@ -229,6 +267,9 @@ impl Default for Config {
             auto_indent: true,
             autocomplete_brackets: true,
             autocomplete_quotes: true,
+            highlight_current_line: true,
+            show_page_guide: false,
+            page_guide_column: 80,
             locale: "en".to_string(),
             shortcuts: Shortcuts::default(),
             recent_files: Vec::new(),

@@ -14,6 +14,7 @@
 //!   two padding components).
 
 use iced::advanced::clipboard::{self, Clipboard};
+use iced::advanced::graphics::text::cosmic_text::Cursor as Cursor_;
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::mouse;
 use iced::advanced::renderer::{self, Renderer as _};
@@ -29,6 +30,7 @@ use iced::{Color, Element, Font, Length, Padding, Pixels, Point, Rectangle, Size
 
 use std::cell::RefCell;
 use std::ops::DerefMut;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -40,18 +42,67 @@ type Editor = <iced::Renderer as TextRenderer>::Editor;
 /// The line-number column of a [`CodeEditor`].
 #[derive(Debug, Clone, Copy)]
 pub struct Gutter {
-    pub background: Color,
+    /// Color of the numbers.
     pub text: Color,
-    pub border: Color,
+    /// Color of the current line's number.
+    pub current: Color,
+}
+
+/// Wash over the cursor's line, with an accent bar on its left edge.
+#[derive(Debug, Clone, Copy)]
+pub struct LineHighlight {
+    pub background: Color,
+    pub bar: Color,
+}
+
+/// What to paint for an active search: a background behind every match, and
+/// a stronger one behind the current match.
+#[derive(Debug, Clone)]
+pub struct SearchPaint {
+    pub query: String,
+    pub case_sensitive: bool,
+    pub use_regex: bool,
+    /// (line, byte range within the line) of the current match.
+    pub current: Option<(usize, Range<usize>)>,
+    pub color: Color,
+    pub current_color: Color,
+    pub current_border: Color,
 }
 
 /// Space between the gutter and the text.
-const GUTTER_GAP: f32 = 10.0;
+const GUTTER_GAP: f32 = 6.0;
 
 /// Width of the gutter for a buffer of `lines` lines at text size `size`.
 fn gutter_width(size: f32, lines: usize) -> f32 {
-    let digits = lines.max(1).to_string().len().max(3);
-    digits as f32 * size * 0.62 + 20.0
+    let digits = lines.max(1).to_string().len().max(2);
+    (digits as f32 * size * 0.6 + 26.0).max(46.0)
+}
+
+/// Byte ranges of the matches of `paint` in one line of text.
+fn line_matches(
+    line: &str,
+    paint: &SearchPaint,
+    regex: Option<&regex::Regex>,
+) -> Vec<Range<usize>> {
+    if paint.query.is_empty() {
+        return Vec::new();
+    }
+    if paint.use_regex {
+        regex
+            .map(|re| {
+                re.find_iter(line)
+                    .filter(|m| !m.is_empty())
+                    .map(|m| m.range())
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else if paint.case_sensitive {
+        line.match_indices(paint.query.as_str())
+            .map(|(i, m)| i..i + m.len())
+            .collect()
+    } else {
+        crate::search::find_literal_ci(line, &paint.query)
+    }
 }
 
 /// A multi-line text input.
@@ -69,6 +120,10 @@ where
     height: Length,
     padding: Padding,
     gutter: Option<Gutter>,
+    line_highlight: Option<LineHighlight>,
+    search: Option<SearchPaint>,
+    /// Column and color of a vertical page guide.
+    guide: Option<(usize, Color)>,
     style: Theme::Style,
     on_edit: Option<Box<dyn Fn(Action) -> Message + 'a>>,
     highlighter_settings: Highlighter::Settings,
@@ -89,6 +144,9 @@ where
             height: Length::Shrink,
             padding: Padding::new(5.0),
             gutter: None,
+            line_highlight: None,
+            search: None,
+            guide: None,
             style: Default::default(),
             on_edit: None,
             highlighter_settings: (),
@@ -130,6 +188,34 @@ where
         self
     }
 
+    pub fn font(mut self, font: Font) -> Self {
+        self.font = Some(font);
+        self
+    }
+
+    pub fn line_height(mut self, line_height: LineHeight) -> Self {
+        self.line_height = line_height;
+        self
+    }
+
+    /// Washes the cursor's line.
+    pub fn line_highlight(mut self, highlight: LineHighlight) -> Self {
+        self.line_highlight = Some(highlight);
+        self
+    }
+
+    /// Paints search matches behind the text.
+    pub fn search(mut self, paint: SearchPaint) -> Self {
+        self.search = Some(paint);
+        self
+    }
+
+    /// Draws a vertical guide after `column` characters (monospace fonts).
+    pub fn page_guide(mut self, column: usize, color: Color) -> Self {
+        self.guide = Some((column, color));
+        self
+    }
+
     pub fn highlight<H: text::Highlighter>(
         self,
         settings: H::Settings,
@@ -144,6 +230,9 @@ where
             height: self.height,
             padding: self.padding,
             gutter: self.gutter,
+            line_highlight: self.line_highlight,
+            search: self.search,
+            guide: self.guide,
             style: self.style,
             on_edit: self.on_edit,
             highlighter_settings: settings,
@@ -558,9 +647,110 @@ where
         let padding = self.text_padding(renderer, internal.editor.line_count());
         let origin = bounds.position() + Vector::new(padding.left, padding.top);
 
+        let size = self.size_px(renderer);
+        let row_height = self.line_height.to_absolute(Pixels(size)).0;
+        let cursor_line = internal.editor.cursor_position().0;
+
+        // Behind the text: the page guide, the cursor line's wash and the
+        // search matches. (Text is always painted above quads.)
+        if let Some((column, color)) = self.guide {
+            // JetBrains Mono's advance is 0.6 em.
+            let x = origin.x + column as f32 * size * 0.6;
+            if x < bounds.x + bounds.width {
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: Rectangle {
+                            x,
+                            y: bounds.y,
+                            width: 1.0,
+                            height: bounds.height,
+                        },
+                        ..renderer::Quad::default()
+                    },
+                    color,
+                );
+            }
+        }
+        let regex = self
+            .search
+            .as_ref()
+            .filter(|p| p.use_regex)
+            .and_then(|p| crate::search::build_regex(&p.query, p.case_sensitive).ok());
+        for run in internal.editor.buffer().layout_runs() {
+            let top = bounds.y + padding.top + run.line_top;
+            if let Some(highlight) = self.line_highlight.filter(|_| run.line_i == cursor_line) {
+                let left = origin.x - GUTTER_GAP;
+                let band = Rectangle {
+                    x: left,
+                    y: top,
+                    width: bounds.x + bounds.width - left,
+                    height: row_height,
+                };
+                if let Some(band) = bounds.intersection(&band) {
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: band,
+                            ..renderer::Quad::default()
+                        },
+                        highlight.background,
+                    );
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: Rectangle { width: 2.0, ..band },
+                            ..renderer::Quad::default()
+                        },
+                        highlight.bar,
+                    );
+                }
+            }
+            if let Some(paint) = &self.search {
+                for range in line_matches(run.text, paint, regex.as_ref()) {
+                    let current = paint
+                        .current
+                        .as_ref()
+                        .is_some_and(|(l, r)| *l == run.line_i && *r == range);
+                    let span = run.highlight(
+                        Cursor_::new(run.line_i, range.start),
+                        Cursor_::new(run.line_i, range.end),
+                    );
+                    let Some((x, width)) = span else { continue };
+                    let rect = Rectangle {
+                        x: origin.x + x,
+                        y: top,
+                        width,
+                        height: row_height,
+                    };
+                    let Some(rect) = bounds.intersection(&rect) else {
+                        continue;
+                    };
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: rect,
+                            border: iced::Border {
+                                color: if current {
+                                    paint.current_border
+                                } else {
+                                    Color::TRANSPARENT
+                                },
+                                width: if current { 1.0 } else { 0.0 },
+                                radius: 3.0.into(),
+                            },
+                            ..renderer::Quad::default()
+                        },
+                        if current {
+                            paint.current_color
+                        } else {
+                            paint.color
+                        },
+                    );
+                }
+            }
+        }
+
         renderer.fill_editor(&internal.editor, origin, style.text_color, *viewport);
 
         let translation = Vector::new(bounds.x + padding.left, bounds.y + padding.top);
+        let caret_height = (size * 1.3).min(row_height);
 
         if state.is_focused {
             match internal.editor.cursor() {
@@ -572,15 +762,11 @@ where
                             renderer::Quad {
                                 bounds: Rectangle {
                                     x: position.x,
-                                    y: position.y,
-                                    width: 1.0,
-                                    height: self
-                                        .line_height
-                                        .to_absolute(
-                                            self.text_size
-                                                .unwrap_or_else(|| renderer.default_size()),
-                                        )
-                                        .into(),
+                                    // A caret a little shorter than the row,
+                                    // centred in it.
+                                    y: position.y + (row_height - caret_height) / 2.0,
+                                    width: 2.0,
+                                    height: caret_height,
                                 },
                                 ..renderer::Quad::default()
                             },
@@ -606,7 +792,6 @@ where
         }
 
         if let Some(gutter) = self.gutter {
-            let size = self.size_px(renderer);
             let width = gutter_width(size, internal.editor.line_count());
             let column = Rectangle {
                 x: bounds.x + self.padding.left,
@@ -614,27 +799,6 @@ where
                 width,
                 height: bounds.height,
             };
-            let row_height = self.line_height.to_absolute(Pixels(size)).0;
-
-            renderer.fill_quad(
-                renderer::Quad {
-                    bounds: column,
-                    ..renderer::Quad::default()
-                },
-                gutter.background,
-            );
-            renderer.fill_quad(
-                renderer::Quad {
-                    bounds: Rectangle {
-                        x: column.x + column.width - 1.0,
-                        width: 1.0,
-                        ..column
-                    },
-                    ..renderer::Quad::default()
-                },
-                gutter.border,
-            );
-
             let clip = column.intersection(viewport).unwrap_or(column);
             let mut previous = None;
             // One layout run per visual row: a wrapped line produces several
@@ -649,10 +813,10 @@ where
                 renderer.fill_text(
                     text::Text {
                         content: &number,
-                        bounds: Size::new(width - 10.0, row_height),
+                        bounds: Size::new(width - 14.0, row_height),
                         size: Pixels(size),
                         line_height: self.line_height,
-                        font: Font::MONOSPACE,
+                        font: self.font.unwrap_or(Font::MONOSPACE),
                         horizontal_alignment: alignment::Horizontal::Right,
                         vertical_alignment: alignment::Vertical::Center,
                         shaping: text::Shaping::Basic,
@@ -660,10 +824,14 @@ where
                     // With right/centre alignment the position is the anchor of
                     // the text, not the corner of its bounds.
                     Point::new(
-                        column.x + width - 10.0,
+                        column.x + width - 14.0,
                         bounds.y + padding.top + run.line_top + row_height / 2.0,
                     ),
-                    gutter.text,
+                    if run.line_i == cursor_line {
+                        gutter.current
+                    } else {
+                        gutter.text
+                    },
                     clip,
                 );
             }
@@ -873,9 +1041,11 @@ mod tests {
     }
 
     #[test]
-    fn gutter_grows_with_the_line_count() {
-        assert_eq!(gutter_width(16.0, 5), gutter_width(16.0, 999));
-        assert!(gutter_width(16.0, 1000) > gutter_width(16.0, 999));
-        assert!(gutter_width(20.0, 10) > gutter_width(12.0, 10));
+    fn gutter_has_a_minimum_width_and_grows_with_the_line_count() {
+        assert_eq!(gutter_width(16.0, 5), gutter_width(16.0, 99));
+        assert_eq!(gutter_width(16.0, 5), 46.0);
+        assert!(gutter_width(16.0, 999) > gutter_width(16.0, 99));
+        assert!(gutter_width(16.0, 9999) > gutter_width(16.0, 999));
+        assert!(gutter_width(30.0, 999) > gutter_width(12.0, 999));
     }
 }
