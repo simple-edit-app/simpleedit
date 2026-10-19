@@ -1,5 +1,5 @@
 use iced::{
-    widget::{button, column, container, scrollable, text, Space},
+    widget::{button, column, container, scrollable, text},
     Element, Length,
 };
 use std::path::PathBuf;
@@ -11,7 +11,7 @@ use crate::theme;
 pub enum SidebarMessage {
     OpenFile(PathBuf),
     RemoveFile(usize),
-    RequestSave(PathBuf),
+    RequestSave,
     RequestSaveAs,
 }
 
@@ -20,7 +20,7 @@ pub enum SidebarAction {
     None,
     OpenFile(PathBuf),
     CloseFile(PathBuf),
-    SaveFile(PathBuf),
+    SaveFile,
     SaveFileAs,
 }
 
@@ -50,10 +50,23 @@ impl SidebarState {
 
     /// Replace an untitled slot with its real path after Save As.
     pub fn rename_file(&mut self, old: &PathBuf, new: PathBuf) {
-        if let Some(pos) = self.files.iter().position(|p| p == old) {
-            self.files[pos] = new;
-            self.selected = Some(pos);
+        if old == &new {
+            return;
         }
+        if let Some(pos) = self.files.iter().position(|p| p == old) {
+            // Saving over a file that is already open must not list it twice.
+            if self.files.contains(&new) {
+                self.files.remove(pos);
+            } else {
+                self.files[pos] = new;
+            }
+            self.selected = None;
+        }
+    }
+
+    pub fn remove_path(&mut self, path: &std::path::Path) {
+        self.files.retain(|p| p != path);
+        self.selected = None;
     }
 
     pub fn update(&mut self, msg: SidebarMessage) -> SidebarAction {
@@ -62,21 +75,13 @@ impl SidebarState {
                 self.selected = self.files.iter().position(|p| p == &path);
                 SidebarAction::OpenFile(path)
             }
-            SidebarMessage::RemoveFile(idx) => {
-                if idx < self.files.len() {
-                    let path = self.files.remove(idx);
-                    // Adjust or clear selected index
-                    self.selected = match self.selected {
-                        Some(sel) if sel == idx => None,
-                        Some(sel) if sel > idx => Some(sel - 1),
-                        other => other,
-                    };
-                    // Always propagate so app can update file_cache and save session
-                    return SidebarAction::CloseFile(path);
-                }
-                SidebarAction::None
-            }
-            SidebarMessage::RequestSave(path) => SidebarAction::SaveFile(path),
+            // The app removes the tab itself (`remove_path`) once any
+            // unsaved-changes confirmation has been answered.
+            SidebarMessage::RemoveFile(idx) => match self.files.get(idx) {
+                Some(path) => SidebarAction::CloseFile(path.clone()),
+                None => SidebarAction::None,
+            },
+            SidebarMessage::RequestSave => SidebarAction::SaveFile,
             SidebarMessage::RequestSaveAs => SidebarAction::SaveFileAs,
         }
     }
@@ -120,8 +125,6 @@ impl SidebarState {
                 let lbl_close = lbl_close.clone();
                 let lbl_save = lbl_save.clone();
                 let lbl_save_as = lbl_save_as.clone();
-                let path_for_save = path.clone();
-                let _path_for_close = path.clone();
 
                 iced_aw::ContextMenu::new(row_button, move || {
                     let ctx_item =
@@ -147,11 +150,7 @@ impl SidebarState {
                             ),
                             ctx_item(
                                 lbl_save.clone(),
-                                is_active.then(|| {
-                                    Message::Sidebar(SidebarMessage::RequestSave(
-                                        path_for_save.clone(),
-                                    ))
-                                }),
+                                is_active.then_some(Message::Sidebar(SidebarMessage::RequestSave)),
                             ),
                             ctx_item(
                                 lbl_save_as.clone(),
@@ -177,10 +176,6 @@ impl SidebarState {
             column(items).spacing(2)
         };
 
-        let header = Space::with_height(0); // placeholder to keep layout identical
-
-        let _ = header; // suppress unused warning
-
         container(
             scrollable(
                 column![
@@ -200,8 +195,6 @@ impl SidebarState {
         .into()
     }
 }
-
-fn _action_button_unused() {} // dead code suppressor noop
 
 #[cfg(test)]
 mod tests {
@@ -226,10 +219,25 @@ mod tests {
     }
 
     #[test]
-    fn remove_file() {
+    fn remove_requests_close_then_remove_path_drops_it() {
         let mut sidebar = SidebarState::new();
         sidebar.add_file(PathBuf::from("/tmp/a.rs"));
-        sidebar.update(SidebarMessage::RemoveFile(0));
+        assert!(matches!(
+            sidebar.update(SidebarMessage::RemoveFile(0)),
+            SidebarAction::CloseFile(_)
+        ));
+        // Nothing is removed until the app confirms.
+        assert_eq!(sidebar.files.len(), 1);
+        sidebar.remove_path(std::path::Path::new("/tmp/a.rs"));
         assert!(sidebar.files.is_empty());
+    }
+
+    #[test]
+    fn renaming_onto_an_open_file_does_not_duplicate_it() {
+        let mut sidebar = SidebarState::new();
+        sidebar.add_file(PathBuf::from("untitled://2"));
+        sidebar.add_file(PathBuf::from("/tmp/a.rs"));
+        sidebar.rename_file(&PathBuf::from("untitled://2"), PathBuf::from("/tmp/a.rs"));
+        assert_eq!(sidebar.files, vec![PathBuf::from("/tmp/a.rs")]);
     }
 }

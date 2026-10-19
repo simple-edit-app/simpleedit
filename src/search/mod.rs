@@ -1,5 +1,6 @@
 use std::ops::Range;
 
+use iced::advanced::widget::{operation, Id as WidgetId, Operation};
 use iced::{
     widget::{button, container, row, text, text_input, tooltip, Space},
     Command, Element, Length,
@@ -8,6 +9,47 @@ use regex::Regex;
 
 use crate::app::Message;
 use crate::theme;
+
+pub fn find_field_id() -> text_input::Id {
+    text_input::Id::new("search-find")
+}
+
+pub fn replace_field_id() -> text_input::Id {
+    text_input::Id::new("search-replace")
+}
+
+/// Resolves to whether one of the search bar's text fields has keyboard
+/// focus, so editor shortcuts (Ctrl+Z, Ctrl+A…) can leave it alone.
+pub fn search_field_focused() -> impl Operation<bool> {
+    struct Focused {
+        ids: [WidgetId; 2],
+        found: bool,
+    }
+    impl Operation<bool> for Focused {
+        fn container(
+            &mut self,
+            _id: Option<&WidgetId>,
+            _bounds: iced::Rectangle,
+            operate_on_children: &mut dyn FnMut(&mut dyn Operation<bool>),
+        ) {
+            operate_on_children(self);
+        }
+
+        fn focusable(&mut self, state: &mut dyn operation::Focusable, id: Option<&WidgetId>) {
+            if state.is_focused() && id.is_some_and(|id| self.ids.contains(id)) {
+                self.found = true;
+            }
+        }
+
+        fn finish(&self) -> operation::Outcome<bool> {
+            operation::Outcome::Some(self.found)
+        }
+    }
+    Focused {
+        ids: [find_field_id().into(), replace_field_id().into()],
+        found: false,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum SearchMessage {
@@ -65,6 +107,15 @@ impl SearchState {
             current_line: None,
             committed: false,
         }
+    }
+
+    /// Forgets all matches; called when the buffer is replaced by another file.
+    pub fn reset(&mut self) {
+        self.matches.clear();
+        self.current = None;
+        self.current_line = None;
+        self.committed = false;
+        self.match_count = 0;
     }
 
     /// The current match's (line index, byte range within that line), for
@@ -143,6 +194,20 @@ impl SearchState {
         }
     }
 
+    /// Whether the editor's selection is exactly the text of the current match.
+    fn current_is_selected(
+        &self,
+        content: &iced::widget::text_editor::Content,
+        text: &str,
+    ) -> bool {
+        match (self.current, content.selection()) {
+            (Some(i), Some(sel)) => {
+                self.matches.get(i).and_then(|r| text.get(r.clone())) == Some(sel.as_str())
+            }
+            _ => false,
+        }
+    }
+
     /// Replaces the current match — the one already selected in the editor
     /// by a prior `Find`/`FindPrevious` — with the replacement text, then
     /// jumps to whatever match now follows it.
@@ -155,16 +220,18 @@ impl SearchState {
         &mut self,
         content: &mut iced::widget::text_editor::Content,
     ) -> Command<Message> {
-        if self.current.is_none() || self.matches.is_empty() {
+        let text = content.text();
+        if self.matches.is_empty() || !self.current_is_selected(content, &text) {
+            self.current = None;
             self.jump(content, true);
             return Command::none();
         }
 
-        // The current match is already selected in the editor (that's how
-        // it got highlighted); pasting over a selection replaces it, same
-        // as the context menu's own Cut/Paste.
+        // The current match is selected in the editor; pasting over a
+        // selection replaces it, same as the context menu's own Cut/Paste.
+        let replacement = self.expanded_replacement(&text);
         content.perform(iced::widget::text_editor::Action::Edit(
-            iced::widget::text_editor::Edit::Paste(std::sync::Arc::new(self.replacement.clone())),
+            iced::widget::text_editor::Edit::Paste(std::sync::Arc::new(replacement)),
         ));
         self.current = None;
         self.current_line = None;
@@ -179,11 +246,35 @@ impl SearchState {
         Command::perform(async {}, |_| Message::Search(SearchMessage::Find))
     }
 
+    /// The replacement for the current match: in regex mode `$1`/`${name}`
+    /// are expanded from the match's capture groups, like Replace All does.
+    fn expanded_replacement(&self, text: &str) -> String {
+        if self.use_regex {
+            if let (Some(i), Ok(re)) = (self.current, build_regex(&self.query, self.case_sensitive))
+            {
+                let range = &self.matches[i];
+                if let Some(caps) = re.captures_at(text, range.start) {
+                    if caps.get(0).map(|m| m.range()) == Some(range.clone()) {
+                        let mut out = String::new();
+                        caps.expand(&self.replacement, &mut out);
+                        return out;
+                    }
+                }
+            }
+        }
+        self.replacement.clone()
+    }
+
     /// (Re)finds every match, then selects the next one (`forward`) or the
     /// previous one, wrapping around either end. The very first jump after a
     /// fresh search starts from whichever match is nearest the cursor.
     fn jump(&mut self, content: &mut iced::widget::text_editor::Content, forward: bool) {
         let text = content.text();
+        // `current` only counts while the editor still has that match
+        // selected; a click elsewhere or an edit makes it stale.
+        if !self.current_is_selected(content, &text) {
+            self.current = None;
+        }
         match find_matches(&text, &self.query, self.case_sensitive, self.use_regex) {
             Ok(matches) => {
                 self.matches = matches;
@@ -227,21 +318,17 @@ impl SearchState {
             return Ok(text.to_string());
         }
         if self.use_regex {
-            let flags = if self.case_sensitive { "" } else { "(?i)" };
-            let re = Regex::new(&format!("{}{}", flags, self.query)).map_err(|e| e.to_string())?;
+            let re = build_regex(&self.query, self.case_sensitive).map_err(|e| e.to_string())?;
             Ok(re.replace_all(text, self.replacement.as_str()).into_owned())
         } else if self.case_sensitive {
             Ok(text.replace(&self.query, &self.replacement))
         } else {
-            // Case-insensitive literal replace
             let mut result = String::with_capacity(text.len());
-            let lower_text = text.to_lowercase();
-            let lower_query = self.query.to_lowercase();
             let mut last = 0;
-            for (start, _) in lower_text.match_indices(lower_query.as_str()) {
-                result.push_str(&text[last..start]);
+            for r in find_literal_ci(text, &self.query) {
+                result.push_str(&text[last..r.start]);
                 result.push_str(&self.replacement);
-                last = start + self.query.len();
+                last = r.end;
             }
             result.push_str(&text[last..]);
             Ok(result)
@@ -303,6 +390,7 @@ impl SearchState {
 
         let bar = row![
             text_input(find_placeholder.as_str(), &self.query)
+                .id(find_field_id())
                 .on_input(|v| Message::Search(SearchMessage::QueryChanged(v)))
                 .on_submit(Message::Search(SearchMessage::Find))
                 .size(13)
@@ -322,6 +410,7 @@ impl SearchState {
             nav("↑", Message::Search(SearchMessage::FindPrevious)),
             nav("↓", Message::Search(SearchMessage::Find)),
             text_input(replace_placeholder.as_str(), &self.replacement)
+                .id(replace_field_id())
                 .on_input(|v| Message::Search(SearchMessage::ReplaceChanged(v)))
                 .size(13)
                 .width(220),
@@ -343,6 +432,57 @@ impl SearchState {
             .style(theme::bar(dark))
             .into()
     }
+}
+
+/// Compiles a user query as a regex: multi-line (`^`/`$` match per line, as
+/// the editor's per-line highlighter does) and optionally case-insensitive.
+pub fn build_regex(query: &str, case_sensitive: bool) -> Result<Regex, regex::Error> {
+    let flags = if case_sensitive { "(?m)" } else { "(?mi)" };
+    Regex::new(&format!("{flags}{query}"))
+}
+
+/// Case-insensitive literal search returning byte ranges *into `text`
+/// itself*. Lowercasing the whole text first would shift offsets whenever a
+/// character changes length (e.g. `İ`), so characters are compared one by
+/// one instead.
+pub fn find_literal_ci(text: &str, query: &str) -> Vec<Range<usize>> {
+    let q: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
+    let mut out = Vec::new();
+    if q.is_empty() {
+        return out;
+    }
+    let starts: Vec<(usize, char)> = text.char_indices().collect();
+    let mut s = 0;
+    while s < starts.len() {
+        let mut k = 0;
+        let mut j = s;
+        let mut ok = true;
+        while k < q.len() {
+            let Some(&(_, c)) = starts.get(j) else {
+                ok = false;
+                break;
+            };
+            for lc in c.to_lowercase() {
+                if k >= q.len() || q[k] != lc {
+                    ok = false;
+                    break;
+                }
+                k += 1;
+            }
+            if !ok {
+                break;
+            }
+            j += 1;
+        }
+        if ok {
+            let end = starts.get(j).map_or(text.len(), |&(i, _)| i);
+            out.push(starts[s].0..end);
+            s = j;
+        } else {
+            s += 1;
+        }
+    }
+    out
 }
 
 /// The next match index, wrapping at either end of a non-empty `matches`.
@@ -381,32 +521,31 @@ fn find_matches(
         return Ok(Vec::new());
     }
     if use_regex {
-        let flags = if case_sensitive { "" } else { "(?i)" };
-        let re = Regex::new(&format!("{flags}{query}")).map_err(|e| e.to_string())?;
-        Ok(re.find_iter(text).map(|m| m.start()..m.end()).collect())
+        let re = build_regex(query, case_sensitive).map_err(|e| e.to_string())?;
+        // Empty matches (`a*`, `^`) can't be selected or highlighted.
+        Ok(re
+            .find_iter(text)
+            .filter(|m| !m.is_empty())
+            .map(|m| m.start()..m.end())
+            .collect())
     } else if case_sensitive {
         Ok(text
             .match_indices(query)
             .map(|(i, m)| i..i + m.len())
             .collect())
     } else {
-        let lower_text = text.to_lowercase();
-        let lower_query = query.to_lowercase();
-        Ok(lower_text
-            .match_indices(lower_query.as_str())
-            .map(|(i, _)| i..i + lower_query.len())
-            .collect())
+        Ok(find_literal_ci(text, query))
     }
 }
 
-/// Converts a `text_editor` cursor position (line, column — both in chars)
-/// to a byte offset into `text`.
+/// Converts a `text_editor` cursor position to a byte offset into `text`.
+/// The editor's column is already a byte index into its line (cosmic-text's
+/// `Cursor::index`), so it only needs clamping to the line.
 fn line_col_to_byte(text: &str, (line, col): (usize, usize)) -> usize {
     let mut offset = 0;
     for (i, l) in text.split('\n').enumerate() {
         if i == line {
-            let take: usize = l.chars().take(col).map(char::len_utf8).sum();
-            return offset + take;
+            return offset + col.min(l.len());
         }
         offset += l.len() + 1;
     }
@@ -444,6 +583,27 @@ fn byte_range_to_line_local(text: &str, range: &Range<usize>) -> (usize, Range<u
     (0, 0..0)
 }
 
+/// Moves the cursor to the start of logical line `target`.
+///
+/// `Motion::Down` steps one *visual* row, which differs from a logical line
+/// when long lines wrap, so progress is read back from the cursor instead of
+/// counted. Stops early if the cursor stops moving (e.g. an unshaped buffer).
+pub fn goto_line_start(content: &mut iced::widget::text_editor::Content, target: usize) {
+    use iced::widget::text_editor::{Action, Motion};
+
+    content.perform(Action::Move(Motion::DocumentStart));
+    let mut last = content.cursor_position();
+    while last.0 < target {
+        content.perform(Action::Move(Motion::Down));
+        let now = content.cursor_position();
+        if now == last {
+            break;
+        }
+        last = now;
+    }
+    content.perform(Action::Move(Motion::Home));
+}
+
 /// Selects `range` in the editor. `text_editor` has no "select this byte
 /// range" action, only relative motions — same approach as jumping to a
 /// line in the Go to Line dialog.
@@ -451,11 +611,7 @@ fn select_range(content: &mut iced::widget::text_editor::Content, text: &str, ra
     use iced::widget::text_editor::{Action, Motion};
 
     let (line, col, len) = byte_range_to_line_col(text, &range);
-    content.perform(Action::Move(Motion::DocumentStart));
-    for _ in 0..line {
-        content.perform(Action::Move(Motion::Down));
-    }
-    content.perform(Action::Move(Motion::Home));
+    goto_line_start(content, line);
     for _ in 0..col {
         content.perform(Action::Move(Motion::Right));
     }
@@ -574,9 +730,9 @@ mod tests {
         // on how this source file's own encoding normalizes an "é" literal.
         let text = format!("caf{}\nworld", '\u{e9}');
         let text = text.as_str();
-        // 4 chars ("caf" + é) but 5 bytes; column 4 is right after it. Line 1
-        // starts one byte further still, past the '\n'.
-        assert_eq!(line_col_to_byte(text, (0, 4)), 5);
+        // The editor's column is a byte index: 5 is right after the é, and
+        // line 1 starts one byte further still, past the '\n'.
+        assert_eq!(line_col_to_byte(text, (0, 5)), 5);
         assert_eq!(line_col_to_byte(text, (1, 0)), 6);
         assert_eq!(line_col_to_byte(text, (1, 2)), 8);
     }
@@ -607,6 +763,35 @@ mod tests {
         assert_eq!(nearest_match_index(&matches, 9, true), 0); // past the end, wraps
         assert_eq!(nearest_match_index(&matches, 9, false), 2);
         assert_eq!(nearest_match_index(&matches, 0, false), 2); // before the start, wraps
+    }
+
+    #[test]
+    fn case_insensitive_offsets_survive_length_changing_lowercase() {
+        // 'İ' (2 bytes) lowercases to "i\u{307}" (3 bytes): offsets taken from
+        // the lowercased text would be wrong for everything after it.
+        let text = "İİ abc ABC";
+        let m = find_literal_ci(text, "abc");
+        assert_eq!(m.len(), 2);
+        for r in &m {
+            assert!(text[r.clone()].eq_ignore_ascii_case("abc"));
+        }
+        let s = make_search("abc", "x", false, false);
+        assert_eq!(s.replace_all(text).unwrap(), "İİ x x");
+    }
+
+    #[test]
+    fn regex_anchors_work_per_line_and_empty_matches_are_dropped() {
+        let m = find_matches("foo\nfoo", "^foo", false, true).unwrap();
+        assert_eq!(m, vec![0..3, 4..7]);
+        assert!(find_matches("abc", "x*", false, true).unwrap().is_empty());
+    }
+
+    #[test]
+    fn regex_replacement_expands_captures_for_the_current_match() {
+        let mut s = make_search(r"(\w+)@", "$1 at ", true, false);
+        s.matches = std::iter::once(0..4).collect();
+        s.current = Some(0);
+        assert_eq!(s.expanded_replacement("bob@x"), "bob at ");
     }
 
     #[test]

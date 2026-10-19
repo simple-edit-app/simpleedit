@@ -12,6 +12,48 @@ need() {
     command -v "$1" &>/dev/null || err "Required tool not found: $1 — please install it and retry."
 }
 
+# Public half of the release signing key (Ed25519); keep in sync with
+# SIGNING_PUBLIC_KEY in src/updater.rs.
+SIGNING_PUBKEY='-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAmZrvmo6ZzYbZD25u7dMsx6dm9HcyrW/ijgwVb4vjeks=
+-----END PUBLIC KEY-----'
+
+# Verify a downloaded file against the release's SHA256SUMS, and that file's
+# signature when it has one. Releases that predate the checksum or signature
+# files are installed with a warning.
+verify() {
+    local file="$1" name="$2" work sums expected actual
+    work=$(mktemp -d)
+    if ! curl -fsSL "https://github.com/${REPO}/releases/download/${VERSION}/SHA256SUMS" -o "$work/SHA256SUMS" 2>/dev/null; then
+        echo "! No SHA256SUMS published for ${VERSION}; skipping integrity check." >&2
+        rm -rf "$work"
+        return 0
+    fi
+    if curl -fsSL "https://github.com/${REPO}/releases/download/${VERSION}/SHA256SUMS.sig" -o "$work/SHA256SUMS.sig" 2>/dev/null; then
+        if openssl pkeyutl -help 2>&1 | grep -q -- '-rawin'; then
+            printf '%s\n' "$SIGNING_PUBKEY" > "$work/pub.pem"
+            openssl pkeyutl -verify -pubin -inkey "$work/pub.pem" -rawin \
+                -in "$work/SHA256SUMS" -sigfile "$work/SHA256SUMS.sig" >/dev/null 2>&1 \
+                || { rm -rf "$work"; err "Invalid signature on SHA256SUMS. Aborting."; }
+            ok "Signature verified"
+        else
+            echo "! This openssl can't verify Ed25519 signatures; checking the checksum only." >&2
+        fi
+    else
+        echo "! No signature published for ${VERSION}; checking the checksum only." >&2
+    fi
+    expected=$(awk -v n="$name" '{f=$2; sub(/^\*/, "", f)} f==n {print $1; exit}' "$work/SHA256SUMS")
+    rm -rf "$work"
+    [ -n "$expected" ] || err "No checksum listed for ${name}."
+    if command -v sha256sum &>/dev/null; then
+        actual=$(sha256sum "$file" | awk '{print $1}')
+    else
+        actual=$(shasum -a 256 "$file" | awk '{print $1}')
+    fi
+    [ "$expected" = "$actual" ] || err "Checksum mismatch for ${name}. Aborting."
+    ok "Checksum verified (${name})"
+}
+
 # ── resolve latest release ───────────────────────────────────────────────────
 need curl
 
@@ -46,6 +88,7 @@ case "$OS" in
             TMP=$(mktemp /tmp/simpleedit-XXXXXX.deb)
             info "Downloading ${DEB}…"
             curl -fsSL --progress-bar "$URL" -o "$TMP"
+            verify "$TMP" "$DEB"
             info "Installing (requires sudo)…"
             sudo dpkg -i "$TMP"
             rm -f "$TMP"
@@ -58,7 +101,9 @@ case "$OS" in
             URL="https://github.com/${REPO}/releases/download/${VERSION}/${TARBALL}"
             TMP=$(mktemp -d)
             info "Downloading ${TARBALL}…"
-            curl -fsSL --progress-bar "$URL" | tar -xz -C "$TMP"
+            curl -fsSL --progress-bar "$URL" -o "$TMP/$TARBALL"
+            verify "$TMP/$TARBALL" "$TARBALL"
+            tar -xz -C "$TMP" -f "$TMP/$TARBALL"
             info "Installing binary to /usr/local/bin (requires sudo)…"
             sudo mv "$TMP/simpleedit" /usr/local/bin/simpleedit
             sudo chmod +x /usr/local/bin/simpleedit
@@ -85,7 +130,9 @@ case "$OS" in
             URL="https://github.com/${REPO}/releases/download/${VERSION}/${TARBALL}"
             TMP=$(mktemp -d)
             info "Downloading ${TARBALL}…"
-            curl -fsSL --progress-bar "$URL" | tar -xz -C "$TMP"
+            curl -fsSL --progress-bar "$URL" -o "$TMP/$TARBALL"
+            verify "$TMP/$TARBALL" "$TARBALL"
+            tar -xz -C "$TMP" -f "$TMP/$TARBALL"
             info "Installing binary to /usr/local/bin (requires sudo)…"
             sudo mv "$TMP/simpleedit" /usr/local/bin/simpleedit
             sudo chmod +x /usr/local/bin/simpleedit

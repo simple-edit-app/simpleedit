@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use iced::{
-    widget::{button, column, container, row, text, Space},
+    widget::{button, column, container, mouse_area, row, text, Space},
     Alignment, Element, Length,
 };
 
@@ -19,16 +19,21 @@ pub fn view(config: &Config, open: Option<TopMenu>) -> Element<'static, Message>
     // (queried via `container::visible_bounds`) instead of a hardcoded pixel
     // offset that only happened to fit one language's label widths.
     let top_button = |label: String, menu: TopMenu| {
-        container(
-            button(text(label).size(13))
-                .padding([6, 12])
-                .on_press(Message::ToggleMenu(menu))
-                .style(iced::theme::Button::custom(theme::GhostButton {
-                    dark,
-                    active: open == Some(menu),
-                })),
+        // Hovering a title while another menu is open switches to it, as in
+        // any standard menu bar.
+        mouse_area(
+            container(
+                button(text(label).size(13))
+                    .padding([6, 12])
+                    .on_press(Message::ToggleMenu(menu))
+                    .style(iced::theme::Button::custom(theme::GhostButton {
+                        dark,
+                        active: open == Some(menu),
+                    })),
+            )
+            .id(menu_id(menu)),
         )
-        .id(menu_id(menu))
+        .on_enter(Message::HoverMenu(menu))
     };
 
     let bar = row![

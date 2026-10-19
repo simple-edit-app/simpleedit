@@ -24,8 +24,20 @@ pub enum ShortcutTarget {
     DeleteLine,
 }
 
+/// The editor text size the running process actually uses (set once at
+/// startup from the config; the slider only affects the next launch).
+static APPLIED_FONT_SIZE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+
+pub fn applied_font_size() -> f32 {
+    *APPLIED_FONT_SIZE.get().unwrap_or(&16.0)
+}
+
+pub fn apply_font_size(size: f32) -> f32 {
+    *APPLIED_FONT_SIZE.get_or_init(|| size.clamp(8.0, 32.0))
+}
+
 /// A single keyboard binding stored as display-friendly strings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShortcutConfig {
     pub ctrl: bool,
     pub shift: bool,
@@ -81,6 +93,7 @@ impl ShortcutConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Shortcuts {
     pub new_file: ShortcutConfig,
     pub open_file: ShortcutConfig,
@@ -95,15 +108,10 @@ pub struct Shortcuts {
     pub quit: ShortcutConfig,
     pub undo: ShortcutConfig,
     pub redo: ShortcutConfig,
-    #[serde(default = "default_duplicate_line")]
     pub duplicate_line: ShortcutConfig,
-    #[serde(default = "default_move_line_up")]
     pub move_line_up: ShortcutConfig,
-    #[serde(default = "default_move_line_down")]
     pub move_line_down: ShortcutConfig,
-    #[serde(default = "default_toggle_comment")]
     pub toggle_comment: ShortcutConfig,
-    #[serde(default = "default_delete_line")]
     pub delete_line: ShortcutConfig,
 }
 
@@ -122,6 +130,61 @@ fn default_toggle_comment() -> ShortcutConfig {
 fn default_delete_line() -> ShortcutConfig {
     ShortcutConfig::ctrl_shift("k")
 }
+
+impl Shortcuts {
+    /// The binding for `target`.
+    pub fn slot_mut(&mut self, target: ShortcutTarget) -> &mut ShortcutConfig {
+        match target {
+            ShortcutTarget::NewFile => &mut self.new_file,
+            ShortcutTarget::OpenFile => &mut self.open_file,
+            ShortcutTarget::SaveFile => &mut self.save_file,
+            ShortcutTarget::SaveAs => &mut self.save_as,
+            ShortcutTarget::CloseFile => &mut self.close_file,
+            ShortcutTarget::Find => &mut self.find,
+            ShortcutTarget::SelectAll => &mut self.select_all,
+            ShortcutTarget::FormatCode => &mut self.format_code,
+            ShortcutTarget::GotoLine => &mut self.goto_line,
+            ShortcutTarget::ToggleSidebar => &mut self.toggle_sidebar,
+            ShortcutTarget::Quit => &mut self.quit,
+            ShortcutTarget::Undo => &mut self.undo,
+            ShortcutTarget::Redo => &mut self.redo,
+            ShortcutTarget::DuplicateLine => &mut self.duplicate_line,
+            ShortcutTarget::MoveLineUp => &mut self.move_line_up,
+            ShortcutTarget::MoveLineDown => &mut self.move_line_down,
+            ShortcutTarget::ToggleComment => &mut self.toggle_comment,
+            ShortcutTarget::DeleteLine => &mut self.delete_line,
+        }
+    }
+
+    /// Whether some action other than `target` is already bound to `sc`.
+    pub fn conflicts(&mut self, target: ShortcutTarget, sc: &ShortcutConfig) -> bool {
+        ALL_TARGETS
+            .iter()
+            .filter(|t| **t != target)
+            .any(|t| self.slot_mut(*t) == sc)
+    }
+}
+
+const ALL_TARGETS: [ShortcutTarget; 18] = [
+    ShortcutTarget::NewFile,
+    ShortcutTarget::OpenFile,
+    ShortcutTarget::SaveFile,
+    ShortcutTarget::SaveAs,
+    ShortcutTarget::CloseFile,
+    ShortcutTarget::Find,
+    ShortcutTarget::SelectAll,
+    ShortcutTarget::FormatCode,
+    ShortcutTarget::GotoLine,
+    ShortcutTarget::ToggleSidebar,
+    ShortcutTarget::Quit,
+    ShortcutTarget::Undo,
+    ShortcutTarget::Redo,
+    ShortcutTarget::DuplicateLine,
+    ShortcutTarget::MoveLineUp,
+    ShortcutTarget::MoveLineDown,
+    ShortcutTarget::ToggleComment,
+    ShortcutTarget::DeleteLine,
+];
 
 impl Default for Shortcuts {
     fn default() -> Self {
@@ -148,25 +211,23 @@ impl Default for Shortcuts {
     }
 }
 
+/// Every field has a default, so a config written by an older version (or
+/// one with extra legacy keys, which are ignored) still loads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
     pub dark_mode: bool,
+    /// Editor text size. Applied at startup: iced 0.12 can't resize the
+    /// editor's text on the fly.
     pub font_size: f32,
-    pub font_family: String,
     pub tab_width: usize,
     pub use_spaces: bool,
     pub show_line_numbers: bool,
-    pub word_wrap: bool,
     pub auto_indent: bool,
     pub autocomplete_brackets: bool,
     pub autocomplete_quotes: bool,
-    pub show_page_guide: bool,
-    pub page_guide_column: usize,
-    pub highlight_current_line: bool,
     pub locale: String,
-    #[serde(default)]
     pub shortcuts: Shortcuts,
-    #[serde(default)]
     pub recent_files: Vec<String>,
 }
 
@@ -175,17 +236,12 @@ impl Default for Config {
         Self {
             dark_mode: true,
             font_size: 14.0,
-            font_family: "Monospace".to_string(),
             tab_width: 4,
             use_spaces: true,
             show_line_numbers: true,
-            word_wrap: true,
             auto_indent: true,
             autocomplete_brackets: true,
             autocomplete_quotes: true,
-            show_page_guide: false,
-            page_guide_column: 80,
-            highlight_current_line: true,
             locale: "en".to_string(),
             shortcuts: Shortcuts::default(),
             recent_files: Vec::new(),
@@ -200,9 +256,11 @@ fn detect_system_dark_mode() -> bool {
             .args(["get", "org.gnome.desktop.interface", "color-scheme"])
             .output()
         {
+            // GNOME reports 'default' for "no preference", which is the light
+            // look; only an explicit 'prefer-dark' means dark.
             let s = String::from_utf8_lossy(&out.stdout);
-            if s.contains("prefer-light") {
-                return false;
+            if out.status.success() && !s.trim().is_empty() {
+                return s.contains("prefer-dark");
             }
         }
     }
@@ -255,8 +313,13 @@ impl Config {
     pub fn load() -> Self {
         if let Some(path) = Self::config_path() {
             if let Ok(s) = std::fs::read_to_string(&path) {
-                if let Ok(cfg) = serde_json::from_str(&s) {
-                    return cfg;
+                match serde_json::from_str(&s) {
+                    Ok(cfg) => return cfg,
+                    // Keep the unreadable file around instead of silently
+                    // overwriting it with defaults on the next save.
+                    Err(_) => {
+                        let _ = std::fs::rename(&path, path.with_extension("json.bak"));
+                    }
                 }
             }
         }
@@ -273,7 +336,7 @@ impl Config {
                 let _ = std::fs::create_dir_all(parent);
             }
             if let Ok(json) = serde_json::to_string_pretty(self) {
-                let _ = std::fs::write(path, json);
+                let _ = crate::fsutil::write_atomic(&path, json.as_bytes(), true);
             }
         }
     }
@@ -325,6 +388,24 @@ mod tests {
         assert_eq!(sc2.display(), "Ctrl+Shift+S");
         let sc3 = ShortcutConfig::alt("ArrowUp");
         assert_eq!(sc3.display(), "Alt+ArrowUp");
+    }
+
+    #[test]
+    fn partial_and_legacy_configs_still_load() {
+        let cfg: Config =
+            serde_json::from_str(r#"{"dark_mode": false, "word_wrap": true, "font_family": "X"}"#)
+                .unwrap();
+        assert!(!cfg.dark_mode);
+        assert_eq!(cfg.tab_width, 4);
+        assert_eq!(cfg.shortcuts.undo, ShortcutConfig::ctrl("z"));
+    }
+
+    #[test]
+    fn shortcut_conflicts_are_detected() {
+        let mut sh = Shortcuts::default();
+        assert!(sh.conflicts(ShortcutTarget::Undo, &ShortcutConfig::ctrl("s")));
+        assert!(!sh.conflicts(ShortcutTarget::SaveFile, &ShortcutConfig::ctrl("s")));
+        assert!(!sh.conflicts(ShortcutTarget::Undo, &ShortcutConfig::ctrl("1")));
     }
 
     #[test]

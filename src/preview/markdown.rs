@@ -365,9 +365,17 @@ fn table_cells(line: &str) -> Vec<String> {
     cells
 }
 
+/// Longest line given inline (bold, links…) parsing.
+const MAX_INLINE_CHARS: usize = 20_000;
+
 /// Splits a line into styled inline spans.
 pub fn parse_inline(src: &str) -> Vec<Span> {
     let chars: Vec<char> = src.chars().collect();
+    // Looking for the closing marker of every opener is quadratic on a very
+    // long line (minified or pasted text); past this, show it as plain text.
+    if chars.len() > MAX_INLINE_CHARS {
+        return vec![Span::new(src, Style::Plain)];
+    }
     let mut spans: Vec<Span> = Vec::new();
     let mut buf = String::new();
     let mut i = 0;
@@ -1033,6 +1041,14 @@ mod tests {
 
     fn plain(text: &str) -> Vec<Span> {
         vec![Span::new(text, Style::Plain)]
+    }
+
+    #[test]
+    fn very_long_lines_are_left_as_plain_text() {
+        let line = "*a ".repeat(MAX_INLINE_CHARS);
+        let spans = parse_inline(&line);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].style, Style::Plain);
     }
 
     #[test]

@@ -29,14 +29,19 @@ impl Session {
             .unwrap_or_default()
     }
 
-    pub fn save(&self) {
+    /// Serialized form, so the caller can skip a write when nothing changed.
+    pub fn to_json(&self) -> Option<String> {
+        serde_json::to_string(self).ok()
+    }
+
+    /// Writes already-serialized session JSON. The file holds unsaved buffer
+    /// contents, so it is owner-only.
+    pub fn write(json: &str) {
         if let Some(path) = Self::path() {
             if let Some(parent) = path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            if let Ok(json) = serde_json::to_string(self) {
-                let _ = std::fs::write(path, json);
-            }
+            let _ = crate::fsutil::write_atomic(&path, json.as_bytes(), true);
         }
     }
 }

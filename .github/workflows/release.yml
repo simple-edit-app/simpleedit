@@ -15,11 +15,12 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
+          toolchain: stable
           targets: aarch64-apple-darwin
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/bin/
@@ -87,7 +88,7 @@ jobs:
           codesign --force --deep --sign - "$APP"
           ditto -c -k --keepParent "$APP" \
             "simpleedit-${{ github.ref_name }}-macos-aarch64.zip"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: simpleedit-macos-aarch64
           path: |
@@ -99,9 +100,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/bin/
@@ -123,7 +126,7 @@ jobs:
           mv simpleedit-*.tar.gz ${{ github.workspace }}/
       - name: Build DEB
         run: |
-          cargo install --force cargo-deb
+          cargo install --locked --force cargo-deb
           cargo deb
           cp target/debian/*.deb ${{ github.workspace }}/
       - name: Build AppImage
@@ -134,10 +137,10 @@ jobs:
           cp assets/simpleedit.png AppDir/
           ln -s usr/bin/${{ env.BINARY_NAME }} AppDir/AppRun
 
-          curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
           chmod +x appimagetool
           ./appimagetool --appimage-extract-and-run AppDir simpleedit-${{ github.ref_name }}-x86_64.AppImage
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: simpleedit-linux
           path: |
@@ -153,17 +156,36 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           merge-multiple: true
+      # The in-app updater and install.sh verify downloads against this file.
+      - name: Generate checksums
+        run: sha256sum simpleedit-*.tar.gz simpleedit-*-macos-aarch64.zip *.deb *.AppImage > SHA256SUMS
+      # Ed25519 signature over SHA256SUMS; the app embeds the public key and
+      # refuses an update whose checksums aren't signed by it.
+      - name: Sign checksums
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          if [ -z "$UPDATE_SIGNING_KEY" ]; then
+            echo "::warning::UPDATE_SIGNING_KEY is not set — releasing without SHA256SUMS.sig. In-app updates to this release will be refused."
+            exit 0
+          fi
+          umask 077
+          printf '%s\n' "$UPDATE_SIGNING_KEY" > update-key.pem
+          openssl pkeyutl -sign -inkey update-key.pem -rawin -in SHA256SUMS -out SHA256SUMS.sig
+          rm -f update-key.pem
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             simpleedit-*.tar.gz
             simpleedit-*-macos-aarch64.zip
             *.deb
             *.AppImage
+            SHA256SUMS
+            SHA256SUMS.sig
           generate_release_notes: true
           draft: false
 
@@ -188,7 +210,7 @@ jobs:
           fi
       - name: Check out the tap
         if: steps.tap.outputs.enabled == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: simple-edit-app/homebrew-tap
           # PAT with `contents: write` on the tap repo.

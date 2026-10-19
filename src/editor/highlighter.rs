@@ -125,7 +125,11 @@ impl Highlighter {
         }
         let ranges: Vec<Range<usize>> = if self.use_regex {
             match &self.regex {
-                Some(re) => re.find_iter(line).map(|m| m.start()..m.end()).collect(),
+                Some(re) => re
+                    .find_iter(line)
+                    .filter(|m| !m.is_empty())
+                    .map(|m| m.start()..m.end())
+                    .collect(),
                 None => Vec::new(),
             }
         } else if self.case_sensitive {
@@ -133,12 +137,7 @@ impl Highlighter {
                 .map(|(i, m)| i..i + m.len())
                 .collect()
         } else {
-            let lower_line = line.to_lowercase();
-            let lower_query = self.query.to_lowercase();
-            lower_line
-                .match_indices(lower_query.as_str())
-                .map(|(i, _)| i..i + lower_query.len())
-                .collect()
+            crate::search::find_literal_ci(line, &self.query)
         };
 
         let current = self
@@ -161,8 +160,7 @@ fn compile_regex(settings: &Settings) -> Option<Regex> {
     if !settings.use_regex || settings.query.is_empty() {
         return None;
     }
-    let flags = if settings.case_sensitive { "" } else { "(?i)" };
-    Regex::new(&format!("{flags}{}", settings.query)).ok()
+    crate::search::build_regex(&settings.query, settings.case_sensitive).ok()
 }
 
 impl text::Highlighter for Highlighter {

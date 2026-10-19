@@ -6,19 +6,14 @@ use iced::{
 use crate::{app::Message, config::Config, theme};
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum PreferencesMessage {
     FontSizeChanged(f32),
     TabWidthChanged(usize),
     UseSpacesToggled(bool),
     ShowLineNumbersToggled(bool),
-    WordWrapToggled(bool),
     AutoIndentToggled(bool),
     AutocompleteBracketsToggled(bool),
     AutocompleteQuotesToggled(bool),
-    ShowPageGuideToggled(bool),
-    PageGuideColumnChanged(usize),
-    HighlightCurrentLineToggled(bool),
     LocaleChanged(String),
 }
 
@@ -27,13 +22,9 @@ pub struct PreferencesState {
     pub tab_width: usize,
     pub use_spaces: bool,
     pub show_line_numbers: bool,
-    pub word_wrap: bool,
     pub auto_indent: bool,
     pub autocomplete_brackets: bool,
     pub autocomplete_quotes: bool,
-    pub show_page_guide: bool,
-    pub page_guide_column: usize,
-    pub highlight_current_line: bool,
     pub locale: String,
 }
 
@@ -44,13 +35,9 @@ impl PreferencesState {
             tab_width: config.tab_width,
             use_spaces: config.use_spaces,
             show_line_numbers: config.show_line_numbers,
-            word_wrap: config.word_wrap,
             auto_indent: config.auto_indent,
             autocomplete_brackets: config.autocomplete_brackets,
             autocomplete_quotes: config.autocomplete_quotes,
-            show_page_guide: config.show_page_guide,
-            page_guide_column: config.page_guide_column,
-            highlight_current_line: config.highlight_current_line,
             locale: config.locale.clone(),
         }
     }
@@ -73,10 +60,6 @@ impl PreferencesState {
                 self.show_line_numbers = v;
                 config.show_line_numbers = v;
             }
-            PreferencesMessage::WordWrapToggled(v) => {
-                self.word_wrap = v;
-                config.word_wrap = v;
-            }
             PreferencesMessage::AutoIndentToggled(v) => {
                 self.auto_indent = v;
                 config.auto_indent = v;
@@ -88,18 +71,6 @@ impl PreferencesState {
             PreferencesMessage::AutocompleteQuotesToggled(v) => {
                 self.autocomplete_quotes = v;
                 config.autocomplete_quotes = v;
-            }
-            PreferencesMessage::ShowPageGuideToggled(v) => {
-                self.show_page_guide = v;
-                config.show_page_guide = v;
-            }
-            PreferencesMessage::PageGuideColumnChanged(v) => {
-                self.page_guide_column = v;
-                config.page_guide_column = v;
-            }
-            PreferencesMessage::HighlightCurrentLineToggled(v) => {
-                self.highlight_current_line = v;
-                config.highlight_current_line = v;
             }
             PreferencesMessage::LocaleChanged(v) => {
                 self.locale = v.clone();
@@ -123,6 +94,18 @@ impl PreferencesState {
                 .style(iced::theme::Button::custom(theme::GhostButton {
                     dark,
                     active: self.locale == code,
+                }))
+        };
+
+        let tab_button = |width: usize| {
+            button(text(width.to_string()).size(13))
+                .padding([4, 10])
+                .on_press(Message::Preferences(PreferencesMessage::TabWidthChanged(
+                    width,
+                )))
+                .style(iced::theme::Button::custom(theme::GhostButton {
+                    dark,
+                    active: self.tab_width == width,
                 }))
         };
 
@@ -152,6 +135,20 @@ impl PreferencesState {
                     text(format!("{:.0}px", self.font_size)).size(12),
                 ]
                 .spacing(8),
+                text(t!("prefs.restart_hint").to_string())
+                    .size(11)
+                    .style(muted),
+                row![
+                    text(t!("prefs.tab_width")).size(12),
+                    tab_button(2),
+                    tab_button(4),
+                    tab_button(8),
+                ]
+                .spacing(6)
+                .align_items(iced::Alignment::Center),
+                checkbox(t!("prefs.use_spaces"), self.use_spaces)
+                    .text_size(13)
+                    .on_toggle(|v| Message::Preferences(PreferencesMessage::UseSpacesToggled(v))),
                 checkbox(t!("prefs.show_line_numbers"), self.show_line_numbers)
                     .text_size(13)
                     .on_toggle(|v| Message::Preferences(
@@ -231,11 +228,12 @@ mod tests {
     }
 
     #[test]
-    fn update_word_wrap() {
+    fn update_tab_settings() {
         let mut config = Config::default();
         let mut prefs = PreferencesState::from_config(&config);
-        prefs.update(PreferencesMessage::WordWrapToggled(false), &mut config);
-        assert!(!prefs.word_wrap);
-        assert!(!config.word_wrap);
+        prefs.update(PreferencesMessage::TabWidthChanged(2), &mut config);
+        prefs.update(PreferencesMessage::UseSpacesToggled(false), &mut config);
+        assert_eq!(config.tab_width, 2);
+        assert!(!config.use_spaces);
     }
 }

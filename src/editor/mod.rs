@@ -37,6 +37,106 @@ use iced::{
 
 use crate::{app::Message, config::Config, search::SearchState};
 
+/// The buffer's text, exactly. `Content::text()` always ends in a newline but
+/// drops a final empty line; this keeps every line and ends in one newline
+/// (none for an empty buffer).
+pub fn buffer_text(content: &iced::widget::text_editor::Content) -> String {
+    let mut text = content
+        .lines()
+        .enumerate()
+        .fold(String::new(), |mut out, (i, line)| {
+            if i > 0 {
+                out.push('\n');
+            }
+            out.push_str(&line);
+            out
+        });
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text
+}
+
+/// The smallest run of whole lines that differs between two buffer texts.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LineReplacement {
+    /// Index of the first differing line.
+    pub first_line: usize,
+    /// The old lines, joined with `\n` (what must be selected).
+    pub old_text: String,
+    /// The lines that replace them, joined with `\n`.
+    pub new_text: String,
+}
+
+/// Diffs two buffer texts by whole lines: common leading and trailing lines
+/// are skipped. Both sides always keep at least one line, so a pure insertion
+/// or deletion still has something to select and replace. `None` if equal.
+pub fn line_replacement(old: &str, new: &str) -> Option<LineReplacement> {
+    if old == new {
+        return None;
+    }
+    let o: Vec<&str> = old.strip_suffix('\n').unwrap_or(old).split('\n').collect();
+    let n: Vec<&str> = new.strip_suffix('\n').unwrap_or(new).split('\n').collect();
+    let mut prefix = o.iter().zip(&n).take_while(|(a, b)| a == b).count();
+    let max_suffix = o.len().min(n.len()) - prefix;
+    let mut suffix = o
+        .iter()
+        .rev()
+        .zip(n.iter().rev())
+        .take(max_suffix)
+        .take_while(|(a, b)| a == b)
+        .count();
+    while o.len() - prefix - suffix == 0 || n.len() - prefix - suffix == 0 {
+        if prefix > 0 {
+            prefix -= 1;
+        } else if suffix > 0 {
+            suffix -= 1;
+        } else {
+            break;
+        }
+    }
+    Some(LineReplacement {
+        first_line: prefix,
+        old_text: o[prefix..o.len() - suffix].join("\n"),
+        new_text: n[prefix..n.len() - suffix].join("\n"),
+    })
+}
+
+/// Makes the buffer read `new_text`. Only the lines that differ are replaced,
+/// through ordinary editor actions, so the scroll position survives; the whole
+/// buffer is rebuilt only for a huge change.
+///
+/// Must only be called once the editor has laid out its current content:
+/// cosmic-text panics ("layout not found") when a motion crosses a line that
+/// was edited since the last layout. The app guarantees that by deferring
+/// such operations until after a redraw (see `layout_stale` in `app.rs`).
+pub fn set_buffer_text(content: &mut iced::widget::text_editor::Content, new_text: &str) {
+    use iced::widget::text_editor::{Action, Edit, Motion};
+
+    let old = buffer_text(content);
+    let Some(change) = line_replacement(&old, new_text) else {
+        return;
+    };
+    let len = change.old_text.chars().count();
+    if len <= 20_000 {
+        crate::search::goto_line_start(content, change.first_line);
+        for _ in 0..len {
+            content.perform(Action::Select(Motion::Right));
+        }
+        let last_line = change.first_line + change.old_text.matches('\n').count();
+        // Belt and braces: never paste unless exactly the old lines are selected.
+        let positioned = content.cursor_position().0 == last_line
+            && content.selection().unwrap_or_default() == change.old_text;
+        if positioned {
+            content.perform(Action::Edit(Edit::Paste(std::sync::Arc::new(
+                change.new_text,
+            ))));
+            return;
+        }
+    }
+    *content = iced::widget::text_editor::Content::with_text(new_text);
+}
+
 pub struct EditorState {
     pub content: text_editor::Content,
     pub language: Option<String>,
@@ -57,8 +157,12 @@ impl EditorState {
         }
     }
 
-    pub fn set_language_by_extension(&mut self, ext: &str) {
-        self.language = extension_to_token(ext).map(|s| s.to_string());
+    /// Like `set_language_by_extension`, but keeps the current language when
+    /// the extension isn't recognized (e.g. a manual override survives a save).
+    pub fn adopt_extension_language(&mut self, ext: &str) {
+        if let Some(token) = extension_to_token(ext) {
+            self.language = Some(token.to_string());
+        }
     }
 
     /// Restores a language remembered for a buffer, falling back to the file
@@ -112,10 +216,9 @@ impl EditorState {
             .height(Length::Fill);
 
         if config.show_line_numbers {
-            let raw = self.content.text();
-            let base = raw.lines().count().max(1);
-            // text_editor shows an implicit empty line after a trailing '\n'
-            let line_count = if raw.ends_with('\n') { base + 1 } else { base };
+            // The buffer's own line count, which already includes the empty
+            // line after a trailing '\n' — no need to rebuild the text per frame.
+            let line_count = self.content.line_count().max(1);
 
             let numbers: String = (1..=line_count)
                 .map(|n| format!("{:>4}", n))
@@ -126,7 +229,7 @@ impl EditorState {
             // Use line_height 1.3 to match cosmic-text default used by text_editor.
             let gutter = container(
                 text(numbers)
-                    .size(16.0)
+                    .size(crate::config::applied_font_size())
                     .line_height(1.3_f32)
                     .font(Font::MONOSPACE)
                     .style(crate::theme::muted_text(config.dark_mode)),
@@ -217,7 +320,7 @@ pub mod statusbar {
         let muted = theme::muted_text(dark);
 
         let (line, col) = cursor;
-        let cursor_text = format!("Ln {}, Col {}", line + 1, col + 1);
+        let cursor_text = t!("status.cursor", line = line + 1, col = col + 1).to_string();
 
         let status_color = if is_error {
             iced::Color::from_rgb(0.88, 0.27, 0.18)
@@ -304,6 +407,58 @@ mod tests {
     }
 
     #[test]
+    fn line_count_matches_visible_lines() {
+        // The gutter numbers rely on the buffer's own line count, which
+        // includes the empty line after a trailing newline.
+        assert_eq!(EditorState::from_content("a").content.line_count(), 1);
+        assert_eq!(EditorState::from_content("a\nb").content.line_count(), 2);
+        // A single trailing newline is absorbed, a second one is a real line.
+        assert_eq!(EditorState::from_content("a\n").content.line_count(), 1);
+        assert_eq!(EditorState::from_content("a\n\n").content.line_count(), 2);
+        assert_eq!(EditorState::new().content.line_count(), 1);
+    }
+
+    #[test]
+    fn line_replacement_isolates_the_changed_lines() {
+        let r = line_replacement("a\nb\nc\n", "a\nB\nc\n").unwrap();
+        assert_eq!(
+            (r.first_line, r.old_text.as_str(), r.new_text.as_str()),
+            (1, "b", "B")
+        );
+        assert_eq!(line_replacement("a\nb\n", "a\nb\n"), None);
+    }
+
+    #[test]
+    fn line_replacement_handles_pure_insertions_and_deletions() {
+        // Duplicate a line: the replaced run keeps one old line to select.
+        let r = line_replacement("a\nb\n", "a\na\nb\n").unwrap();
+        assert_eq!(
+            (r.first_line, r.old_text.as_str(), r.new_text.as_str()),
+            (0, "a", "a\na")
+        );
+        // Delete the last line.
+        let r = line_replacement("a\nb\n", "a\n").unwrap();
+        assert_eq!(
+            (r.first_line, r.old_text.as_str(), r.new_text.as_str()),
+            (0, "a\nb", "a")
+        );
+        // Delete everything.
+        let r = line_replacement("a\n", "").unwrap();
+        assert_eq!((r.old_text.as_str(), r.new_text.as_str()), ("a", ""));
+    }
+
+    #[test]
+    fn buffer_text_keeps_trailing_blank_lines() {
+        // `Content::text()` drops the last line when it is empty, which would
+        // silently shorten a file ending in a blank line on every save.
+        for text in ["a\n", "a\n\n", "a\nb\n", "a\n\n\n"] {
+            let c = EditorState::from_content(text).content;
+            assert_eq!(buffer_text(&c), text);
+        }
+        assert_eq!(buffer_text(&EditorState::new().content), "");
+    }
+
+    #[test]
     fn editor_state_new_is_empty() {
         let state = EditorState::new();
         // iced initializes Content::new() with a single newline
@@ -320,7 +475,7 @@ mod tests {
     #[test]
     fn set_language_by_extension_known() {
         let mut state = EditorState::new();
-        state.set_language_by_extension("rs");
+        state.adopt_extension_language("rs");
         assert_eq!(state.language, Some("rs".to_string()));
     }
 
@@ -342,9 +497,10 @@ mod tests {
     }
 
     #[test]
-    fn set_language_by_extension_unknown() {
+    fn unknown_extension_keeps_a_manual_language_override() {
         let mut state = EditorState::new();
-        state.set_language_by_extension("unknown_ext");
-        assert!(state.language.is_none());
+        state.language = Some("py".to_string());
+        state.adopt_extension_language("unknown_ext");
+        assert_eq!(state.language, Some("py".to_string()));
     }
 }

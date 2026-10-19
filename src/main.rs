@@ -1,7 +1,7 @@
 #[macro_use]
 extern crate rust_i18n;
 
-use iced::{window, Application, Settings, Size};
+use iced::{window, Application, Pixels, Settings, Size};
 
 fn load_icon() -> Option<window::Icon> {
     let bytes = include_bytes!("assets/icon.png");
@@ -14,6 +14,7 @@ mod app;
 mod config;
 mod editor;
 mod formatter;
+mod fsutil;
 mod i18n;
 mod menu_bar;
 mod preferences;
@@ -29,7 +30,8 @@ i18n!("src/i18n");
 fn main() -> iced::Result {
     // The saved preference wins; Config::load() falls back to the system locale
     // only when no config file exists yet.
-    rust_i18n::set_locale(&config::Config::load().locale);
+    let config = config::Config::load();
+    rust_i18n::set_locale(&config.locale);
 
     let file_arg = std::env::args()
         .nth(1)
@@ -46,7 +48,11 @@ fn main() -> iced::Result {
 
     app::SimpleEditApp::run(Settings {
         flags: file_arg,
+        default_text_size: Pixels(config::apply_font_size(config.font_size)),
         window: window::Settings {
+            // Closing the window goes through the app (Message::Quit) so the
+            // session is saved first.
+            exit_on_close_request: false,
             size: Size::new(1200.0, 800.0),
             min_size: Some(Size::new(600.0, 400.0)),
             resizable: true,
