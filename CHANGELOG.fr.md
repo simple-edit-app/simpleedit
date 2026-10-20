@@ -1,5 +1,10 @@
 # Journal des modifications
 
+## [1.11.0] - 2026-10-20
+
+### Ajouté
+- Le menu Fichier range les fichiers récents dans un sous-menu « Fichiers récents » qui s'ouvre au survol, avec une entrée « Effacer » pour vider la liste.
+
 ## [1.10.0] - 2026-10-20
 
 ### Corrigé

@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.11.0] - 2026-10-20
+
+### Added
+- The File menu keeps the recent files in a "Recent Files" submenu that opens on hover, with a "Clear" entry to empty the list.
+
 ## [1.10.0] - 2026-10-20
 
 ### Fixed
