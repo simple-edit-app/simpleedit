@@ -1,8 +1,8 @@
 name: simpleedit
-version: '0.5.3'
+adopt-info: simpleedit
 summary: A fast, stable, cross-platform text editor
 description: |
-  SimpleEdit is a fast, stable text editor with syntax highlighting for 60+
+  SimpleEdit is a fast, stable text editor with syntax highlighting for 30+
   languages, a file sidebar, search/replace with regex, and full i18n support
   (English and French). Compatible with Ubuntu, Debian, and other Linux distros.
 
@@ -17,6 +17,10 @@ parts:
   simpleedit:
     plugin: rust
     source: .
+    # The snap's version is the crate's, so the two can't drift apart.
+    override-pull: |
+      craftctl default
+      craftctl set version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
     build-packages:
       - libgtk-3-dev
       - libxkbcommon-dev

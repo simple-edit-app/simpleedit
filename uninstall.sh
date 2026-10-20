@@ -80,7 +80,8 @@ case "$OS" in
         fi
         if [ -d /Applications/SimpleEdit.app ]; then
             info "Removing /Applications/SimpleEdit.app…"
-            rm -rf /Applications/SimpleEdit.app
+            # An app installed by an administrator needs sudo; try without first.
+            rm -rf /Applications/SimpleEdit.app 2>/dev/null || sudo rm -rf /Applications/SimpleEdit.app
             REMOVED=1
         fi
         if [ -f /usr/local/bin/simpleedit ]; then

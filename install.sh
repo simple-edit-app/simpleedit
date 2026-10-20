@@ -18,32 +18,60 @@ SIGNING_PUBKEY='-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEAmZrvmo6ZzYbZD25u7dMsx6dm9HcyrW/ijgwVb4vjeks=
 -----END PUBLIC KEY-----'
 
-# Verify a downloaded file against the release's SHA256SUMS, and that file's
-# signature when it has one. Releases that predate the checksum or signature
-# files are installed with a warning.
+# Verification is mandatory: the checksum list must be signed with the release
+# key, and the file must match the list. A release that lacks either, or a
+# machine that can't check the signature, makes the install fail. `--insecure`
+# (or SIMPLEEDIT_INSECURE=1) installs anyway, with a warning, for old releases.
+INSECURE="${SIMPLEEDIT_INSECURE:-0}"
+for arg in "$@"; do
+    case "$arg" in
+        --insecure) INSECURE=1 ;;
+        *) err "Unknown option: $arg" ;;
+    esac
+done
+
+# An openssl that can verify Ed25519 signatures with -rawin (OpenSSL 3; the
+# LibreSSL of macOS can't, Homebrew's openssl@3 can).
+find_openssl() {
+    local candidate
+    for candidate in openssl /opt/homebrew/opt/openssl@3/bin/openssl /usr/local/opt/openssl@3/bin/openssl; do
+        if command -v "$candidate" &>/dev/null && "$candidate" pkeyutl -help 2>&1 | grep -q -- '-rawin'; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Either refuse (default) or warn (--insecure).
+unverifiable() {
+    if [ "$INSECURE" = "1" ]; then
+        echo "! $1 Installing without that check (--insecure)." >&2
+    else
+        err "$1 Aborting; use --insecure to install anyway."
+    fi
+}
+
 verify() {
-    local file="$1" name="$2" work sums expected actual
+    local file="$1" name="$2" work expected actual openssl
     work=$(mktemp -d)
+    trap 'rm -rf "$work"' RETURN
     if ! curl -fsSL "https://github.com/${REPO}/releases/download/${VERSION}/SHA256SUMS" -o "$work/SHA256SUMS" 2>/dev/null; then
-        echo "! No SHA256SUMS published for ${VERSION}; skipping integrity check." >&2
-        rm -rf "$work"
+        unverifiable "No SHA256SUMS is published for ${VERSION}."
         return 0
     fi
-    if curl -fsSL "https://github.com/${REPO}/releases/download/${VERSION}/SHA256SUMS.sig" -o "$work/SHA256SUMS.sig" 2>/dev/null; then
-        if openssl pkeyutl -help 2>&1 | grep -q -- '-rawin'; then
-            printf '%s\n' "$SIGNING_PUBKEY" > "$work/pub.pem"
-            openssl pkeyutl -verify -pubin -inkey "$work/pub.pem" -rawin \
-                -in "$work/SHA256SUMS" -sigfile "$work/SHA256SUMS.sig" >/dev/null 2>&1 \
-                || { rm -rf "$work"; err "Invalid signature on SHA256SUMS. Aborting."; }
-            ok "Signature verified"
-        else
-            echo "! This openssl can't verify Ed25519 signatures; checking the checksum only." >&2
-        fi
+    if ! curl -fsSL "https://github.com/${REPO}/releases/download/${VERSION}/SHA256SUMS.sig" -o "$work/SHA256SUMS.sig" 2>/dev/null; then
+        unverifiable "No signature is published for ${VERSION}."
+    elif ! openssl=$(find_openssl); then
+        unverifiable "This system has no openssl able to verify Ed25519 signatures (install OpenSSL 3, e.g. 'brew install openssl@3')."
     else
-        echo "! No signature published for ${VERSION}; checking the checksum only." >&2
+        printf '%s\n' "$SIGNING_PUBKEY" > "$work/pub.pem"
+        "$openssl" pkeyutl -verify -pubin -inkey "$work/pub.pem" -rawin \
+            -in "$work/SHA256SUMS" -sigfile "$work/SHA256SUMS.sig" >/dev/null 2>&1 \
+            || err "Invalid signature on SHA256SUMS. Aborting."
+        ok "Signature verified"
     fi
     expected=$(awk -v n="$name" '{f=$2; sub(/^\*/, "", f)} f==n {print $1; exit}' "$work/SHA256SUMS")
-    rm -rf "$work"
     [ -n "$expected" ] || err "No checksum listed for ${name}."
     if command -v sha256sum &>/dev/null; then
         actual=$(sha256sum "$file" | awk '{print $1}')
@@ -90,7 +118,12 @@ case "$OS" in
             curl -fsSL --progress-bar "$URL" -o "$TMP"
             verify "$TMP" "$DEB"
             info "Installing (requires sudo)…"
-            sudo dpkg -i "$TMP"
+            # apt also installs the package's dependencies; dpkg alone doesn't.
+            if command -v apt-get &>/dev/null; then
+                sudo apt-get install -y "$TMP"
+            else
+                sudo dpkg -i "$TMP"
+            fi
             rm -f "$TMP"
             # Refresh icon cache so the app appears in the launcher immediately
             sudo gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true

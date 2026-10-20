@@ -1,6 +1,8 @@
 pub mod highlighter;
 
 /// All (token, display_name) pairs recognized by the syntax highlighter.
+/// The token is what formatters, comment markers and previews key on; the
+/// grammar used for coloring may be a close relative (see `highlighter`).
 pub const SUPPORTED_LANGUAGES: &[(&str, &str)] = &[
     ("rs", "Rust"),
     ("py", "Python"),
@@ -10,23 +12,32 @@ pub const SUPPORTED_LANGUAGES: &[(&str, &str)] = &[
     ("tsx", "TSX"),
     ("html", "HTML"),
     ("css", "CSS"),
+    ("scss", "SCSS"),
+    ("less", "Less"),
     ("json", "JSON"),
     ("toml", "TOML"),
     ("yaml", "YAML"),
     ("md", "Markdown"),
     ("sh", "Shell"),
+    ("make", "Makefile"),
     ("c", "C"),
     ("cpp", "C++"),
+    ("cs", "C#"),
     ("java", "Java"),
     ("go", "Go"),
     ("rb", "Ruby"),
     ("php", "PHP"),
+    ("pl", "Perl"),
+    ("hs", "Haskell"),
+    ("scala", "Scala"),
     ("swift", "Swift"),
     ("kt", "Kotlin"),
     ("xml", "XML"),
     ("sql", "SQL"),
     ("lua", "Lua"),
     ("r", "R"),
+    ("tex", "LaTeX"),
+    ("diff", "Diff"),
 ];
 
 use iced::{Element, Length};
@@ -104,21 +115,22 @@ pub fn line_replacement(old: &str, new: &str) -> Option<LineReplacement> {
 ///
 /// Must only be called once the editor has laid out its current content:
 /// cosmic-text panics ("layout not found") when a motion crosses a line that
-/// was edited since the last layout. The app guarantees that by deferring
-/// such operations until after a redraw (see `layout_stale` in `app.rs`).
+/// was edited since the last layout. `Content::settle` takes care of that.
 pub fn set_buffer_text(content: &mut crate::code_editor::Content, new_text: &str) {
-    use iced::widget::text_editor::{Action, Edit, Motion};
-
     let old = buffer_text(content);
-    let Some(change) = line_replacement(&old, new_text) else {
+    replace_text(content, &old, new_text);
+}
+
+/// `set_buffer_text` for a caller that already holds the current text
+/// (`old`), saving a full copy of the buffer.
+pub fn replace_text(content: &mut crate::code_editor::Content, old: &str, new_text: &str) {
+    use iced::widget::text_editor::{Action, Edit};
+
+    let Some(change) = line_replacement(old, new_text) else {
         return;
     };
-    let len = change.old_text.chars().count();
-    if len <= 20_000 {
-        crate::search::goto_line_start(content, change.first_line);
-        for _ in 0..len {
-            content.perform(Action::Select(Motion::Right));
-        }
+    if change.old_text.len() <= 100_000 {
+        content.select_bytes(change.first_line, 0, change.old_text.len());
         let last_line = change.first_line + change.old_text.matches('\n').count();
         // Belt and braces: never paste unless exactly the old lines are selected.
         let positioned = content.cursor_position().0 == last_line
@@ -146,6 +158,7 @@ impl EditorState {
         }
     }
 
+    #[cfg(test)]
     pub fn from_content(text: &str) -> Self {
         Self {
             content: crate::code_editor::Content::with_text(text),
@@ -155,8 +168,8 @@ impl EditorState {
 
     /// Like `set_language_by_extension`, but keeps the current language when
     /// the extension isn't recognized (e.g. a manual override survives a save).
-    pub fn adopt_extension_language(&mut self, ext: &str) {
-        if let Some(token) = extension_to_token(ext) {
+    pub fn adopt_path_language(&mut self, path: &std::path::Path, first_line: &str) {
+        if let Some(token) = detect_language(path, first_line) {
             self.language = Some(token.to_string());
         }
     }
@@ -164,13 +177,13 @@ impl EditorState {
     /// Restores a language remembered for a buffer, falling back to the file
     /// extension: sessions and the file cache predate the language override and
     /// may carry `None` for a file that was never the active editor.
-    pub fn restore_language(&mut self, cached: Option<String>, path: &std::path::Path) {
-        self.language = cached.or_else(|| {
-            path.extension()
-                .and_then(|e| e.to_str())
-                .and_then(extension_to_token)
-                .map(str::to_string)
-        });
+    pub fn restore_language(
+        &mut self,
+        cached: Option<String>,
+        path: &std::path::Path,
+        first_line: &str,
+    ) {
+        self.language = cached.or_else(|| detect_language(path, first_line).map(str::to_string));
     }
 
     pub fn view<'a>(
@@ -180,6 +193,7 @@ impl EditorState {
         bookmarks: &[usize],
     ) -> Element<'a, Message> {
         let dark = config.dark_mode;
+        self.content.set_wrapping(config.word_wrap);
         let p = crate::theme::palette(dark);
         let extension = self.language.clone().unwrap_or_default();
 
@@ -192,9 +206,7 @@ impl EditorState {
                 highlighter::Settings { dark, extension },
                 highlighter::to_format,
             )
-            .style(iced::theme::TextEditor::Custom(Box::new(
-                crate::theme::EditorStyle { dark },
-            )))
+            .style(crate::theme::editor_style(dark))
             .height(Length::Fill);
 
         if let Some((query, case_sensitive, use_regex)) =
@@ -204,6 +216,7 @@ impl EditorState {
                 query,
                 case_sensitive,
                 use_regex,
+                regex: search.and_then(SearchState::compiled_regex),
                 current: search.and_then(SearchState::current_match_line),
                 color: p.search_match,
                 current_color: iced::Color {
@@ -275,32 +288,87 @@ pub fn text_origin(config: &Config, lines: usize) -> iced::Vector {
 const LINE_HEIGHT: f32 = 1.7;
 
 fn extension_to_token(ext: &str) -> Option<&'static str> {
-    match ext {
+    match ext.to_ascii_lowercase().as_str() {
         "rs" => Some("rs"),
-        "py" => Some("py"),
-        "js" | "jsx" => Some("js"),
-        "ts" | "tsx" => Some("ts"),
-        "html" | "htm" => Some("html"),
+        "py" | "pyw" => Some("py"),
+        "js" | "mjs" | "cjs" => Some("js"),
+        "jsx" => Some("jsx"),
+        "ts" | "mts" | "cts" => Some("ts"),
+        "tsx" => Some("tsx"),
+        "html" | "htm" | "xhtml" => Some("html"),
         "css" => Some("css"),
+        "scss" => Some("scss"),
+        "less" => Some("less"),
         "json" => Some("json"),
         "toml" => Some("toml"),
         "yaml" | "yml" => Some("yaml"),
-        "md" => Some("md"),
-        "sh" | "bash" => Some("sh"),
+        "md" | "markdown" => Some("md"),
+        "sh" | "bash" | "zsh" => Some("sh"),
+        "mk" | "mak" => Some("make"),
         "c" | "h" => Some("c"),
-        "cpp" | "cc" | "cxx" | "hpp" => Some("cpp"),
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some("cpp"),
+        "cs" => Some("cs"),
         "java" => Some("java"),
         "go" => Some("go"),
         "rb" => Some("rb"),
         "php" => Some("php"),
+        "pl" | "pm" => Some("pl"),
+        "hs" => Some("hs"),
+        "scala" => Some("scala"),
         "swift" => Some("swift"),
-        "kt" => Some("kt"),
-        "xml" => Some("xml"),
+        "kt" | "kts" => Some("kt"),
+        "xml" | "svg" | "plist" => Some("xml"),
         "sql" => Some("sql"),
         "lua" => Some("lua"),
         "r" => Some("r"),
+        "tex" => Some("tex"),
+        "diff" | "patch" => Some("diff"),
         _ => None,
     }
+}
+
+/// Files recognized by their whole name.
+fn filename_to_token(name: &str) -> Option<&'static str> {
+    match name {
+        "Makefile" | "makefile" | "GNUmakefile" => Some("make"),
+        ".bashrc" | ".bash_profile" | ".bash_aliases" | ".profile" | ".zshrc" | ".zprofile"
+        | ".zshenv" => Some("sh"),
+        _ => None,
+    }
+}
+
+/// The language named by a `#!` first line.
+fn shebang_to_token(first_line: &str) -> Option<&'static str> {
+    let rest = first_line.strip_prefix("#!")?;
+    let mut words = rest.split_whitespace();
+    let mut program = words.next()?.rsplit('/').next()?;
+    if program == "env" {
+        program = words.find(|w| !w.starts_with('-'))?;
+    }
+    let program = program.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    match program {
+        "sh" | "bash" | "zsh" | "dash" | "ash" => Some("sh"),
+        "python" => Some("py"),
+        "node" | "nodejs" | "deno" => Some("js"),
+        "ruby" => Some("rb"),
+        "perl" => Some("pl"),
+        "php" => Some("php"),
+        "lua" => Some("lua"),
+        _ => None,
+    }
+}
+
+/// The language of a file: by extension, then by name, then by shebang.
+pub fn detect_language(path: &std::path::Path, first_line: &str) -> Option<&'static str> {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .and_then(extension_to_token)
+        .or_else(|| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(filename_to_token)
+        })
+        .or_else(|| shebang_to_token(first_line))
 }
 
 pub mod statusbar {
@@ -317,8 +385,9 @@ pub mod statusbar {
         pub status: &'a str,
         pub is_error: bool,
         pub dark: bool,
-        /// Cursor as (line, byte column).
+        /// Cursor as (line, column in characters), both from 0.
         pub cursor: (usize, usize),
+        pub line_ending: &'a str,
         pub language: Option<&'a str>,
         pub selection: Option<String>,
         pub file_size: Option<u64>,
@@ -326,13 +395,15 @@ pub mod statusbar {
         pub tab_width: usize,
     }
 
-    fn size_label(b: u64) -> String {
+    pub(super) fn size_label(b: u64) -> String {
+        const KB: f64 = 1024.0;
+        let value = b as f64;
         if b < 1024 {
-            format!("{}B", b)
-        } else if b < 1024 * 1024 {
-            format!("{}KB", b / 1024)
+            t!("status.size_b", n = b).to_string()
+        } else if value < KB * KB {
+            t!("status.size_kb", n = format!("{:.1}", value / KB)).to_string()
         } else {
-            format!("{}MB", b / (1024 * 1024))
+            t!("status.size_mb", n = format!("{:.1}", value / (KB * KB))).to_string()
         }
     }
 
@@ -368,38 +439,40 @@ pub mod statusbar {
             p.accent
         };
 
-        let mut right = row![].spacing(18).align_items(Alignment::Center);
+        let mut right = row![].spacing(18).align_y(Alignment::Center);
         if let Some(sel) = info.selection {
-            right = right.push(text(sel).size(11.5).style(muted));
+            right = right.push(text(sel).size(11.5).color(muted));
         }
         if let Some(bytes) = info.file_size {
-            right = right.push(text(size_label(bytes)).size(11.5).style(muted));
+            right = right.push(text(size_label(bytes)).size(11.5).color(muted));
         }
         right = right
             .push(
                 text(t!("status.cursor", line = line + 1, col = col + 1).to_string())
                     .size(11.5)
-                    .style(muted),
+                    .color(muted),
             )
-            .push(text(indent).size(11.5).style(muted))
-            .push(text("UTF-8").size(11.5).style(muted))
-            .push(text(lang_label).size(11.5).style(p.text));
+            .push(text(indent).size(11.5).color(muted))
+            .push(text(info.line_ending).size(11.5).color(muted))
+            .push(text("UTF-8").size(11.5).color(muted))
+            .push(text(lang_label).size(11.5).color(p.text));
 
         let bar = row![
-            container(Space::new(6, 6)).style(theme::dot(dot_color)),
+            container(Space::new().width(6).height(6)).style(theme::dot(dot_color)),
             text(info.status)
                 .size(11.5)
-                .style(if info.is_error { dot_color } else { muted }),
-            Space::with_width(Length::Fill),
+                .shaping(iced::widget::text::Shaping::Advanced)
+                .color(if info.is_error { dot_color } else { muted }),
+            Space::new().width(Length::Fill),
             right,
         ]
         .spacing(6)
         .padding([0, 14])
         .height(30)
-        .align_items(Alignment::Center);
+        .align_y(Alignment::Center);
 
         column![
-            container(Space::with_height(1))
+            container(Space::new().height(1))
                 .width(Length::Fill)
                 .style(theme::rule(dark)),
             bar
@@ -489,6 +562,122 @@ mod tests {
     }
 
     #[test]
+    fn tsx_and_jsx_keep_their_own_token_and_common_extensions_are_known() {
+        for (ext, token) in [
+            ("tsx", "tsx"),
+            ("jsx", "jsx"),
+            ("mjs", "js"),
+            ("markdown", "md"),
+            ("scss", "scss"),
+            ("kts", "kt"),
+            ("HTM", "html"),
+        ] {
+            assert_eq!(extension_to_token(ext), Some(token), ".{ext}");
+        }
+    }
+
+    #[test]
+    fn languages_are_found_by_name_and_by_shebang() {
+        let p = std::path::Path::new;
+        assert_eq!(detect_language(p("/x/Makefile"), ""), Some("make"));
+        assert_eq!(detect_language(p("/x/.bashrc"), ""), Some("sh"));
+        assert_eq!(
+            detect_language(p("/x/run"), "#!/usr/bin/env python3"),
+            Some("py")
+        );
+        assert_eq!(detect_language(p("/x/run"), "#!/bin/bash"), Some("sh"));
+        assert_eq!(detect_language(p("/x/run"), "plain"), None);
+        // The extension wins over a shebang.
+        assert_eq!(detect_language(p("/x/a.rb"), "#!/bin/sh"), Some("rb"));
+    }
+
+    #[test]
+    fn every_listed_language_has_an_extension_or_a_name() {
+        // The language picker offers these tokens; detection must be able to
+        // produce each of them.
+        for (token, _) in SUPPORTED_LANGUAGES {
+            let produced = [
+                "rs", "py", "js", "jsx", "ts", "tsx", "html", "css", "scss", "less", "json",
+                "toml", "yaml", "md", "sh", "mk", "c", "cpp", "cs", "java", "go", "rb", "php",
+                "pl", "hs", "scala", "swift", "kt", "xml", "sql", "lua", "r", "tex", "diff",
+            ]
+            .iter()
+            .any(|ext| extension_to_token(ext) == Some(*token));
+            assert!(produced, "no extension maps to {token}");
+        }
+    }
+
+    #[test]
+    fn positioning_the_cursor_in_a_big_file_is_instant() {
+        let text = "let x = 1;\n".repeat(100_000);
+        let mut content = crate::code_editor::Content::with_text(&text);
+        let started = std::time::Instant::now();
+        crate::code_editor::goto_line_start(&mut content, 50_000);
+        assert_eq!(content.cursor_position(), (50_000, 0));
+        content.select_bytes(99_990, 4, 8);
+        assert_eq!(content.selection().as_deref(), Some("x = 1;\nl"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn selection_counts_match_the_selected_text() {
+        let mut content = crate::code_editor::Content::with_text("héllo\nwörld\nend\n");
+        content.select_bytes(0, 1, 11);
+        let text = content.selection().unwrap();
+        assert_eq!(
+            content.selection_counts(),
+            Some((text.chars().count(), text.lines().count()))
+        );
+        content.select_bytes(1, 0, 0);
+        assert_eq!(content.selection_counts(), None);
+    }
+
+    #[test]
+    fn wrapping_can_be_switched_without_touching_the_text() {
+        let content = crate::code_editor::Content::with_text("a long line\n");
+        content.set_wrapping(false);
+        content.set_wrapping(false);
+        content.set_wrapping(true);
+        assert_eq!(buffer_text(&content), "a long line\n");
+    }
+
+    #[test]
+    fn set_buffer_text_keeps_trailing_tabs() {
+        // cosmic-text strips a trailing control character from pasted text.
+        let mut content = crate::code_editor::Content::with_text("x\n");
+        set_buffer_text(&mut content, "a\t\n");
+        assert_eq!(buffer_text(&content), "a\t\n");
+    }
+
+    #[test]
+    fn pasting_a_tab_after_text_inserts_it() {
+        use iced::widget::text_editor::{Action, Edit, Motion};
+        let mut content = crate::code_editor::Content::with_text("ab\n");
+        content.perform(Action::Move(Motion::DocumentEnd));
+        content.perform(Action::Edit(Edit::Paste(std::sync::Arc::new(
+            "\t\t".into(),
+        ))));
+        assert_eq!(buffer_text(&content), "ab\t\t\n");
+    }
+
+    #[test]
+    fn pasted_windows_line_breaks_are_normalized() {
+        use iced::widget::text_editor::{Action, Edit};
+        let mut content = crate::code_editor::Content::with_text("");
+        content.perform(Action::Edit(Edit::Paste(std::sync::Arc::new(
+            "x\r\ny".into(),
+        ))));
+        assert_eq!(buffer_text(&content), "x\ny\n");
+    }
+
+    #[test]
+    fn size_labels_use_one_decimal() {
+        // (The unit depends on the interface language other tests may set.)
+        assert!(statusbar::size_label(1_992_294).starts_with("1.9"));
+        assert!(statusbar::size_label(512).starts_with("512"));
+    }
+
+    #[test]
     fn editor_state_new_is_empty() {
         let state = EditorState::new();
         // iced initializes Content::new() with a single newline
@@ -505,24 +694,28 @@ mod tests {
     #[test]
     fn set_language_by_extension_known() {
         let mut state = EditorState::new();
-        state.adopt_extension_language("rs");
+        state.adopt_path_language(std::path::Path::new("a.rs"), "");
         assert_eq!(state.language, Some("rs".to_string()));
     }
 
     #[test]
     fn restore_language_prefers_the_cached_value() {
         let mut state = EditorState::new();
-        state.restore_language(Some("md".to_string()), std::path::Path::new("/a/b.json"));
+        state.restore_language(
+            Some("md".to_string()),
+            std::path::Path::new("/a/b.json"),
+            "",
+        );
         assert_eq!(state.language, Some("md".to_string()));
     }
 
     #[test]
     fn restore_language_falls_back_to_the_extension() {
         let mut state = EditorState::new();
-        state.restore_language(None, std::path::Path::new("/a/b.json"));
+        state.restore_language(None, std::path::Path::new("/a/b.json"), "");
         assert_eq!(state.language, Some("json".to_string()));
 
-        state.restore_language(None, std::path::Path::new("/a/b.unknown"));
+        state.restore_language(None, std::path::Path::new("/a/b.unknown"), "");
         assert!(state.language.is_none());
     }
 
@@ -530,7 +723,7 @@ mod tests {
     fn unknown_extension_keeps_a_manual_language_override() {
         let mut state = EditorState::new();
         state.language = Some("py".to_string());
-        state.adopt_extension_language("unknown_ext");
+        state.adopt_path_language(std::path::Path::new("a.unknown_ext"), "");
         assert_eq!(state.language, Some("py".to_string()));
     }
 }

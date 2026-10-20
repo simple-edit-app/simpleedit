@@ -23,6 +23,9 @@ static LIGHT: Lazy<highlighting::Theme> = Lazy::new(|| build_theme(false));
 
 const LINES_PER_SNAPSHOT: usize = 50;
 
+/// Lines longer than this (in bytes) are not colored.
+const MAX_HIGHLIGHTED_LINE: usize = 10_000;
+
 fn syn_color(c: Color) -> SynColor {
     let byte = |v: f32| (v * 255.0).round().clamp(0.0, 255.0) as u8;
     SynColor {
@@ -90,9 +93,19 @@ pub struct Highlighter {
     current_line: usize,
 }
 
-fn syntax_for(extension: &str) -> &'static parsing::SyntaxReference {
+/// The grammar that colors a language token: its own when syntect ships one,
+/// else a close relative (TypeScript reads as JavaScript, Kotlin and Swift
+/// as Java, TOML as shell for its comments, strings and numbers).
+fn syntax_for(token: &str) -> &'static parsing::SyntaxReference {
+    let grammar = match token {
+        "ts" | "tsx" | "jsx" => "js",
+        "scss" | "less" => "css",
+        "kt" | "swift" => "java",
+        "toml" => "sh",
+        other => other,
+    };
     SYNTAXES
-        .find_syntax_by_token(extension)
+        .find_syntax_by_token(grammar)
         .unwrap_or_else(|| SYNTAXES.find_syntax_plain_text())
 }
 
@@ -167,6 +180,12 @@ impl text::Highlighter for Highlighter {
 
         self.current_line += 1;
 
+        // Coloring a minified file's single line takes seconds on each
+        // keystroke; such a line stays plain.
+        if line.len() > MAX_HIGHLIGHTED_LINE {
+            return Box::new(std::iter::empty());
+        }
+
         let (parser, stack) = self.caches.last_mut().expect("Caches must not be empty");
 
         let ops = parser.parse_line(line, &SYNTAXES).unwrap_or_default();
@@ -221,6 +240,11 @@ fn refines(extension: &str) -> bool {
             | "xml"
             | "html"
             | "css"
+            | "scss"
+            | "less"
+            | "make"
+            | "diff"
+            | "tex"
             | "sql"
             | "sh"
             | "bash"
@@ -408,5 +432,33 @@ mod tests {
             at = r.end;
         }
         assert_eq!(at, line.len());
+    }
+
+    #[test]
+    fn every_listed_language_is_colored_by_some_grammar() {
+        for (token, name) in crate::editor::SUPPORTED_LANGUAGES {
+            let syntax = super::syntax_for(token);
+            assert_ne!(syntax.name, "Plain Text", "{name} ({token}) has no grammar");
+        }
+    }
+
+    #[test]
+    fn a_very_long_line_is_left_plain() {
+        use iced::advanced::text::Highlighter as _;
+        let mut h = super::Highlighter::new(&super::Settings {
+            dark: true,
+            extension: "json".into(),
+        });
+        let long = format!("[{}]", "1,".repeat(super::MAX_HIGHLIGHTED_LINE));
+        assert_eq!(h.highlight_line(&long).count(), 0);
+        assert!(h.highlight_line("[1]").count() > 0);
+    }
+
+    #[test]
+    fn languages_without_their_own_grammar_use_a_close_relative() {
+        assert_eq!(super::syntax_for("tsx").name, "JavaScript");
+        assert_eq!(super::syntax_for("scss").name, "CSS");
+        assert_eq!(super::syntax_for("kt").name, "Java");
+        assert_eq!(super::syntax_for("unknown").name, "Plain Text");
     }
 }

@@ -13,11 +13,10 @@ use iced::{
         Clipboard, Layout, Shell, Widget,
     },
     alignment::Horizontal,
-    event, mouse,
+    mouse,
     widget::{column, container, mouse_area, row, scrollable, text, Space},
-    Color, Command, Element, Event, Font, Length, Rectangle, Size, Theme, Vector,
+    Color, Element, Event, Font, Length, Rectangle, Size, Task, Theme, Vector,
 };
-use iced_aw::{Grid, GridRow};
 
 use crate::app::Message;
 use crate::theme;
@@ -366,16 +365,33 @@ fn table_cells(line: &str) -> Vec<String> {
 }
 
 /// Longest line given inline (bold, links…) parsing.
-const MAX_INLINE_CHARS: usize = 20_000;
+const MAX_INLINE_CHARS: usize = 200_000;
+
+/// Delimiters already known to have no (valid) partner from some position
+/// on, so an unmatched opener repeated thousands of times (`*a *a *a …`)
+/// doesn't rescan the rest of the line each time.
+#[derive(Default)]
+struct Misses(std::collections::HashMap<String, usize>);
+
+impl Misses {
+    fn known(&self, key: &str, from: usize) -> bool {
+        self.0.get(key).is_some_and(|miss| from >= *miss)
+    }
+
+    fn record(&mut self, key: &str, from: usize) {
+        let entry = self.0.entry(key.to_string()).or_insert(from);
+        *entry = (*entry).min(from);
+    }
+}
 
 /// Splits a line into styled inline spans.
 pub fn parse_inline(src: &str) -> Vec<Span> {
     let chars: Vec<char> = src.chars().collect();
-    // Looking for the closing marker of every opener is quadratic on a very
-    // long line (minified or pasted text); past this, show it as plain text.
+    // Past this, a line is shown as plain text.
     if chars.len() > MAX_INLINE_CHARS {
         return vec![Span::new(src, Style::Plain)];
     }
+    let mut misses = Misses::default();
     let mut spans: Vec<Span> = Vec::new();
     let mut buf = String::new();
     let mut i = 0;
@@ -387,7 +403,7 @@ pub fn parse_inline(src: &str) -> Vec<Span> {
                 buf.push(chars[i + 1]);
                 i += 2;
             }
-            '`' => match find(&chars, i + 1, "`") {
+            '`' => match find_cached(&chars, i + 1, "`", &mut misses) {
                 Some(end) => {
                     push_plain(&mut spans, &mut buf);
                     spans.push(Span::new(collect(&chars, i + 1, end), Style::Code));
@@ -401,7 +417,7 @@ pub fn parse_inline(src: &str) -> Vec<Span> {
             '*' | '_' => {
                 let run = chars[i..].iter().take_while(|ch| **ch == c).count().min(3);
                 let start = i + run;
-                match emphasis_end(&chars, i, c, run) {
+                match emphasis_end(&chars, i, c, run, &mut misses) {
                     Some(end) => {
                         push_plain(&mut spans, &mut buf);
                         let style = match run {
@@ -421,7 +437,7 @@ pub fn parse_inline(src: &str) -> Vec<Span> {
             '[' | '!' => {
                 let open = if c == '!' { i + 1 } else { i };
                 let is_link = chars.get(open) == Some(&'[');
-                match is_link.then(|| link(&chars, open)).flatten() {
+                match is_link.then(|| link(&chars, open, &mut misses)).flatten() {
                     Some((label, href, end)) => {
                         push_plain(&mut spans, &mut buf);
                         spans.push(Span::link(label, href));
@@ -449,41 +465,66 @@ pub fn parse_inline(src: &str) -> Vec<Span> {
 /// Follows the two rules that matter in practice: the delimiters must hug the
 /// emphasized text (so `2 * 3 * 4` stays arithmetic), and `_` only delimits at
 /// a word boundary (so `snake_case_name` stays one word).
-fn emphasis_end(chars: &[char], i: usize, marker: char, run: usize) -> Option<usize> {
+fn emphasis_end(
+    chars: &[char],
+    i: usize,
+    marker: char,
+    run: usize,
+    misses: &mut Misses,
+) -> Option<usize> {
     let start = i + run;
-    if chars.get(start).map_or(true, |c| c.is_whitespace()) {
+    if chars.get(start).is_none_or(|c| c.is_whitespace()) {
         return None;
     }
     if marker == '_' && i > 0 && chars[i - 1].is_alphanumeric() {
         return None;
     }
 
-    let delim: String = std::iter::repeat(marker).take(run).collect();
-    let mut from = start + 1;
+    let delim: String = std::iter::repeat_n(marker, run).collect();
+    let key = format!("emphasis {delim}");
+    let first = start + 1;
+    if misses.known(&key, first) {
+        return None;
+    }
+    let mut from = first;
     while let Some(end) = find(chars, from, &delim) {
         let closes = !chars[end - 1].is_whitespace()
-            && (marker != '_' || chars.get(end + run).map_or(true, |c| !c.is_alphanumeric()));
+            && (marker != '_' || chars.get(end + run).is_none_or(|c| !c.is_alphanumeric()));
         if closes {
             return Some(end);
         }
         from = end + 1;
     }
+    misses.record(&key, first);
     None
 }
 
 /// Parses `[label](url)` starting at the `[`; returns the label, the url,
 /// and the index just past the closing `)`.
-fn link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
-    let close = find(chars, start + 1, "]")?;
+fn link(chars: &[char], start: usize, misses: &mut Misses) -> Option<(String, String, usize)> {
+    let close = find_cached(chars, start + 1, "]", misses)?;
     if chars.get(close + 1) != Some(&'(') {
         return None;
     }
-    let end = find(chars, close + 2, ")")?;
+    let end = find_cached(chars, close + 2, ")", misses)?;
     Some((
         collect(chars, start + 1, close),
         collect(chars, close + 2, end),
         end + 1,
     ))
+}
+
+/// `find`, remembering a failure: no occurrence after `from` means none
+/// after any later position either.
+fn find_cached(chars: &[char], from: usize, needle: &str, misses: &mut Misses) -> Option<usize> {
+    if misses.known(needle, from) {
+        return None;
+    }
+    let found = find(chars, from, needle);
+    if found.is_none() {
+        misses.record(needle, from);
+    }
+    found
 }
 
 /// Index of the next occurrence of `needle` at or after `from`.
@@ -514,7 +555,8 @@ fn push_plain(spans: &mut Vec<Span>, buf: &mut String) {
 // one matches.
 
 /// GitHub's heading-to-anchor algorithm: lowercase, drop anything but
-/// letters/digits/spaces/hyphens, turn spaces into hyphens.
+/// letters, digits, underscores, spaces and hyphens, turn spaces into
+/// hyphens.
 fn slugify(text: &str) -> String {
     let mut slug = String::new();
     for c in text.chars() {
@@ -522,9 +564,31 @@ fn slugify(text: &str) -> String {
             slug.extend(c.to_lowercase());
         } else if c == ' ' || c == '-' {
             slug.push('-');
+        } else if c == '_' {
+            slug.push('_');
         }
     }
     slug
+}
+
+/// An anchor as written in a link: `%C3%A9` is `é`.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// The plain text of a heading's spans, markers already stripped by the
@@ -557,12 +621,12 @@ fn assign_slugs(blocks: &[Block]) -> Vec<Option<String>> {
 }
 
 /// Stable id of the preview's own scrollable, so a link click can scroll it.
-pub fn scrollable_id() -> scrollable::Id {
-    scrollable::Id::new("markdown-preview")
+pub fn scrollable_id() -> iced::widget::Id {
+    iced::widget::Id::new("markdown-preview")
 }
 
-fn anchor_id(slug: &str) -> container::Id {
-    container::Id::new(format!("md-anchor-{slug}"))
+fn anchor_id(slug: &str) -> iced::widget::Id {
+    iced::widget::Id::from(format!("md-anchor-{slug}"))
 }
 
 /// Walks the widget tree to find how far a heading's anchor sits below the
@@ -578,30 +642,28 @@ struct FindHeadingOffset {
 }
 
 impl Operation<Option<f32>> for FindHeadingOffset {
-    fn container(
-        &mut self,
-        id: Option<&WidgetId>,
-        bounds: Rectangle,
-        operate_on_children: &mut dyn FnMut(&mut dyn Operation<Option<f32>>),
-    ) {
-        if self.offset.is_some() {
-            return;
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<Option<f32>>)) {
+        // Found: nothing below the heading (or after it) matters.
+        if self.offset.is_none() {
+            operate(self);
         }
-        if id == Some(&self.target_id) {
+    }
+
+    fn container(&mut self, id: Option<&WidgetId>, bounds: Rectangle) {
+        if self.offset.is_none() && id == Some(&self.target_id) {
             if let Some(top) = self.scrollable_top {
                 self.offset = Some(bounds.y - top);
             }
-            return;
         }
-        operate_on_children(self);
     }
 
     fn scrollable(
         &mut self,
-        _state: &mut dyn operation::Scrollable,
         id: Option<&WidgetId>,
         bounds: Rectangle,
+        _content_bounds: Rectangle,
         _translation: Vector,
+        _state: &mut dyn operation::Scrollable,
     ) {
         if id == Some(&self.scrollable_id) {
             self.scrollable_top = Some(bounds.y);
@@ -613,13 +675,13 @@ impl Operation<Option<f32>> for FindHeadingOffset {
     }
 }
 
-/// A `Command` resolving to the target heading's offset for `href`
+/// A `Task` resolving to the target heading's offset for `href`
 /// (`#some-slug`), or `None` if it names no heading in the current document.
-pub fn find_offset_command(href: &str) -> Command<Option<f32>> {
-    let slug = href.trim_start_matches('#').to_lowercase();
-    Command::widget(FindHeadingOffset {
-        scrollable_id: scrollable_id().into(),
-        target_id: anchor_id(&slug).into(),
+pub fn find_offset_command(href: &str) -> Task<Option<f32>> {
+    let slug = percent_decode(href.trim_start_matches('#')).to_lowercase();
+    iced::advanced::widget::operate(FindHeadingOffset {
+        scrollable_id: scrollable_id(),
+        target_id: anchor_id(&slug),
         scrollable_top: None,
         offset: None,
     })
@@ -673,9 +735,7 @@ pub fn view(blocks: &[Block], dark: bool) -> Element<'static, Message> {
             .width(Length::Fill)
             .padding([22, 28]),
     )
-    .style(iced::theme::Scrollable::Custom(Box::new(
-        theme::Scrollbar { dark },
-    )))
+    .style(theme::Scrollbar { dark }.style())
     .id(scrollable_id())
     .width(Length::Fill)
     .height(Length::Fill)
@@ -711,7 +771,7 @@ fn block_view(block: &Block, dark: bool, slug: Option<&str>) -> Element<'static,
         } => {
             // Bullets are a small accent dot; numbers stay muted text.
             let marker: Element<'static, Message> = if marker == "•" {
-                container(container(Space::new(5, 5)).style(theme::dot(p.accent)))
+                container(container(Space::new().width(5).height(5)).style(theme::dot(p.accent)))
                     .padding(iced::Padding {
                         top: 8.0,
                         right: 0.0,
@@ -722,13 +782,13 @@ fn block_view(block: &Block, dark: bool, slug: Option<&str>) -> Element<'static,
             } else {
                 text(marker.clone())
                     .size(BODY_SIZE)
-                    .style(theme::muted_text(dark))
+                    .color(theme::muted_text(dark))
                     .into()
             };
             row![
-                Space::with_width(Length::Fixed(*depth as f32 * 18.0)),
+                Space::new().width(Length::Fixed(*depth as f32 * 18.0)),
                 marker,
-                Space::with_width(Length::Fixed(10.0)),
+                Space::new().width(Length::Fixed(10.0)),
                 spans_view(spans, BODY_SIZE, p.text, dark, theme::UI),
             ]
             .into()
@@ -737,14 +797,14 @@ fn block_view(block: &Block, dark: bool, slug: Option<&str>) -> Element<'static,
             text(code.clone())
                 .size(12.0)
                 .font(theme::MONO)
-                .style(p.text)
+                .color(p.text)
                 .shaping(iced::widget::text::Shaping::Advanced),
         )
         .width(Length::Fill)
         .padding([12, 14])
         .style(theme::code_block(dark))
         .into(),
-        Block::Rule => container(Space::with_height(1))
+        Block::Rule => container(Space::new().height(1))
             .width(Length::Fill)
             .style(theme::rule(dark))
             .into(),
@@ -771,72 +831,40 @@ fn table_view(
         .len()
         .max(rows.iter().map(Vec::len).max().unwrap_or(0));
 
-    // A cell must report its own natural (Shrink) width for Grid to size
-    // the column around it — Grid's own measurement pass hands every cell
-    // `Limits::NONE` (i.e. an unbounded max), and a `Length::Fill` cell
-    // resolves that straight to `f32::INFINITY`, which Grid then treats as
-    // contributing *zero* to the column's width. So alignment can't be a
-    // per-cell `container::align_x` here (that collapses the whole table);
-    // it's Grid's own single, table-wide `horizontal_alignment` instead,
-    // applied only when every column actually agrees on one.
-    let cell = |spans: &[Span], is_header: bool| -> Element<'static, Message> {
+    let cell = move |spans: &[Span], is_header: bool| -> Element<'static, Message> {
         let font = if is_header { bold_font() } else { theme::UI };
         container(spans_view(spans, BODY_SIZE, p.text, dark, font))
             .padding([6, 10])
             .into()
     };
 
-    // The header/body divider: one hairline `Fill` cell per column, so it
-    // reads as a single rule spanning the table — Grid has no notion of a
-    // cell that spans several columns. Being `Fill`, each one measures as
-    // `f32::INFINITY` and Grid ignores that when sizing columns (same
-    // reasoning as above), so this row rides on the real content rows'
-    // widths without affecting them.
-    let divider_row = || {
-        let mut row = GridRow::new();
-        for _ in 0..columns {
-            let line: Element<'static, Message> = container(Space::with_height(Length::Fixed(1.0)))
-                .width(Length::Fill)
-                .style(theme::rule(dark))
-                .into();
-            row = row.push(line);
-        }
-        row
-    };
+    // The body rows are looked up by index; the data is shared by every
+    // column's cell builder.
+    let body: std::sync::Arc<Vec<Vec<Vec<Span>>>> = std::sync::Arc::new(rows.to_vec());
+    let table_columns = (0..columns).map(|col| {
+        let header_spans = header.get(col).map(Vec::as_slice).unwrap_or(&[]);
+        let body = std::sync::Arc::clone(&body);
+        let align: iced::alignment::Horizontal = alignments
+            .get(col)
+            .copied()
+            .map(Into::into)
+            .unwrap_or(iced::alignment::Horizontal::Left);
+        iced::widget::table::column(cell(header_spans, true), move |row: usize| {
+            let spans = body[row].get(col).map(Vec::as_slice).unwrap_or(&[]);
+            cell(spans, false)
+        })
+        .align_x(align)
+    });
 
-    let uniform_alignment = alignments
-        .first()
-        .filter(|first| alignments.iter().all(|a| a == *first))
-        .copied();
-
-    let mut grid = Grid::new()
-        .column_width(Length::Shrink)
-        .column_spacing(0.0)
-        .row_spacing(0.0);
-    if let Some(align) = uniform_alignment {
-        grid = grid.horizontal_alignment(align.into());
-    }
-
-    let mut header_row = GridRow::new();
-    for col in 0..columns {
-        let spans = header.get(col).map(Vec::as_slice).unwrap_or(&[]);
-        header_row = header_row.push(cell(spans, true));
-    }
-    grid = grid.push(header_row).push(divider_row());
-
-    for row in rows {
-        let mut grid_row = GridRow::new();
-        for col in 0..columns {
-            let spans = row.get(col).map(Vec::as_slice).unwrap_or(&[]);
-            grid_row = grid_row.push(cell(spans, false));
-        }
-        grid = grid.push(grid_row);
-    }
+    let grid = iced::widget::table(table_columns, 0..rows.len())
+        .padding(0)
+        .separator_x(0)
+        .separator_y(1);
 
     wheel_gate(
         scrollable(container(grid).style(theme::table_border(dark)))
             .direction(scrollable::Direction::Horizontal(
-                scrollable::Properties::default(),
+                scrollable::Scrollbar::default(),
             ))
             .width(Length::Fill),
     )
@@ -861,14 +889,6 @@ fn wheel_gate<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Messa
 }
 
 impl<'a> Widget<Message, Theme, iced::Renderer> for WheelGate<'a> {
-    fn tag(&self) -> iced::advanced::widget::tree::Tag {
-        self.content.as_widget().tag()
-    }
-
-    fn state(&self) -> iced::advanced::widget::tree::State {
-        self.content.as_widget().state()
-    }
-
     fn children(&self) -> Vec<Tree> {
         vec![Tree::new(&self.content)]
     }
@@ -882,49 +902,49 @@ impl<'a> Widget<Message, Theme, iced::Renderer> for WheelGate<'a> {
     }
 
     fn layout(
-        &self,
+        &mut self,
         tree: &mut Tree,
         renderer: &iced::Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
         self.content
-            .as_widget()
+            .as_widget_mut()
             .layout(&mut tree.children[0], renderer, limits)
     }
 
     fn operate(
-        &self,
+        &mut self,
         tree: &mut Tree,
         layout: Layout<'_>,
         renderer: &iced::Renderer,
-        operation: &mut dyn Operation<Message>,
+        operation: &mut dyn Operation,
     ) {
         self.content
-            .as_widget()
+            .as_widget_mut()
             .operate(&mut tree.children[0], layout, renderer, operation);
     }
 
-    fn on_event(
+    fn update(
         &mut self,
         tree: &mut Tree,
-        event: Event,
+        event: &Event,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         renderer: &iced::Renderer,
         clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
-    ) -> event::Status {
+    ) {
         if let Event::Mouse(mouse::Event::WheelScrolled { delta }) = event {
             let (x, y) = match delta {
                 mouse::ScrollDelta::Lines { x, y } | mouse::ScrollDelta::Pixels { x, y } => (x, y),
             };
             if y.abs() >= x.abs() {
-                return event::Status::Ignored;
+                return;
             }
         }
 
-        self.content.as_widget_mut().on_event(
+        self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
             layout,
@@ -933,7 +953,7 @@ impl<'a> Widget<Message, Theme, iced::Renderer> for WheelGate<'a> {
             clipboard,
             shell,
             viewport,
-        )
+        );
     }
 
     fn mouse_interaction(
@@ -977,13 +997,18 @@ impl<'a> Widget<Message, Theme, iced::Renderer> for WheelGate<'a> {
     fn overlay<'b>(
         &'b mut self,
         tree: &'b mut Tree,
-        layout: Layout<'_>,
+        layout: Layout<'b>,
         renderer: &iced::Renderer,
+        viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'b, Message, Theme, iced::Renderer>> {
-        self.content
-            .as_widget_mut()
-            .overlay(&mut tree.children[0], layout, renderer, translation)
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
     }
 }
 
@@ -1017,12 +1042,12 @@ fn spans_view(
                 .size(size)
                 .shaping(iced::widget::text::Shaping::Advanced);
             let widget = match span.style {
-                Style::Plain => widget.font(base_font).style(color),
-                Style::Bold => widget.font(bold_font()).style(color),
-                Style::Italic => widget.font(italic_font()).style(color),
-                Style::BoldItalic => widget.font(bold_italic_font()).style(color),
-                Style::Code => widget.font(theme::MONO).size(size - 1.5).style(color),
-                Style::Link => widget.font(base_font).style(accent),
+                Style::Plain => widget.font(base_font).color(color),
+                Style::Bold => widget.font(bold_font()).color(color),
+                Style::Italic => widget.font(italic_font()).color(color),
+                Style::BoldItalic => widget.font(bold_italic_font()).color(color),
+                Style::Code => widget.font(theme::MONO).size(size - 1.5).color(color),
+                Style::Link => widget.font(base_font).color(accent),
             };
             // Only in-document anchors (`#slug`) are wired up to jump
             // anywhere; an external link stays styled but inert.
@@ -1063,6 +1088,18 @@ mod tests {
         let spans = parse_inline(&line);
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].style, Style::Plain);
+    }
+
+    #[test]
+    fn unmatched_markers_repeated_many_times_stay_linear() {
+        let started = std::time::Instant::now();
+        for unit in ["*a ", "`a ", "[a ", "_a ", "**a "] {
+            let line = unit.repeat(30_000);
+            let spans = parse_inline(&line);
+            assert!(!spans.is_empty());
+        }
+        // Quadratic scanning took seconds per line; this takes milliseconds.
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]
@@ -1274,9 +1311,18 @@ mod tests {
     }
 
     #[test]
+    fn unclosed_emphasis_does_not_make_parsing_quadratic() {
+        let line = "*a ".repeat(6_000);
+        let started = std::time::Instant::now();
+        parse_inline(&line);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
     fn ragged_rows_are_kept_as_parsed_not_padded() {
-        // table_view pads/truncates these to the header's column count at
-        // render time; the parser just records what's actually there.
+        // table_view gives the table as many columns as its widest row (the
+        // header included) and leaves the short rows' cells empty; nothing is
+        // cut. The parser just records what's actually there.
         let blocks = parse("| A | B |\n| --- | --- |\n| 1 |\n| 2 | 3 | 4 |");
         let Block::Table { rows, .. } = &blocks[0] else {
             panic!("expected a table");
@@ -1293,6 +1339,20 @@ mod tests {
             "1-inventaire-et-santé-mesurée"
         );
         assert_eq!(slugify("Qualité, tests, CI"), "qualité-tests-ci");
+    }
+
+    #[test]
+    fn slugify_keeps_underscores() {
+        assert_eq!(slugify("my_heading"), "my_heading");
+        assert_eq!(slugify("snake_case & more"), "snake_case--more");
+    }
+
+    #[test]
+    fn anchors_are_percent_decoded() {
+        assert_eq!(percent_decode("caf%C3%A9"), "café");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("a%2"), "a%2");
+        assert_eq!(percent_decode("a%zzb"), "a%zzb");
     }
 
     #[test]

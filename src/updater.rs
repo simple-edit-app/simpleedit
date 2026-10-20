@@ -45,6 +45,32 @@ fn client(timeout: Duration) -> Result<reqwest::Client, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Fetches `url` and reads at most `max` bytes of the body: a declared length
+/// over the cap is refused up front, and an undeclared one is cut off as soon
+/// as it grows past it, rather than buffering whatever the server sends.
+async fn fetch_limited(client: &reqwest::Client, url: &str, max: usize) -> Result<Vec<u8>, String> {
+    let mut response = client
+        .get(url)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| e.to_string())?;
+    if response
+        .content_length()
+        .is_some_and(|len| len > max as u64)
+    {
+        return Err(t!("update.err_checksum").to_string());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        body.extend_from_slice(&chunk);
+        if body.len() > max {
+            return Err(t!("update.err_checksum").to_string());
+        }
+    }
+    Ok(body)
+}
+
 /// Largest changelog worth reading; anything bigger is ignored.
 const MAX_CHANGELOG: usize = 512 * 1024;
 
@@ -57,16 +83,7 @@ async fn release_notes(latest: &str) -> Vec<crate::changelog::Entry> {
         crate::changelog::file_name(&rust_i18n::locale())
     );
     let fetched = async {
-        let res = client(Duration::from_secs(15))?
-            .get(url)
-            .send()
-            .await
-            .and_then(|r| r.error_for_status())
-            .map_err(|e| e.to_string())?;
-        let bytes = res.bytes().await.map_err(|e| e.to_string())?;
-        if bytes.len() > MAX_CHANGELOG {
-            return Err(String::new());
-        }
+        let bytes = fetch_limited(&client(Duration::from_secs(15))?, &url, MAX_CHANGELOG).await?;
         Ok::<_, String>(String::from_utf8_lossy(&bytes).into_owned())
     };
     let Ok(text) = fetched.await else {
@@ -175,9 +192,13 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Largest `SHA256SUMS` or signature worth reading.
+const MAX_SUMS: usize = 64 * 1024;
+
 /// Downloads the release asset into a fresh private directory and checks it
-/// against the release's `SHA256SUMS`. Returns the path of the verified file.
-pub async fn download_update(version: String) -> Result<PathBuf, String> {
+/// against the release's `SHA256SUMS`. Returns the path of the verified file
+/// and the hash it was verified against (checked again at install time).
+pub async fn download_update(version: String) -> Result<(PathBuf, String), String> {
     if parse_version(&version).is_none() {
         return Err(t!("update.err_api").to_string());
     }
@@ -187,59 +208,39 @@ pub async fn download_update(version: String) -> Result<PathBuf, String> {
     let base = format!("https://github.com/{REPO}/releases/download/v{version}");
     let client = client(Duration::from_secs(300))?;
 
-    let sums = client
-        .get(format!("{base}/SHA256SUMS"))
-        .send()
-        .await
-        .and_then(|r| r.error_for_status())
-        .map_err(|e| e.to_string())?
-        .text()
-        .await
-        .map_err(|e| e.to_string())?;
-    let sig = client
-        .get(format!("{base}/SHA256SUMS.sig"))
-        .send()
-        .await
-        .and_then(|r| r.error_for_status())
-        .map_err(|e| e.to_string())?
-        .bytes()
-        .await
-        .map_err(|e| e.to_string())?;
-    if !verify_signature(sums.as_bytes(), &sig) {
+    let sums = fetch_limited(&client, &format!("{base}/SHA256SUMS"), MAX_SUMS).await?;
+    let sig = fetch_limited(&client, &format!("{base}/SHA256SUMS.sig"), MAX_SUMS).await?;
+    if !verify_signature(&sums, &sig) {
         return Err(t!("update.err_signature").to_string());
     }
+    let sums = String::from_utf8_lossy(&sums).into_owned();
     let expected =
         expected_hash(&sums, &asset).ok_or_else(|| t!("update.err_checksum").to_string())?;
 
-    let bytes = client
-        .get(format!("{base}/{asset}"))
-        .send()
-        .await
-        .and_then(|r| r.error_for_status())
-        .map_err(|e| e.to_string())?
-        .bytes()
-        .await
-        .map_err(|e| e.to_string())?;
-    if bytes.len() > MAX_DOWNLOAD || sha256_hex(&bytes) != expected {
+    let bytes = fetch_limited(&client, &format!("{base}/{asset}"), MAX_DOWNLOAD).await?;
+    if sha256_hex(&bytes) != expected {
         return Err(t!("update.err_checksum").to_string());
     }
 
     // A fresh 0700 directory: nobody else can pre-create or swap the file
-    // between this write and the privileged install.
+    // between this write and the privileged install. It is kept only once
+    // the file is in it; any failure removes it on the way out.
     let dir = tempfile::Builder::new()
         .prefix("simpleedit-update-")
         .tempdir()
-        .map_err(|e| e.to_string())?
-        .keep();
-    let dest = dir.join(&asset);
+        .map_err(|e| e.to_string())?;
+    let dest = dir.path().join(&asset);
     std::fs::write(&dest, &bytes).map_err(|e| e.to_string())?;
-    Ok(dest)
+    let kept = dir.keep();
+    Ok((kept.join(&asset), expected))
 }
 
-pub async fn install_update(path: PathBuf) -> Result<(), String> {
+/// Installs the downloaded package. `expected` is the hash it was verified
+/// against: the file is hashed again right before it is used.
+pub async fn install_update(path: PathBuf, expected: String) -> Result<(), String> {
     let result = tokio::task::spawn_blocking({
         let path = path.clone();
-        move || install_blocking(&path)
+        move || install_blocking(&path, &expected)
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -249,11 +250,31 @@ pub async fn install_update(path: PathBuf) -> Result<(), String> {
     result
 }
 
+/// Whether the file still has the hash it was verified with.
+fn still_verified(path: &Path, expected: &str) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    if sha256_hex(&bytes) == expected {
+        Ok(())
+    } else {
+        Err(t!("update.err_checksum").to_string())
+    }
+}
+
 #[cfg(target_os = "linux")]
-fn install_blocking(path: &Path) -> Result<(), String> {
+fn install_blocking(path: &Path, expected: &str) -> Result<(), String> {
+    still_verified(path, expected)?;
+    // The package sits in a directory of the user's, so a program running as
+    // the same user could swap it once the privileged part has started. Root
+    // therefore copies it somewhere only root can write, checks the copy
+    // against the hash and installs that copy.
+    let script = r#"set -e
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+cp -- "$2" "$tmp/update.deb"
+echo "$1  $tmp/update.deb" | sha256sum -c - >/dev/null
+dpkg -i "$tmp/update.deb""#;
     let status = std::process::Command::new("pkexec")
-        .arg("dpkg")
-        .arg("-i")
+        .args(["sh", "-c", script, "sh", expected])
         .arg(path)
         .status()
         .map_err(|e| e.to_string())?;
@@ -266,7 +287,8 @@ fn install_blocking(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
-fn install_blocking(path: &Path) -> Result<(), String> {
+fn install_blocking(path: &Path, expected: &str) -> Result<(), String> {
+    still_verified(path, expected)?;
     let tmp_dir = path
         .parent()
         .map(|d| d.join("extract"))
@@ -286,18 +308,29 @@ fn install_blocking(path: &Path) -> Result<(), String> {
         return Err(t!("update.err_extract").to_string());
     }
 
-    // The binary's path goes in as an AppleScript argument and is quoted by
-    // `quoted form of`, never spliced into the script text.
+    // The privileged step copies the binary next to its destination (a place
+    // only an administrator can write), checks that copy against the hash
+    // taken here and only then moves it into place. The paths and the hash
+    // go in as AppleScript arguments and are quoted by `quoted form of`,
+    // never spliced into the script text.
+    let binary = tmp_dir.join("simpleedit");
+    let binary_hash =
+        sha256_hex(&std::fs::read(&binary).map_err(|_| t!("update.err_extract").to_string())?);
     let ok = std::process::Command::new("osascript")
         .args([
             "-e",
             "on run argv",
             "-e",
-            "do shell script \"cp \" & quoted form of (item 1 of argv) & \" /usr/local/bin/simpleedit && chmod +x /usr/local/bin/simpleedit\" with administrator privileges",
+            "set src to quoted form of (item 1 of argv)",
+            "-e",
+            "set digest to quoted form of (item 2 of argv)",
+            "-e",
+            "do shell script \"cp \" & src & \" /usr/local/bin/simpleedit.new && echo \" & digest & \"'  /usr/local/bin/simpleedit.new' | shasum -a 256 -c - >/dev/null && chmod +x /usr/local/bin/simpleedit.new && mv -f /usr/local/bin/simpleedit.new /usr/local/bin/simpleedit\" with administrator privileges",
             "-e",
             "end run",
         ])
-        .arg(tmp_dir.join("simpleedit"))
+        .arg(&binary)
+        .arg(&binary_hash)
         .status()
         .map_err(|e| e.to_string())?
         .success();

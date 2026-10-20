@@ -5,13 +5,34 @@ on:
     tags:
       - 'v*.*.*'
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   BINARY_NAME: simpleedit
+  # Passed to scripts through the environment, never interpolated into them.
+  TAG: ${{ github.ref_name }}
 
 jobs:
+  check-version:
+    name: Tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # The .deb is named after Cargo.toml, the other assets after the tag, and
+      # the in-app updater looks for simpleedit_<tag>-1_amd64.deb.
+      - run: |
+          CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"(.*)"/\1/')
+          if [ "v${CARGO_VERSION}" != "$TAG" ]; then
+            echo "::error::Tag $TAG does not match the version in Cargo.toml (v${CARGO_VERSION})"
+            exit 1
+          fi
+
   build-macos:
     name: Build macOS (Apple Silicon)
+    needs: check-version
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -20,21 +41,12 @@ jobs:
         with:
           toolchain: stable
           targets: aarch64-apple-darwin
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: macos-aarch64-release-${{ hashFiles('**/Cargo.lock') }}
       - name: Build
         run: cargo build --release --target aarch64-apple-darwin
       - name: Package tarball
         run: |
           cd target/aarch64-apple-darwin/release
-          tar czf simpleedit-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz ${{ env.BINARY_NAME }}
+          tar czf simpleedit-${TAG}-aarch64-apple-darwin.tar.gz ${{ env.BINARY_NAME }}
           mv simpleedit-*.tar.gz ${{ github.workspace }}/
       - name: Build .app bundle
         run: |
@@ -87,7 +99,7 @@ jobs:
           # Ad-hoc signature: unsigned bundles are rejected outright on Apple Silicon
           codesign --force --deep --sign - "$APP"
           ditto -c -k --keepParent "$APP" \
-            "simpleedit-${{ github.ref_name }}-macos-aarch64.zip"
+            "simpleedit-${TAG}-macos-aarch64.zip"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: simpleedit-macos-aarch64
@@ -97,6 +109,7 @@ jobs:
 
   build-linux:
     name: Build Linux (x86_64)
+    needs: check-version
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -104,15 +117,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: linux-x86_64-release-${{ hashFiles('**/Cargo.lock') }}
       - name: Install deps
         run: |
           sudo apt-get update
@@ -122,11 +126,11 @@ jobs:
       - name: Package tarball
         run: |
           cd target/release
-          tar czf simpleedit-${{ github.ref_name }}-x86_64-linux.tar.gz ${{ env.BINARY_NAME }}
+          tar czf simpleedit-${TAG}-x86_64-linux.tar.gz ${{ env.BINARY_NAME }}
           mv simpleedit-*.tar.gz ${{ github.workspace }}/
       - name: Build DEB
         run: |
-          cargo install --locked --force cargo-deb
+          cargo install --locked --version 3.8.0 cargo-deb
           cargo deb
           cp target/debian/*.deb ${{ github.workspace }}/
       - name: Build AppImage
@@ -138,8 +142,9 @@ jobs:
           ln -s usr/bin/${{ env.BINARY_NAME }} AppDir/AppRun
 
           curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool" | sha256sum -c -
           chmod +x appimagetool
-          ./appimagetool --appimage-extract-and-run AppDir simpleedit-${{ github.ref_name }}-x86_64.AppImage
+          ./appimagetool --appimage-extract-and-run AppDir simpleedit-${TAG}-x86_64.AppImage
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: simpleedit-linux
@@ -168,9 +173,11 @@ jobs:
         env:
           UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
         run: |
+          # install.sh and the in-app updater both refuse unsigned releases, so
+          # publishing one would only break them.
           if [ -z "$UPDATE_SIGNING_KEY" ]; then
-            echo "::warning::UPDATE_SIGNING_KEY is not set — releasing without SHA256SUMS.sig. In-app updates to this release will be refused."
-            exit 0
+            echo "::error::UPDATE_SIGNING_KEY is not set — refusing to release without SHA256SUMS.sig."
+            exit 1
           fi
           umask 077
           printf '%s\n' "$UPDATE_SIGNING_KEY" > update-key.pem

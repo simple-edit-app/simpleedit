@@ -11,7 +11,7 @@ use crate::theme;
 #[derive(Debug, Clone)]
 pub enum SidebarMessage {
     OpenFile(PathBuf),
-    RemoveFile(usize),
+    RemoveFile(PathBuf),
     RequestSave,
     RequestSaveAs,
 }
@@ -27,15 +27,11 @@ pub enum SidebarAction {
 
 pub struct SidebarState {
     pub files: Vec<PathBuf>,
-    pub selected: Option<usize>,
 }
 
 impl SidebarState {
     pub fn new() -> Self {
-        Self {
-            files: Vec::new(),
-            selected: None,
-        }
+        Self { files: Vec::new() }
     }
 
     pub fn files(&self) -> &[PathBuf] {
@@ -44,9 +40,8 @@ impl SidebarState {
 
     pub fn add_file(&mut self, path: PathBuf) {
         if !self.files.contains(&path) {
-            self.files.push(path.clone());
+            self.files.push(path);
         }
-        self.selected = self.files.iter().position(|p| p == &path);
     }
 
     /// Replace an untitled slot with its real path after Save As.
@@ -61,27 +56,26 @@ impl SidebarState {
             } else {
                 self.files[pos] = new;
             }
-            self.selected = None;
         }
     }
 
     pub fn remove_path(&mut self, path: &std::path::Path) {
         self.files.retain(|p| p != path);
-        self.selected = None;
     }
 
     pub fn update(&mut self, msg: SidebarMessage) -> SidebarAction {
         match msg {
-            SidebarMessage::OpenFile(path) => {
-                self.selected = self.files.iter().position(|p| p == &path);
-                SidebarAction::OpenFile(path)
-            }
+            SidebarMessage::OpenFile(path) => SidebarAction::OpenFile(path),
             // The app removes the tab itself (`remove_path`) once any
-            // unsaved-changes confirmation has been answered.
-            SidebarMessage::RemoveFile(idx) => match self.files.get(idx) {
-                Some(path) => SidebarAction::CloseFile(path.clone()),
-                None => SidebarAction::None,
-            },
+            // unsaved-changes confirmation has been answered. The tab is
+            // named by path: the list may have changed since it was drawn.
+            SidebarMessage::RemoveFile(path) => {
+                if self.files.contains(&path) {
+                    SidebarAction::CloseFile(path)
+                } else {
+                    SidebarAction::None
+                }
+            }
             SidebarMessage::RequestSave => SidebarAction::SaveFile,
             SidebarMessage::RequestSaveAs => SidebarAction::SaveFileAs,
         }
@@ -99,24 +93,13 @@ impl SidebarState {
         let lbl_save_as = t!("sidebar.save_as").to_string();
         let p = theme::palette(dark);
 
+        let labels = crate::app::unique_labels(&self.files);
         let items: Vec<Element<Message>> = self
             .files
             .iter()
-            .enumerate()
-            .map(|(i, path)| {
+            .zip(labels)
+            .map(|(path, name)| {
                 let untitled = crate::app::is_untitled(path);
-                let name = if untitled {
-                    let n = path
-                        .to_str()
-                        .unwrap_or("")
-                        .trim_start_matches("untitled://");
-                    format!("{} {}", t!("sidebar.untitled"), n)
-                } else {
-                    path.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("?")
-                        .to_string()
-                };
                 // Short extension in mono, e.g. "rs", "json".
                 let ext = if untitled {
                     String::new()
@@ -126,18 +109,19 @@ impl SidebarState {
                         .unwrap_or("")
                         .to_lowercase()
                 };
-                let is_selected = self.selected == Some(i);
                 let is_active = current_file.as_ref() == Some(path);
+                let is_selected = is_active;
                 let is_dirty = dirty.contains(path);
                 let path_clone = path.clone();
+                let close_path = path.clone();
 
                 let ext_color = if is_selected { p.accent } else { p.muted };
                 let marker: Element<Message> = if is_dirty {
-                    container(Space::new(6, 6))
+                    container(Space::new().width(6).height(6))
                         .style(theme::dot(p.accent))
                         .into()
                 } else {
-                    Space::new(6, 6).into()
+                    Space::new().width(6).height(6).into()
                 };
 
                 let row_button = button(
@@ -145,21 +129,27 @@ impl SidebarState {
                         text(ext)
                             .size(9.5)
                             .font(theme::MONO)
-                            .style(ext_color)
+                            .color(ext_color)
                             .width(20),
-                        text(name).size(13).width(Length::Fill),
+                        text(name)
+                            .size(13)
+                            .shaping(iced::widget::text::Shaping::Advanced)
+                            .width(Length::Fill),
                         marker,
                     ]
                     .spacing(8)
-                    .align_items(Alignment::Center),
+                    .align_y(Alignment::Center),
                 )
                 .on_press(Message::Sidebar(SidebarMessage::OpenFile(path_clone)))
                 .width(Length::Fill)
                 .padding([7, 8])
-                .style(iced::theme::Button::custom(theme::SidebarRow {
-                    dark,
-                    selected: is_selected,
-                }));
+                .style(
+                    (theme::SidebarRow {
+                        dark,
+                        selected: is_selected,
+                    })
+                    .style(),
+                );
 
                 // Build context menu labels (owned Strings for 'static closure)
                 let lbl_close = lbl_close.clone();
@@ -172,11 +162,14 @@ impl SidebarState {
                             let mut btn = button(text(label).size(13))
                                 .padding([7, 10])
                                 .width(Length::Fixed(176.0))
-                                .style(iced::theme::Button::custom(theme::MenuItem {
-                                    dark,
-                                    radius: theme::R_SM,
-                                    highlighted: false,
-                                }));
+                                .style(
+                                    (theme::MenuItem {
+                                        dark,
+                                        radius: theme::R_SM,
+                                        highlighted: false,
+                                    })
+                                    .style(),
+                                );
                             if let Some(m) = msg {
                                 btn = btn.on_press(m);
                             }
@@ -187,7 +180,9 @@ impl SidebarState {
                         column![
                             ctx_item(
                                 lbl_close.clone(),
-                                Some(Message::Sidebar(SidebarMessage::RemoveFile(i))),
+                                Some(Message::Sidebar(SidebarMessage::RemoveFile(
+                                    close_path.clone(),
+                                ))),
                             ),
                             ctx_item(
                                 lbl_save.clone(),
@@ -212,7 +207,7 @@ impl SidebarState {
         let file_list: Element<Message> = if items.is_empty() {
             text(t!("sidebar.no_files"))
                 .size(12)
-                .style(theme::muted_text(dark))
+                .color(theme::muted_text(dark))
                 .into()
         } else {
             column(items).spacing(2).into()
@@ -230,16 +225,14 @@ impl SidebarState {
                 container(
                     text(t!("sidebar.files").to_uppercase())
                         .size(10.5)
-                        .style(theme::muted_text(dark))
+                        .color(theme::muted_text(dark))
                         .font(theme::UI_MEDIUM)
                 )
                 .padding([0, 8]),
                 scrollable(file_list)
-                    .style(iced::theme::Scrollable::Custom(Box::new(
-                        theme::Scrollbar { dark }
-                    )))
+                    .style(theme::Scrollbar { dark }.style())
                     .height(Length::Fill),
-                container(text(footer).size(11.5).style(theme::muted_text(dark))).padding(8),
+                container(text(footer).size(11.5).color(theme::muted_text(dark))).padding(8),
             ]
             .spacing(10),
         )
@@ -270,7 +263,6 @@ mod tests {
         sidebar.add_file(PathBuf::from("/tmp/a.rs"));
         sidebar.add_file(PathBuf::from("/tmp/b.py"));
         assert_eq!(sidebar.files.len(), 2);
-        assert_eq!(sidebar.selected, Some(1));
     }
 
     #[test]
@@ -278,7 +270,7 @@ mod tests {
         let mut sidebar = SidebarState::new();
         sidebar.add_file(PathBuf::from("/tmp/a.rs"));
         assert!(matches!(
-            sidebar.update(SidebarMessage::RemoveFile(0)),
+            sidebar.update(SidebarMessage::RemoveFile(PathBuf::from("/tmp/a.rs"))),
             SidebarAction::CloseFile(_)
         ));
         // Nothing is removed until the app confirms.

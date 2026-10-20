@@ -28,6 +28,25 @@ pub enum ShortcutTarget {
     PrevBookmark,
 }
 
+/// How a key is named to the user.
+pub fn key_label(key: &str) -> String {
+    match key {
+        "Return" => t!("key.enter").to_string(),
+        "ArrowUp" => t!("key.up").to_string(),
+        "ArrowDown" => t!("key.down").to_string(),
+        "ArrowLeft" => t!("key.left").to_string(),
+        "ArrowRight" => t!("key.right").to_string(),
+        "PageUp" => t!("key.page_up").to_string(),
+        "PageDown" => t!("key.page_down").to_string(),
+        "Delete" => t!("key.delete").to_string(),
+        "Backspace" => t!("key.backspace").to_string(),
+        "Space" => t!("key.space").to_string(),
+        "Tab" => t!("key.tab").to_string(),
+        k if k.chars().count() == 1 => k.to_uppercase(),
+        k => k.to_string(),
+    }
+}
+
 /// A single keyboard binding stored as display-friendly strings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShortcutConfig {
@@ -88,19 +107,18 @@ impl ShortcutConfig {
         }
         let mut s = String::new();
         if self.ctrl {
-            s.push_str("Ctrl+");
+            s.push_str(&t!("key.ctrl"));
+            s.push('+');
         }
         if self.shift {
-            s.push_str("Shift+");
+            s.push_str(&t!("key.shift"));
+            s.push('+');
         }
         if self.alt {
-            s.push_str("Alt+");
+            s.push_str(&t!("key.alt"));
+            s.push('+');
         }
-        if self.key.len() == 1 {
-            s.push_str(&self.key.to_uppercase());
-        } else {
-            s.push_str(&self.key);
-        }
+        s.push_str(&key_label(&self.key));
         s
     }
 
@@ -171,68 +189,73 @@ fn default_delete_line() -> ShortcutConfig {
     ShortcutConfig::ctrl_shift("k")
 }
 
-impl Shortcuts {
-    /// The binding for `target`.
-    pub fn slot_mut(&mut self, target: ShortcutTarget) -> &mut ShortcutConfig {
-        match target {
-            ShortcutTarget::NewFile => &mut self.new_file,
-            ShortcutTarget::OpenFile => &mut self.open_file,
-            ShortcutTarget::SaveFile => &mut self.save_file,
-            ShortcutTarget::SaveAs => &mut self.save_as,
-            ShortcutTarget::CloseFile => &mut self.close_file,
-            ShortcutTarget::Find => &mut self.find,
-            ShortcutTarget::SelectAll => &mut self.select_all,
-            ShortcutTarget::FormatCode => &mut self.format_code,
-            ShortcutTarget::GotoLine => &mut self.goto_line,
-            ShortcutTarget::CommandPalette => &mut self.command_palette,
-            ShortcutTarget::ToggleSidebar => &mut self.toggle_sidebar,
-            ShortcutTarget::Quit => &mut self.quit,
-            ShortcutTarget::Undo => &mut self.undo,
-            ShortcutTarget::Redo => &mut self.redo,
-            ShortcutTarget::DuplicateLine => &mut self.duplicate_line,
-            ShortcutTarget::MoveLineUp => &mut self.move_line_up,
-            ShortcutTarget::MoveLineDown => &mut self.move_line_down,
-            ShortcutTarget::ToggleComment => &mut self.toggle_comment,
-            ShortcutTarget::DeleteLine => &mut self.delete_line,
-            ShortcutTarget::ToggleBookmark => &mut self.toggle_bookmark,
-            ShortcutTarget::NextBookmark => &mut self.next_bookmark,
-            ShortcutTarget::PrevBookmark => &mut self.prev_bookmark,
+/// The one table tying each action to its field: it generates both accessors
+/// and the list of all targets, so a new shortcut is added in a single place.
+macro_rules! shortcut_slots {
+    ($($target:ident => $field:ident,)*) => {
+        impl Shortcuts {
+            /// The binding for `target`.
+            pub fn slot_mut(&mut self, target: ShortcutTarget) -> &mut ShortcutConfig {
+                match target { $(ShortcutTarget::$target => &mut self.$field,)* }
+            }
+
+            /// The binding for `target`, read only.
+            pub fn slot(&self, target: ShortcutTarget) -> &ShortcutConfig {
+                match target { $(ShortcutTarget::$target => &self.$field,)* }
+            }
         }
+
+        const ALL_TARGETS: &[ShortcutTarget] = &[$(ShortcutTarget::$target,)*];
+    };
+}
+
+shortcut_slots! {
+    NewFile => new_file,
+    OpenFile => open_file,
+    SaveFile => save_file,
+    SaveAs => save_as,
+    CloseFile => close_file,
+    Find => find,
+    SelectAll => select_all,
+    FormatCode => format_code,
+    GotoLine => goto_line,
+    CommandPalette => command_palette,
+    ToggleSidebar => toggle_sidebar,
+    Quit => quit,
+    Undo => undo,
+    Redo => redo,
+    DuplicateLine => duplicate_line,
+    MoveLineUp => move_line_up,
+    MoveLineDown => move_line_down,
+    ToggleComment => toggle_comment,
+    DeleteLine => delete_line,
+    ToggleBookmark => toggle_bookmark,
+    NextBookmark => next_bookmark,
+    PrevBookmark => prev_bookmark,
+}
+
+impl Shortcuts {
+    /// Whether an action listed before `target` has the same binding.
+    fn conflicts_before(&self, target: ShortcutTarget, sc: &ShortcutConfig) -> bool {
+        ALL_TARGETS
+            .iter()
+            .take_while(|t| **t != target)
+            .any(|t| self.slot(*t) == sc)
     }
 
     /// Whether some action other than `target` is already bound to `sc`.
-    pub fn conflicts(&mut self, target: ShortcutTarget, sc: &ShortcutConfig) -> bool {
+    pub fn conflicts(&self, target: ShortcutTarget, sc: &ShortcutConfig) -> bool {
         ALL_TARGETS
             .iter()
             .filter(|t| **t != target)
-            .any(|t| self.slot_mut(*t) == sc)
+            .any(|t| self.slot(*t) == sc)
     }
 }
 
-const ALL_TARGETS: [ShortcutTarget; 22] = [
-    ShortcutTarget::NewFile,
-    ShortcutTarget::OpenFile,
-    ShortcutTarget::SaveFile,
-    ShortcutTarget::SaveAs,
-    ShortcutTarget::CloseFile,
-    ShortcutTarget::Find,
-    ShortcutTarget::SelectAll,
-    ShortcutTarget::FormatCode,
-    ShortcutTarget::GotoLine,
-    ShortcutTarget::CommandPalette,
-    ShortcutTarget::ToggleSidebar,
-    ShortcutTarget::Quit,
-    ShortcutTarget::Undo,
-    ShortcutTarget::Redo,
-    ShortcutTarget::DuplicateLine,
-    ShortcutTarget::MoveLineUp,
-    ShortcutTarget::MoveLineDown,
-    ShortcutTarget::ToggleComment,
-    ShortcutTarget::DeleteLine,
-    ShortcutTarget::ToggleBookmark,
-    ShortcutTarget::NextBookmark,
-    ShortcutTarget::PrevBookmark,
-];
+/// `F1`..`F12`: keys that need no modifier to be a shortcut.
+pub fn is_function_key(key: &str) -> bool {
+    key.len() > 1 && key.starts_with('F') && key[1..].bytes().all(|b| b.is_ascii_digit())
+}
 
 impl Default for Shortcuts {
     fn default() -> Self {
@@ -284,7 +307,14 @@ pub struct Config {
     pub page_guide_column: usize,
     /// A miniature of the whole file along the editor's right edge.
     pub show_minimap: bool,
+    /// Long lines wrap at the edge; off, they run past it (faster on huge lines).
+    pub word_wrap: bool,
     pub locale: String,
+    /// Whether the file list is shown.
+    pub show_sidebar: bool,
+    /// Size of the window when it was last closed or resized.
+    pub window_width: f32,
+    pub window_height: f32,
     /// The version that last ran, to show what's new after an update.
     pub last_version: String,
     pub shortcuts: Shortcuts,
@@ -306,7 +336,11 @@ impl Default for Config {
             show_page_guide: false,
             page_guide_column: 80,
             show_minimap: true,
+            word_wrap: true,
             locale: "en".to_string(),
+            show_sidebar: true,
+            window_width: 1200.0,
+            window_height: 800.0,
             last_version: String::new(),
             shortcuts: Shortcuts::default(),
             recent_files: Vec::new(),
@@ -314,9 +348,43 @@ impl Default for Config {
     }
 }
 
+/// The desktop portal's `color-scheme` (1 = dark, 2 = light, 0 = none),
+/// read from `gdbus`'s output such as `(<<uint32 1>>,)`.
+fn parse_portal_color_scheme(output: &str) -> Option<bool> {
+    let value = output.split("uint32").nth(1)?.trim_start();
+    match value.chars().next()? {
+        '1' => Some(true),
+        '0' | '2' => Some(false),
+        _ => None,
+    }
+}
+
 fn detect_system_dark_mode() -> bool {
     #[cfg(target_os = "linux")]
     {
+        // The portal covers every desktop (KDE, GNOME, …).
+        if let Ok(out) = std::process::Command::new("gdbus")
+            .args([
+                "call",
+                "--session",
+                "--dest",
+                "org.freedesktop.portal.Desktop",
+                "--object-path",
+                "/org/freedesktop/portal/desktop",
+                "--method",
+                "org.freedesktop.portal.Settings.Read",
+                "org.freedesktop.appearance",
+                "color-scheme",
+            ])
+            .output()
+        {
+            if out.status.success() {
+                if let Some(dark) = parse_portal_color_scheme(&String::from_utf8_lossy(&out.stdout))
+                {
+                    return dark;
+                }
+            }
+        }
         if let Ok(out) = std::process::Command::new("gsettings")
             .args(["get", "org.gnome.desktop.interface", "color-scheme"])
             .output()
@@ -372,18 +440,21 @@ fn detect_system_locale() -> String {
 
 impl Config {
     pub fn config_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| d.join("simpleedit").join("config.json"))
+        crate::fsutil::config_dir().map(|d| d.join("simpleedit").join("config.json"))
     }
 
     pub fn load() -> Self {
         if let Some(path) = Self::config_path() {
             if let Ok(s) = std::fs::read_to_string(&path) {
-                match serde_json::from_str(&s) {
-                    Ok(cfg) => return cfg,
+                match serde_json::from_str::<Config>(&s) {
+                    Ok(mut cfg) => {
+                        cfg.sanitize();
+                        return cfg;
+                    }
                     // Keep the unreadable file around instead of silently
                     // overwriting it with defaults on the next save.
                     Err(_) => {
-                        let _ = std::fs::rename(&path, path.with_extension("json.bak"));
+                        let _ = crate::fsutil::set_aside(&path);
                     }
                 }
             }
@@ -392,6 +463,41 @@ impl Config {
             dark_mode: detect_system_dark_mode(),
             locale: detect_system_locale(),
             ..Default::default()
+        }
+    }
+
+    /// Brings hand-edited values back into a range the app works with.
+    pub fn sanitize(&mut self) {
+        self.tab_width = self.tab_width.clamp(1, 16);
+        self.font_size = if self.font_size.is_finite() {
+            self.font_size.clamp(8.0, 32.0)
+        } else {
+            Config::default().font_size
+        };
+        self.page_guide_column = self.page_guide_column.clamp(1, 500);
+        for size in [&mut self.window_width, &mut self.window_height] {
+            *size = if size.is_finite() {
+                size.clamp(600.0, 10_000.0)
+            } else {
+                800.0
+            };
+        }
+        if !matches!(self.locale.as_str(), "en" | "fr") {
+            self.locale = detect_system_locale();
+        }
+        // An unusable binding falls back to its default, and so does the
+        // later of two actions sharing one.
+        let defaults = Shortcuts::default();
+        for &target in ALL_TARGETS {
+            let usable = {
+                let sc = self.shortcuts.slot(target);
+                !sc.key.is_empty()
+                    && !self.shortcuts.conflicts_before(target, sc)
+                    && (sc.ctrl || sc.alt || is_function_key(&sc.key))
+            };
+            if !usable {
+                *self.shortcuts.slot_mut(target) = defaults.slot(target).clone();
+            }
         }
     }
 
@@ -447,14 +553,59 @@ mod tests {
 
     #[test]
     fn shortcut_display() {
-        let (n, s, up) = if cfg!(target_os = "macos") {
-            ("⌘N", "⇧⌘S", "⌥↑")
+        // (The wording of the modifiers follows the interface language.)
+        let n = ShortcutConfig::ctrl("n").display();
+        let s = ShortcutConfig::ctrl_shift("s").display();
+        assert!(n.ends_with('N') && s.ends_with('S'));
+        assert!(s.len() > n.len());
+        if cfg!(target_os = "macos") {
+            assert_eq!(ShortcutConfig::alt("ArrowUp").display(), "⌥↑");
         } else {
-            ("Ctrl+N", "Ctrl+Shift+S", "Alt+ArrowUp")
+            assert!(!ShortcutConfig::alt("ArrowUp").display().contains("Arrow"));
+        }
+    }
+
+    #[test]
+    fn hand_edited_values_are_brought_back_in_range() {
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"tab_width": 0, "font_size": -3, "page_guide_column": 0, "locale": "de",
+                "window_width": 5, "shortcuts": {"undo": {"ctrl": false, "shift": false,
+                "alt": false, "key": ""}}}"#,
+        )
+        .unwrap();
+        cfg.sanitize();
+        assert_eq!(cfg.tab_width, 1);
+        assert_eq!(cfg.font_size, 8.0);
+        assert_eq!(cfg.page_guide_column, 1);
+        assert!(matches!(cfg.locale.as_str(), "en" | "fr"));
+        assert_eq!(cfg.window_width, 600.0);
+        assert_eq!(cfg.shortcuts.undo, ShortcutConfig::ctrl("z"));
+
+        let mut cfg = Config {
+            tab_width: 1_000_000_000,
+            font_size: f32::NAN,
+            ..Config::default()
         };
-        assert_eq!(ShortcutConfig::ctrl("n").display(), n);
-        assert_eq!(ShortcutConfig::ctrl_shift("s").display(), s);
-        assert_eq!(ShortcutConfig::alt("ArrowUp").display(), up);
+        cfg.sanitize();
+        assert_eq!(cfg.tab_width, 16);
+        assert_eq!(cfg.font_size, 14.0);
+    }
+
+    #[test]
+    fn two_actions_on_one_key_keep_only_the_first() {
+        let mut cfg = Config::default();
+        cfg.shortcuts.redo = ShortcutConfig::ctrl("z");
+        cfg.sanitize();
+        assert_eq!(cfg.shortcuts.undo, ShortcutConfig::ctrl("z"));
+        assert_eq!(cfg.shortcuts.redo, ShortcutConfig::ctrl("y"));
+    }
+
+    #[test]
+    fn the_portal_color_scheme_is_read() {
+        assert_eq!(parse_portal_color_scheme("(<<uint32 1>>,)"), Some(true));
+        assert_eq!(parse_portal_color_scheme("(<<uint32 2>>,)"), Some(false));
+        assert_eq!(parse_portal_color_scheme("(<<uint32 0>>,)"), Some(false));
+        assert_eq!(parse_portal_color_scheme("error"), None);
     }
 
     #[test]
@@ -469,9 +620,9 @@ mod tests {
 
     #[test]
     fn default_shortcuts_never_collide() {
-        let mut sh = Shortcuts::default();
-        for target in ALL_TARGETS {
-            let own = sh.slot_mut(target).clone();
+        let sh = Shortcuts::default();
+        for &target in ALL_TARGETS {
+            let own = sh.slot(target).clone();
             assert!(!sh.conflicts(target, &own), "{target:?} collides");
         }
         assert_eq!(sh.toggle_bookmark, ShortcutConfig::ctrl("F2"));
@@ -481,7 +632,7 @@ mod tests {
 
     #[test]
     fn shortcut_conflicts_are_detected() {
-        let mut sh = Shortcuts::default();
+        let sh = Shortcuts::default();
         assert!(sh.conflicts(ShortcutTarget::Undo, &ShortcutConfig::ctrl("s")));
         assert!(!sh.conflicts(ShortcutTarget::SaveFile, &ShortcutConfig::ctrl("s")));
         assert!(!sh.conflicts(ShortcutTarget::Undo, &ShortcutConfig::ctrl("1")));

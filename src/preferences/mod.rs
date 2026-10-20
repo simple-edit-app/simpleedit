@@ -24,7 +24,9 @@ pub enum PreferencesMessage {
     AutocompleteQuotesToggled(bool),
     HighlightCurrentLineToggled(bool),
     ShowPageGuideToggled(bool),
+    PageGuideColumnChanged(usize),
     ShowMinimapToggled(bool),
+    WordWrapToggled(bool),
     LocaleChanged(String),
 }
 
@@ -93,34 +95,12 @@ const LOCALES: [LocaleChoice; 2] = [
 
 pub struct PreferencesState {
     pub page: PrefsPage,
-    pub font_size: f32,
-    pub tab_width: usize,
-    pub use_spaces: bool,
-    pub show_line_numbers: bool,
-    pub auto_indent: bool,
-    pub autocomplete_brackets: bool,
-    pub autocomplete_quotes: bool,
-    pub highlight_current_line: bool,
-    pub show_page_guide: bool,
-    pub show_minimap: bool,
-    pub locale: String,
 }
 
 impl PreferencesState {
-    pub fn from_config(config: &Config) -> Self {
+    pub fn from_config(_config: &Config) -> Self {
         Self {
             page: PrefsPage::Editor,
-            font_size: config.font_size,
-            tab_width: config.tab_width,
-            use_spaces: config.use_spaces,
-            show_line_numbers: config.show_line_numbers,
-            auto_indent: config.auto_indent,
-            autocomplete_brackets: config.autocomplete_brackets,
-            autocomplete_quotes: config.autocomplete_quotes,
-            highlight_current_line: config.highlight_current_line,
-            show_page_guide: config.show_page_guide,
-            show_minimap: config.show_minimap,
-            locale: config.locale.clone(),
         }
     }
 
@@ -133,47 +113,42 @@ impl PreferencesState {
                 return false;
             }
             PreferencesMessage::FontSizeChanged(v) => {
-                self.font_size = v;
                 config.font_size = v;
             }
             PreferencesMessage::TabWidthChanged(v) => {
-                self.tab_width = v;
                 config.tab_width = v;
             }
             PreferencesMessage::UseSpacesToggled(v) => {
-                self.use_spaces = v;
                 config.use_spaces = v;
             }
             PreferencesMessage::ShowLineNumbersToggled(v) => {
-                self.show_line_numbers = v;
                 config.show_line_numbers = v;
             }
             PreferencesMessage::AutoIndentToggled(v) => {
-                self.auto_indent = v;
                 config.auto_indent = v;
             }
             PreferencesMessage::AutocompleteBracketsToggled(v) => {
-                self.autocomplete_brackets = v;
                 config.autocomplete_brackets = v;
             }
             PreferencesMessage::AutocompleteQuotesToggled(v) => {
-                self.autocomplete_quotes = v;
                 config.autocomplete_quotes = v;
             }
             PreferencesMessage::HighlightCurrentLineToggled(v) => {
-                self.highlight_current_line = v;
                 config.highlight_current_line = v;
             }
+            PreferencesMessage::PageGuideColumnChanged(v) => {
+                config.page_guide_column = v;
+            }
             PreferencesMessage::ShowPageGuideToggled(v) => {
-                self.show_page_guide = v;
                 config.show_page_guide = v;
             }
             PreferencesMessage::ShowMinimapToggled(v) => {
-                self.show_minimap = v;
                 config.show_minimap = v;
             }
+            PreferencesMessage::WordWrapToggled(v) => {
+                config.word_wrap = v;
+            }
             PreferencesMessage::LocaleChanged(v) => {
-                self.locale = v.clone();
                 config.locale = v.clone();
                 rust_i18n::set_locale(&v);
             }
@@ -189,25 +164,28 @@ impl PreferencesState {
         let close = button(text("×").size(17))
             .padding([4, 8])
             .on_press(Message::TogglePreferences)
-            .style(iced::theme::Button::custom(theme::GhostButton {
-                dark,
-                active: false,
-            }));
+            .style(
+                (theme::GhostButton {
+                    dark,
+                    active: false,
+                })
+                .style(),
+            );
 
         let title_row = row![
-            Space::with_width(40),
+            Space::new().width(40),
             text(t!("prefs.window_title").to_string())
                 .size(13)
                 .font(theme::UI_SEMIBOLD)
                 .width(Length::Fill)
-                .horizontal_alignment(iced::alignment::Horizontal::Center),
+                .align_x(iced::alignment::Horizontal::Center),
             container(close)
                 .width(40)
                 .align_x(iced::alignment::Horizontal::Right),
         ]
         .padding([0, 16])
         .height(46)
-        .align_items(Alignment::Center);
+        .align_y(Alignment::Center);
 
         let nav_items: Vec<Element<Message>> = PrefsPage::ALL
             .iter()
@@ -218,10 +196,13 @@ impl PreferencesState {
                     .on_press(Message::Preferences(PreferencesMessage::PageSelected(
                         *page,
                     )))
-                    .style(iced::theme::Button::custom(theme::SidebarRow {
-                        dark,
-                        selected: self.page == *page,
-                    }))
+                    .style(
+                        (theme::SidebarRow {
+                            dark,
+                            selected: self.page == *page,
+                        })
+                        .style(),
+                    )
                     .into()
             })
             .collect();
@@ -230,24 +211,28 @@ impl PreferencesState {
             .padding([16, 10])
             .width(210)
             .height(Length::Fill)
-            .style(move |_: &iced::Theme| container::Appearance {
+            .style(move |_: &iced::Theme| container::Style {
                 text_color: Some(p.text),
                 background: Some(iced::Background::Color(p.surface)),
                 border: iced::Border {
                     color: iced::Color::TRANSPARENT,
                     width: 0.0,
-                    radius: [0.0, 0.0, 0.0, theme::R_PALETTE].into(),
+                    radius: iced::border::Radius::default().bottom_left(theme::R_PALETTE),
                 },
                 shadow: iced::Shadow::default(),
+                ..container::Style::default()
             });
 
         let page: Element<Message> = match self.page {
-            PrefsPage::Editor => column![self.editor_card(dark), self.language_card(dark)]
-                .spacing(14)
-                .into(),
+            PrefsPage::Editor => column![
+                self.editor_card(config, dark),
+                self.language_card(config, dark)
+            ]
+            .spacing(14)
+            .into(),
             PrefsPage::Appearance => self.appearance_card(dark),
             PrefsPage::Shortcuts => shortcuts_list(dark, config, capturing),
-            PrefsPage::Language => self.language_card(dark),
+            PrefsPage::Language => self.language_card(config, dark),
             PrefsPage::Updates => self.updates_card(dark),
         };
 
@@ -262,20 +247,18 @@ impl PreferencesState {
                 })
                 .width(Length::Fill),
         )
-        .style(iced::theme::Scrollable::Custom(Box::new(
-            theme::Scrollbar { dark },
-        )))
+        .style(theme::Scrollbar { dark }.style())
         .width(Length::Fill)
         .height(Length::Fill);
 
         container(column![
             title_row,
-            container(Space::with_height(1))
+            container(Space::new().height(1))
                 .width(Length::Fill)
                 .style(theme::rule(dark)),
             row![nav, content].height(Length::Fill),
         ])
-        .style(move |_: &iced::Theme| container::Appearance {
+        .style(move |_: &iced::Theme| container::Style {
             text_color: Some(p.text),
             background: Some(iced::Background::Color(p.bg)),
             border: iced::Border {
@@ -291,28 +274,27 @@ impl PreferencesState {
                 offset: iced::Vector::new(0.0, 18.0),
                 blur_radius: 50.0,
             },
+            ..container::Style::default()
         })
         .into()
     }
 
-    fn editor_card(&self, dark: bool) -> Element<'_, Message> {
+    fn editor_card(&self, config: &Config, dark: bool) -> Element<'_, Message> {
         let font_size = row![
-            slider(8.0..=32.0, self.font_size, |v| {
+            slider(8.0..=32.0, config.font_size, |v| {
                 Message::Preferences(PreferencesMessage::FontSizeChanged(v.round()))
             })
             .step(1.0_f32)
             .width(140)
-            .style(iced::theme::Slider::Custom(Box::new(theme::Slider {
-                dark
-            }))),
-            text(format!("{:.0} px", self.font_size))
+            .style((theme::Slider { dark }).style()),
+            text(format!("{:.0} px", config.font_size))
                 .size(13)
                 .font(theme::MONO)
                 .width(48)
-                .horizontal_alignment(iced::alignment::Horizontal::Right),
+                .align_x(iced::alignment::Horizontal::Right),
         ]
         .spacing(10)
-        .align_items(Alignment::Center);
+        .align_y(Alignment::Center);
 
         let tab_width = {
             let seg = |width: usize| {
@@ -321,13 +303,37 @@ impl PreferencesState {
                     .on_press(Message::Preferences(PreferencesMessage::TabWidthChanged(
                         width,
                     )))
-                    .style(iced::theme::Button::custom(theme::Segment {
-                        dark,
-                        active: self.tab_width == width,
-                        radius: theme::R_SM,
-                    }))
+                    .style(
+                        (theme::Segment {
+                            dark,
+                            active: config.tab_width == width,
+                            radius: theme::R_SM,
+                        })
+                        .style(),
+                    )
             };
             container(row![seg(2), seg(4), seg(8)].spacing(2))
+                .padding(2)
+                .style(theme::field(dark, false, theme::R_ROW))
+        };
+
+        let guide_column = {
+            let seg = |column: usize| {
+                button(text(column.to_string()).size(12).font(theme::MONO))
+                    .padding([3, 10])
+                    .on_press(Message::Preferences(
+                        PreferencesMessage::PageGuideColumnChanged(column),
+                    ))
+                    .style(
+                        (theme::Segment {
+                            dark,
+                            active: config.page_guide_column == column,
+                            radius: theme::R_SM,
+                        })
+                        .style(),
+                    )
+            };
+            container(row![seg(72), seg(80), seg(100), seg(120)].spacing(2))
                 .padding(2)
                 .style(theme::field(dark, false, theme::R_ROW))
         };
@@ -341,43 +347,52 @@ impl PreferencesState {
             setting_row(t!("prefs.tab_width").to_string(), tab_width.into()),
             toggle(
                 t!("prefs.use_spaces").to_string(),
-                self.use_spaces,
+                config.use_spaces,
                 PreferencesMessage::UseSpacesToggled,
             ),
             toggle(
                 t!("prefs.show_line_numbers").to_string(),
-                self.show_line_numbers,
+                config.show_line_numbers,
                 PreferencesMessage::ShowLineNumbersToggled,
             ),
             toggle(
                 t!("prefs.auto_indent").to_string(),
-                self.auto_indent,
+                config.auto_indent,
                 PreferencesMessage::AutoIndentToggled,
             ),
             toggle(
                 t!("prefs.autocomplete_brackets").to_string(),
-                self.autocomplete_brackets,
+                config.autocomplete_brackets,
                 PreferencesMessage::AutocompleteBracketsToggled,
             ),
             toggle(
                 t!("prefs.autocomplete_quotes").to_string(),
-                self.autocomplete_quotes,
+                config.autocomplete_quotes,
                 PreferencesMessage::AutocompleteQuotesToggled,
             ),
             toggle(
                 t!("prefs.highlight_current_line").to_string(),
-                self.highlight_current_line,
+                config.highlight_current_line,
                 PreferencesMessage::HighlightCurrentLineToggled,
             ),
             toggle(
                 t!("prefs.show_page_guide").to_string(),
-                self.show_page_guide,
+                config.show_page_guide,
                 PreferencesMessage::ShowPageGuideToggled,
+            ),
+            setting_row(
+                t!("prefs.page_guide_column").to_string(),
+                guide_column.into(),
             ),
             toggle(
                 t!("prefs.show_minimap").to_string(),
-                self.show_minimap,
+                config.show_minimap,
                 PreferencesMessage::ShowMinimapToggled,
+            ),
+            toggle(
+                t!("prefs.word_wrap").to_string(),
+                config.word_wrap,
+                PreferencesMessage::WordWrapToggled,
             ),
         ];
 
@@ -389,11 +404,14 @@ impl PreferencesState {
             button(text(label).size(12))
                 .padding([3, 12])
                 .on_press(Message::ThemeChanged(is_dark))
-                .style(iced::theme::Button::custom(theme::Segment {
-                    dark,
-                    active: dark == is_dark,
-                    radius: theme::R_SM,
-                }))
+                .style(
+                    (theme::Segment {
+                        dark,
+                        active: dark == is_dark,
+                        radius: theme::R_SM,
+                    })
+                    .style(),
+                )
         };
         let control = container(
             row![
@@ -411,18 +429,16 @@ impl PreferencesState {
         )
     }
 
-    fn language_card(&self, dark: bool) -> Element<'_, Message> {
-        let selected = LOCALES.iter().copied().find(|l| l.code == self.locale);
+    fn language_card(&self, config: &Config, dark: bool) -> Element<'_, Message> {
+        let selected = LOCALES.iter().copied().find(|l| l.code == config.locale);
         let select = pick_list(LOCALES, selected, |choice| {
             Message::Preferences(PreferencesMessage::LocaleChanged(choice.code.to_string()))
         })
         .padding([6, 12])
         .width(150)
         .text_size(13)
-        .style(iced::theme::PickList::Custom(
-            std::rc::Rc::new(theme::Select { dark }),
-            std::rc::Rc::new(theme::Select { dark }),
-        ));
+        .style(theme::Select { dark }.style())
+        .menu_style(theme::Select { dark }.menu_style());
 
         card_of_rows(
             dark,
@@ -437,7 +453,7 @@ impl PreferencesState {
         let check = button(text(t!("menu.help_check_updates").to_string()).size(12))
             .padding([6, 12])
             .on_press(Message::CheckForUpdate)
-            .style(iced::theme::Button::custom(theme::Outline { dark }));
+            .style((theme::Outline { dark }).style());
 
         card_of_rows(
             dark,
@@ -454,7 +470,7 @@ fn setting_row<'a>(label: String, control: Element<'a, Message>) -> Element<'a, 
     row![text(label).size(13).width(Length::Fill), control]
         .spacing(16)
         .padding([12, 16])
-        .align_items(Alignment::Center)
+        .align_y(Alignment::Center)
         .into()
 }
 
@@ -466,7 +482,7 @@ fn card_of_rows<'a>(dark: bool, rows: Vec<Element<'a, Message>>) -> Element<'a, 
         col = col.push(row_el);
         if i != last {
             col = col.push(
-                container(Space::with_height(1))
+                container(Space::new().height(1))
                     .width(Length::Fill)
                     .style(theme::rule(dark)),
             );
@@ -480,13 +496,13 @@ fn card_of_rows<'a>(dark: bool, rows: Vec<Element<'a, Message>>) -> Element<'a, 
 
 /// A 36×20 switch with a 14px knob.
 pub fn switch(dark: bool, on: bool, message: Message) -> Element<'static, Message> {
-    let knob = container(Space::new(14, 14)).style(theme::switch_knob(dark, on));
-    button(row![Space::with_width(if on { 17.0 } else { 0.0 }), knob])
+    let knob = container(Space::new().width(14).height(14)).style(theme::switch_knob(dark, on));
+    button(row![Space::new().width(if on { 17.0 } else { 0.0 }), knob])
         .padding(3)
         .width(36)
         .height(20)
         .on_press(message)
-        .style(iced::theme::Button::custom(theme::SwitchTrack { dark, on }))
+        .style((theme::SwitchTrack { dark, on }).style())
         .into()
 }
 
@@ -626,15 +642,18 @@ pub fn shortcuts_list(
                 text(key_label)
                     .size(12)
                     .font(theme::MONO)
-                    .style(if is_capturing { p.accent } else { p.text }),
+                    .color(if is_capturing { p.accent } else { p.text }),
             )
             .padding([4, 10])
             .on_press(Message::StartCaptureShortcut(target))
-            .style(iced::theme::Button::custom(theme::Segment {
-                dark,
-                active: is_capturing,
-                radius: theme::R_SM,
-            }));
+            .style(
+                (theme::Segment {
+                    dark,
+                    active: is_capturing,
+                    radius: theme::R_SM,
+                })
+                .style(),
+            );
             setting_row(label, key_button.into())
         })
         .collect();
@@ -647,7 +666,7 @@ pub fn shortcuts_list(
             t!("shortcuts.click_to_rebind").to_string()
         })
         .size(11.5)
-        .style(p.muted),
+        .color(p.muted),
     ]
     .spacing(10)
     .into()
@@ -661,13 +680,14 @@ mod tests {
     fn preferences_from_default_config() {
         let config = Config::default();
         let prefs = PreferencesState::from_config(&config);
-        assert_eq!(prefs.font_size, 14.0);
-        assert_eq!(prefs.tab_width, 4);
-        assert!(prefs.use_spaces);
-        assert_eq!(prefs.locale, "en");
-        assert!(prefs.highlight_current_line);
-        assert!(!prefs.show_page_guide);
-        assert!(prefs.show_minimap);
+        assert!(matches!(prefs.page, PrefsPage::Editor));
+        assert_eq!(config.font_size, 14.0);
+        assert_eq!(config.tab_width, 4);
+        assert!(config.use_spaces);
+        assert_eq!(config.locale, "en");
+        assert!(config.highlight_current_line);
+        assert!(!config.show_page_guide);
+        assert!(config.show_minimap);
     }
 
     #[test]
@@ -675,7 +695,7 @@ mod tests {
         let mut config = Config::default();
         let mut prefs = PreferencesState::from_config(&config);
         assert!(prefs.update(PreferencesMessage::FontSizeChanged(18.0), &mut config));
-        assert_eq!(prefs.font_size, 18.0);
+        assert_eq!(config.font_size, 18.0);
         assert_eq!(config.font_size, 18.0);
     }
 
@@ -687,7 +707,7 @@ mod tests {
             PreferencesMessage::LocaleChanged("fr".to_string()),
             &mut config,
         );
-        assert_eq!(prefs.locale, "fr");
+        assert_eq!(config.locale, "fr");
         assert_eq!(config.locale, "fr");
         assert_eq!(rust_i18n::locale().to_string(), "fr");
 
@@ -716,6 +736,8 @@ mod tests {
         assert!(!config.highlight_current_line);
         assert!(config.show_page_guide);
         assert!(!config.show_minimap);
+        prefs.update(PreferencesMessage::WordWrapToggled(false), &mut config);
+        assert!(!config.word_wrap);
     }
 
     #[test]

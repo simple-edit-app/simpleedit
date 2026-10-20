@@ -23,29 +23,49 @@ fn key(path: &Path) -> String {
 
 impl Bookmarks {
     fn store() -> Option<PathBuf> {
-        dirs::data_dir().map(|d| d.join("simpleedit").join("bookmarks.json"))
+        crate::fsutil::data_dir().map(|d| d.join("simpleedit").join("bookmarks.json"))
     }
 
     pub fn load() -> Self {
-        Self::store()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        let Some(path) = Self::store() else {
+            return Self::default();
+        };
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return Self::default();
+        };
+        serde_json::from_str(&raw).unwrap_or_else(|_| {
+            // Keep the unreadable file instead of overwriting it.
+            let _ = crate::fsutil::set_aside(&path);
+            Self::default()
+        })
     }
 
-    /// Writes the bookmarks if they changed since the last write.
+    /// Writes the bookmarks if they changed since the last write. A failed
+    /// write is retried on the next call.
     pub fn save(&mut self) {
         if !self.dirty {
             return;
         }
-        self.dirty = false;
         let (Some(path), Ok(json)) = (Self::store(), serde_json::to_string(self)) else {
             return;
         };
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = crate::fsutil::write_atomic(&path, json.as_bytes(), true);
+        if crate::fsutil::write_atomic(&path, json.as_bytes(), true).is_ok() {
+            self.dirty = false;
+        }
+    }
+
+    /// Forgets the bookmarks of files that no longer exist (untitled buffers
+    /// are not files).
+    pub fn prune_missing(&mut self) {
+        let before = self.files.len();
+        self.files
+            .retain(|path, _| path.starts_with("untitled://") || Path::new(path).exists());
+        if self.files.len() != before {
+            self.dirty = true;
+        }
     }
 
     /// The bookmarked lines of a file, in order.

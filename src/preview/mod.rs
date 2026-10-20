@@ -64,18 +64,21 @@ impl PreviewKind {
 /// and Split (or Raw and Tree for JSON); it sits at the right of the
 /// editor's toolbar.
 pub fn segmented(kind: PreviewKind, mode: ViewMode, dark: bool) -> Element<'static, Message> {
-    let mut bar = row![].spacing(2).align_items(Alignment::Center);
+    let mut bar = row![].spacing(2).align_y(Alignment::Center);
 
     for m in kind.modes() {
         bar = bar.push(
             button(text(kind.label(*m)).size(12))
                 .padding([3, 10])
                 .on_press(Message::SetViewMode(*m))
-                .style(iced::theme::Button::custom(theme::Segment {
-                    dark,
-                    active: mode == *m,
-                    radius: theme::R_SM,
-                })),
+                .style(
+                    (theme::Segment {
+                        dark,
+                        active: mode == *m,
+                        radius: theme::R_SM,
+                    })
+                    .style(),
+                ),
         );
     }
 

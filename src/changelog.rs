@@ -58,13 +58,16 @@ pub fn file_name(locale: &str) -> &'static str {
     }
 }
 
-/// The compiled-in changelog, in the interface language.
+static EN_ENTRIES: once_cell::sync::Lazy<Vec<Entry>> = once_cell::sync::Lazy::new(|| parse(EN));
+static FR_ENTRIES: once_cell::sync::Lazy<Vec<Entry>> = once_cell::sync::Lazy::new(|| parse(FR));
+
+/// The compiled-in changelog, in the interface language (parsed once).
 pub fn embedded() -> Vec<Entry> {
-    parse(if rust_i18n::locale().starts_with("fr") {
-        FR
+    if rust_i18n::locale().starts_with("fr") {
+        FR_ENTRIES.clone()
     } else {
-        EN
-    })
+        EN_ENTRIES.clone()
+    }
 }
 
 /// The releases after `current` up to and including `latest`.

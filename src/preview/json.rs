@@ -54,10 +54,24 @@ fn collect_paths(value: &Value, path: &str, out: &mut HashSet<String>) {
     }
 }
 
+/// The path of a child. A key that is not a plain identifier is quoted
+/// (`$["a.b"]`), so `{"a.b": …}` and `{"a": {"b": …}}` don't share a path.
 fn child_path(parent: &str, key: &str, index: Option<usize>) -> String {
     match index {
         Some(i) => format!("{}[{}]", parent, i),
-        None => format!("{}.{}", parent, key),
+        None => {
+            let plain = key
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if plain {
+                format!("{}.{}", parent, key)
+            } else {
+                let quoted = serde_json::to_string(key).unwrap_or_else(|_| "\"?\"".into());
+                format!("{}[{}]", parent, quoted)
+            }
+        }
     }
 }
 
@@ -111,7 +125,7 @@ fn mono(content: String, size: f32, color: Color) -> iced::widget::Text<'static>
     text(content)
         .size(size)
         .font(theme::MONO)
-        .style(color)
+        .color(color)
         .shaping(iced::widget::text::Shaping::Advanced)
 }
 
@@ -147,9 +161,7 @@ pub fn view(value: &Value, collapsed: &HashSet<String>, dark: bool) -> Element<'
             .width(Length::Fill)
             .padding([22, 28]),
     )
-    .style(iced::theme::Scrollable::Custom(Box::new(
-        theme::Scrollbar { dark },
-    )))
+    .style(theme::Scrollbar { dark }.style())
     .width(Length::Fill)
     .height(Length::Fill)
     .into()
@@ -188,7 +200,7 @@ fn push_node(
         };
         rows.push(
             line(depth)
-                .push(Space::with_width(Length::Fixed(CHEVRON_WIDTH)))
+                .push(Space::new().width(Length::Fixed(CHEVRON_WIDTH)))
                 .push(key_label(key, dark))
                 .push(mono(format!("{}{}", value_text, tail), SIZE, color))
                 .into(),
@@ -260,14 +272,14 @@ fn push_node(
     }
     rows.push(
         line(depth)
-            .push(Space::with_width(Length::Fixed(CHEVRON_WIDTH)))
+            .push(Space::new().width(Length::Fixed(CHEVRON_WIDTH)))
             .push(mono(format!("{}{}", close, tail), SIZE, muted))
             .into(),
     );
 }
 
 fn line(depth: usize) -> iced::widget::Row<'static, Message> {
-    row![Space::with_width(Length::Fixed(depth as f32 * INDENT))].align_items(Alignment::Center)
+    row![Space::new().width(Length::Fixed(depth as f32 * INDENT))].align_y(Alignment::Center)
 }
 
 fn key_label(key: Option<&str>, dark: bool) -> Element<'static, Message> {
@@ -278,7 +290,7 @@ fn key_label(key: Option<&str>, dark: bool) -> Element<'static, Message> {
             theme::syntax(dark).function,
         )
         .into(),
-        None => Space::with_width(Length::Fixed(0.0)).into(),
+        None => Space::new().width(Length::Fixed(0.0)).into(),
     }
 }
 
@@ -289,15 +301,18 @@ fn chevron(path: String, open: bool, dark: bool) -> Element<'static, Message> {
             // for these arrows, which the UI font doesn't have.
             .shaping(iced::widget::text::Shaping::Advanced)
             .size(9)
-            .style(theme::muted_text(dark)),
+            .color(theme::muted_text(dark)),
     )
     .padding([0, 4])
     .width(Length::Fixed(CHEVRON_WIDTH))
     .on_press(Message::JsonToggle(path))
-    .style(iced::theme::Button::custom(theme::GhostButton {
-        dark,
-        active: false,
-    }))
+    .style(
+        (theme::GhostButton {
+            dark,
+            active: false,
+        })
+        .style(),
+    )
     .into()
 }
 
@@ -349,5 +364,24 @@ mod tests {
     fn brackets_report_child_counts() {
         assert_eq!(brackets(&value(r#"{"a": 1, "b": 2}"#)), ("{", "}", 2));
         assert_eq!(brackets(&value("[1, 2, 3]")), ("[", "]", 3));
+    }
+
+    #[test]
+    fn keys_with_dots_get_their_own_path() {
+        let doc: Value =
+            serde_json::from_str(r#"{"a.b": {"x": 1}, "a": {"b": {"x": 2}}}"#).unwrap();
+        let paths = container_paths(&doc);
+        // root + two objects + one nested object: four foldable nodes, four paths.
+        assert_eq!(paths.len(), 4);
+        assert!(paths.contains("$[\"a.b\"]"));
+        assert!(paths.contains("$.a.b"));
+    }
+
+    #[test]
+    fn big_numbers_are_shown_as_written() {
+        let doc: Value =
+            serde_json::from_str("[12345678901234567890123, 0.1234567890123456789]").unwrap();
+        assert_eq!(scalar_text(&doc[0]), "12345678901234567890123");
+        assert_eq!(scalar_text(&doc[1]), "0.1234567890123456789");
     }
 }

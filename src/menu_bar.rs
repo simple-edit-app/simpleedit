@@ -27,10 +27,13 @@ pub fn view(config: &Config, open: Option<TopMenu>) -> Element<'static, Message>
                 button(text(label).size(13))
                     .padding([5, 9])
                     .on_press(Message::ToggleMenu(menu))
-                    .style(iced::theme::Button::custom(theme::MenuTitle {
-                        dark,
-                        open: open == Some(menu),
-                    })),
+                    .style(
+                        (theme::MenuTitle {
+                            dark,
+                            open: open == Some(menu),
+                        })
+                        .style(),
+                    ),
             )
             .id(menu_id(menu)),
         )
@@ -42,11 +45,14 @@ pub fn view(config: &Config, open: Option<TopMenu>) -> Element<'static, Message>
         button(text(label).size(12))
             .padding([3, 10])
             .on_press(Message::ThemeChanged(is_dark))
-            .style(iced::theme::Button::custom(theme::Segment {
-                dark,
-                active: dark == is_dark,
-                radius: theme::R_PILL,
-            }))
+            .style(
+                (theme::Segment {
+                    dark,
+                    active: dark == is_dark,
+                    radius: theme::R_PILL,
+                })
+                .style(),
+            )
     };
     let p = theme::palette(dark);
     let theme_switch = container(
@@ -57,7 +63,7 @@ pub fn view(config: &Config, open: Option<TopMenu>) -> Element<'static, Message>
         .spacing(2),
     )
     .padding(2)
-    .style(move |_: &iced::Theme| container::Appearance {
+    .style(move |_: &iced::Theme| container::Style {
         text_color: Some(p.text),
         background: Some(iced::Background::Color(p.elevated)),
         border: iced::Border {
@@ -66,6 +72,7 @@ pub fn view(config: &Config, open: Option<TopMenu>) -> Element<'static, Message>
             radius: theme::R_PILL.into(),
         },
         shadow: iced::Shadow::default(),
+        ..container::Style::default()
     });
 
     let bar = row![
@@ -73,13 +80,13 @@ pub fn view(config: &Config, open: Option<TopMenu>) -> Element<'static, Message>
         top_button(t!("menu.edit").to_string(), TopMenu::Edit),
         top_button(t!("menu.view").to_string(), TopMenu::View),
         top_button(t!("menu.help").to_string(), TopMenu::Help),
-        Space::with_width(Length::Fill),
+        Space::new().width(Length::Fill),
         theme_switch,
     ]
     .spacing(2)
     .padding([0, 14])
     .height(42)
-    .align_items(Alignment::Center);
+    .align_y(Alignment::Center);
 
     container(bar)
         .width(Length::Fill)
@@ -146,12 +153,12 @@ pub fn dropdown_view(
 /// The stable `Id` of a top menu button's wrapping container, so its
 /// dropdown can be anchored to wherever that button actually renders —
 /// independent of label length, font, or DPI.
-pub fn menu_id(menu: TopMenu) -> container::Id {
+pub fn menu_id(menu: TopMenu) -> iced::widget::Id {
     match menu {
-        TopMenu::File => container::Id::new("menu-file"),
-        TopMenu::Edit => container::Id::new("menu-edit"),
-        TopMenu::View => container::Id::new("menu-view"),
-        TopMenu::Help => container::Id::new("menu-help"),
+        TopMenu::File => iced::widget::Id::new("menu-file"),
+        TopMenu::Edit => iced::widget::Id::new("menu-edit"),
+        TopMenu::View => iced::widget::Id::new("menu-view"),
+        TopMenu::Help => iced::widget::Id::new("menu-help"),
     }
 }
 
@@ -164,30 +171,38 @@ pub fn item(
 ) -> Element<'static, Message> {
     let content: Element<'static, Message> = if let Some(sc) = shortcut {
         row![
-            text(label).size(13),
-            Space::with_width(Length::Fill),
-            text(sc).size(11.5).style(theme::muted_text(dark)),
+            text(label)
+                .size(13)
+                .shaping(iced::widget::text::Shaping::Advanced),
+            Space::new().width(Length::Fill),
+            text(sc).size(11.5).color(theme::muted_text(dark)),
         ]
-        .align_items(Alignment::Center)
+        .align_y(Alignment::Center)
         .into()
     } else {
-        text(label).size(13).into()
+        text(label)
+            .size(13)
+            .shaping(iced::widget::text::Shaping::Advanced)
+            .into()
     };
 
     button(content)
         .padding([7, 10])
         .width(Length::Fill)
         .on_press(message)
-        .style(iced::theme::Button::custom(theme::MenuItem {
-            dark,
-            radius: theme::R_SM,
-            highlighted: false,
-        }))
+        .style(
+            (theme::MenuItem {
+                dark,
+                radius: theme::R_SM,
+                highlighted: false,
+            })
+            .style(),
+        )
         .into()
 }
 
 pub fn disabled_item(label: String, dark: bool) -> Element<'static, Message> {
-    container(text(label).size(13).style(theme::muted_text(dark)))
+    container(text(label).size(13).color(theme::muted_text(dark)))
         .padding([7, 10])
         .width(Length::Fill)
         .into()
@@ -195,7 +210,7 @@ pub fn disabled_item(label: String, dark: bool) -> Element<'static, Message> {
 
 pub fn separator(dark: bool) -> Element<'static, Message> {
     container(
-        container(Space::with_height(1))
+        container(Space::new().height(1))
             .width(Length::Fill)
             .style(theme::rule(dark)),
     )
@@ -237,14 +252,14 @@ fn menu_items(
             if !config.recent_files.is_empty() {
                 items.push(separator(dark));
                 items.push(disabled_item(t!("menu.file_recents").to_string(), dark));
-                for path_str in &config.recent_files {
-                    let path = PathBuf::from(path_str);
-                    let name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or(path_str)
-                        .to_string();
-                    items.push(item(name, None, dark, Message::OpenRecentFile(path)));
+                let recents: Vec<PathBuf> = config.recent_files.iter().map(PathBuf::from).collect();
+                for (path, name) in recents.iter().zip(crate::app::unique_labels(&recents)) {
+                    items.push(item(
+                        name,
+                        None,
+                        dark,
+                        Message::OpenRecentFile(path.clone()),
+                    ));
                 }
                 items.push(separator(dark));
             }

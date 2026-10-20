@@ -18,24 +18,36 @@ use iced::advanced::graphics::text::cosmic_text::Cursor as Cursor_;
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::mouse;
 use iced::advanced::renderer::{self, Renderer as _};
-use iced::advanced::text::editor::{Cursor, Editor as _};
+use iced::advanced::text::editor::{Cursor, Editor as _, Position, Selection};
 use iced::advanced::text::highlighter::{self, Highlighter};
 use iced::advanced::text::{self, LineHeight, Renderer as TextRenderer};
 use iced::advanced::widget::{self, tree};
 use iced::advanced::Shell;
 use iced::alignment;
-use iced::event::{self, Event};
 use iced::keyboard::{self, key};
-use iced::{Color, Element, Font, Length, Padding, Pixels, Point, Rectangle, Size, Vector};
+use iced::{
+    Background, Border, Color, Element, Event, Font, Length, Padding, Pixels, Point, Rectangle,
+    Size, Vector,
+};
 
 use std::cell::RefCell;
 use std::ops::DerefMut;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::sync::Mutex;
 
-pub use iced::widget::text_editor::{Action, Edit, Motion, StyleSheet};
+pub use iced::widget::text_editor::{Action, Edit, Motion};
+
+/// How the editor looks: the surface behind the text, the caret and the
+/// selection.
+#[derive(Debug, Clone, Copy)]
+pub struct Style {
+    pub background: Background,
+    pub border: Border,
+    /// The caret.
+    pub value: Color,
+    pub selection: Color,
+}
 
 type Editor = <iced::Renderer as TextRenderer>::Editor;
 
@@ -62,6 +74,8 @@ pub struct SearchPaint {
     pub query: String,
     pub case_sensitive: bool,
     pub use_regex: bool,
+    /// The query compiled once (regex mode), not on every frame.
+    pub regex: Option<Arc<regex::Regex>>,
     /// (line, byte range within the line) of the current match.
     pub current: Option<(usize, Range<usize>)>,
     pub color: Color,
@@ -180,6 +194,8 @@ fn line_matches(
         line.match_indices(paint.query.as_str())
             .map(|(i, m)| i..i + m.len())
             .collect()
+    } else if let Some(re) = regex {
+        re.find_iter(line).map(|m| m.range()).collect()
     } else {
         crate::search::find_literal_ci(line, &paint.query)
     }
@@ -190,7 +206,6 @@ fn line_matches(
 pub struct CodeEditor<'a, Highlighter, Message, Theme = iced::Theme>
 where
     Highlighter: text::Highlighter,
-    Theme: StyleSheet,
 {
     content: &'a Content,
     font: Option<Font>,
@@ -206,16 +221,13 @@ where
     guide: Option<(usize, Color)>,
     minimap: Option<Minimap>,
     bookmarks: Option<BookmarkPaint>,
-    style: Theme::Style,
+    style: Style,
     on_edit: Option<Box<dyn Fn(Action) -> Message + 'a>>,
     highlighter_settings: Highlighter::Settings,
     highlighter_format: fn(&Highlighter::Highlight, &Theme) -> highlighter::Format<Font>,
 }
 
-impl<'a, Message, Theme> CodeEditor<'a, highlighter::PlainText, Message, Theme>
-where
-    Theme: StyleSheet,
-{
+impl<'a, Message, Theme> CodeEditor<'a, highlighter::PlainText, Message, Theme> {
     pub fn new(content: &'a Content) -> Self {
         Self {
             content,
@@ -231,7 +243,12 @@ where
             guide: None,
             minimap: None,
             bookmarks: None,
-            style: Default::default(),
+            style: Style {
+                background: Background::Color(Color::TRANSPARENT),
+                border: Border::default(),
+                value: Color::BLACK,
+                selection: Color::BLACK,
+            },
             on_edit: None,
             highlighter_settings: (),
             highlighter_format: |_highlight, _theme| highlighter::Format::default(),
@@ -242,7 +259,6 @@ where
 impl<'a, Highlighter, Message, Theme> CodeEditor<'a, Highlighter, Message, Theme>
 where
     Highlighter: text::Highlighter,
-    Theme: StyleSheet,
 {
     pub fn height(mut self, height: impl Into<Length>) -> Self {
         self.height = height.into();
@@ -339,8 +355,8 @@ where
         }
     }
 
-    pub fn style(mut self, style: impl Into<Theme::Style>) -> Self {
-        self.style = style.into();
+    pub fn style(mut self, style: Style) -> Self {
+        self.style = style;
         self
     }
 
@@ -376,16 +392,28 @@ where
         (delta != 0).then_some(delta)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw_minimap(
         &self,
         renderer: &mut iced::Renderer,
         editor: &Editor,
+        version: (u64, u64),
+        cache: &RefCell<MinimapCache>,
         rect: Rectangle,
         minimap: Minimap,
         regex: Option<&regex::Regex>,
     ) {
         let buffer = editor.buffer();
         let lines = buffer.lines.len();
+        let mut cache = cache.borrow_mut();
+        if cache.key != Some(version) {
+            cache.spans = buffer
+                .lines
+                .iter()
+                .map(|l| minimap_span(l.text()))
+                .collect();
+            cache.key = Some(version);
+        }
         let scale = minimap_scale(lines, rect.height);
         let top = rect.y + MINIMAP_INSET;
         let quad = |renderer: &mut iced::Renderer, x, y, width, height, color| {
@@ -444,9 +472,10 @@ where
         let step = group as f32 * scale;
         let max_width = rect.width - 12.0;
         for (row, first) in (0..lines).step_by(group).enumerate() {
-            let span = buffer.lines[first..(first + group).min(lines)]
+            let span = cache.spans[first..(first + group).min(lines)]
                 .iter()
-                .filter_map(|l| minimap_span(l.text()))
+                .flatten()
+                .copied()
                 .fold(None, |acc: Option<(usize, usize)>, (start, len)| {
                     Some(match acc {
                         Some((s, end)) => (s.min(start), end.max(start + len)),
@@ -500,17 +529,32 @@ where
             .as_ref()
             .filter(|_| lines <= MINIMAP_MAX_MARKED_LINES)
         {
-            for (i, line) in buffer.lines.iter().enumerate() {
-                if !line_matches(line.text(), paint, regex).is_empty() {
-                    quad(
-                        renderer,
-                        rect.x + rect.width - 4.0,
-                        top + i as f32 * scale,
-                        4.0,
-                        scale.max(2.0),
-                        minimap.marker,
-                    );
-                }
+            let search_key = (
+                version.0,
+                version.1,
+                paint.query.clone(),
+                paint.case_sensitive,
+                paint.use_regex,
+            );
+            if cache.search_key.as_ref() != Some(&search_key) {
+                cache.marked = buffer
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, line)| !line_matches(line.text(), paint, regex).is_empty())
+                    .map(|(i, _)| i)
+                    .collect();
+                cache.search_key = Some(search_key);
+            }
+            for &i in &cache.marked {
+                quad(
+                    renderer,
+                    rect.x + rect.width - 4.0,
+                    top + i as f32 * scale,
+                    4.0,
+                    scale.max(2.0),
+                    minimap.marker,
+                );
             }
         }
     }
@@ -547,23 +591,19 @@ pub struct Content(RefCell<Internal>);
 /// text it shows was swapped for another one.
 static NEXT_CONTENT_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Bounds, font, size and line height of the last editor layout. A new
-/// `Content` has never been laid out, so [`Content::settle`] borrows these.
-static LAST_LAYOUT: Mutex<Option<(Size, Font, Pixels, LineHeight)>> = Mutex::new(None);
-
-fn remember_layout(bounds: Size, font: Font, size: Pixels, line_height: LineHeight) {
-    if let Ok(mut last) = LAST_LAYOUT.lock() {
-        *last = Some((bounds, font, size, line_height));
-    }
-}
-
 struct Internal {
     id: u64,
     /// Topmost line edited since the widget last told its highlighter.
     changed_from: Option<usize>,
     editor: Editor,
     is_dirty: bool,
+    /// Bumped by every edit, to know when cached per-line data is stale.
+    revision: u64,
+    wrapping: text::Wrapping,
 }
+
+/// Ordered (line, byte) ends of a selection.
+pub type SelectionRange = ((usize, usize), (usize, usize));
 
 impl Content {
     pub fn new() -> Self {
@@ -571,66 +611,122 @@ impl Content {
     }
 
     pub fn with_text(text: &str) -> Self {
+        // The buffer keeps one line per `\n`, so a final newline would show
+        // as an extra empty line; the app writes one back when it saves.
+        let text = text.strip_suffix('\n').unwrap_or(text);
         Self(RefCell::new(Internal {
             id: NEXT_CONTENT_ID.fetch_add(1, Ordering::Relaxed),
             changed_from: None,
             editor: Editor::with_text(text),
             is_dirty: true,
+            revision: 0,
+            wrapping: text::Wrapping::Word,
         }))
     }
 
     pub fn perform(&mut self, action: Action) {
+        // cosmic-text drops one trailing control character from every pasted
+        // segment (meant for the newline), which eats a final tab, and keeps
+        // the `\r` of Windows line endings.
+        if let Action::Edit(Edit::Paste(text)) = &action {
+            let text = normalize_pasted(text);
+            if text
+                .chars()
+                .next_back()
+                .is_some_and(|c| c != '\n' && c.is_control())
+            {
+                // A sentinel keeps the tab; it is deleted right after.
+                self.perform_raw(Action::Edit(Edit::Paste(Arc::new(format!("{text}x")))));
+                self.perform_raw(Action::Edit(Edit::Backspace));
+            } else {
+                self.perform_raw(Action::Edit(Edit::Paste(Arc::new(text))));
+            }
+            return;
+        }
+        self.perform_raw(action);
+    }
+
+    fn perform_raw(&mut self, action: Action) {
         let internal = self.0.get_mut();
         // Remember the topmost line an edit may touch (the selection can
         // start above the cursor), for the highlighter.
         let touched = matches!(action, Action::Edit(_)).then(|| {
-            let line = internal.editor.cursor_position().0;
-            let above = internal
-                .editor
-                .selection()
-                .map_or(0, |s| s.matches('\n').count());
+            let cursor = internal.editor.cursor();
+            let line = cursor.position.line;
+            let above = cursor
+                .selection
+                .map_or(0, |anchor| anchor.line.abs_diff(line));
             line.saturating_sub(above)
         });
+        if touched.is_some() {
+            internal.revision += 1;
+        }
         internal.editor.perform(action);
         if let Some(before) = touched {
-            let after = internal.editor.cursor_position().0;
+            let after = internal.editor.cursor().position.line;
             let top = before.min(after);
             internal.changed_from = Some(internal.changed_from.map_or(top, |c| c.min(top)));
         }
         internal.is_dirty = true;
     }
 
-    /// Lays out and shapes the text now.
-    ///
-    /// An edit leaves its lines unshaped until the widget's next layout, and
-    /// cosmic-text panics ("layout not found") when a motion such as
-    /// `Home` or `Down` starts on one, while `Left`/`Right` silently do
-    /// nothing. Calling this first makes such motions reliable. A no-op until
-    /// an editor has been laid out once.
-    pub fn settle(&mut self) {
-        let last = LAST_LAYOUT.lock().ok().and_then(|last| *last);
-        let Some((bounds, font, size, line_height)) = last else {
-            return;
-        };
-        let internal = self.0.get_mut();
-        // The editor tells its highlighter about edited lines during this
-        // update; the real highlighter isn't at hand, so `changed_from`
-        // (kept by `perform`) passes that on at the next layout.
-        internal.editor.update(
-            bounds,
-            font,
-            size,
-            line_height,
-            &mut highlighter::PlainText::new(&()),
-        );
-    }
-
     pub fn line_count(&self) -> usize {
         self.0.borrow().editor.line_count()
     }
 
+    /// Puts the cursor at (`line`, byte `col`) and, with `len_bytes`, selects
+    /// that many bytes of the text after it (a selection may span lines).
+    ///
+    /// The position is set directly on the editor: no motion, no layout, so
+    /// the cost doesn't depend on where in the file it is.
+    pub fn select_bytes(&mut self, line: usize, col: usize, len_bytes: usize) {
+        let line = line.min(self.line_count().saturating_sub(1));
+        let start = (line, col);
+        let end = if len_bytes == 0 {
+            None
+        } else {
+            // Walk the lines the selection covers to find where it ends.
+            let (mut line_i, mut at, mut left) = (line, col, len_bytes);
+            loop {
+                let Some(text) = self.line(line_i) else {
+                    break Some((line_i.saturating_sub(1), usize::MAX));
+                };
+                let rest = text.len().saturating_sub(at);
+                if left <= rest {
+                    break Some((line_i, at + left));
+                }
+                left -= rest + 1;
+                line_i += 1;
+                at = 0;
+            }
+        };
+        let internal = self.0.get_mut();
+        // `move_to` only ever sets a selection, never clears one.
+        if internal.editor.cursor().selection.is_some() {
+            internal.editor.perform(Action::Move(Motion::Left));
+        }
+        let at = |(line, column)| Position { line, column };
+        internal.editor.move_to(match end {
+            Some(end) => Cursor {
+                position: at(end),
+                selection: Some(at(start)),
+            },
+            None => Cursor {
+                position: at(start),
+                selection: None,
+            },
+        });
+        internal.is_dirty = true;
+    }
+
     pub fn line(&self, index: usize) -> Option<impl std::ops::Deref<Target = str> + '_> {
-        std::cell::Ref::filter_map(self.0.borrow(), |internal| internal.editor.line(index)).ok()
+        std::cell::Ref::filter_map(self.0.borrow(), |internal| {
+            match internal.editor.line(index)?.text {
+                std::borrow::Cow::Borrowed(text) => Some(text),
+                std::borrow::Cow::Owned(_) => None,
+            }
+        })
+        .ok()
     }
 
     pub fn lines(&self) -> impl Iterator<Item = impl std::ops::Deref<Target = str> + '_> {
@@ -645,7 +741,10 @@ impl Content {
             fn next(&mut self) -> Option<Self::Item> {
                 let line =
                     std::cell::Ref::filter_map(std::cell::Ref::clone(&self.internal), |internal| {
-                        internal.editor.line(self.current)
+                        match internal.editor.line(self.current)?.text {
+                            std::borrow::Cow::Borrowed(text) => Some(text),
+                            std::borrow::Cow::Owned(_) => None,
+                        }
                     })
                     .ok()?;
                 self.current += 1;
@@ -677,14 +776,69 @@ impl Content {
         text
     }
 
+    /// The selection as ordered (line, byte) ends; no text is copied.
+    pub fn selection_range(&self) -> Option<SelectionRange> {
+        let cursor = self.0.borrow().editor.cursor();
+        let anchor = cursor.selection?;
+        let (a, b) = (
+            (anchor.line, anchor.column),
+            (cursor.position.line, cursor.position.column),
+        );
+        if a == b {
+            return None;
+        }
+        Some(if a < b { (a, b) } else { (b, a) })
+    }
+
+    /// Characters and lines in the selection, counted without copying it.
+    pub fn selection_counts(&self) -> Option<(usize, usize)> {
+        let (start, end) = self.selection_range()?;
+        let mut chars = 0;
+        for line_i in start.0..=end.0 {
+            let line = self.line(line_i)?;
+            let from = if line_i == start.0 { start.1 } else { 0 };
+            let to = if line_i == end.0 { end.1 } else { line.len() };
+            chars += line.get(from..to)?.chars().count();
+            if line_i != end.0 {
+                chars += 1;
+            }
+        }
+        Some((chars, end.0 - start.0 + 1))
+    }
+
+    /// Word wrapping on or off (long lines then run off the edge).
+    pub fn set_wrapping(&self, wrapping: bool) {
+        self.0.borrow_mut().wrapping = if wrapping {
+            text::Wrapping::Word
+        } else {
+            text::Wrapping::None
+        };
+    }
+
+    /// Bumped by every edit.
+    pub fn revision(&self) -> u64 {
+        self.0.borrow().revision
+    }
+
     pub fn selection(&self) -> Option<String> {
-        self.0.borrow().editor.selection()
+        self.0.borrow().editor.copy()
     }
 
     /// The cursor as (line, byte index within the line).
     pub fn cursor_position(&self) -> (usize, usize) {
-        self.0.borrow().editor.cursor_position()
+        let position = self.0.borrow().editor.cursor().position;
+        (position.line, position.column)
     }
+}
+
+/// A pasted text as the buffer wants it: only `\n` between lines.
+fn normalize_pasted(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// Moves the cursor to the start of logical line `target`.
+pub fn goto_line_start(content: &mut Content, target: usize) {
+    content.select_bytes(target, 0, 0);
 }
 
 impl Default for Content {
@@ -705,13 +859,26 @@ struct State<Highlighter: text::Highlighter> {
     highlighter_format_address: usize,
     /// The `Content` the highlighter has been following.
     content_id: u64,
+    /// Per-line data of the minimap, recomputed only after an edit.
+    minimap_cache: RefCell<MinimapCache>,
+}
+
+/// What the minimap derives from the text: it costs a pass over the whole
+/// file, so it is kept until the text or the search changes.
+#[derive(Default)]
+struct MinimapCache {
+    /// (content id, revision) the spans were computed for.
+    key: Option<(u64, u64)>,
+    spans: Vec<Option<(usize, usize)>>,
+    /// (content id, revision, query, case, regex) the marked lines are for.
+    search_key: Option<(u64, u64, String, bool, bool)>,
+    marked: Vec<usize>,
 }
 
 impl<'a, Highlighter, Message, Theme> iced::advanced::Widget<Message, Theme, iced::Renderer>
     for CodeEditor<'a, Highlighter, Message, Theme>
 where
     Highlighter: text::Highlighter,
-    Theme: StyleSheet,
 {
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<State<Highlighter>>()
@@ -728,6 +895,7 @@ where
             highlighter_settings: self.highlighter_settings.clone(),
             highlighter_format_address: self.highlighter_format as usize,
             content_id: self.content.0.borrow().id,
+            minimap_cache: RefCell::default(),
         })
     }
 
@@ -739,7 +907,7 @@ where
     }
 
     fn layout(
-        &self,
+        &mut self,
         tree: &mut widget::Tree,
         renderer: &iced::Renderer,
         limits: &layout::Limits,
@@ -774,18 +942,13 @@ where
 
         let limits = limits.height(self.height);
         let padding = self.text_padding(renderer, internal.editor.line_count());
-        remember_layout(
-            limits.shrink(padding).max(),
-            self.font.unwrap_or_else(|| renderer.default_font()),
-            self.text_size.unwrap_or_else(|| renderer.default_size()),
-            self.line_height,
-        );
-
+        let wrapping = internal.wrapping;
         internal.editor.update(
             limits.shrink(padding).max(),
             self.font.unwrap_or_else(|| renderer.default_font()),
             self.text_size.unwrap_or_else(|| renderer.default_size()),
             self.line_height,
+            wrapping,
             state.highlighter.borrow_mut().deref_mut(),
         );
 
@@ -799,25 +962,25 @@ where
                     limits
                         .height(min_bounds.height)
                         .max()
-                        .expand(Size::new(0.0, padding.vertical())),
+                        .expand(Size::new(0.0, padding.y())),
                 )
             }
         }
     }
 
-    fn on_event(
+    fn update(
         &mut self,
         tree: &mut widget::Tree,
-        event: Event,
+        event: &Event,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         renderer: &iced::Renderer,
         clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
         _viewport: &Rectangle,
-    ) -> event::Status {
+    ) {
         let Some(on_edit) = self.on_edit.as_ref() else {
-            return event::Status::Ignored;
+            return;
         };
 
         let state = tree.state.downcast_mut::<State<Highlighter>>();
@@ -839,7 +1002,8 @@ where
                     if state.minimap_drag =>
                 {
                     state.minimap_drag = false;
-                    return event::Status::Captured;
+                    shell.capture_event();
+                    return;
                 }
                 _ => None,
             };
@@ -847,13 +1011,14 @@ where
                 if let Some(lines) = self.minimap_scroll(y - rect.y, rect.height) {
                     shell.publish(on_edit(Action::Scroll { lines }));
                 }
-                return event::Status::Captured;
+                shell.capture_event();
+                return;
             }
         }
 
         let Some(update) = Update::from_event(event, state, layout.bounds(), padding, cursor)
         else {
-            return event::Status::Ignored;
+            return;
         };
 
         match update {
@@ -906,7 +1071,7 @@ where
             }
         }
 
-        event::Status::Captured
+        shell.capture_event();
     }
 
     fn draw(
@@ -916,7 +1081,7 @@ where
         theme: &Theme,
         style: &renderer::Style,
         layout: Layout<'_>,
-        cursor: mouse::Cursor,
+        _cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
         let bounds = layout.bounds();
@@ -930,18 +1095,7 @@ where
             |highlight| (self.highlighter_format)(highlight, theme),
         );
 
-        let is_disabled = self.on_edit.is_none();
-        let is_mouse_over = cursor.is_over(bounds);
-
-        let appearance = if is_disabled {
-            theme.disabled(&self.style)
-        } else if state.is_focused {
-            theme.focused(&self.style)
-        } else if is_mouse_over {
-            theme.hovered(&self.style)
-        } else {
-            theme.active(&self.style)
-        };
+        let appearance = self.style;
 
         renderer.fill_quad(
             renderer::Quad {
@@ -957,7 +1111,7 @@ where
 
         let size = self.size_px(renderer);
         let row_height = self.line_height.to_absolute(Pixels(size)).0;
-        let cursor_line = internal.editor.cursor_position().0;
+        let cursor_line = internal.editor.cursor().position.line;
 
         // Behind the text: the page guide, the cursor line's wash and the
         // search matches. (Text is always painted above quads.)
@@ -979,11 +1133,7 @@ where
                 );
             }
         }
-        let regex = self
-            .search
-            .as_ref()
-            .filter(|p| p.use_regex)
-            .and_then(|p| crate::search::build_regex(&p.query, p.case_sensitive).ok());
+        let regex = self.search.as_ref().and_then(|p| p.regex.clone());
         for run in internal.editor.buffer().layout_runs() {
             let top = bounds.y + padding.top + run.line_top;
             if let Some(highlight) = self.line_highlight.filter(|_| run.line_i == cursor_line) {
@@ -1018,7 +1168,7 @@ where
                 }
             }
             if let Some(paint) = &self.search {
-                for range in line_matches(run.text, paint, regex.as_ref()) {
+                for range in line_matches(run.text, paint, regex.as_deref()) {
                     let current = paint
                         .current
                         .as_ref()
@@ -1067,8 +1217,8 @@ where
         let caret_height = (size * 1.3).min(row_height);
 
         if state.is_focused {
-            match internal.editor.cursor() {
-                Cursor::Caret(position) => {
+            match internal.editor.selection() {
+                Selection::Caret(position) => {
                     let position = position + translation;
 
                     if bounds.contains(position) {
@@ -1084,11 +1234,11 @@ where
                                 },
                                 ..renderer::Quad::default()
                             },
-                            theme.value_color(&self.style),
+                            self.style.value,
                         );
                     }
                 }
-                Cursor::Selection(ranges) => {
+                Selection::Range(ranges) => {
                     for range in ranges
                         .into_iter()
                         .filter_map(|range| bounds.intersection(&(range + translation)))
@@ -1098,7 +1248,7 @@ where
                                 bounds: range,
                                 ..renderer::Quad::default()
                             },
-                            theme.selection_color(&self.style),
+                            self.style.selection,
                         );
                     }
                 }
@@ -1126,14 +1276,15 @@ where
                 let number = (run.line_i + 1).to_string();
                 renderer.fill_text(
                     text::Text {
-                        content: &number,
+                        content: number.clone(),
                         bounds: Size::new(width - 14.0, row_height),
                         size: Pixels(size),
                         line_height: self.line_height,
                         font: self.font.unwrap_or(Font::MONOSPACE),
-                        horizontal_alignment: alignment::Horizontal::Right,
-                        vertical_alignment: alignment::Vertical::Center,
+                        align_x: text::Alignment::Right,
+                        align_y: alignment::Vertical::Center,
                         shaping: text::Shaping::Basic,
+                        wrapping: text::Wrapping::None,
                     },
                     // With right/centre alignment the position is the anchor of
                     // the text, not the corner of its bounds.
@@ -1176,7 +1327,11 @@ where
                         renderer::Quad {
                             bounds: flag,
                             border: iced::Border {
-                                radius: [2.0, 2.0, 1.0, 1.0].into(),
+                                radius: iced::border::Radius::default()
+                                    .top_left(2.0)
+                                    .top_right(2.0)
+                                    .bottom_right(1.0)
+                                    .bottom_left(1.0),
                                 ..iced::Border::default()
                             },
                             ..renderer::Quad::default()
@@ -1191,9 +1346,11 @@ where
             self.draw_minimap(
                 renderer,
                 &internal.editor,
+                (internal.id, internal.revision),
+                &state.minimap_cache,
                 minimap_rect(bounds),
                 minimap,
-                regex.as_ref(),
+                regex.as_deref(),
             );
         }
     }
@@ -1227,7 +1384,7 @@ impl<'a, Highlighter, Message, Theme> From<CodeEditor<'a, Highlighter, Message, 
 where
     Highlighter: text::Highlighter,
     Message: 'a,
-    Theme: StyleSheet + 'a,
+    Theme: 'a,
 {
     fn from(editor: CodeEditor<'a, Highlighter, Message, Theme>) -> Self {
         Self::new(editor)
@@ -1247,7 +1404,7 @@ enum Update {
 
 impl Update {
     fn from_event<H: Highlighter>(
-        event: Event,
+        event: &Event,
         state: &State<H>,
         bounds: Rectangle,
         padding: Padding,
@@ -1262,7 +1419,11 @@ impl Update {
             Event::Mouse(event) => match event {
                 mouse::Event::ButtonPressed(mouse::Button::Left) => {
                     if let Some(cursor_position) = cursor.position_in(bounds) {
-                        let click = mouse::Click::new(cursor_position - inset, state.last_click);
+                        let click = mouse::Click::new(
+                            cursor_position - inset,
+                            mouse::Button::Left,
+                            state.last_click,
+                        );
                         Some(Update::Click(click))
                     } else if state.is_focused {
                         Some(Update::Unfocus)
@@ -1326,15 +1487,27 @@ impl Update {
                         _ => {}
                     }
 
+                    // A shortcut (Ctrl/Cmd+key) types nothing; AltGr, which
+                    // some systems report as Ctrl+Alt, still does.
+                    let typing_shortcut = modifiers.command() && !modifiers.alt();
                     if let Some(text) = text {
                         if let Some(c) = text.chars().find(|c| !c.is_control()) {
+                            if typing_shortcut {
+                                return None;
+                            }
                             return edit(Edit::Insert(c));
                         }
                     }
 
                     if let keyboard::Key::Named(named_key) = key.as_ref() {
+                        // Alt+Up / Alt+Down move the line (an app shortcut).
+                        if modifiers.alt()
+                            && matches!(named_key, key::Named::ArrowUp | key::Named::ArrowDown)
+                        {
+                            return None;
+                        }
                         if let Some(motion) = motion(named_key) {
-                            let motion = if is_jump_modifier_pressed(modifiers) {
+                            let motion = if is_jump_modifier_pressed(*modifiers) {
                                 motion.widen()
                             } else {
                                 motion
@@ -1354,6 +1527,20 @@ impl Update {
             },
             _ => None,
         }
+    }
+}
+
+/// Whether the editor itself handles this key combination (a shortcut bound
+/// to it could never fire while the editor has the focus). `key` is the
+/// name an app shortcut uses.
+pub fn consumes_key(key: &str, ctrl: bool, alt: bool) -> bool {
+    match key {
+        "Return" | "Backspace" | "Delete" | "ArrowLeft" | "ArrowRight" | "Home" | "End"
+        | "PageUp" | "PageDown" => true,
+        // Alt+Up/Down are left to the app (see `Update::from_event`).
+        "ArrowUp" | "ArrowDown" => !alt,
+        "c" | "x" | "v" => ctrl && !alt,
+        _ => false,
     }
 }
 
@@ -1383,23 +1570,59 @@ fn is_jump_modifier_pressed(modifiers: keyboard::Modifiers) -> bool {
 mod tests {
     use super::*;
 
+    fn key_event(key: key::Named, modifiers: keyboard::Modifiers) -> Event {
+        Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(key),
+            modified_key: keyboard::Key::Named(key),
+            physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        })
+    }
+
+    fn focused_state() -> State<highlighter::PlainText> {
+        State {
+            is_focused: true,
+            last_click: None,
+            drag_click: None,
+            partial_scroll: 0.0,
+            minimap_drag: false,
+            highlighter: RefCell::new(highlighter::PlainText::new(&())),
+            highlighter_settings: (),
+            highlighter_format_address: 0,
+            content_id: 0,
+            minimap_cache: RefCell::default(),
+        }
+    }
+
+    fn from_key(key: key::Named, modifiers: keyboard::Modifiers) -> Option<Update> {
+        Update::from_event(
+            &key_event(key, modifiers),
+            &focused_state(),
+            Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0)),
+            Padding::ZERO,
+            mouse::Cursor::Unavailable,
+        )
+    }
+
     #[test]
-    fn settle_makes_motions_safe_right_after_an_edit() {
-        // Without `settle`, `Home` right after an edit panics in cosmic-text.
-        remember_layout(
-            Size::new(800.0, 600.0),
-            Font::DEFAULT,
-            Pixels(14.0),
-            LineHeight::default(),
-        );
-        let mut content = Content::with_text("a\nb\nc\nd\n");
-        content.perform(Action::Edit(Edit::Insert('x')));
-        content.settle();
-        content.perform(Action::Move(Motion::DocumentStart));
-        content.perform(Action::Move(Motion::Down));
-        content.perform(Action::Move(Motion::Down));
-        content.perform(Action::Move(Motion::Home));
-        assert_eq!(content.cursor_position(), (2, 0));
+    fn alt_arrows_reach_the_app_but_plain_arrows_move_the_cursor() {
+        assert!(from_key(key::Named::ArrowUp, keyboard::Modifiers::ALT).is_none());
+        assert!(from_key(key::Named::ArrowDown, keyboard::Modifiers::ALT).is_none());
+        assert!(matches!(
+            from_key(key::Named::ArrowUp, keyboard::Modifiers::empty()),
+            Some(Update::Action(Action::Move(Motion::Up)))
+        ));
+    }
+
+    #[test]
+    fn consumed_keys_are_known() {
+        assert!(!consumes_key("ArrowUp", false, true));
+        assert!(consumes_key("ArrowUp", false, false));
+        assert!(consumes_key("c", true, false));
+        assert!(!consumes_key("d", true, false));
     }
 
     #[test]

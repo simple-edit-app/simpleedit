@@ -6,10 +6,15 @@
   <title>SimpleEdit — A fast, clean, cross-platform text editor</title>
   <meta name="description" content="SimpleEdit is a fast, clean text editor written in Rust for macOS and Linux." />
   <meta name="color-scheme" content="dark light" />
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
   <style>
+    /* Fonts are served from this site (no request to Google's servers). */
+    @font-face { font-family: 'Instrument Sans'; font-weight: 400; font-style: normal; font-display: swap; src: url('fonts/InstrumentSans-Regular.ttf') format('truetype'); }
+    @font-face { font-family: 'Instrument Sans'; font-weight: 500; font-style: normal; font-display: swap; src: url('fonts/InstrumentSans-Medium.ttf') format('truetype'); }
+    @font-face { font-family: 'Instrument Sans'; font-weight: 600; font-style: normal; font-display: swap; src: url('fonts/InstrumentSans-SemiBold.ttf') format('truetype'); }
+    @font-face { font-family: 'Instrument Sans'; font-weight: 700; font-style: normal; font-display: swap; src: url('fonts/InstrumentSans-Bold.ttf') format('truetype'); }
+    @font-face { font-family: 'JetBrains Mono'; font-weight: 400; font-style: normal; font-display: swap; src: url('fonts/JetBrainsMono-Regular.ttf') format('truetype'); }
+    @font-face { font-family: 'JetBrains Mono'; font-weight: 500; font-style: normal; font-display: swap; src: url('fonts/JetBrainsMono-Medium.ttf') format('truetype'); }
+
     /* SimpleEdit — "Nocturne" design tokens (see design/tokens/tokens.css) */
     :root {
       --font-ui: 'Instrument Sans', system-ui, sans-serif;
@@ -422,7 +427,7 @@
     <span data-lang="fr">Un éditeur de texte rapide, propre et multiplateforme</span>
   </h1>
   <p class="lead">
-    <span data-lang="en">Written in Rust. Syntax highlighting for 60+ languages, regex search, Markdown preview.</span>
+    <span data-lang="en">Written in Rust. Syntax highlighting for 30+ languages, regex search, Markdown preview.</span>
     <span data-lang="fr">Écrit en Rust. Coloration syntaxique pour plus de 60 langages, recherche avec regex, aperçu Markdown.</span>
   </p>
   <div class="cta">
@@ -463,7 +468,7 @@
     <div class="feature">
       <div class="num">01</div>
       <h3><span data-lang="en">Syntax highlighting</span><span data-lang="fr">Coloration syntaxique</span></h3>
-      <p><span data-lang="en">60+ languages via TextMate grammars.</span><span data-lang="fr">60+ langages via des grammaires TextMate.</span></p>
+      <p><span data-lang="en">30+ languages via TextMate grammars.</span><span data-lang="fr">30+ langages via des grammaires TextMate.</span></p>
     </div>
     <div class="feature">
       <div class="num">02</div>
@@ -522,7 +527,7 @@
       <p class="install-label"><span data-lang="en">Linux — .deb (install):</span><span data-lang="fr">Linux — .deb (installer) :</span></p>
       <div class="cmd">
         <span class="prompt">$</span>
-        <code>curl -L -o simpleedit.deb "$(curl -s https://api.github.com/repos/simple-edit-app/simpleedit/releases/latest | grep -oP '"browser_download_url":\s*"\K[^"]+\.deb')" &amp;&amp; sudo apt install ./simpleedit.deb</code>
+        <code>curl -fsSL https://api.github.com/repos/simple-edit-app/simpleedit/releases/latest | sed -n 's/.*"browser_download_url": *"\([^"]*\.deb\)".*/\1/p' | xargs curl -fsSLO &amp;&amp; sudo apt install ./simpleedit_*.deb</code>
         <button class="copy-btn" onclick="copyCode(this)"><span data-lang="en">Copy</span><span data-lang="fr">Copier</span></button>
       </div>
     </div>
@@ -531,7 +536,7 @@
       <p class="install-label"><span data-lang="en">Linux — AppImage (install):</span><span data-lang="fr">Linux — AppImage (installer) :</span></p>
       <div class="cmd">
         <span class="prompt">$</span>
-        <code>curl -L -o simpleedit.AppImage "$(curl -s https://api.github.com/repos/simple-edit-app/simpleedit/releases/latest | grep -oP '"browser_download_url":\s*"\K[^"]+\.AppImage')" &amp;&amp; chmod +x simpleedit.AppImage &amp;&amp; ./simpleedit.AppImage</code>
+        <code>curl -fsSL https://api.github.com/repos/simple-edit-app/simpleedit/releases/latest | sed -n 's/.*"browser_download_url": *"\([^"]*\.AppImage\)".*/\1/p' | xargs curl -fsSLO &amp;&amp; chmod +x simpleedit-*.AppImage &amp;&amp; ./simpleedit-*.AppImage</code>
         <button class="copy-btn" onclick="copyCode(this)"><span data-lang="en">Copy</span><span data-lang="fr">Copier</span></button>
       </div>
       <p class="install-note">
@@ -548,8 +553,8 @@
         <button class="copy-btn" onclick="copyCode(this)"><span data-lang="en">Copy</span><span data-lang="fr">Copier</span></button>
       </div>
       <p class="install-note">
-        <span data-lang="en">Detects how SimpleEdit was installed — Homebrew cask, <code>.deb</code> package or plain binary — and removes it. Your settings are left untouched — delete <code>~/.config/simpleedit</code> on Linux, or <code>~/Library/Application&nbsp;Support/simpleedit</code> on macOS, to remove them too.</span>
-        <span data-lang="fr">Détecte le mode d’installation — cask Homebrew, paquet <code>.deb</code> ou binaire simple — et le supprime. Vos réglages sont conservés — supprimez <code>~/.config/simpleedit</code> sous Linux, ou <code>~/Library/Application&nbsp;Support/simpleedit</code> sous macOS, pour les effacer aussi.</span>
+        <span data-lang="en">Detects how SimpleEdit was installed — Homebrew cask, <code>.deb</code> package or plain binary — and removes it. Your settings and session are left untouched — delete <code>~/.config/simpleedit</code> and <code>~/.local/share/simpleedit</code> (the session, which holds the text of your unsaved files) on Linux, or <code>~/Library/Application&nbsp;Support/simpleedit</code> on macOS, to remove them too.</span>
+        <span data-lang="fr">Détecte le mode d’installation — cask Homebrew, paquet <code>.deb</code> ou binaire simple — et le supprime. Vos réglages et votre session sont conservés — supprimez <code>~/.config/simpleedit</code> et <code>~/.local/share/simpleedit</code> (la session, qui contient le texte de vos fichiers non enregistrés) sous Linux, ou <code>~/Library/Application&nbsp;Support/simpleedit</code> sous macOS, pour les effacer aussi.</span>
       </p>
     </div>
 

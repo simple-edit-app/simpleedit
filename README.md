@@ -11,7 +11,7 @@ A fast, stable, cross-platform text editor for **macOS** and **Linux**. Built in
 
 ## Features
 
-- **Syntax highlighting** for 60+ languages (TextMate grammars)
+- **Syntax highlighting** for 30+ languages (TextMate grammars)
 - **File sidebar** — open and switch between multiple files
 - **Search & Replace** with regex support
 - **Dark / Light theme**
@@ -72,12 +72,12 @@ Download and install the latest `.deb` package:
 
 ```bash
 curl -fsSL https://api.github.com/repos/simple-edit-app/simpleedit/releases/latest \
-  | grep '"browser_download_url"' | grep '\.deb' \
-  | cut -d '"' -f 4 | xargs wget -q -O simpleedit.deb
-sudo dpkg -i simpleedit.deb && rm simpleedit.deb
+  | sed -n 's/.*"browser_download_url": *"\([^"]*\.deb\)".*/\1/p' \
+  | xargs curl -fsSLO
+sudo apt install ./simpleedit_*.deb && rm simpleedit_*.deb
 ```
 
-Or grab the file directly from the [Releases page](https://github.com/simple-edit-app/simpleedit/releases/latest).
+This command does not verify the download. The [one-liner](#one-liner-linux--macos) does (Ed25519 signature on `SHA256SUMS`, then the file's checksum); to check by hand, download `SHA256SUMS` from the [Releases page](https://github.com/simple-edit-app/simpleedit/releases/latest) next to the `.deb` and run `sha256sum -c --ignore-missing SHA256SUMS`.
 
 **Uninstall:**
 ```bash
@@ -120,8 +120,15 @@ cargo build --release
 
 ```bash
 simpleedit                  # open with last session
-simpleedit path/to/file     # open a specific file
+simpleedit path/to/file     # open a specific file (several files: one tab each)
+simpleedit new-file.txt     # a file that doesn't exist yet opens empty; saving creates it
 ```
+
+### Good to know
+
+- Files up to **64 MB** open; larger ones are refused. Files must be **UTF-8** text. Line endings (LF / CRLF) and the presence of a final newline are kept as they were.
+- **Unsaved text is kept between runs**: the session (including the content of untitled and modified buffers) is stored in `~/.local/share/simpleedit/session.json` (`~/Library/Application Support/simpleedit` on macOS), readable by you only. Delete that folder to forget it.
+- Formatters (prettier, rustfmt, black…) run in the folder of the file, so the project's own configuration applies. prettier must be installed; nothing is downloaded for you.
 
 ---
 

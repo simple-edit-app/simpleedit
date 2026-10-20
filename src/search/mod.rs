@@ -3,39 +3,49 @@ use std::ops::Range;
 use iced::advanced::widget::{operation, Id as WidgetId, Operation};
 use iced::{
     widget::{button, column, container, row, text, text_input, tooltip},
-    Alignment, Command, Element, Length,
+    Alignment, Element, Length, Task,
 };
 use regex::Regex;
 
 use crate::app::Message;
 use crate::theme;
 
-pub fn find_field_id() -> text_input::Id {
-    text_input::Id::new("search-find")
+pub fn find_field_id() -> iced::widget::Id {
+    iced::widget::Id::new("search-find")
 }
 
-pub fn replace_field_id() -> text_input::Id {
-    text_input::Id::new("search-replace")
+pub fn replace_field_id() -> iced::widget::Id {
+    iced::widget::Id::new("search-replace")
 }
 
 /// Resolves to whether one of the search bar's text fields has keyboard
-/// focus, so editor shortcuts (Ctrl+Z, Ctrl+A…) can leave it alone.
+/// focus, so editor shortcuts (Ctrl+Z, Ctrl+A, Tab…) can leave it alone.
 pub fn search_field_focused() -> impl Operation<bool> {
+    field_focused(vec![find_field_id(), replace_field_id()])
+}
+
+/// Resolves to whether the find field has keyboard focus (Enter there goes
+/// to the next match).
+pub fn find_field_focused() -> impl Operation<bool> {
+    field_focused(vec![find_field_id()])
+}
+
+fn field_focused(ids: Vec<WidgetId>) -> impl Operation<bool> {
     struct Focused {
-        ids: [WidgetId; 2],
+        ids: Vec<WidgetId>,
         found: bool,
     }
     impl Operation<bool> for Focused {
-        fn container(
-            &mut self,
-            _id: Option<&WidgetId>,
-            _bounds: iced::Rectangle,
-            operate_on_children: &mut dyn FnMut(&mut dyn Operation<bool>),
-        ) {
-            operate_on_children(self);
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<bool>)) {
+            operate(self);
         }
 
-        fn focusable(&mut self, state: &mut dyn operation::Focusable, id: Option<&WidgetId>) {
+        fn focusable(
+            &mut self,
+            id: Option<&WidgetId>,
+            _bounds: iced::Rectangle,
+            state: &mut dyn operation::Focusable,
+        ) {
             if state.is_focused() && id.is_some_and(|id| self.ids.contains(id)) {
                 self.found = true;
             }
@@ -45,10 +55,7 @@ pub fn search_field_focused() -> impl Operation<bool> {
             operation::Outcome::Some(self.found)
         }
     }
-    Focused {
-        ids: [find_field_id().into(), replace_field_id().into()],
-        found: false,
-    }
+    Focused { ids, found: false }
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +98,9 @@ pub struct SearchState {
     /// typing in the field doesn't force a full re-highlight of the buffer
     /// on every keystroke — only committing the search does.
     committed: bool,
+    /// The query as a regex when matching needs one (regex mode, or a
+    /// case-insensitive literal), compiled once per search.
+    compiled: Option<std::sync::Arc<Regex>>,
 }
 
 impl SearchState {
@@ -106,16 +116,33 @@ impl SearchState {
             current: None,
             current_line: None,
             committed: false,
+            compiled: None,
         }
     }
 
     /// Forgets all matches; called when the buffer is replaced by another file.
     pub fn reset(&mut self) {
+        self.reset_matches();
+        self.match_count = 0;
+    }
+
+    /// Forgets the matches (the text they pointed into changed).
+    pub fn reset_matches(&mut self) {
         self.matches.clear();
         self.current = None;
         self.current_line = None;
         self.committed = false;
-        self.match_count = 0;
+        self.compiled = None;
+    }
+
+    pub fn set_error(&mut self, error: String) {
+        self.last_error = Some(one_line(&error));
+        self.reset_matches();
+    }
+
+    /// The compiled query for the editor's match highlighting.
+    pub fn compiled_regex(&self) -> Option<std::sync::Arc<Regex>> {
+        self.compiled.clone()
     }
 
     /// The current match's (line index, byte range within that line), for
@@ -137,7 +164,7 @@ impl SearchState {
         &mut self,
         msg: SearchMessage,
         content: &mut crate::code_editor::Content,
-    ) -> Command<Message> {
+    ) -> Task<Message> {
         match msg {
             SearchMessage::QueryChanged(q) => {
                 self.query = q;
@@ -146,11 +173,11 @@ impl SearchState {
                 self.current = None;
                 self.current_line = None;
                 self.committed = false;
-                Command::none()
+                Task::none()
             }
             SearchMessage::ReplaceChanged(r) => {
                 self.replacement = r;
-                Command::none()
+                Task::none()
             }
             SearchMessage::ToggleRegex => {
                 self.use_regex = !self.use_regex;
@@ -158,7 +185,7 @@ impl SearchState {
                 self.current = None;
                 self.current_line = None;
                 self.committed = false;
-                Command::none()
+                Task::none()
             }
             SearchMessage::ToggleCaseSensitive => {
                 self.case_sensitive = !self.case_sensitive;
@@ -166,29 +193,17 @@ impl SearchState {
                 self.current = None;
                 self.current_line = None;
                 self.committed = false;
-                Command::none()
+                Task::none()
             }
-            SearchMessage::ReplaceAll => {
-                let text = content.text();
-                match self.replace_all(&text) {
-                    Ok(new_text) => {
-                        *content = crate::code_editor::Content::with_text(&new_text);
-                    }
-                    Err(e) => self.last_error = Some(e),
-                }
-                self.matches.clear();
-                self.current = None;
-                self.current_line = None;
-                self.committed = false;
-                Command::none()
-            }
+            // Rewrites the whole buffer, so the app does it (undo, bookmarks).
+            SearchMessage::ReplaceAll => Task::none(),
             SearchMessage::Find => {
                 self.jump(content, true);
-                Command::none()
+                Task::none()
             }
             SearchMessage::FindPrevious => {
                 self.jump(content, false);
-                Command::none()
+                Task::none()
             }
             SearchMessage::Replace => self.replace_current(content),
         }
@@ -212,12 +227,12 @@ impl SearchState {
     /// changed since), this is the same as a first `Find`: it only jumps,
     /// same as pressing Enter — replacing nothing was ever selected would be
     /// a surprise, not a convenience.
-    fn replace_current(&mut self, content: &mut crate::code_editor::Content) -> Command<Message> {
-        let text = content.text();
+    fn replace_current(&mut self, content: &mut crate::code_editor::Content) -> Task<Message> {
+        let text = crate::editor::buffer_text(content);
         if self.matches.is_empty() || !self.current_is_selected(content, &text) {
             self.current = None;
             self.jump(content, true);
-            return Command::none();
+            return Task::none();
         }
 
         // The current match is selected in the editor; pasting over a
@@ -236,7 +251,7 @@ impl SearchState {
         // content.cursor_position() synchronously right after this edit
         // panics: "layout not found"). So finding the next match happens on
         // the next update cycle instead of immediately here.
-        Command::perform(async {}, |_| Message::Search(SearchMessage::Find))
+        Task::perform(async {}, |_| Message::Search(SearchMessage::Find))
     }
 
     /// The replacement for the current match: in regex mode `$1`/`${name}`
@@ -262,7 +277,7 @@ impl SearchState {
     /// previous one, wrapping around either end. The very first jump after a
     /// fresh search starts from whichever match is nearest the cursor.
     fn jump(&mut self, content: &mut crate::code_editor::Content, forward: bool) {
-        let text = content.text();
+        let text = crate::editor::buffer_text(content);
         // `current` only counts while the editor still has that match
         // selected; a click elsewhere or an edit makes it stale.
         if !self.current_is_selected(content, &text) {
@@ -275,20 +290,15 @@ impl SearchState {
                 self.last_error = None;
             }
             Err(e) => {
-                self.matches.clear();
+                self.reset_matches();
                 self.match_count = 0;
-                self.current = None;
-                self.current_line = None;
-                self.committed = false;
-                self.last_error = Some(e);
+                self.last_error = Some(one_line(&e));
                 return;
             }
         }
 
         if self.matches.is_empty() {
-            self.current = None;
-            self.current_line = None;
-            self.committed = false;
+            self.reset_matches();
             return;
         }
 
@@ -303,6 +313,15 @@ impl SearchState {
         self.current = Some(next);
         self.current_line = Some(byte_range_to_line_local(&text, &self.matches[next]));
         self.committed = true;
+        self.compiled = if self.use_regex {
+            build_regex(&self.query, self.case_sensitive)
+                .ok()
+                .map(Into::into)
+        } else if !self.case_sensitive {
+            literal_ci_regex(&self.query).map(Into::into)
+        } else {
+            None
+        };
         select_range(content, &text, self.matches[next].clone());
     }
 
@@ -348,13 +367,15 @@ impl SearchState {
         let replace_all_label = t!("search.replace_all").to_string();
         let case_sensitive_label = t!("search.case_sensitive").to_string();
         let regex_label = t!("search.regex").to_string();
+        let prev_label = t!("search.previous").to_string();
+        let next_label = t!("search.next").to_string();
 
         // A toggle chip with its full label as a hover tooltip.
         let chip = |label: &'static str, hint: String, active: bool, message: Message| {
             let btn = button(text(label).size(11.5).font(theme::MONO))
                 .padding([5, 8])
                 .on_press(message)
-                .style(iced::theme::Button::custom(theme::Chip { dark, active }));
+                .style((theme::Chip { dark, active }).style());
             tooltip(btn, text(hint).size(11), tooltip::Position::Bottom)
                 .gap(4)
                 .padding(6)
@@ -368,25 +389,46 @@ impl SearchState {
                 text_input(find_placeholder.as_str(), &self.query)
                     .id(find_field_id())
                     .on_input(|v| Message::Search(SearchMessage::QueryChanged(v)))
-                    .on_submit(Message::Search(SearchMessage::Find))
                     .size(13)
                     .padding(0)
-                    .style(iced::theme::TextInput::Custom(Box::new(theme::BareField {
-                        dark
-                    }))),
-                text(count_label).size(11.5).style(p.muted),
+                    .style((theme::BareField { dark }).style()),
+                text(count_label).size(11.5).color(p.muted),
             ]
             .spacing(8)
-            .align_items(Alignment::Center),
+            .align_y(Alignment::Center),
         )
         .padding([0, 10])
         .width(Length::Fill)
         .height(30)
-        .center_y()
+        .align_y(iced::alignment::Vertical::Center)
         .style(theme::field(dark, true, theme::R_ROW));
+
+        // Previous / next match (Shift+Enter and Enter do the same).
+        let step = |arrow: &'static str, hint: String, message: SearchMessage| {
+            let btn = button(
+                text(arrow)
+                    .size(12)
+                    .shaping(iced::widget::text::Shaping::Advanced),
+            )
+            .padding([5, 8])
+            .on_press(Message::Search(message))
+            .style(
+                (theme::Chip {
+                    dark,
+                    active: false,
+                })
+                .style(),
+            );
+            tooltip(btn, text(hint).size(11), tooltip::Position::Bottom)
+                .gap(4)
+                .padding(6)
+                .style(theme::tooltip(dark))
+        };
 
         let find_row = row![
             find_field,
+            step("↑", prev_label, SearchMessage::FindPrevious),
+            step("↓", next_label, SearchMessage::Find),
             chip(
                 ".*",
                 regex_label,
@@ -401,7 +443,7 @@ impl SearchState {
             ),
         ]
         .spacing(6)
-        .align_items(Alignment::Center);
+        .align_y(Alignment::Center);
 
         let replace_field = container(
             text_input(replace_placeholder.as_str(), &self.replacement)
@@ -409,14 +451,12 @@ impl SearchState {
                 .on_input(|v| Message::Search(SearchMessage::ReplaceChanged(v)))
                 .size(13)
                 .padding(0)
-                .style(iced::theme::TextInput::Custom(Box::new(theme::BareField {
-                    dark,
-                }))),
+                .style((theme::BareField { dark }).style()),
         )
         .padding([0, 10])
         .width(Length::Fill)
         .height(30)
-        .center_y()
+        .align_y(iced::alignment::Vertical::Center)
         .style(theme::field(dark, false, theme::R_ROW));
 
         let replace_row = row![
@@ -424,18 +464,18 @@ impl SearchState {
             button(text(replace_label).size(12))
                 .padding([6, 10])
                 .on_press(Message::Search(SearchMessage::Replace))
-                .style(iced::theme::Button::custom(theme::Outline { dark })),
+                .style((theme::Outline { dark }).style()),
             button(text(replace_all_label).size(12).font(theme::UI_SEMIBOLD))
                 .padding([6, 10])
                 .on_press(Message::Search(SearchMessage::ReplaceAll))
-                .style(iced::theme::Button::custom(theme::Primary { dark })),
+                .style((theme::Primary { dark }).style()),
         ]
         .spacing(6)
-        .align_items(Alignment::Center);
+        .align_y(Alignment::Center);
 
         container(column![find_row, replace_row].spacing(8))
             .padding(10)
-            .width(392)
+            .width(432)
             .style(theme::card(dark))
             .into()
     }
@@ -448,48 +488,44 @@ pub fn build_regex(query: &str, case_sensitive: bool) -> Result<Regex, regex::Er
     Regex::new(&format!("{flags}{query}"))
 }
 
+/// The first line of an error message, cut to fit the little counter of the
+/// search card (the `regex` crate's own messages run over several lines).
+fn one_line(message: &str) -> String {
+    let line = message
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with("error:"))
+        .or_else(|| message.lines().next())
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches("error:")
+        .trim();
+    let cut: String = line.chars().take(48).collect();
+    if cut.len() < line.len() {
+        format!("{cut}…")
+    } else {
+        cut
+    }
+}
+
+/// `query` as a case-insensitive literal.
+fn literal_ci_regex(query: &str) -> Option<Regex> {
+    if query.is_empty() {
+        return None;
+    }
+    regex::RegexBuilder::new(&regex::escape(query))
+        .case_insensitive(true)
+        .build()
+        .ok()
+}
+
 /// Case-insensitive literal search returning byte ranges *into `text`
-/// itself*. Lowercasing the whole text first would shift offsets whenever a
-/// character changes length (e.g. `İ`), so characters are compared one by
-/// one instead.
+/// itself* (lowercasing the whole text first would shift offsets whenever a
+/// character changes length, e.g. `İ`). Linear in the text.
 pub fn find_literal_ci(text: &str, query: &str) -> Vec<Range<usize>> {
-    let q: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
-    let mut out = Vec::new();
-    if q.is_empty() {
-        return out;
-    }
-    let starts: Vec<(usize, char)> = text.char_indices().collect();
-    let mut s = 0;
-    while s < starts.len() {
-        let mut k = 0;
-        let mut j = s;
-        let mut ok = true;
-        while k < q.len() {
-            let Some(&(_, c)) = starts.get(j) else {
-                ok = false;
-                break;
-            };
-            for lc in c.to_lowercase() {
-                if k >= q.len() || q[k] != lc {
-                    ok = false;
-                    break;
-                }
-                k += 1;
-            }
-            if !ok {
-                break;
-            }
-            j += 1;
-        }
-        if ok {
-            let end = starts.get(j).map_or(text.len(), |&(i, _)| i);
-            out.push(starts[s].0..end);
-            s = j;
-        } else {
-            s += 1;
-        }
-    }
-    out
+    literal_ci_regex(query)
+        .map(|re| re.find_iter(text).map(|m| m.range()).collect())
+        .unwrap_or_default()
 }
 
 /// The next match index, wrapping at either end of a non-empty `matches`.
@@ -559,16 +595,13 @@ fn line_col_to_byte(text: &str, (line, col): (usize, usize)) -> usize {
     offset
 }
 
-/// Converts a byte range into (line, start column, length) — all in chars,
-/// what `text_editor`'s `Motion::Right` steps over.
+/// Converts a byte range into (line, start byte column, length in bytes).
 fn byte_range_to_line_col(text: &str, range: &Range<usize>) -> (usize, usize, usize) {
     let mut offset = 0;
     for (line_idx, l) in text.split('\n').enumerate() {
         let line_end = offset + l.len();
         if range.start >= offset && range.start <= line_end {
-            let col = l[..range.start - offset].chars().count();
-            let len = text[range.start..range.end].chars().count();
-            return (line_idx, col, len);
+            return (line_idx, range.start - offset, range.end - range.start);
         }
         offset = line_end + 1;
     }
@@ -590,43 +623,12 @@ fn byte_range_to_line_local(text: &str, range: &Range<usize>) -> (usize, Range<u
     (0, 0..0)
 }
 
-/// Moves the cursor to the start of logical line `target`.
-///
-/// `Motion::Down` steps one *visual* row, which differs from a logical line
-/// when long lines wrap, so progress is read back from the cursor instead of
-/// counted. Stops early if the cursor stops moving (e.g. an unshaped buffer).
-pub fn goto_line_start(content: &mut crate::code_editor::Content, target: usize) {
-    use iced::widget::text_editor::{Action, Motion};
+pub use crate::code_editor::goto_line_start;
 
-    // Motions across lines edited since the last layout would panic.
-    content.settle();
-    content.perform(Action::Move(Motion::DocumentStart));
-    let mut last = content.cursor_position();
-    while last.0 < target {
-        content.perform(Action::Move(Motion::Down));
-        let now = content.cursor_position();
-        if now == last {
-            break;
-        }
-        last = now;
-    }
-    content.perform(Action::Move(Motion::Home));
-}
-
-/// Selects `range` in the editor. `text_editor` has no "select this byte
-/// range" action, only relative motions — same approach as jumping to a
-/// line in the Go to Line dialog.
+/// Selects `range` (byte offsets into `text`) in the editor.
 fn select_range(content: &mut crate::code_editor::Content, text: &str, range: Range<usize>) {
-    use iced::widget::text_editor::{Action, Motion};
-
-    let (line, col, len) = byte_range_to_line_col(text, &range);
-    goto_line_start(content, line);
-    for _ in 0..col {
-        content.perform(Action::Move(Motion::Right));
-    }
-    for _ in 0..len {
-        content.perform(Action::Select(Motion::Right));
-    }
+    let (line, col, _) = byte_range_to_line_col(text, &range);
+    content.select_bytes(line, col, range.end - range.start);
 }
 
 #[cfg(test)]
@@ -650,6 +652,7 @@ mod tests {
             current: None,
             current_line: None,
             committed: false,
+            compiled: None,
         }
     }
 
@@ -753,7 +756,7 @@ mod tests {
         let start = line_col_to_byte(text, (1, 6)); // start of "café"
         let len_bytes = "caf\u{e9}".len();
         let (line, col, len) = byte_range_to_line_col(text, &(start..start + len_bytes));
-        assert_eq!((line, col, len), (1, 6, 4));
+        assert_eq!((line, col, len), (1, 6, len_bytes));
     }
 
     #[test]
@@ -810,5 +813,39 @@ mod tests {
         s.jump(&mut content, true);
         assert_eq!(s.current, None);
         assert_eq!(s.match_count, 0);
+    }
+
+    #[test]
+    fn the_match_is_selected_after_emoji_accents_and_right_to_left_text() {
+        for text in [
+            "\u{1F44D}\u{1F3FD} foo",
+            "\u{1F1EB}\u{1F1F7} foo",
+            "cafe\u{301} foo",
+            "\u{5E9}\u{5DC}\u{5D5}\u{5DD} foo",
+            "plain foo",
+        ] {
+            let mut content = crate::code_editor::Content::with_text(&format!("{text}\n"));
+            let mut s = make_search("foo", "", false, true);
+            s.jump(&mut content, true);
+            assert_eq!(content.selection().as_deref(), Some("foo"), "in {text:?}");
+        }
+    }
+
+    #[test]
+    fn a_match_spanning_lines_is_selected_whole() {
+        let mut content = crate::code_editor::Content::with_text("ab\ncd\nef\n");
+        let mut s = make_search("b\ncd", "", false, true);
+        s.jump(&mut content, true);
+        assert_eq!(content.selection().as_deref(), Some("b\ncd"));
+    }
+
+    #[test]
+    fn long_regex_errors_fit_the_counter() {
+        let mut s = make_search("(", "", true, false);
+        let mut content = crate::code_editor::Content::with_text("x\n");
+        s.jump(&mut content, true);
+        let shown = s.last_error.clone().unwrap();
+        assert!(!shown.contains('\n'));
+        assert!(shown.chars().count() <= 49);
     }
 }

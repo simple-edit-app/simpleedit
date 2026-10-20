@@ -2,6 +2,7 @@
 name = "simpleedit"
 version = "1.9.0"
 edition = "2021"
+rust-version = "1.89"
 description = "A fast, stable, cross-platform text editor"
 license = "MIT"
 repository = "https://github.com/simple-edit-app/simpleedit"
@@ -14,12 +15,13 @@ name = "simpleedit"
 path = "src/main.rs"
 
 [dependencies]
-iced = { version = "0.12", features = ["advanced", "highlighter", "tokio", "lazy", "web-colors"] }
-iced_aw = { version = "0.9", default-features = false, features = ["menu", "context_menu", "quad", "drop_down", "floating_element", "modal", "wrap", "grid"] }
-syntect = { version = "5", default-features = false, features = ["default-syntaxes", "default-themes", "plist-load"] }
+iced = { version = "0.14", features = ["advanced", "tokio", "lazy", "selector"] }
+iced_aw = { version = "0.14", default-features = false, features = ["context_menu", "wrap"] }
+syntect = { version = "5", default-features = false, features = ["default-syntaxes", "regex-onig"] }
 regex = "1"
+unicode-segmentation = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 rfd = "0.14"
 dirs = "5"
 rust-i18n = "3"
@@ -48,7 +50,7 @@ maintainer-scripts = "debian/"
 maintainer = "sindus"
 copyright = "2024, sindus"
 license-file = ["LICENSE", "0"]
-extended-description = "A fast, stable, cross-platform text editor with syntax highlighting for 60+ languages."
+extended-description = "A fast, stable, cross-platform text editor with syntax highlighting for 30+ languages."
 depends = "$auto"
 section = "editors"
 priority = "optional"
@@ -58,3 +60,9 @@ assets = [
     ["assets/simpleedit.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
     ["assets/simpleedit.svg", "usr/share/icons/hicolor/scalable/apps/", "644"],
 ]
+
+
+# iced_winit 0.14.1 without winit's default macOS menu, whose Cmd+Q quits
+# without saving the session.
+[patch.crates-io]
+iced_winit = { path = "vendor/iced_winit" }

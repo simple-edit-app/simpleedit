@@ -1,9 +1,10 @@
 use iced::{
-    executor,
     widget::{button, column, container, row, scrollable, text, text_editor, text_input, Space},
-    Alignment, Application, Command, Element, Length, Theme,
+    Alignment, Element, Length, Task, Theme,
 };
 use std::collections::{HashMap, HashSet};
+
+use crate::history::{History, Snapshot};
 use std::path::{Path, PathBuf};
 
 use crate::{
@@ -13,6 +14,8 @@ use crate::{
     preview::{self, PreviewKind, ViewMode},
     search::{SearchMessage, SearchState},
     sidebar::{SidebarAction, SidebarMessage, SidebarState},
+    tabs::{fingerprint, CachedBuffer, DiskStamp, Loaded, TextFormat},
+    text_ops::{self, comment_style},
     theme as se_theme,
 };
 
@@ -46,6 +49,8 @@ pub enum ActiveOverlay {
     UpdateError(String),
     /// Closing this tab would discard unsaved changes.
     ConfirmClose(PathBuf),
+    /// The session couldn't be written: quitting would lose unsaved buffers.
+    ConfirmQuit(String),
     /// Saving would overwrite changes made to the file outside the editor.
     ConfirmOverwrite(PathBuf),
 }
@@ -57,9 +62,16 @@ pub enum Message {
     Search(SearchMessage),
     Preferences(PreferencesMessage),
     OpenFile,
-    FileOpened(Result<(PathBuf, String), String>),
+    /// A file chosen by the user (dialog, command line, recent files).
+    FileOpened(Result<Loaded, String>),
+    /// A file read to switch to its tab; superseded by a later switch.
+    TabRead(Result<Loaded, String>),
+    /// The open file changed on disk and was read again.
+    FileReloaded(Result<Loaded, String>),
     SaveFile,
     SaveFileAs,
+    /// The path picked in "Save as", with the tab it was started from.
+    SaveAsChosen(Option<PathBuf>, Result<PathBuf, String>),
     /// The tab the save was started from, and the path + exact text written.
     FileSaved(Option<PathBuf>, Result<(PathBuf, String), String>),
     NewFile,
@@ -68,6 +80,8 @@ pub enum Message {
     ToggleSidebar,
     TogglePreferences,
     ThemeChanged(bool),
+    /// Switches between the dark and the light theme.
+    ToggleTheme,
     InsertTab,
     ToggleMenu(TopMenu),
     /// The pointer entered a menu title: switches menus if one is already open.
@@ -85,8 +99,8 @@ pub enum Message {
     ClipboardContent(Option<String>),
     FormatFile,
     FormatSelection,
-    FileFormatted(Result<String, String>),
-    SelectionFormatted(Result<String, String>),
+    FileFormatted(FormatJob, Result<String, String>),
+    SelectionFormatted(FormatJob, Result<String, String>),
     CloseErrorPanel,
     Undo,
     Redo,
@@ -99,6 +113,22 @@ pub enum Message {
         alt: bool,
     },
     EscapePressed,
+    /// Enter pressed while a search field might own it; `shift` goes back.
+    SearchEnter {
+        shift: bool,
+    },
+    SearchEnterChecked {
+        shift: bool,
+        in_find_field: bool,
+    },
+    /// The autosave wrote (or failed to write) the session.
+    SessionWritten(Result<(), String>),
+    /// Quit although the session couldn't be saved.
+    QuitAnyway,
+    /// Re-parses the preview if the text changed (typing is debounced).
+    PreviewTick,
+    /// The window was resized (kept for the next start).
+    WindowResized(f32, f32),
     // Overlays
     CloseOverlay,
     OpenGotoLine,
@@ -108,7 +138,7 @@ pub enum Message {
     SetLanguage(String),
     OpenShortcuts,
     StartCaptureShortcut(ShortcutTarget),
-    // Command palette
+    // Task palette
     OpenPalette,
     PaletteQueryChanged(String),
     PaletteSubmit,
@@ -141,7 +171,7 @@ pub enum Message {
     UpdateChecked(Result<Option<(String, Vec<crate::changelog::Entry>)>, String>),
     OpenChangelog,
     ConfirmInstallUpdate(String),
-    UpdateDownloaded(Result<std::path::PathBuf, String>),
+    UpdateDownloaded(Result<(std::path::PathBuf, String), String>),
     UpdateInstalled(Result<(), String>),
     // Markdown / JSON preview
     SetViewMode(ViewMode),
@@ -158,6 +188,14 @@ pub enum Message {
     MarkdownLinkClicked(String),
     /// Resolves the position of the heading `MarkdownLinkClicked` targeted.
     PreviewScrollTo(Option<f32>),
+}
+
+/// What the window starts with.
+#[derive(Default)]
+pub struct Flags {
+    pub config: Config,
+    /// Files named on the command line.
+    pub files: Vec<PathBuf>,
 }
 
 pub struct SimpleEditApp {
@@ -187,23 +225,41 @@ pub struct SimpleEditApp {
     format_error: Option<String>,
     show_error_panel: bool,
     untitled_counter: u32,
-    file_cache: HashMap<PathBuf, (String, Option<String>, bool)>,
+    file_cache: HashMap<PathBuf, CachedBuffer>,
     overlay: ActiveOverlay,
     goto_line_input: String,
     /// Word-level undo history (capped by count and total size).
-    undo_stack: Vec<Snapshot>,
+    undo_stack: History,
     /// Redo history rebuilt when undoing.
-    redo_stack: Vec<Snapshot>,
+    redo_stack: History,
     /// Undo/redo history of the tabs that aren't the active one.
-    undo_cache: HashMap<PathBuf, (Vec<Snapshot>, Vec<Snapshot>)>,
+    undo_cache: HashMap<PathBuf, (History, History)>,
     /// Preference changes are written out on the next autosave tick, not on
     /// every slider movement.
     config_dirty: bool,
-    /// The last session JSON written, so unchanged sessions aren't rewritten.
-    last_session: String,
-    /// Modification time of the current file when it was last read or written,
+    /// Fingerprint of the last session JSON written, so unchanged sessions
+    /// aren't rewritten.
+    last_session: u64,
+    /// Held while this is the window that saves the session.
+    session_lock: Option<crate::session::InstanceLock>,
+    /// Whether this window saves the session and the bookmarks.
+    session_owner: bool,
+    /// Bumped by every message that may change what the session holds, so the
+    /// autosave tick can skip the work when nothing happened.
+    rev: u64,
+    /// `rev` the session was last built at.
+    session_rev: u64,
+    /// How the current file stores its text (line endings, final newline).
+    format: TextFormat,
+    /// State on disk of the current file when it was last read or written,
     /// to notice edits made by other programs.
-    disk_mtime: Option<std::time::SystemTime>,
+    disk_stamp: Option<DiskStamp>,
+    /// Fingerprint of the text last read or saved, to see that an undo got
+    /// back to it.
+    saved_fp: Option<u64>,
+    /// The tab the user last asked to switch to, so a slow read of another
+    /// one doesn't take over.
+    pending_open: Option<PathBuf>,
     /// Whether the "changed on disk" warning was already shown.
     external_warned: bool,
     /// Size on disk of `size_for`, cached so `view` does no I/O.
@@ -216,13 +272,24 @@ pub struct SimpleEditApp {
     view_mode: ViewMode,
     /// Parsed preview of the buffer, rebuilt only when the text changes.
     preview: PreviewDoc,
-    /// The buffer `preview` was built from.
-    preview_src: String,
+    /// The status-bar label of the selection (`None` without one), kept up to
+    /// date by `update` so `view` doesn't copy a possibly huge selection on
+    /// every frame.
+    selection_info: Option<String>,
+    /// What `selection_info` was computed for (selection, text revision).
+    selection_key: Option<(Option<crate::code_editor::SelectionRange>, u64)>,
+    /// `text_rev` the preview was parsed at.
+    preview_text_rev: u64,
+    /// Bumped by every message that may change the buffer text.
+    text_rev: u64,
     /// Folded node paths of the JSON tree.
     json_collapsed: std::sync::Arc<HashSet<String>>,
     /// Bumped whenever what the preview shows changes, so the cached widget
     /// tree (iced `lazy`) is rebuilt only then, not on every frame.
     preview_rev: u64,
+    /// Closers typed by the auto-pairing and not stepped over yet:
+    /// (line, byte column, character).
+    pending_closers: Vec<(usize, usize, char)>,
     /// Ctrl/Cmd currently held, tracked for Ctrl+click on a chevron.
     mod_ctrl: bool,
     /// Alt currently held, tracked for Alt+click on a chevron.
@@ -231,28 +298,34 @@ pub struct SimpleEditApp {
 
 /// Cap on the memory the undo history of one buffer may hold.
 const UNDO_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Cap on the undo history of all tabs together.
+const UNDO_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const UNDO_MAX_STEPS: usize = 100;
 /// Files larger than this are refused instead of freezing the editor.
 const MAX_OPEN_BYTES: u64 = 64 * 1024 * 1024;
+/// The same limit for pasted text.
+/// A line longer than this makes layout and typing slow.
+const LONG_LINE_BYTES: usize = 20_000;
+const MAX_PASTE_BYTES: usize = 64 * 1024 * 1024;
 /// Marker error for a dialog the user dismissed: not worth a status message.
 const CANCELLED: &str = "cancelled";
 
-/// A buffer state with its cursor (line, byte column).
+/// What a background format run started from: the format result is only
+/// applied if the buffer still reads the same.
 #[derive(Debug, Clone)]
-struct Snapshot {
-    text: String,
-    cursor: (usize, usize),
+pub struct FormatJob {
+    path: Option<PathBuf>,
+    /// Fingerprint of the text that was sent (the whole buffer, or the
+    /// selection).
+    source: u64,
 }
 
-fn mtime(path: &Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
+fn trim_history(stack: &mut History) {
+    stack.trim(UNDO_MAX_STEPS, UNDO_MAX_BYTES);
 }
 
-fn trim_history(stack: &mut Vec<Snapshot>) {
-    let mut bytes: usize = stack.iter().map(|s| s.text.len()).sum();
-    while stack.len() > UNDO_MAX_STEPS || (bytes > UNDO_MAX_BYTES && stack.len() > 1) {
-        bytes -= stack.remove(0).text.len();
-    }
+fn history_bytes(stacks: &(History, History)) -> usize {
+    stacks.0.bytes() + stacks.1.bytes()
 }
 
 /// The cached parse backing the preview pane.
@@ -263,24 +336,17 @@ enum PreviewDoc {
     JsonError(String),
 }
 
-impl Application for SimpleEditApp {
-    type Executor = executor::Default;
-    type Message = Message;
-    type Theme = Theme;
-    type Flags = Option<PathBuf>;
-
-    fn new(flags: Self::Flags) -> (Self, Command<Message>) {
-        let config = Config::load();
-        let session = crate::session::Session::load();
-
-        let mut app = Self {
-            bookmarks: crate::bookmarks::Bookmarks::load(),
+impl SimpleEditApp {
+    /// An app with one empty untitled tab, reading nothing from disk.
+    fn blank(config: Config) -> Self {
+        Self {
+            bookmarks: crate::bookmarks::Bookmarks::default(),
             editor: EditorState::new(),
             sidebar: SidebarState::new(),
             search: SearchState::new(),
             preferences: PreferencesState::from_config(&config),
             show_search: false,
-            show_sidebar: true,
+            show_sidebar: config.show_sidebar,
             show_preferences: false,
             capturing: None,
             palette_query: String::new(),
@@ -298,74 +364,142 @@ impl Application for SimpleEditApp {
             file_cache: HashMap::new(),
             overlay: ActiveOverlay::None,
             goto_line_input: String::new(),
-            undo_stack: Vec::new(),
-            redo_stack: Vec::new(),
+            undo_stack: History::default(),
+            redo_stack: History::default(),
             undo_cache: HashMap::new(),
             config_dirty: false,
-            last_session: String::new(),
-            disk_mtime: None,
+            last_session: 0,
+            session_lock: None,
+            session_owner: true,
+            rev: 1,
+            session_rev: 0,
+            format: TextFormat::default(),
+            disk_stamp: None,
+            saved_fp: None,
+            pending_open: None,
             external_warned: false,
             file_size: None,
             size_for: None,
             undo_new_group: true,
             view_mode: ViewMode::Raw,
             preview: PreviewDoc::None,
-            preview_src: String::new(),
+            selection_info: None,
+            selection_key: None,
+            preview_text_rev: 0,
+            text_rev: 1,
             json_collapsed: Default::default(),
             preview_rev: 0,
+            pending_closers: Vec::new(),
             mod_ctrl: false,
             mod_alt: false,
             config,
-        };
+        }
+    }
+}
 
-        app.restore_session(session);
+impl SimpleEditApp {
+    pub fn new(flags: Flags) -> (Self, Task<Message>) {
+        // The first window owns the session; others start empty and leave it
+        // alone, so closing them can't overwrite it.
+        let lock = crate::session::InstanceLock::acquire();
+        let owner = lock.is_some();
+        let loaded = if owner {
+            crate::session::Session::load()
+        } else {
+            crate::session::Loaded {
+                session: crate::session::Session::default(),
+                set_aside: None,
+            }
+        };
+        let mut app = Self::blank(flags.config);
+        app.session_lock = lock;
+        app.session_owner = owner;
+        if owner {
+            app.bookmarks = crate::bookmarks::Bookmarks::load();
+        } else {
+            app.set_status(t!("status.second_window"), false);
+        }
+
+        app.bookmarks.prune_missing();
+        let mut commands = vec![app.restore_session(loaded.session)];
+        if let Some(aside) = loaded.set_aside {
+            let name = aside
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            app.set_status(t!("status.session_set_aside", name = name.as_str()), true);
+        }
         app.announce_new_version();
 
-        // If a file path was given on the command line, open it on top of the session
-        let cmd = if let Some(path) = flags {
-            Command::perform(read_file(path), Message::FileOpened)
-        } else {
-            Command::none()
-        };
-        (app, cmd)
+        // Files given on the command line open on top of the session.
+        for path in flags.files {
+            commands.push(Task::perform(read_file(path, true), Message::FileOpened));
+        }
+        (app, Task::batch(commands))
     }
 
-    fn title(&self) -> String {
-        let untitled = t!("app.untitled").to_string();
-        let file_name = self
+    pub fn title(&self) -> String {
+        let name = self
             .current_file
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .unwrap_or(untitled.as_str());
+            .as_deref()
+            .map(file_label)
+            .unwrap_or_else(|| t!("app.untitled").to_string());
         let dirty = if self.is_dirty { " •" } else { "" };
-        format!("SimpleEdit — {}{}", file_name, dirty)
+        format!("SimpleEdit — {}{}", name, dirty)
     }
 
-    fn update(&mut self, message: Message) -> Command<Message> {
+    pub fn update(&mut self, message: Message) -> Task<Message> {
+        // What the autosave and the preview have to look at again.
+        let passive = matches!(
+            &message,
+            Message::AutoSave
+                | Message::ModifiersChanged { .. }
+                | Message::MenuBounds(..)
+                | Message::ToggleMenu(_)
+                | Message::HoverMenu(_)
+                | Message::SessionWritten(_)
+                | Message::PreviewTick
+                | Message::WindowResized(..)
+        );
+        let edits_text = !passive && !matches!(&message, Message::EditorAction(a) if !a.is_edit());
+        if edits_text {
+            self.text_rev += 1;
+        }
+        if !passive {
+            self.rev += 1;
+        }
+        // While typing in a preview, the parse waits for the next tick.
+        let typing = matches!(&message, Message::EditorAction(a) if a.is_edit());
         let command = self.handle(message);
-        self.refresh_preview();
+        if !typing {
+            self.refresh_preview();
+        }
         self.refresh_file_size();
+        if !passive {
+            self.refresh_selection_info();
+        }
         command
     }
 
-    fn subscription(&self) -> iced::Subscription<Message> {
-        let keys = iced::keyboard::on_key_press(|key, modifiers| {
-            use iced::keyboard::{key::Named, Key};
+    pub fn subscription(&self) -> iced::Subscription<Message> {
+        // `listen_with` also sees events that a widget captured: the search
+        // field swallows every key, the editor all arrows and Enter, and the
+        // shortcuts must still work then.
+        let keys = iced::event::listen_with(|event, status, _window| {
+            use iced::event::Status;
+            use iced::keyboard::{key::Named, Event, Key};
 
+            let iced::Event::Keyboard(Event::KeyPressed { key, modifiers, .. }) = event else {
+                return None;
+            };
             if key == Key::Named(Named::Escape) {
                 return Some(Message::EscapePressed);
-            }
-            if key == Key::Named(Named::Tab) {
-                if modifiers.shift() {
-                    return Some(Message::DedentLine);
-                }
-                return Some(Message::InsertTab);
             }
 
             let key_str = match key.as_ref() {
                 Key::Character(c) => c.to_lowercase(),
                 Key::Named(Named::Enter) => "Return".to_string(),
+                Key::Named(Named::Tab) => "Tab".to_string(),
                 Key::Named(Named::ArrowUp) => "ArrowUp".to_string(),
                 Key::Named(Named::ArrowDown) => "ArrowDown".to_string(),
                 Key::Named(Named::ArrowLeft) => "ArrowLeft".to_string(),
@@ -391,6 +525,14 @@ impl Application for SimpleEditApp {
                 Key::Named(Named::F12) => "F12".to_string(),
                 _ => return None,
             };
+            // Plain typing in a widget is none of the app's business (and
+            // would wake it up on every keystroke); modified keys and keys a
+            // widget left alone are.
+            let ignored = status == Status::Ignored;
+            let is_enter = key_str == "Return";
+            if !(ignored || modifiers.command() || modifiers.alt() || is_enter) {
+                return None;
+            }
 
             Some(Message::KeyPressed {
                 key: key_str,
@@ -402,7 +544,7 @@ impl Application for SimpleEditApp {
 
         // Chevron clicks need the modifier state at click time, which a button
         // press message does not carry.
-        let modifiers = iced::event::listen_with(|event, _status| match event {
+        let modifiers = iced::event::listen_with(|event, _status, _window| match event {
             iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(m)) => {
                 Some(Message::ModifiersChanged {
                     ctrl: m.command(),
@@ -410,17 +552,27 @@ impl Application for SimpleEditApp {
                 })
             }
             // The window is closed through the app so the session is saved.
-            iced::Event::Window(_, iced::window::Event::CloseRequested) => Some(Message::Quit),
+            iced::Event::Window(iced::window::Event::CloseRequested) => Some(Message::Quit),
+            iced::Event::Window(iced::window::Event::Resized(size)) => {
+                Some(Message::WindowResized(size.width, size.height))
+            }
             _ => None,
         });
 
         let autosave =
-            iced::time::every(std::time::Duration::from_secs(5)).map(|_| Message::AutoSave);
+            iced::time::every(std::time::Duration::from_secs(2)).map(|_| Message::AutoSave);
 
-        iced::Subscription::batch([keys, modifiers, autosave])
+        let mut subscriptions = vec![keys, modifiers, autosave];
+        if self.view_mode != ViewMode::Raw && self.preview_kind().is_some() {
+            subscriptions.push(
+                iced::time::every(std::time::Duration::from_millis(150))
+                    .map(|_| Message::PreviewTick),
+            );
+        }
+        iced::Subscription::batch(subscriptions)
     }
 
-    fn view(&self) -> Element<'_, Message> {
+    pub fn view(&self) -> Element<'_, Message> {
         let dark = self.config.dark_mode;
 
         let title_bar = crate::menu_bar::view(&self.config, self.open_menu);
@@ -431,20 +583,11 @@ impl Application for SimpleEditApp {
         } else {
             ViewMode::Raw
         };
-        let editor_widget = self.editor_pane(preview_kind, view_mode, dark);
-        // The context menu's actions (select/cut/copy/paste/format) all act on
-        // the raw buffer, which isn't what's on screen in Preview mode — right-
-        // clicking the rendered Markdown/JSON tree wouldn't do anything a user
-        // could make sense of, so it's only offered over the raw editor.
-        let editor_with_context: Element<'_, Message> = if view_mode == ViewMode::Preview {
-            editor_widget
-        } else {
-            self.with_context_menu(editor_widget, dark)
-        };
+        let editor_with_context = self.editor_pane(preview_kind, view_mode, dark);
 
         // The search card floats over the top-right corner of the editor.
         let body: Element<'_, Message> = if self.show_search {
-            crate::floating::TopRight::new(
+            crate::floating::top_right(
                 editor_with_context,
                 self.search.view(dark),
                 12.0,
@@ -455,26 +598,26 @@ impl Application for SimpleEditApp {
                     0.0
                 },
             )
-            .into()
         } else {
             editor_with_context
         };
 
-        let cursor = self.editor.content.cursor_position();
-        let selection_info = self.editor.content.selection().map(|s| {
-            let chars = s.chars().count();
-            let lines = s.lines().count();
-            if lines > 1 {
-                format!("{}L {}C", lines, chars)
-            } else {
-                format!("{}C", chars)
-            }
-        });
+        let (line, byte_col) = self.editor.content.cursor_position();
+        // Columns count characters, not the bytes the editor indexes by.
+        let cursor = (
+            line,
+            self.editor
+                .content
+                .line(line)
+                .map_or(0, |l| l[..floor_boundary(&l, byte_col)].chars().count()),
+        );
+        let selection_info = self.selection_info.clone();
         let status_bar = crate::editor::statusbar::view(crate::editor::statusbar::Info {
             status: &self.status_message,
             is_error: self.status_is_error,
             dark,
             cursor,
+            line_ending: self.format.ending.label(),
             language: self.editor.language.as_deref(),
             selection: selection_info,
             file_size: self.file_size,
@@ -488,32 +631,38 @@ impl Application for SimpleEditApp {
                     text(t!("panel.errors").to_string())
                         .size(10.5)
                         .font(se_theme::UI_MEDIUM)
-                        .style(se_theme::muted_text(dark)),
-                    Space::with_width(Length::Fill),
-                    button(text("×").size(16).style(se_theme::muted_text(dark)))
+                        .color(se_theme::muted_text(dark)),
+                    Space::new().width(Length::Fill),
+                    button(text("×").size(16).color(se_theme::muted_text(dark)))
                         .padding([2, 6])
                         .on_press(Message::CloseErrorPanel)
-                        .style(iced::theme::Button::custom(se_theme::GhostButton {
-                            dark,
-                            active: false,
-                        })),
+                        .style(
+                            (se_theme::GhostButton {
+                                dark,
+                                active: false,
+                            })
+                            .style()
+                        ),
                 ]
                 .padding([4, 14])
-                .align_items(Alignment::Center);
+                .align_y(Alignment::Center);
 
                 let body = scrollable(
                     container(
                         text(err.clone())
                             .size(12)
-                            .style(se_theme::error_color(dark))
+                            .color(se_theme::error_color(dark))
                             .font(se_theme::MONO),
                     )
-                    .padding([4, 14, 8, 14])
+                    .padding(iced::Padding {
+                        top: 4.0,
+                        right: 14.0,
+                        bottom: 8.0,
+                        left: 14.0,
+                    })
                     .width(Length::Fill),
                 )
-                .style(iced::theme::Scrollable::Custom(Box::new(
-                    se_theme::Scrollbar { dark },
-                )))
+                .style(se_theme::Scrollbar { dark }.style())
                 .height(Length::Fixed(100.0));
 
                 container(column![rule(dark), header, body])
@@ -532,7 +681,7 @@ impl Application for SimpleEditApp {
                 container(
                     text(t!("status.formatting").to_string())
                         .size(12)
-                        .style(se_theme::accent_color(dark)),
+                        .color(se_theme::accent_color(dark)),
                 )
                 .width(Length::Fill)
                 .padding([4, 14])
@@ -595,13 +744,7 @@ impl Application for SimpleEditApp {
                 lang_override_enabled,
                 self.bookmark_state(),
             );
-            iced_aw::floating_element::FloatingElement::new(base, dropdown)
-                .anchor(iced_aw::floating_element::Anchor::NorthWest)
-                .offset(iced_aw::floating_element::Offset {
-                    x: bounds.x,
-                    y: bounds.y + bounds.height,
-                })
-                .into()
+            crate::floating::at_point(base, dropdown, bounds.x, bounds.y + bounds.height)
         } else {
             base
         };
@@ -613,23 +756,13 @@ impl Application for SimpleEditApp {
                 .height(Length::Fill)
                 .max_width(900)
                 .max_height(640);
-            iced_aw::Modal::new(
+            crate::floating::modal(
                 with_dropdown,
-                Some(
-                    container(window)
-                        .padding(40)
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .center_x()
-                        .center_y(),
-                ),
+                container(window).padding(40),
+                Some(Message::TogglePreferences),
+                dark,
+                false,
             )
-            .backdrop(Message::TogglePreferences)
-            .on_esc(Message::EscapePressed)
-            .style(iced_aw::style::modal::ModalStyles::custom(
-                se_theme::Scrim { dark },
-            ))
-            .into()
         } else {
             with_dropdown
         };
@@ -641,17 +774,13 @@ impl Application for SimpleEditApp {
                 let shown = self.palette_entries();
                 let card =
                     crate::palette::view(dark, &self.palette_query, &shown, self.palette_selected);
-                iced_aw::Modal::new(
+                crate::floating::modal(
                     with_prefs,
-                    Some(column![Space::with_height(84), card].align_items(Alignment::Center)),
+                    column![Space::new().height(84), card].align_x(Alignment::Center),
+                    Some(Message::CloseOverlay),
+                    dark,
+                    true,
                 )
-                .backdrop(Message::CloseOverlay)
-                .on_esc(Message::CloseOverlay)
-                .align_y(iced::alignment::Vertical::Top)
-                .style(iced_aw::style::modal::ModalStyles::custom(
-                    se_theme::Scrim { dark },
-                ))
-                .into()
             }
             other => {
                 let overlay = match other {
@@ -671,20 +800,27 @@ impl Application for SimpleEditApp {
                         self.view_overwrite_overlay(dark, path)
                     }
                     ActiveOverlay::ConfirmClose(path) => self.view_confirm_overlay(dark, path),
+                    ActiveOverlay::ConfirmQuit(error) => confirm_card(
+                        dark,
+                        t!("quit.title").to_string(),
+                        t!("quit.message", error = error.as_str()).to_string(),
+                        t!("quit.confirm").to_string(),
+                        Message::QuitAnyway,
+                    ),
                     _ => self.view_update_overlay(dark),
                 };
-                iced_aw::Modal::new(with_prefs, Some(overlay))
-                    .backdrop(Message::CloseOverlay)
-                    .on_esc(Message::CloseOverlay)
-                    .style(iced_aw::style::modal::ModalStyles::custom(
-                        se_theme::Scrim { dark },
-                    ))
-                    .into()
+                // A running download or install can't be dismissed: its
+                // outcome would arrive without context. Escape reaches the
+                // app through its own subscription, for every overlay.
+                let on_blur = self
+                    .overlay_is_dismissable()
+                    .then_some(Message::CloseOverlay);
+                crate::floating::modal(with_prefs, overlay, on_blur, dark, false)
             }
         }
     }
 
-    fn theme(&self) -> Theme {
+    pub fn theme(&self) -> Theme {
         if self.config.dark_mode {
             se_theme::ink_dark()
         } else {
@@ -709,12 +845,14 @@ impl Message {
                 | Message::MoveLineDown
                 | Message::ToggleComment
                 | Message::DeleteLine
+                | Message::InsertTab
+                | Message::DedentLine
         )
     }
 }
 
 impl SimpleEditApp {
-    fn handle(&mut self, message: Message) -> Command<Message> {
+    fn handle(&mut self, message: Message) -> Task<Message> {
         // Passive/background messages must not close an open dropdown: X11
         // fires a spurious ModifiersChanged right after the very click that
         // opens the menu, AutoSave ticks every 5s regardless of the UI, and
@@ -726,13 +864,25 @@ impl SimpleEditApp {
                 | Message::MenuBounds(..)
                 | Message::ModifiersChanged { .. }
                 | Message::AutoSave
+                | Message::SessionWritten(_)
+                | Message::PreviewTick
+                | Message::WindowResized(..)
         );
         if closes_menu {
+            // Escape on an open menu closes only that menu.
+            if matches!(message, Message::EscapePressed) && self.open_menu.take().is_some() {
+                return Task::none();
+            }
             self.open_menu = None;
         }
 
         match message {
             Message::EditorAction(action) => {
+                // Without a tab there is nothing to edit (the next one is
+                // still being read).
+                if self.current_file.is_none() && action.is_edit() {
+                    return Task::none();
+                }
                 // Lines added or removed by an edit move the bookmarks below.
                 let probe = action.is_edit().then(|| self.edit_probe());
                 let command = self.editor_action(action);
@@ -743,20 +893,22 @@ impl SimpleEditApp {
             }
             Message::InsertTab => {
                 if !self.editing_blocked() {
-                    if self.selection_lines().is_some() {
+                    if self.selection_span().is_some() {
                         return self.handle(Message::IndentSelection);
                     }
                     // With a single-line selection this replaces it, as
                     // in most editors.
-                    let text = self.indent_unit();
+                    let text = self.tab_text();
                     self.push_undo();
                     self.undo_new_group = true;
-                    self.editor.content.perform(text_editor::Action::Edit(
-                        text_editor::Edit::Paste(std::sync::Arc::new(text)),
-                    ));
+                    self.edited(|app| {
+                        app.editor.content.perform(text_editor::Action::Edit(
+                            text_editor::Edit::Paste(std::sync::Arc::new(text)),
+                        ));
+                    });
                     self.is_dirty = true;
                 }
-                Command::none()
+                Task::none()
             }
             Message::SelectAll => {
                 self.editor.content.perform(text_editor::Action::Move(
@@ -765,7 +917,7 @@ impl SimpleEditApp {
                 self.editor.content.perform(text_editor::Action::Select(
                     text_editor::Motion::DocumentEnd,
                 ));
-                Command::none()
+                Task::none()
             }
             Message::ToggleMenu(menu) => {
                 self.open_menu = if self.open_menu == Some(menu) {
@@ -780,85 +932,138 @@ impl SimpleEditApp {
                     self.open_menu = Some(menu);
                     self.query_menu_bounds()
                 } else {
-                    Command::none()
+                    Task::none()
                 }
             }
             Message::MenuBounds(menu, bounds) => {
                 if let Some(bounds) = bounds {
                     self.menu_bounds.insert(menu, bounds);
                 }
-                Command::none()
+                Task::none()
             }
             Message::NewFile => {
                 self.stash_current();
                 self.untitled_counter += 1;
                 let path = untitled_path(self.untitled_counter);
-                self.load_buffer(path, String::new(), None, false);
-                self.status_message = t!("status.new_file").to_string();
-                Command::none()
+                self.load_buffer(path, CachedBuffer::blank());
+                self.set_status(t!("status.new_file"), false);
+                Task::none()
             }
-            Message::OpenFile => Command::perform(open_file(), Message::FileOpened),
+            Message::OpenFile => Task::perform(open_file(), Message::FileOpened),
             Message::FileOpened(result) => {
                 match result {
-                    Ok((path, content)) => {
-                        // Re-opening the file being edited must not throw away
-                        // its unsaved changes.
-                        if self.current_file.as_ref() == Some(&path) && self.is_dirty {
-                            return Command::none();
-                        }
-                        let cached = self.file_cache.remove(&path);
-                        if self.current_file.as_ref() != Some(&path) {
-                            self.stash_current();
-                        }
-                        // A background tab with unsaved edits wins over the disk.
-                        let (content, language, dirty) = match cached {
-                            Some((c, l, true)) => (c, l, true),
-                            _ => (content, None, false),
-                        };
-                        self.config.add_recent(&path);
-                        self.config.save();
-                        self.load_buffer(path, content, language, dirty);
-                        self.status_message = t!("status.file_opened").to_string();
-                    }
+                    Ok(loaded) => self.open_loaded(loaded),
                     Err(e) if e == CANCELLED => {}
+                    Err(e) => self.set_status(format!("{}: {}", t!("status.error"), e), true),
+                }
+                Task::none()
+            }
+            Message::TabRead(result) => {
+                match result {
+                    // A slower read of a tab the user has left behind.
+                    // (Its cached state stays for the next visit.)
+                    Ok(loaded)
+                        if self
+                            .pending_open
+                            .as_ref()
+                            .is_some_and(|p| *p != loaded.path) => {}
+                    Ok(loaded) => self.open_loaded(loaded),
                     Err(e) => {
-                        self.status_message = format!("{}: {}", t!("status.error"), e);
+                        self.set_status(format!("{}: {}", t!("status.error"), e), true);
+                        let failed = self.pending_open.take();
+                        // Without a tab to show, drop the one that can't be read.
+                        if self.current_file.is_none() {
+                            if let Some(path) = failed {
+                                self.sidebar.remove_path(&path);
+                                self.file_cache.remove(&path);
+                            }
+                            return self.ensure_tab();
+                        }
                     }
                 }
-                Command::none()
+                Task::none()
+            }
+            Message::FileReloaded(result) => {
+                match result {
+                    Ok(loaded) => self.apply_reload(loaded),
+                    Err(e) => self.set_status(format!("{}: {}", t!("status.error"), e), true),
+                }
+                Task::none()
             }
             Message::SaveFile => {
                 if let Some(path) = self.current_file.clone() {
-                    let changed = !is_untitled(&path)
-                        && self.disk_mtime.is_some()
-                        && mtime(&path) != self.disk_mtime;
-                    if changed {
+                    if self.changed_on_disk(&path) {
                         self.overlay = ActiveOverlay::ConfirmOverwrite(path);
-                        return Command::none();
+                        return Task::none();
                     }
                 }
                 let content = crate::editor::buffer_text(&self.editor.content);
                 let origin = self.current_file.clone();
                 match origin.clone() {
                     Some(path) if !is_untitled(&path) => {
-                        save_command(origin, save_file(path, content))
+                        save_command(origin, save_file(path, content, self.format))
                     }
-                    _ => save_command(origin, save_file_as(content)),
+                    Some(_) => self.start_save_as(origin),
+                    None => Task::none(),
                 }
             }
-            Message::SaveFileAs => save_command(
-                self.current_file.clone(),
-                save_file_as(crate::editor::buffer_text(&self.editor.content)),
-            ),
+            Message::SaveFileAs => self.start_save_as(self.current_file.clone()),
+            Message::SaveAsChosen(origin, result) => match result {
+                Ok(path) => {
+                    // Another tab holds unsaved work for that file: writing
+                    // over the file would silently drop it.
+                    let elsewhere = origin.as_ref() != Some(&path)
+                        && self.sidebar.files().contains(&path)
+                        && self.is_path_dirty(&path);
+                    if elsewhere {
+                        self.set_status(
+                            t!("status.save_as_open_tab", name = file_label(&path).as_str()),
+                            true,
+                        );
+                        return Task::none();
+                    }
+                    // Whatever the tab holds now is what gets written.
+                    let content = if origin == self.current_file {
+                        crate::editor::buffer_text(&self.editor.content)
+                    } else {
+                        origin
+                            .as_ref()
+                            .and_then(|o| self.file_cache.get(o))
+                            .and_then(CachedBuffer::text)
+                            .unwrap_or_default()
+                    };
+                    let format = if origin == self.current_file {
+                        self.format
+                    } else {
+                        origin
+                            .as_ref()
+                            .and_then(|o| self.file_cache.get(o))
+                            .map(|c| c.format)
+                            .unwrap_or_default()
+                    };
+                    save_command(origin, save_file(path, content, format))
+                }
+                Err(e) if e == CANCELLED => Task::none(),
+                Err(e) => {
+                    self.set_status(format!("{}: {}", t!("status.error"), e), true);
+                    Task::none()
+                }
+            },
             Message::FileSaved(origin, result) => {
                 match result {
                     Ok((path, saved)) => {
-                        self.file_cache.remove(&path);
                         self.size_for = None;
                         // The tab the save started from may no longer be the
                         // active one (the dialog is asynchronous).
                         let from_current = origin == self.current_file;
-                        if let Some(old) = origin.as_ref().filter(|o| is_untitled(o)) {
+                        if let Some(old) = origin.as_ref().filter(|o| **o != path) {
+                            // "Save as" turns the tab into the new file; the
+                            // old file stays as it is on disk.
+                            if self.sidebar.files().contains(&path) {
+                                self.sidebar.remove_path(&path);
+                                self.undo_cache.remove(&path);
+                            }
+                            self.file_cache.remove(&path);
                             self.sidebar.rename_file(old, path.clone());
                             self.bookmarks.rename(old, &path);
                             if !from_current {
@@ -871,41 +1076,40 @@ impl SimpleEditApp {
                             }
                         }
                         self.sidebar.add_file(path.clone());
-                        let ext = path
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .unwrap_or("")
-                            .to_string();
+                        let saved_fp = fingerprint(&saved);
+                        let stamp = DiskStamp::of(&path);
                         if from_current {
-                            self.editor.adopt_extension_language(&ext);
+                            let first_line = first_line_of(&self.editor.content);
+                            self.editor.adopt_path_language(&path, &first_line);
                             // Edits made while the save was in flight stay dirty.
-                            self.is_dirty =
-                                crate::editor::buffer_text(&self.editor.content) != saved;
-                            self.disk_mtime = mtime(&path);
+                            let now = crate::editor::buffer_text(&self.editor.content);
+                            self.is_dirty = now != saved;
+                            self.saved_fp = Some(saved_fp);
+                            self.disk_stamp = stamp;
                             self.external_warned = false;
                             self.current_file = Some(path.clone());
                         } else if let Some(entry) = self.file_cache.get_mut(&path) {
-                            entry.2 = entry.0 != saved;
+                            entry.dirty = entry.text().is_some_and(|t| t != saved);
+                            entry.saved_fp = Some(saved_fp);
+                            entry.stamp = stamp;
                         }
                         self.config.add_recent(&path);
-                        self.config.save();
-                        self.status_message = t!("status.file_saved").to_string();
+                        self.config_dirty = true;
+                        self.set_status(t!("status.file_saved"), false);
                     }
                     Err(e) if e == CANCELLED => {}
-                    Err(e) => {
-                        self.status_message = format!("{}: {}", t!("status.error"), e);
-                    }
+                    Err(e) => self.set_status(format!("{}: {}", t!("status.error"), e), true),
                 }
-                Command::none()
+                Task::none()
             }
             Message::CloseFile => match self.current_file.clone() {
                 Some(path) => self.request_close(path),
-                None => Command::none(),
+                None => Task::none(),
             },
             Message::ConfirmOverwrite => {
                 self.overlay = ActiveOverlay::None;
                 // Take the new on-disk state as the baseline, then save.
-                self.disk_mtime = self.current_file.as_deref().and_then(mtime);
+                self.disk_stamp = self.current_file.as_deref().and_then(DiskStamp::of);
                 self.handle(Message::SaveFile)
             }
             Message::ConfirmDiscard(path) => {
@@ -916,47 +1120,77 @@ impl SimpleEditApp {
                 self.show_search = !self.show_search;
                 if self.show_search {
                     // Ready to type, as the card opens.
-                    text_input::focus(crate::search::find_field_id())
+                    iced::widget::operation::focus(crate::search::find_field_id())
                 } else {
-                    Command::none()
+                    Task::none()
                 }
             }
             Message::ToggleSidebar => {
                 self.show_sidebar = !self.show_sidebar;
-                Command::none()
+                self.config.show_sidebar = self.show_sidebar;
+                self.config_dirty = true;
+                Task::none()
+            }
+            Message::WindowResized(width, height) => {
+                // Remembered, and written with the next autosave tick.
+                if (self.config.window_width, self.config.window_height) != (width, height) {
+                    self.config.window_width = width;
+                    self.config.window_height = height;
+                    self.config_dirty = true;
+                }
+                Task::none()
             }
             Message::TogglePreferences => {
                 self.show_preferences = !self.show_preferences;
-                Command::none()
+                Task::none()
+            }
+            Message::ToggleTheme => {
+                let dark = !self.config.dark_mode;
+                self.handle(Message::ThemeChanged(dark))
             }
             Message::ThemeChanged(dark) => {
                 self.config.dark_mode = dark;
                 self.config.save();
-                Command::none()
+                Task::none()
             }
             Message::Sidebar(msg) => match self.sidebar.update(msg) {
                 SidebarAction::OpenFile(path) => self.activate(path),
                 SidebarAction::CloseFile(path) => self.request_close(path),
                 // Only offered for the active file.
                 SidebarAction::SaveFile => self.handle(Message::SaveFile),
-                SidebarAction::SaveFileAs => save_command(
-                    self.current_file.clone(),
-                    save_file_as(crate::editor::buffer_text(&self.editor.content)),
-                ),
-                SidebarAction::None => Command::none(),
+                SidebarAction::SaveFileAs => self.start_save_as(self.current_file.clone()),
+                SidebarAction::None => Task::none(),
             },
+            Message::Search(SearchMessage::ReplaceAll) => {
+                let old = crate::editor::buffer_text(&self.editor.content);
+                match self.search.replace_all(&old) {
+                    Ok(new_text) if new_text != old => {
+                        self.push_undo();
+                        self.undo_new_group = true;
+                        self.is_dirty = true;
+                        self.search.reset_matches();
+                        // Minimal replacement: scroll and cursor survive.
+                        self.replace_buffer_text(&new_text);
+                    }
+                    Ok(_) => self.search.reset_matches(),
+                    Err(e) => self.search.set_error(e),
+                }
+                Task::none()
+            }
             Message::Search(msg) => {
-                let replacing = matches!(msg, SearchMessage::Replace | SearchMessage::ReplaceAll);
+                let replacing = matches!(msg, SearchMessage::Replace);
                 let before = replacing.then(|| self.snapshot());
+                let probe = replacing.then(|| self.edit_probe());
                 let command = self.search.update(msg, &mut self.editor.content);
                 // Replacements are edits like any other: undoable and dirty.
-                if let Some(before) = before {
+                if let (Some(before), Some((count, top))) = (before, probe) {
                     if crate::editor::buffer_text(&self.editor.content) != before.text {
-                        self.undo_stack.push(before);
+                        self.undo_stack.push_back(before);
                         trim_history(&mut self.undo_stack);
                         self.redo_stack.clear();
                         self.undo_new_group = true;
                         self.is_dirty = true;
+                        self.shift_bookmarks(count, top);
                     }
                 }
                 command
@@ -965,16 +1199,25 @@ impl SimpleEditApp {
                 if self.preferences.update(msg, &mut self.config) {
                     self.config_dirty = true;
                 }
-                Command::none()
+                Task::none()
             }
             Message::About => {
                 self.overlay = ActiveOverlay::About;
-                Command::none()
+                Task::none()
             }
-            Message::Quit => {
-                // Unsaved buffers live on in the session file, so quitting
-                // loses nothing.
-                self.save_session();
+            Message::Quit => match self.save_session_now() {
+                Ok(()) => {
+                    self.config.save();
+                    std::process::exit(0)
+                }
+                // Unsaved buffers live on in the session file; if it can't be
+                // written, quitting would lose them.
+                Err(e) => {
+                    self.overlay = ActiveOverlay::ConfirmQuit(e);
+                    Task::none()
+                }
+            },
+            Message::QuitAnyway => {
                 self.config.save();
                 std::process::exit(0)
             }
@@ -982,169 +1225,260 @@ impl SimpleEditApp {
                 if let Some(text) = self.editor.content.selection() {
                     return iced::clipboard::write(text);
                 }
-                Command::none()
+                Task::none()
             }
             Message::ContextCut => {
+                if self.editing_blocked() {
+                    return Task::none();
+                }
                 if let Some(text) = self.editor.content.selection() {
                     self.push_undo();
                     self.undo_new_group = true;
-                    self.editor
-                        .content
-                        .perform(text_editor::Action::Edit(text_editor::Edit::Delete));
+                    self.edited(|app| {
+                        app.editor
+                            .content
+                            .perform(text_editor::Action::Edit(text_editor::Edit::Delete));
+                    });
                     self.is_dirty = true;
                     return iced::clipboard::write(text);
                 }
-                Command::none()
+                Task::none()
             }
-            Message::ContextPaste => iced::clipboard::read(Message::ClipboardContent),
+            Message::ContextPaste => {
+                if self.editing_blocked() {
+                    return Task::none();
+                }
+                iced::clipboard::read().map(Message::ClipboardContent)
+            }
             Message::ClipboardContent(Some(text)) => {
+                if self.editing_blocked() {
+                    return Task::none();
+                }
+                if text.len() > MAX_PASTE_BYTES {
+                    self.set_status(
+                        format!(
+                            "{}: {}",
+                            t!("status.error"),
+                            t!("status.err_paste_too_large")
+                        ),
+                        true,
+                    );
+                    return Task::none();
+                }
                 self.push_undo();
                 self.undo_new_group = true;
-                self.editor
-                    .content
-                    .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
-                        std::sync::Arc::new(text),
-                    )));
+                self.edited(|app| {
+                    app.editor.content.perform(text_editor::Action::Edit(
+                        text_editor::Edit::Paste(std::sync::Arc::new(text)),
+                    ));
+                });
                 self.is_dirty = true;
-                Command::none()
+                Task::none()
             }
-            Message::ClipboardContent(None) => Command::none(),
+            Message::ClipboardContent(None) => Task::none(),
             Message::ContextDelete => {
+                // Nothing selected, nothing to delete (and no empty undo step).
+                if self.editing_blocked() || self.editor.content.selection().is_none() {
+                    return Task::none();
+                }
                 self.push_undo();
                 self.undo_new_group = true;
-                self.editor
-                    .content
-                    .perform(text_editor::Action::Edit(text_editor::Edit::Delete));
+                self.edited(|app| {
+                    app.editor
+                        .content
+                        .perform(text_editor::Action::Edit(text_editor::Edit::Delete));
+                });
                 self.is_dirty = true;
-                Command::none()
+                Task::none()
             }
             Message::FormatFile => {
+                if self.is_formatting {
+                    return Task::none();
+                }
                 if let Some(ext) = self.editor.language.clone() {
                     self.is_formatting = true;
-                    self.status_message = t!("status.formatting").to_string();
+                    self.set_status(t!("status.formatting"), false);
                     let content = crate::editor::buffer_text(&self.editor.content);
-                    Command::perform(
-                        crate::formatter::format(content, ext),
-                        Message::FileFormatted,
+                    let job = FormatJob {
+                        path: self.current_file.clone(),
+                        source: fingerprint(&content),
+                    };
+                    let target = self.format_target();
+                    Task::perform(
+                        crate::formatter::format(content, ext, target),
+                        move |result| Message::FileFormatted(job.clone(), result),
                     )
                 } else {
-                    self.status_message = t!("status.no_language").to_string();
-                    Command::none()
+                    self.set_status(t!("status.no_language"), false);
+                    Task::none()
                 }
             }
             Message::FormatSelection => {
+                if self.is_formatting {
+                    return Task::none();
+                }
                 if let (Some(ext), Some(selected)) = (
                     self.editor.language.clone(),
                     self.editor.content.selection(),
                 ) {
                     self.is_formatting = true;
-                    self.status_message = t!("status.formatting").to_string();
+                    self.set_status(t!("status.formatting"), false);
+                    let job = FormatJob {
+                        path: self.current_file.clone(),
+                        source: fingerprint(&selected),
+                    };
+                    let target = self.format_target();
                     // Formatters end their output with a newline; a fragment
                     // that didn't end with one shouldn't gain one.
                     let had_newline = selected.ends_with('\n');
-                    Command::perform(
+                    Task::perform(
                         async move {
-                            crate::formatter::format(selected, ext).await.map(|f| {
-                                if had_newline {
-                                    f
-                                } else {
-                                    f.trim_end_matches('\n').to_string()
-                                }
-                            })
+                            crate::formatter::format(selected, ext, target)
+                                .await
+                                .map(|f| {
+                                    if had_newline {
+                                        f
+                                    } else {
+                                        f.trim_end_matches('\n').to_string()
+                                    }
+                                })
                         },
-                        Message::SelectionFormatted,
+                        move |result| Message::SelectionFormatted(job.clone(), result),
                     )
                 } else {
-                    Command::none()
+                    Task::none()
                 }
             }
-            Message::FileFormatted(result) => {
+            Message::FileFormatted(job, result) => {
                 self.is_formatting = false;
+                // The user moved on, or kept typing: the result describes text
+                // that is no longer there.
+                let current = self.current_file == job.path
+                    && fingerprint(&crate::editor::buffer_text(&self.editor.content)) == job.source;
+                if !current {
+                    self.set_status(t!("status.format_stale"), true);
+                    return Task::none();
+                }
                 match result {
                     Ok(formatted) => {
                         let (line, col) = self.editor.content.cursor_position();
-                        self.status_is_error = false;
                         self.format_error = None;
-                        self.status_message = t!("status.formatted").to_string();
-                        return self.apply_text_edit(formatted, line, col);
+                        self.show_error_panel = false;
+                        self.set_status(t!("status.formatted"), false);
+                        let formatted = TextFormat::decode(&formatted).0;
+                        return self.apply_text_edit(formatted, line, col, None);
                     }
-                    Err(e) => {
-                        self.status_is_error = true;
-                        self.format_error = Some(e.clone());
-                        self.show_error_panel = true;
-                        self.status_message = t!("status.format_error").to_string();
-                    }
+                    Err(e) => self.show_format_error(e),
                 }
-                Command::none()
+                Task::none()
             }
-            Message::SelectionFormatted(result) => {
+            Message::SelectionFormatted(job, result) => {
                 self.is_formatting = false;
+                let current = self.current_file == job.path
+                    && self
+                        .editor
+                        .content
+                        .selection()
+                        .is_some_and(|sel| fingerprint(&sel) == job.source);
+                if !current {
+                    self.set_status(t!("status.format_stale"), true);
+                    return Task::none();
+                }
                 match result {
                     Ok(formatted) => {
                         self.push_undo();
                         self.undo_new_group = true;
-                        self.editor.content.perform(text_editor::Action::Edit(
-                            text_editor::Edit::Paste(std::sync::Arc::new(formatted)),
-                        ));
+                        self.edited(|app| {
+                            app.editor.content.perform(text_editor::Action::Edit(
+                                text_editor::Edit::Paste(std::sync::Arc::new(formatted)),
+                            ));
+                        });
                         self.is_dirty = true;
-                        self.status_is_error = false;
                         self.format_error = None;
-                        self.status_message = t!("status.formatted").to_string();
+                        self.show_error_panel = false;
+                        self.set_status(t!("status.formatted"), false);
                     }
-                    Err(e) => {
-                        self.status_is_error = true;
-                        self.format_error = Some(e.clone());
-                        self.show_error_panel = true;
-                        self.status_message = t!("status.format_error").to_string();
-                    }
+                    Err(e) => self.show_format_error(e),
                 }
-                Command::none()
+                Task::none()
             }
             Message::CloseErrorPanel => {
                 self.show_error_panel = false;
-                Command::none()
+                Task::none()
             }
             Message::Undo => {
-                if let Some(prev) = self.undo_stack.pop() {
+                if self.editing_blocked() {
+                    return Task::none();
+                }
+                if let Some(prev) = self.undo_stack.pop_back() {
                     let current = self.snapshot();
-                    self.redo_stack.push(current);
+                    self.redo_stack.push_back(current);
                     trim_history(&mut self.redo_stack);
                     return self.restore_snapshot(prev);
                 }
-                Command::none()
+                Task::none()
             }
             Message::Redo => {
-                if let Some(next) = self.redo_stack.pop() {
+                if self.editing_blocked() {
+                    return Task::none();
+                }
+                if let Some(next) = self.redo_stack.pop_back() {
                     let current = self.snapshot();
-                    self.undo_stack.push(current);
+                    self.undo_stack.push_back(current);
                     trim_history(&mut self.undo_stack);
                     return self.restore_snapshot(next);
                 }
-                Command::none()
+                Task::none()
             }
             Message::AutoSave => {
                 if self.config_dirty {
                     self.config_dirty = false;
                     self.config.save();
                 }
-                self.save_session();
-                self.check_external_change()
+                let external = self.check_external_change();
+                if self.rev == self.session_rev {
+                    return external;
+                }
+                match self.session_write_job() {
+                    Some(job) => {
+                        Task::batch([external, Task::perform(job, Message::SessionWritten)])
+                    }
+                    None => external,
+                }
+            }
+            Message::SessionWritten(result) => {
+                match result {
+                    Ok(()) => {}
+                    Err(e) => {
+                        // Try again at the next tick.
+                        self.last_session = 0;
+                        self.session_rev = 0;
+                        self.set_status(format!("{}: {}", t!("status.session_not_saved"), e), true);
+                    }
+                }
+                Task::none()
+            }
+            Message::PreviewTick => {
+                self.refresh_preview();
+                Task::none()
             }
             // --- Overlays ---
             Message::CloseOverlay => {
-                self.capturing = None;
-                self.overlay = ActiveOverlay::None;
-                Command::none()
+                if self.overlay_is_dismissable() {
+                    self.capturing = None;
+                    self.overlay = ActiveOverlay::None;
+                }
+                Task::none()
             }
             Message::OpenGotoLine => {
                 self.goto_line_input = String::new();
                 self.overlay = ActiveOverlay::GotoLine;
-                text_input::focus(goto_line_id())
+                iced::widget::operation::focus(goto_line_id())
             }
             Message::GotoLineInputChanged(s) => {
                 // Allow only digits
                 self.goto_line_input = s.chars().filter(|c| c.is_ascii_digit()).collect();
-                Command::none()
+                Task::none()
             }
             Message::GotoLineSubmit => {
                 if let Ok(n) = self.goto_line_input.parse::<usize>() {
@@ -1153,37 +1487,37 @@ impl SimpleEditApp {
                     crate::search::goto_line_start(&mut self.editor.content, target);
                 }
                 self.overlay = ActiveOverlay::None;
-                Command::none()
+                Task::none()
             }
             Message::OpenLanguagePicker => {
                 self.overlay = ActiveOverlay::LanguagePicker;
-                Command::none()
+                Task::none()
             }
             Message::SetLanguage(ext) => {
                 self.editor.language = if ext.is_empty() { None } else { Some(ext) };
                 self.reset_view_mode();
                 self.overlay = ActiveOverlay::None;
-                Command::none()
+                Task::none()
             }
             Message::OpenShortcuts => {
                 self.capturing = None;
                 self.overlay = ActiveOverlay::Shortcuts;
-                Command::none()
+                Task::none()
             }
             Message::StartCaptureShortcut(target) => {
                 self.capturing = Some(target);
-                Command::none()
+                Task::none()
             }
             Message::OpenPalette => {
                 self.palette_query.clear();
                 self.palette_selected = 0;
                 self.overlay = ActiveOverlay::Palette;
-                text_input::focus(crate::palette::input_id())
+                iced::widget::operation::focus(crate::palette::input_id())
             }
             Message::PaletteQueryChanged(query) => {
                 self.palette_query = query;
                 self.palette_selected = 0;
-                Command::none()
+                crate::palette::scroll_to_selected(0)
             }
             Message::PaletteSubmit => {
                 let shown = self.palette_entries();
@@ -1192,7 +1526,7 @@ impl SimpleEditApp {
                         let command = entry.command;
                         self.handle(Message::PaletteRun(command))
                     }
-                    _ => Command::none(),
+                    _ => Task::none(),
                 }
             }
             Message::PaletteRun(command) => {
@@ -1216,21 +1550,27 @@ impl SimpleEditApp {
                     };
                     // A bare letter (or Shift+letter) would fire on every
                     // keystroke typed into the editor.
-                    let is_function_key = sc.key.len() > 1
-                        && sc.key.starts_with('F')
-                        && sc.key[1..].bytes().all(|b| b.is_ascii_digit());
-                    if !(sc.ctrl || sc.alt || is_function_key) {
-                        self.status_message = t!("shortcuts.needs_modifier").to_string();
-                        return Command::none();
+                    if !(sc.ctrl || sc.alt || crate::config::is_function_key(&sc.key)) {
+                        let ctrl = if cfg!(target_os = "macos") {
+                            "⌘"
+                        } else {
+                            "Ctrl"
+                        };
+                        self.set_status(t!("shortcuts.needs_modifier", ctrl = ctrl), true);
+                        return Task::none();
+                    }
+                    if crate::code_editor::consumes_key(&sc.key, sc.ctrl, sc.alt) {
+                        self.set_status(t!("shortcuts.reserved"), true);
+                        return Task::none();
                     }
                     if self.config.shortcuts.conflicts(target, &sc) {
-                        self.status_message = t!("shortcuts.conflict").to_string();
-                        return Command::none();
+                        self.set_status(t!("shortcuts.conflict"), true);
+                        return Task::none();
                     }
                     *self.config.shortcuts.slot_mut(target) = sc;
                     self.config.save();
                     self.capturing = None;
-                    return Command::none();
+                    return Task::none();
                 }
                 // The palette: arrows move the selection (Enter is the
                 // field's own submit, Escape closes).
@@ -1244,21 +1584,41 @@ impl SimpleEditApp {
                         let len = self.palette_entries().len();
                         self.palette_selected =
                             crate::palette::step(self.palette_selected, delta, len);
+                        return crate::palette::scroll_to_selected(self.palette_selected);
                     }
-                    return Command::none();
+                    return Task::none();
                 }
                 // Don't fire shortcuts while any overlay or the Preferences
                 // window is open
                 if !matches!(self.overlay, ActiveOverlay::None) || self.show_preferences {
-                    return Command::none();
+                    return Task::none();
                 }
-                // Shift+Enter: previous match. Plain Enter is the search
-                // field's own on_submit, which iced correctly scopes to
-                // when that field has focus; this subscription-level
-                // shortcut can't tell which widget is focused, so it's
-                // deliberately narrowed to the modified case only.
-                if self.show_search && shift && key.eq_ignore_ascii_case("return") {
-                    return self.handle(Message::Search(SearchMessage::FindPrevious));
+                // Enter in the search card goes to the next match, Shift+Enter
+                // to the previous one — when the find field has the focus
+                // (it captures the key itself, which is why this listens to
+                // captured events too).
+                if key == "Return" && !ctrl && !alt {
+                    if self.show_search {
+                        return iced::advanced::widget::operate(crate::search::find_field_focused()).map(
+                            move |in_find_field| Message::SearchEnterChecked {
+                                shift,
+                                in_find_field,
+                            },
+                        );
+                    }
+                    return Task::none();
+                }
+                // Tab indents, Shift+Tab dedents; a search field keeps it.
+                if key == "Tab" {
+                    if ctrl || alt {
+                        return Task::none();
+                    }
+                    let m = if shift {
+                        Message::DedentLine
+                    } else {
+                        Message::InsertTab
+                    };
+                    return self.check_search_focus_then(m);
                 }
                 // Match against config shortcuts. A symbol key (`/`) may need
                 // Shift on some layouts (AZERTY), so Shift doesn't count
@@ -1302,70 +1662,51 @@ impl SimpleEditApp {
                     .map(|(_, m)| m)
                     .or_else(|| sc_check(&sh.quit).then_some(Message::Quit));
                 match msg {
-                    // With the search bar open, a text field may own the keys:
-                    // Ctrl+Z / Ctrl+A belong to it, not to the buffer.
-                    Some(m) if self.show_search && m.is_editor_shortcut() => {
-                        Command::widget(crate::search::search_field_focused()).map(move |focused| {
-                            Message::ShortcutChecked(Box::new(m.clone()), focused)
-                        })
-                    }
-                    Some(m) => self.handle(m),
-                    None => Command::none(),
+                    Some(m) => self.check_search_focus_then(m),
+                    None => Task::none(),
                 }
             }
             Message::DuplicateLine => {
                 if self.editing_blocked() {
-                    return Command::none();
+                    return Task::none();
                 }
                 let text = crate::editor::buffer_text(&self.editor.content);
-                let (line, col) = self.editor.content.cursor_position();
-                let new_text = duplicate_line(&text, line);
-                self.apply_text_edit(new_text, line + 1, col)
+                let span = self.selection_span();
+                let (first, last) = self.lines_to_edit(span);
+                let new_text = text_ops::duplicate_lines(&text, first, last);
+                // The copy goes below, and the cursor follows it.
+                let shift = (last - first + 1) as isize;
+                self.apply_line_edit(&text, new_text, shift, span)
             }
-            Message::MoveLineUp => {
-                if self.editing_blocked() {
-                    return Command::none();
-                }
-                let text = crate::editor::buffer_text(&self.editor.content);
-                let (line, col) = self.editor.content.cursor_position();
-                let (new_text, new_line) = move_line(&text, line, true);
-                self.apply_text_edit(new_text, new_line, col)
-            }
-            Message::MoveLineDown => {
-                if self.editing_blocked() {
-                    return Command::none();
-                }
-                let text = crate::editor::buffer_text(&self.editor.content);
-                let (line, col) = self.editor.content.cursor_position();
-                let (new_text, new_line) = move_line(&text, line, false);
-                self.apply_text_edit(new_text, new_line, col)
-            }
+            Message::MoveLineUp => self.move_lines(true),
+            Message::MoveLineDown => self.move_lines(false),
             Message::ToggleComment => {
                 if self.editing_blocked() {
-                    return Command::none();
+                    return Task::none();
                 }
-                // Formats without comments (JSON) have nothing to toggle.
+                // Plain text and formats without comments (JSON) have nothing
+                // to toggle.
                 let Some((prefix, suffix)) = comment_style(self.editor.language.as_deref()) else {
-                    return Command::none();
+                    return Task::none();
                 };
                 let text = crate::editor::buffer_text(&self.editor.content);
-                let (line, col) = self.editor.content.cursor_position();
-                let (first, last) = self.selection_lines().unwrap_or((line, line));
-                let new_text = toggle_comment_lines(&text, first, last, prefix, suffix);
-                self.apply_text_edit(new_text, line, col)
+                let span = self.selection_span();
+                let (first, last) = self.lines_to_edit(span);
+                let new_text = text_ops::toggle_comment_lines(&text, first, last, prefix, suffix);
+                self.apply_line_edit(&text, new_text, 0, span)
             }
             Message::DeleteLine => {
                 if self.editing_blocked() {
-                    return Command::none();
+                    return Task::none();
                 }
                 let text = crate::editor::buffer_text(&self.editor.content);
-                let (line, _) = self.editor.content.cursor_position();
-                let (new_text, new_line) = delete_line_op(&text, line);
-                self.apply_text_edit(new_text, new_line, 0)
+                let (first, last) = self.lines_to_edit(self.selection_span());
+                let (new_text, new_line) = text_ops::delete_lines(&text, first, last);
+                self.apply_text_edit(new_text, new_line, 0, None)
             }
             Message::ToggleBookmark => {
                 let Some(path) = self.current_file.clone() else {
-                    return Command::none();
+                    return Task::none();
                 };
                 let (line, _) = self.editor.content.cursor_position();
                 let added = self.bookmarks.toggle(&path, line);
@@ -1376,7 +1717,7 @@ impl SimpleEditApp {
                 }
                 .to_string();
                 self.status_is_error = false;
-                Command::none()
+                Task::none()
             }
             Message::EditorRightClick(at) => {
                 // The context menu acts on the clicked line: move the caret
@@ -1389,7 +1730,7 @@ impl SimpleEditApp {
                         .perform(text_editor::Action::Click(at - origin));
                     self.undo_new_group = true;
                 }
-                Command::none()
+                Task::none()
             }
             Message::NextBookmark => self.jump_to_bookmark(true),
             Message::PrevBookmark => self.jump_to_bookmark(false),
@@ -1399,29 +1740,35 @@ impl SimpleEditApp {
                     self.status_message = t!("status.bookmarks_cleared").to_string();
                     self.status_is_error = false;
                 }
-                Command::none()
+                Task::none()
             }
             Message::IndentSelection => {
                 if self.editing_blocked() {
-                    return Command::none();
+                    return Task::none();
                 }
-                let Some((first, last)) = self.selection_lines() else {
-                    return Command::none();
+                let Some(span) = self.selection_span() else {
+                    return Task::none();
                 };
+                let (first, last) = span.lines();
                 let text = crate::editor::buffer_text(&self.editor.content);
-                let (line, col) = self.editor.content.cursor_position();
-                let new_text = indent_lines(&text, first, last, &self.indent_unit());
-                self.apply_text_edit(new_text, line, col)
+                let new_text = text_ops::indent_lines(&text, first, last, &self.indent_unit());
+                self.apply_line_edit(&text, new_text, 0, Some(span))
             }
             Message::DedentLine => {
                 if self.editing_blocked() {
-                    return Command::none();
+                    return Task::none();
                 }
                 let text = crate::editor::buffer_text(&self.editor.content);
-                let (line, col) = self.editor.content.cursor_position();
-                let (first, last) = self.selection_lines().unwrap_or((line, line));
-                let new_text = dedent_lines(&text, first, last, &self.indent_unit());
-                self.apply_text_edit(new_text, line, col)
+                let span = self.selection_span();
+                let (first, last) = self.lines_to_edit(span);
+                let new_text = text_ops::dedent_lines(
+                    &text,
+                    first,
+                    last,
+                    &self.indent_unit(),
+                    self.config.tab_width,
+                );
+                self.apply_line_edit(&text, new_text, 0, span)
             }
             Message::OpenRecentFile(path) => {
                 if !path.exists() {
@@ -1429,18 +1776,39 @@ impl SimpleEditApp {
                         .recent_files
                         .retain(|f| *f != path.to_string_lossy().as_ref());
                     self.config.save();
-                    self.status_message =
-                        format!("{}: {}", t!("status.error"), t!("status.no_file"));
-                    return Command::none();
+                    self.set_status(
+                        format!("{}: {}", t!("status.error"), t!("status.no_file")),
+                        true,
+                    );
+                    return Task::none();
                 }
-                self.sidebar.add_file(path.clone());
-                self.activate(path)
+                // The tab appears once the file has been read.
+                if self.sidebar.files().contains(&path) {
+                    self.activate(path)
+                } else {
+                    Task::perform(read_file(path, false), Message::FileOpened)
+                }
             }
             Message::ShortcutChecked(inner, focused) => {
                 if focused {
-                    Command::none()
+                    Task::none()
                 } else {
                     self.handle(*inner)
+                }
+            }
+            Message::SearchEnter { shift } => self.handle(Message::Search(if shift {
+                SearchMessage::FindPrevious
+            } else {
+                SearchMessage::Find
+            })),
+            Message::SearchEnterChecked {
+                shift,
+                in_find_field,
+            } => {
+                if in_find_field {
+                    self.handle(Message::SearchEnter { shift })
+                } else {
+                    Task::none()
                 }
             }
             Message::EscapePressed => {
@@ -1449,69 +1817,73 @@ impl SimpleEditApp {
                 if self.capturing.is_some() {
                     self.capturing = None;
                 } else if !matches!(self.overlay, ActiveOverlay::None) {
-                    self.overlay = ActiveOverlay::None;
+                    if self.overlay_is_dismissable() {
+                        self.overlay = ActiveOverlay::None;
+                    }
                 } else if self.show_preferences {
                     self.show_preferences = false;
                 } else if self.show_search {
                     self.show_search = false;
                 }
-                Command::none()
+                Task::none()
             }
             Message::CheckForUpdate => {
                 self.overlay = ActiveOverlay::UpdateChecking;
-                Command::perform(crate::updater::check_for_update(), Message::UpdateChecked)
+                Task::perform(crate::updater::check_for_update(), Message::UpdateChecked)
             }
             Message::OpenChangelog => {
-                self.open_menu = None;
                 self.overlay = ActiveOverlay::Changelog;
-                Command::none()
+                Task::none()
             }
             Message::UpdateChecked(Ok(Some((version, notes)))) => {
                 self.overlay = ActiveOverlay::UpdateAvailable(version, notes);
-                Command::none()
+                Task::none()
             }
             Message::UpdateChecked(Ok(None)) => {
                 self.overlay = ActiveOverlay::UpdateUpToDate;
-                Command::none()
+                Task::none()
             }
             Message::UpdateChecked(Err(e)) => {
                 self.overlay = ActiveOverlay::UpdateError(e);
-                Command::none()
+                Task::none()
             }
             Message::ConfirmInstallUpdate(version) => {
                 self.overlay = ActiveOverlay::UpdateDownloading;
-                Command::perform(
+                Task::perform(
                     crate::updater::download_update(version),
                     Message::UpdateDownloaded,
                 )
             }
-            Message::UpdateDownloaded(Ok(path)) => {
+            Message::UpdateDownloaded(Ok((path, hash))) => {
                 self.overlay = ActiveOverlay::UpdateInstalling;
-                Command::perform(
-                    crate::updater::install_update(path),
+                Task::perform(
+                    crate::updater::install_update(path, hash),
                     Message::UpdateInstalled,
                 )
             }
             Message::UpdateDownloaded(Err(e)) => {
                 self.overlay = ActiveOverlay::UpdateError(e);
-                Command::none()
+                Task::none()
             }
             Message::UpdateInstalled(Ok(())) => {
-                self.save_session();
+                if let Err(e) = self.save_session_now() {
+                    self.overlay = ActiveOverlay::UpdateError(e);
+                    return Task::none();
+                }
                 self.config.save();
                 // On success this never returns — the process re-execs and exits.
                 if let Err(e) = crate::updater::restart() {
                     self.overlay = ActiveOverlay::UpdateError(e);
                 }
-                Command::none()
+                Task::none()
             }
             Message::UpdateInstalled(Err(e)) => {
                 self.overlay = ActiveOverlay::UpdateError(e);
-                Command::none()
+                Task::none()
             }
             Message::SetViewMode(mode) => {
                 self.view_mode = mode;
-                Command::none()
+                Task::none()
             }
             Message::JsonToggle(path) => {
                 // Ctrl+click opens every node, Alt+click closes every node.
@@ -1525,13 +1897,13 @@ impl SimpleEditApp {
                         collapsed.insert(path);
                     }
                     self.preview_rev += 1;
-                    Command::none()
+                    Task::none()
                 }
             }
             Message::JsonExpandAll => {
                 self.json_collapsed = Default::default();
                 self.preview_rev += 1;
-                Command::none()
+                Task::none()
             }
             Message::JsonCollapseAll => {
                 if let PreviewDoc::Json(value) = &self.preview {
@@ -1539,17 +1911,17 @@ impl SimpleEditApp {
                         std::sync::Arc::new(crate::preview::json::container_paths(value));
                     self.preview_rev += 1;
                 }
-                Command::none()
+                Task::none()
             }
             Message::ModifiersChanged { ctrl, alt } => {
                 self.mod_ctrl = ctrl;
                 self.mod_alt = alt;
-                Command::none()
+                Task::none()
             }
             Message::MarkdownLinkClicked(href) => {
                 crate::preview::markdown::find_offset_command(&href).map(Message::PreviewScrollTo)
             }
-            Message::PreviewScrollTo(Some(y)) => iced::widget::scrollable::scroll_to(
+            Message::PreviewScrollTo(Some(y)) => iced::widget::operation::scroll_to(
                 crate::preview::markdown::scrollable_id(),
                 iced::widget::scrollable::AbsoluteOffset {
                     x: 0.0,
@@ -1558,24 +1930,78 @@ impl SimpleEditApp {
                     y: (y - 12.0).max(0.0),
                 },
             ),
-            Message::PreviewScrollTo(None) => Command::none(),
+            Message::PreviewScrollTo(None) => Task::none(),
         }
     }
 
     /// Asks the renderer where the open menu's button sits, so its dropdown
     /// can be anchored under it regardless of label/font/DPI.
-    fn query_menu_bounds(&self) -> Command<Message> {
+    fn query_menu_bounds(&self) -> Task<Message> {
         match self.open_menu {
-            Some(m) => iced::widget::container::visible_bounds(crate::menu_bar::menu_id(m))
-                .map(move |bounds| Message::MenuBounds(m, bounds)),
-            None => Command::none(),
+            Some(m) => iced::widget::selector::find(iced::widget::selector::id(
+                crate::menu_bar::menu_id(m),
+            ))
+            .map(move |target| Message::MenuBounds(m, target.and_then(|t| t.visible_bounds()))),
+            None => Task::none(),
         }
     }
 
-    /// Whether a panel or dialog owns the keyboard, so editing commands
-    /// (Tab, line operations) must leave the buffer alone.
+    /// Whether the open overlay can be closed by hand.
+    fn overlay_is_dismissable(&self) -> bool {
+        !matches!(
+            self.overlay,
+            ActiveOverlay::UpdateDownloading | ActiveOverlay::UpdateInstalling
+        )
+    }
+
+    /// Recomputes the selection label of the status bar.
+    fn refresh_selection_info(&mut self) {
+        let key = (
+            self.editor.content.selection_range(),
+            self.editor.content.revision(),
+        );
+        if self.selection_key == Some(key) {
+            return;
+        }
+        self.selection_key = Some(key);
+        self.selection_info = self
+            .editor
+            .content
+            .selection_counts()
+            .map(|(chars, lines)| {
+                if lines > 1 {
+                    t!("status.selection_lines", lines = lines, chars = chars).to_string()
+                } else {
+                    t!("status.selection_chars", chars = chars).to_string()
+                }
+            });
+    }
+
+    /// Shows a message in the status bar (in red for an error).
+    fn set_status(&mut self, message: impl ToString, is_error: bool) {
+        self.status_message = message.to_string();
+        self.status_is_error = is_error;
+    }
+
+    /// Whether a panel or dialog owns the keyboard, or there is nothing to
+    /// edit, so editing commands (Tab, line operations) must leave the buffer
+    /// alone. A hidden editor (Preview mode) counts: the user can't see what
+    /// they would change.
     fn editing_blocked(&self) -> bool {
-        self.show_search || self.show_preferences || !matches!(self.overlay, ActiveOverlay::None)
+        self.current_file.is_none()
+            || self.show_preferences
+            || !matches!(self.overlay, ActiveOverlay::None)
+            || (self.view_mode == ViewMode::Preview && self.preview_kind().is_some())
+    }
+
+    /// Runs `m` unless a search field has the keyboard (it owns Tab, Ctrl+A…).
+    fn check_search_focus_then(&mut self, m: Message) -> Task<Message> {
+        if self.show_search && m.is_editor_shortcut() {
+            iced::advanced::widget::operate(crate::search::search_field_focused())
+                .map(move |focused| Message::ShortcutChecked(Box::new(m.clone()), focused))
+        } else {
+            self.handle(m)
+        }
     }
 
     /// One level of indentation, per the tab settings.
@@ -1587,16 +2013,60 @@ impl SimpleEditApp {
         }
     }
 
+    /// What the Tab key types: spaces up to the next tab stop, or a tab.
+    fn tab_text(&self) -> String {
+        if !self.config.use_spaces {
+            return "\t".to_string();
+        }
+        let (line, col) = self.editor.content.cursor_position();
+        let before = self
+            .editor
+            .content
+            .line(line)
+            .map(|l| l[..floor_boundary(&l, col)].to_string())
+            .unwrap_or_default();
+        " ".repeat(text_ops::spaces_to_tab_stop(&before, self.config.tab_width))
+    }
+
+    /// Whether `edit` would change the buffer: Backspace at the very start
+    /// or Delete at the very end do nothing, and shouldn't leave an undo step.
+    fn edit_changes_text(&self, edit: &text_editor::Edit) -> bool {
+        if self.editor.content.selection().is_some() {
+            return true;
+        }
+        let (line, col) = self.editor.content.cursor_position();
+        match edit {
+            text_editor::Edit::Backspace => line > 0 || col > 0,
+            text_editor::Edit::Delete => {
+                let last = self.editor.content.line_count().saturating_sub(1);
+                line < last
+                    || self
+                        .editor
+                        .content
+                        .line(line)
+                        .is_some_and(|l| col < l.len())
+            }
+            _ => true,
+        }
+    }
+
     /// An action in the text area: undo grouping, auto-indent, auto-pairing,
     /// then the action itself.
-    fn editor_action(&mut self, action: text_editor::Action) -> Command<Message> {
+    fn editor_action(&mut self, action: text_editor::Action) -> Task<Message> {
         let is_edit = action.is_edit();
 
         if is_edit {
             if let text_editor::Action::Edit(edit) = &action {
+                if !self.edit_changes_text(edit) {
+                    return Task::none();
+                }
                 match edit {
                     text_editor::Edit::Insert(ch) => {
-                        if ch.is_whitespace() {
+                        if self.editor.content.selection().is_some() {
+                            // Typing over a selection is a step of its own.
+                            self.push_undo();
+                            self.undo_new_group = ch.is_whitespace();
+                        } else if ch.is_whitespace() {
                             // Whitespace ends the current word group; next non-ws starts a new one
                             self.undo_new_group = true;
                         } else if self.undo_new_group {
@@ -1612,15 +2082,31 @@ impl SimpleEditApp {
                         self.undo_new_group = true;
                     }
                 }
+                if let text_editor::Edit::Paste(text) = edit {
+                    if text.len() > MAX_PASTE_BYTES {
+                        self.undo_stack.pop_back();
+                        self.set_status(
+                            format!(
+                                "{}: {}",
+                                t!("status.error"),
+                                t!("status.err_paste_too_large")
+                            ),
+                            true,
+                        );
+                        return Task::none();
+                    }
+                }
             }
         } else {
             // Motion action: next edit opens a new group
             self.undo_new_group = true;
+            self.pending_closers.clear();
         }
 
         // Auto-indent: replicate leading whitespace of current line on Enter
         if self.config.auto_indent {
             if let text_editor::Action::Edit(text_editor::Edit::Enter) = &action {
+                self.pending_closers.clear();
                 let (line_idx, col) = self.editor.content.cursor_position();
                 // Only the whitespace before the cursor: pressing Enter
                 // inside the indentation must not duplicate all of it.
@@ -1644,7 +2130,7 @@ impl SimpleEditApp {
                     ));
                 }
                 self.is_dirty = true;
-                return Command::none();
+                return Task::none();
             }
         }
 
@@ -1653,13 +2139,27 @@ impl SimpleEditApp {
             if let Some(command) = self.autopair(*ch, &action) {
                 return command;
             }
+            self.shift_pending_closers(ch.len_utf8());
+        } else if is_edit {
+            self.pending_closers.clear();
         }
 
         self.editor.content.perform(action);
         if is_edit {
             self.is_dirty = true;
         }
-        Command::none()
+        Task::none()
+    }
+
+    /// Characters typed on the cursor's line push the auto-inserted closers
+    /// after it to the right.
+    fn shift_pending_closers(&mut self, bytes: usize) {
+        let (line, col) = self.editor.content.cursor_position();
+        for (l, c, _) in &mut self.pending_closers {
+            if *l == line && *c >= col {
+                *c += bytes;
+            }
+        }
     }
 
     /// (line count, topmost line an edit may touch), taken before an edit.
@@ -1687,6 +2187,13 @@ impl SimpleEditApp {
             .shift(path, top, count as isize - count_before as isize);
     }
 
+    /// Runs an edit of the buffer and moves the bookmarks along with it.
+    fn edited(&mut self, edit: impl FnOnce(&mut Self)) {
+        let (count, top) = self.edit_probe();
+        edit(self);
+        self.shift_bookmarks(count, top);
+    }
+
     fn bookmark_lines(&self) -> &[usize] {
         self.current_file
             .as_deref()
@@ -1705,9 +2212,9 @@ impl SimpleEditApp {
     }
 
     /// Moves the cursor to the next (or previous) bookmark of the file.
-    fn jump_to_bookmark(&mut self, forward: bool) -> Command<Message> {
+    fn jump_to_bookmark(&mut self, forward: bool) -> Task<Message> {
         let Some(path) = self.current_file.clone() else {
-            return Command::none();
+            return Task::none();
         };
         let (line, _) = self.editor.content.cursor_position();
         let total = self.editor.content.line_count();
@@ -1721,12 +2228,9 @@ impl SimpleEditApp {
                 crate::search::goto_line_start(&mut self.editor.content, target);
                 self.undo_new_group = true;
             }
-            None => {
-                self.status_message = t!("status.no_bookmarks").to_string();
-                self.status_is_error = false;
-            }
+            None => self.set_status(t!("status.no_bookmarks"), false),
         }
-        Command::none()
+        Task::none()
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -1738,57 +2242,99 @@ impl SimpleEditApp {
 
     fn push_undo(&mut self) {
         let snapshot = self.snapshot();
-        self.undo_stack.push(snapshot);
+        self.undo_stack.push_back(snapshot);
         trim_history(&mut self.undo_stack);
         self.redo_stack.clear();
     }
 
+    /// Keeps the undo history of the background tabs within a global budget
+    /// (the largest histories go first).
+    fn enforce_undo_budget(&mut self) {
+        let mut total: usize = self.undo_cache.values().map(history_bytes).sum();
+        while total > UNDO_TOTAL_BYTES {
+            let Some((largest, size)) = self
+                .undo_cache
+                .iter()
+                .map(|(p, h)| (p.clone(), history_bytes(h)))
+                .max_by_key(|(_, size)| *size)
+            else {
+                break;
+            };
+            self.undo_cache.remove(&largest);
+            total -= size;
+        }
+    }
+
     /// Puts the cursor at (`line`, byte column `col`), clamped to the buffer.
     fn restore_cursor(&mut self, line: usize, col: usize) {
-        let target = line.min(self.editor.content.line_count().saturating_sub(1));
-        crate::search::goto_line_start(&mut self.editor.content, target);
-        // `col` is a byte index; Motion::Right steps over characters.
-        let steps = self
-            .editor
-            .content
-            .line(target)
-            .map(|l| {
-                let mut end = col.min(l.len());
-                while !l.is_char_boundary(end) {
-                    end -= 1;
-                }
-                l[..end].chars().count()
-            })
-            .unwrap_or(0);
-        for _ in 0..steps {
-            self.editor
-                .content
-                .perform(text_editor::Action::Move(text_editor::Motion::Right));
-        }
+        self.editor.content.select_bytes(line, col, 0);
     }
 
     /// Replaces the buffer with a history snapshot and puts the cursor back.
-    fn restore_snapshot(&mut self, snap: Snapshot) -> Command<Message> {
+    fn restore_snapshot(&mut self, snap: Snapshot) -> Task<Message> {
         let (line, col) = snap.cursor;
-        self.is_dirty = true;
+        // Back to the saved text means nothing left to save.
+        self.is_dirty = self.saved_fp != Some(fingerprint(&snap.text));
         self.undo_new_group = true;
         self.replace_buffer_text(&snap.text);
         self.restore_cursor(line, col);
-        Command::none()
+        Task::none()
     }
 
     /// Applies a whole-buffer text transformation as one undo step and moves
-    /// the cursor to (`line`, `col`). A no-op transformation changes nothing.
-    fn apply_text_edit(&mut self, new_text: String, line: usize, col: usize) -> Command<Message> {
-        if new_text == crate::editor::buffer_text(&self.editor.content) {
-            return Command::none();
+    /// the cursor to (`line`, `col`), or selects `selection`. A no-op
+    /// transformation changes nothing.
+    fn apply_text_edit(
+        &mut self,
+        new_text: String,
+        line: usize,
+        col: usize,
+        selection: Option<Span>,
+    ) -> Task<Message> {
+        let old = crate::editor::buffer_text(&self.editor.content);
+        if new_text == old {
+            return Task::none();
         }
-        self.push_undo();
+        // One copy of the buffer serves the undo step, the bookmarks and the
+        // minimal replacement.
+        self.undo_stack.push_back(Snapshot {
+            text: old.clone(),
+            cursor: self.editor.content.cursor_position(),
+        });
+        trim_history(&mut self.undo_stack);
+        self.redo_stack.clear();
         self.is_dirty = true;
         self.undo_new_group = true;
-        self.replace_buffer_text(&new_text);
-        self.restore_cursor(line, col);
-        Command::none()
+        if let Some(path) = &self.current_file {
+            self.bookmarks.remap(path, &old, &new_text);
+        }
+        crate::editor::replace_text(&mut self.editor.content, &old, &new_text);
+        match selection {
+            Some(span) => {
+                let len = self.span_len(span);
+                self.editor
+                    .content
+                    .select_bytes(span.start.0, span.start.1, len);
+            }
+            None => self.restore_cursor(line, col),
+        }
+        Task::none()
+    }
+
+    /// Like `apply_text_edit` for a line command: the cursor (and selection)
+    /// keep their place on the text, `line_shift` lines further down.
+    fn apply_line_edit(
+        &mut self,
+        old: &str,
+        new_text: String,
+        line_shift: isize,
+        selection: Option<Span>,
+    ) -> Task<Message> {
+        let (line, col) = self.editor.content.cursor_position();
+        let new_line = (line as isize + line_shift).max(0) as usize;
+        let col = remap_col(nth_line(old, line), nth_line(&new_text, new_line), col);
+        let selection = selection.map(|s| remap_span(old, &new_text, s, line_shift));
+        self.apply_text_edit(new_text, new_line, col, selection)
     }
 
     fn replace_buffer_text(&mut self, new_text: &str) {
@@ -1801,11 +2347,22 @@ impl SimpleEditApp {
         crate::editor::set_buffer_text(&mut self.editor.content, new_text);
     }
 
-    /// The (first, last) logical lines covered by a multi-line selection.
-    /// `text_editor` exposes the selected text and the cursor, not the
-    /// anchor, so the start line is inferred by checking which end of the
-    /// selection the cursor is on against the buffer's actual lines.
-    fn selection_lines(&self) -> Option<(usize, usize)> {
+    /// The bytes covered by `span` in the buffer as it is now.
+    fn span_len(&self, span: Span) -> usize {
+        let content = &self.editor.content;
+        let len_of = |i: usize| content.line(i).map_or(0, |l| l.len());
+        if span.start.0 == span.end.0 {
+            return span.end.1.saturating_sub(span.start.1);
+        }
+        let middle: usize = (span.start.0 + 1..span.end.0).map(|i| len_of(i) + 1).sum();
+        len_of(span.start.0).saturating_sub(span.start.1) + 1 + middle + span.end.1
+    }
+
+    /// The span of a selection running over several lines. (`text_editor`
+    /// exposes the selected text and the cursor, not the anchor, so the start
+    /// is inferred by checking which end of the selection the cursor is on
+    /// against the buffer's actual lines.)
+    fn selection_span(&self) -> Option<Span> {
         let selected = self.editor.content.selection()?;
         let n = selected.split('\n').count();
         if n < 2 {
@@ -1825,17 +2382,53 @@ impl SimpleEditApp {
         };
         // Cursor at the end of the selection (the usual drag direction)...
         if cursor_line + 1 >= n && cursor_col == last.len() && fits(cursor_line + 1 - n) {
-            let start = cursor_line + 1 - n;
-            return Some((start, cursor_line));
+            let start_line = cursor_line + 1 - n;
+            let start_col = self
+                .editor
+                .content
+                .line(start_line)
+                .map_or(0, |l| l.len().saturating_sub(first.len()));
+            return Some(Span {
+                start: (start_line, start_col),
+                end: (cursor_line, cursor_col),
+            });
         }
         // ...or at its start.
-        fits(cursor_line).then_some((cursor_line, cursor_line + n - 1))
+        fits(cursor_line).then_some(Span {
+            start: (cursor_line, cursor_col),
+            end: (cursor_line + n - 1, last.len()),
+        })
+    }
+
+    /// The lines a line command applies to: the selected ones, else the
+    /// cursor's.
+    fn lines_to_edit(&self, span: Option<Span>) -> (usize, usize) {
+        span.map_or_else(
+            || {
+                let line = self.editor.content.cursor_position().0;
+                (line, line)
+            },
+            Span::lines,
+        )
+    }
+
+    /// Alt+Up / Alt+Down: the selected lines (or the cursor's) one line up or down.
+    fn move_lines(&mut self, up: bool) -> Task<Message> {
+        if self.editing_blocked() {
+            return Task::none();
+        }
+        let text = crate::editor::buffer_text(&self.editor.content);
+        let span = self.selection_span();
+        let (first, last) = self.lines_to_edit(span);
+        let (new_text, new_first) = text_ops::move_lines(&text, first, last, up);
+        let shift = new_first as isize - first as isize;
+        self.apply_line_edit(&text, new_text, shift, span)
     }
 
     /// Auto-closing of brackets and quotes for the typed character `ch`.
     /// `None` means "insert it normally".
-    fn autopair(&mut self, ch: char, action: &text_editor::Action) -> Option<Command<Message>> {
-        use text_editor::{Action, Edit, Motion};
+    fn autopair(&mut self, ch: char, action: &text_editor::Action) -> Option<Task<Message>> {
+        use text_editor::{Action, Edit};
 
         let closer = match ch {
             '(' => Some(')'),
@@ -1869,39 +2462,49 @@ impl SimpleEditApp {
             .unwrap_or((None, None));
         let selection = self.editor.content.selection();
 
-        // Typing the closing character that is already there steps over it.
+        // Typing the closing character that was inserted automatically steps
+        // over it; one the user typed (or any other) is just inserted.
+        let pending = self
+            .pending_closers
+            .iter()
+            .position(|&(l, c, p)| l == line && c == col && p == ch);
         if (is_closer || is_quote) && selection.is_none() && after == Some(ch) {
-            // Replace the character with itself rather than moving the
-            // cursor: a motion over a line just typed on would panic.
-            self.editor.content.perform(Action::Edit(Edit::Delete));
-            self.editor.content.perform(Action::Edit(Edit::Insert(ch)));
-            return Some(Command::none());
+            if let Some(i) = pending {
+                self.pending_closers.remove(i);
+                // Replace the character with itself rather than moving the
+                // cursor: a motion over a line just typed on would panic.
+                self.editor.content.perform(Action::Edit(Edit::Delete));
+                self.editor.content.perform(Action::Edit(Edit::Insert(ch)));
+                return Some(Task::none());
+            }
         }
         if is_closer {
             return None;
         }
         let close = closer.unwrap_or(ch);
 
-        // With a selection, surround it instead of replacing it.
+        // With a selection, surround it instead of replacing it. (The undo
+        // step was opened by `editor_action`.)
         if let Some(selected) = selection {
-            self.push_undo();
-            self.undo_new_group = true;
+            self.pending_closers.clear();
             self.editor
                 .content
                 .perform(Action::Edit(Edit::Paste(std::sync::Arc::new(format!(
                     "{ch}{selected}{close}"
                 )))));
             self.is_dirty = true;
-            return Some(Command::none());
+            return Some(Task::none());
         }
 
         // Only pair before whitespace / a closer / line end; quotes also
-        // not after a word character (apostrophes: don't, it's).
-        let room = after.map_or(true, |c| {
+        // not after a word character (apostrophes: don't, it's), and a
+        // single quote not at all in Rust, where it mostly starts a lifetime.
+        let room = after.is_none_or(|c| {
             c.is_whitespace() || matches!(c, ')' | ']' | '}' | ',' | ';' | ':' | '.')
         });
         let word_before = before.is_some_and(|c| c.is_alphanumeric() || c == '\\');
-        if !room || (is_quote && word_before) {
+        let rust_lifetime = ch == '\'' && self.editor.language.as_deref() == Some("rs");
+        if !room || (is_quote && word_before) || rust_lifetime {
             return None;
         }
 
@@ -1910,10 +2513,12 @@ impl SimpleEditApp {
             .content
             .perform(Action::Edit(Edit::Insert(close)));
         self.is_dirty = true;
-        // Motion::Left does nothing on unshaped lines, so shape them first.
-        self.editor.content.settle();
-        self.editor.content.perform(Action::Move(Motion::Left));
-        Some(Command::none())
+        // Back over the closer, which then sits right after the cursor.
+        let (line, end) = self.editor.content.cursor_position();
+        let col = end - close.len_utf8();
+        self.editor.content.select_bytes(line, col, 0);
+        self.pending_closers.push((line, col, close));
+        Some(Task::none())
     }
 
     /// Whether the tab for `path` holds unsaved changes.
@@ -1921,22 +2526,22 @@ impl SimpleEditApp {
         if self.current_file.as_deref() == Some(path) {
             self.is_dirty
         } else {
-            self.file_cache.get(path).is_some_and(|e| e.2)
+            self.file_cache.get(path).is_some_and(|e| e.dirty)
         }
     }
 
     /// Closes a tab, asking first if that would discard unsaved changes.
-    fn request_close(&mut self, path: PathBuf) -> Command<Message> {
+    fn request_close(&mut self, path: PathBuf) -> Task<Message> {
         if self.is_path_dirty(&path) {
             self.overlay = ActiveOverlay::ConfirmClose(path);
-            Command::none()
+            Task::none()
         } else {
             self.close_path(path)
         }
     }
 
     /// Removes a tab and, if it was the active one, switches to its neighbour.
-    fn close_path(&mut self, path: PathBuf) -> Command<Message> {
+    fn close_path(&mut self, path: PathBuf) -> Task<Message> {
         let index = self.sidebar.files().iter().position(|p| *p == path);
         self.file_cache.remove(&path);
         self.undo_cache.remove(&path);
@@ -1947,7 +2552,7 @@ impl SimpleEditApp {
             self.bookmarks.clear(&path);
         }
 
-        let mut command = Command::none();
+        let mut command = Task::none();
         if self.current_file.as_ref() == Some(&path) {
             self.editor = EditorState::new();
             self.reset_view_mode();
@@ -1957,31 +2562,55 @@ impl SimpleEditApp {
             self.redo_stack.clear();
             self.undo_new_group = true;
             self.search.reset();
-            self.status_message = t!("status.ready").to_string();
+            self.format = TextFormat::default();
+            self.disk_stamp = None;
+            self.saved_fp = None;
+            self.set_status(t!("status.ready"), false);
             let files = self.sidebar.files();
             let next = index
                 .and_then(|i| files.get(i))
                 .or_else(|| files.last())
                 .cloned();
-            if let Some(next) = next {
-                command = self.activate(next);
-            }
+            command = match next {
+                Some(next) => self.activate(next),
+                None => self.ensure_tab(),
+            };
         }
-        self.save_session();
+        let _ = self.save_session_now();
         command
     }
 
-    /// Parks the active buffer (text, language, dirty flag, undo history) so
-    /// another file can take the editor.
+    /// The editor is never left without a tab: when the last one is closed, a
+    /// blank untitled one takes its place (text typed with nowhere to live
+    /// would be lost).
+    fn ensure_tab(&mut self) -> Task<Message> {
+        if self.current_file.is_some() {
+            return Task::none();
+        }
+        if let Some(first) = self.sidebar.files().first().cloned() {
+            return self.activate(first);
+        }
+        self.untitled_counter = 1;
+        self.load_buffer(untitled_path(1), CachedBuffer::blank());
+        Task::none()
+    }
+
+    /// Parks the active buffer (text, cursor, scroll, language, dirty flag,
+    /// undo history) so another file can take the editor.
     fn stash_current(&mut self) {
         if let Some(current) = self.current_file.clone() {
+            let content = std::mem::take(&mut self.editor.content);
             self.file_cache.insert(
                 current.clone(),
-                (
-                    crate::editor::buffer_text(&self.editor.content),
-                    self.editor.language.clone(),
-                    self.is_dirty,
-                ),
+                CachedBuffer {
+                    content: Some(content),
+                    language: self.editor.language.clone(),
+                    dirty: self.is_dirty,
+                    stamp: self.disk_stamp,
+                    format: self.format,
+                    saved_fp: self.saved_fp,
+                    view_mode: self.view_mode,
+                },
             );
             self.undo_cache.insert(
                 current,
@@ -1990,72 +2619,199 @@ impl SimpleEditApp {
                     std::mem::take(&mut self.redo_stack),
                 ),
             );
+            self.enforce_undo_budget();
         }
     }
 
-    /// Puts a file's content in the editor and makes it the current tab.
-    fn load_buffer(
-        &mut self,
-        path: PathBuf,
-        content: String,
-        language: Option<String>,
-        dirty: bool,
-    ) {
-        self.editor = EditorState::from_content(&content);
-        self.editor.restore_language(language, &path);
+    /// Puts a buffer in the editor and makes it the current tab.
+    fn load_buffer(&mut self, path: PathBuf, buffer: CachedBuffer) {
+        let content = buffer.content.unwrap_or_default();
+        let first_line = first_line_of(&content);
+        self.editor = EditorState {
+            content,
+            language: None,
+        };
+        self.editor
+            .restore_language(buffer.language, &path, &first_line);
         self.reset_view_mode();
+        self.view_mode = buffer.view_mode;
         self.sidebar.add_file(path.clone());
         let (undo, redo) = self.undo_cache.remove(&path).unwrap_or_default();
         self.undo_stack = undo;
         self.redo_stack = redo;
         self.undo_new_group = true;
+        self.pending_closers.clear();
         self.search.reset();
-        self.disk_mtime = (!is_untitled(&path)).then(|| mtime(&path)).flatten();
+        self.format_error = None;
+        self.show_error_panel = false;
+        self.format = buffer.format;
+        self.disk_stamp = buffer.stamp;
+        self.saved_fp = buffer.saved_fp;
         self.external_warned = false;
         self.current_file = Some(path);
-        self.is_dirty = dirty;
+        self.is_dirty = buffer.dirty;
+        self.text_rev += 1;
+    }
+
+    /// Makes a file just read the active tab.
+    fn open_loaded(&mut self, loaded: Loaded) {
+        let path = loaded.path.clone();
+        self.pending_open = None;
+        if self.current_file.as_ref() == Some(&path) {
+            // Opening the file being edited again: bring it up to date, but
+            // never throw away unsaved changes.
+            if self.is_dirty {
+                self.set_status(t!("status.already_open_modified"), false);
+            } else {
+                self.apply_reload(loaded);
+            }
+            return;
+        }
+        let cached = self.file_cache.remove(&path);
+        self.stash_current();
+        let mut warn_changed = false;
+        let buffer = match cached {
+            // A background tab with unsaved edits wins over the disk.
+            Some(c) if c.dirty && c.content.is_some() => {
+                warn_changed = c.stamp.is_some() && loaded.stamp != c.stamp;
+                c
+            }
+            other => {
+                let view_mode = other.as_ref().map(|c| c.view_mode);
+                let language = other.and_then(|c| c.language);
+                let mut buffer = CachedBuffer::from_loaded(loaded, language);
+                if let Some(mode) = view_mode {
+                    buffer.view_mode = mode;
+                }
+                buffer
+            }
+        };
+        self.config.add_recent(&path);
+        self.config_dirty = true;
+        self.load_buffer(path, buffer);
+        if warn_changed {
+            self.external_warned = true;
+            self.set_status(t!("status.changed_on_disk"), true);
+        } else if self.has_very_long_line() {
+            self.set_status(t!("status.long_line_hint"), false);
+        } else {
+            self.set_status(t!("status.file_opened"), false);
+        }
+    }
+
+    /// Whether a line is so long (minified JSON, say) that typing on it is
+    /// slow: the status bar then suggests formatting the file.
+    fn has_very_long_line(&self) -> bool {
+        self.editor
+            .language
+            .as_deref()
+            .is_some_and(crate::formatter::has_formatter)
+            && self
+                .editor
+                .content
+                .lines()
+                .any(|line| line.len() > LONG_LINE_BYTES)
+    }
+
+    /// Replaces the text of the active tab by a newer version from disk,
+    /// keeping the undo history (the old text is one Ctrl+Z away), the cursor,
+    /// the scroll position, the language and the view mode.
+    fn apply_reload(&mut self, loaded: Loaded) {
+        if self.current_file.as_ref() != Some(&loaded.path) {
+            return;
+        }
+        if self.is_dirty {
+            // Typing started while the file was being read: the disk version
+            // is not applied, and saving will ask first.
+            self.external_warned = true;
+            self.set_status(t!("status.changed_on_disk"), true);
+            return;
+        }
+        let old = crate::editor::buffer_text(&self.editor.content);
+        if old != loaded.text {
+            let (line, col) = self.editor.content.cursor_position();
+            self.push_undo();
+            self.undo_new_group = true;
+            self.replace_buffer_text(&loaded.text);
+            self.restore_cursor(line, col);
+            self.text_rev += 1;
+        }
+        self.saved_fp = Some(fingerprint(&loaded.text));
+        self.format = loaded.format;
+        self.disk_stamp = loaded.stamp;
+        self.external_warned = false;
+        self.size_for = None;
+        self.set_status(t!("status.file_reloaded"), false);
     }
 
     /// Switches to a tab: instantly if its buffer is cached, from disk otherwise.
-    fn activate(&mut self, path: PathBuf) -> Command<Message> {
+    fn activate(&mut self, path: PathBuf) -> Task<Message> {
         if self.current_file.as_ref() == Some(&path) {
-            return Command::none();
+            return Task::none();
         }
-        if let Some((content, language, dirty)) = self.file_cache.remove(&path) {
+        self.pending_open = Some(path.clone());
+        let cached = self.file_cache.get(&path);
+        if let Some(entry) = cached.filter(|e| e.content.is_some()) {
+            // A saved file may have changed since this copy was made.
+            let changed =
+                !is_untitled(&path) && entry.stamp.is_some() && DiskStamp::of(&path) != entry.stamp;
+            if changed && !entry.dirty {
+                return Task::perform(read_file(path, false), Message::TabRead);
+            }
+            let Some(entry) = self.file_cache.remove(&path) else {
+                return Task::none();
+            };
+            self.pending_open = None;
             self.stash_current();
-            self.load_buffer(path, content, language, dirty);
-            self.status_message = t!("status.file_opened").to_string();
-            Command::none()
+            self.load_buffer(path, entry);
+            if changed {
+                // Modified here and there: saving will ask before overwriting.
+                self.external_warned = true;
+                self.set_status(t!("status.changed_on_disk"), true);
+            } else {
+                self.set_status(t!("status.file_opened"), false);
+            }
+            Task::none()
         } else if is_untitled(&path) {
+            self.pending_open = None;
             self.stash_current();
-            self.load_buffer(path, String::new(), None, false);
-            Command::none()
+            self.load_buffer(path, CachedBuffer::blank());
+            Task::none()
         } else {
-            // FileOpened parks the current buffer once the read succeeds.
-            Command::perform(read_file(path), Message::FileOpened)
+            // TabRead parks the current buffer once the read succeeds.
+            Task::perform(read_file(path, false), Message::TabRead)
         }
+    }
+
+    /// Whether the file changed on disk since this tab read or wrote it.
+    fn changed_on_disk(&self, path: &Path) -> bool {
+        !is_untitled(path)
+            && self.disk_stamp.is_some()
+            && DiskStamp::of(path).is_some_and(|now| Some(now) != self.disk_stamp)
     }
 
     /// Notices edits made to the current file by other programs: a clean
     /// buffer is reloaded, a modified one is warned about (saving then asks
     /// before overwriting).
-    fn check_external_change(&mut self) -> Command<Message> {
+    fn check_external_change(&mut self) -> Task<Message> {
         let Some(path) = self.current_file.clone().filter(|p| !is_untitled(p)) else {
-            return Command::none();
+            return Task::none();
         };
-        let now = mtime(&path);
-        if now.is_none() || now == self.disk_mtime {
-            return Command::none();
+        let Some(now) = DiskStamp::of(&path) else {
+            return Task::none();
+        };
+        if Some(now) == self.disk_stamp {
+            return Task::none();
         }
         if self.is_dirty {
             if !self.external_warned {
                 self.external_warned = true;
-                self.status_message = t!("status.changed_on_disk").to_string();
+                self.set_status(t!("status.changed_on_disk"), true);
             }
-            return Command::none();
+            return Task::none();
         }
-        self.disk_mtime = now;
-        Command::perform(read_file(path), Message::FileOpened)
+        // The new state becomes the baseline only once it has been applied.
+        Task::perform(read_file(path, false), Message::FileReloaded)
     }
 
     fn refresh_file_size(&mut self) {
@@ -2082,35 +2838,124 @@ impl SimpleEditApp {
         self.json_collapsed = Default::default();
         self.preview_rev += 1;
         self.preview = PreviewDoc::None;
-        self.preview_src.clear();
     }
 
     /// Reparses the buffer for the preview pane, but only when it is visible
-    /// and its text actually changed since the last parse.
+    /// and its text may have changed since the last parse.
     fn refresh_preview(&mut self) {
         let Some(kind) = self.preview_kind() else {
             self.preview = PreviewDoc::None;
-            self.preview_src.clear();
             return;
         };
         if self.view_mode == ViewMode::Raw {
             return;
         }
+        if !matches!(self.preview, PreviewDoc::None) && self.preview_text_rev == self.text_rev {
+            return;
+        }
 
         let src = crate::editor::buffer_text(&self.editor.content);
-        if matches!(self.preview, PreviewDoc::None) || src != self.preview_src {
-            self.preview = match kind {
-                PreviewKind::Markdown => {
-                    PreviewDoc::Markdown(std::sync::Arc::new(crate::preview::markdown::parse(&src)))
-                }
-                PreviewKind::Json => match crate::preview::json::parse(&src) {
-                    Ok(value) => PreviewDoc::Json(std::sync::Arc::new(value)),
-                    Err(e) => PreviewDoc::JsonError(e),
-                },
-            };
-            self.preview_src = src;
-            self.preview_rev += 1;
-        }
+        self.preview = match kind {
+            PreviewKind::Markdown => {
+                PreviewDoc::Markdown(std::sync::Arc::new(crate::preview::markdown::parse(&src)))
+            }
+            PreviewKind::Json => match crate::preview::json::parse(&src) {
+                Ok(value) => PreviewDoc::Json(std::sync::Arc::new(value)),
+                Err(e) => PreviewDoc::JsonError(e),
+            },
+        };
+        self.preview_text_rev = self.text_rev;
+        self.preview_rev += 1;
+    }
+
+    /// Shows a formatter's failure: the whole output in the panel, a short
+    /// note in the status bar.
+    fn show_format_error(&mut self, error: String) {
+        let short = crate::formatter::short_error(&error);
+        self.format_error = Some(error);
+        self.show_error_panel = true;
+        self.set_status(format!("{}: {short}", t!("status.format_error")), true);
+    }
+
+    /// The file the formatter should believe it is formatting, so it finds
+    /// the project's configuration next to it. `None` for an unsaved buffer.
+    fn format_target(&self) -> Option<PathBuf> {
+        self.current_file.clone().filter(|p| !is_untitled(p))
+    }
+
+    /// Opens the "Save as" dialog; the chosen path comes back as `SaveAsChosen`.
+    fn start_save_as(&self, origin: Option<PathBuf>) -> Task<Message> {
+        let suggestion = origin.clone().filter(|p| !is_untitled(p));
+        let name = origin.as_deref().map(file_label);
+        Task::perform(pick_save_path(suggestion, name), move |result| {
+            Message::SaveAsChosen(origin.clone(), result)
+        })
+    }
+}
+
+/// The first line of the buffer (capped), to recognize a `#!` script.
+fn first_line_of(content: &crate::code_editor::Content) -> String {
+    content
+        .line(0)
+        .map(|l| l.chars().take(200).collect())
+        .unwrap_or_default()
+}
+
+/// The largest char boundary of `s` at or before `index`.
+fn floor_boundary(s: &str, index: usize) -> usize {
+    let mut index = index.min(s.len());
+    while !s.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
+/// A selection over several lines: (line, byte column) of both ends.
+#[derive(Debug, Clone, Copy)]
+struct Span {
+    start: (usize, usize),
+    end: (usize, usize),
+}
+
+impl Span {
+    /// The lines a line command touches: a selection ending at the very
+    /// start of a line doesn't include it.
+    fn lines(self) -> (usize, usize) {
+        let last = if self.end.1 == 0 && self.end.0 > self.start.0 {
+            self.end.0 - 1
+        } else {
+            self.end.0
+        };
+        (self.start.0, last)
+    }
+}
+
+fn nth_line(text: &str, index: usize) -> &str {
+    text.split('\n').nth(index).unwrap_or("")
+}
+
+/// A column of `old_line` as it reads in `new_line` after an edit that
+/// changed the line's length at its start.
+fn remap_col(old_line: &str, new_line: &str, col: usize) -> usize {
+    if col == 0 {
+        return 0;
+    }
+    let delta = new_line.len() as isize - old_line.len() as isize;
+    let col = (col as isize + delta).clamp(0, new_line.len() as isize) as usize;
+    floor_boundary(new_line, col)
+}
+
+fn remap_span(old: &str, new: &str, span: Span, line_shift: isize) -> Span {
+    let map = |(line, col): (usize, usize)| {
+        let new_line = (line as isize + line_shift).max(0) as usize;
+        (
+            new_line,
+            remap_col(nth_line(old, line), nth_line(new, new_line), col),
+        )
+    };
+    Span {
+        start: map(span.start),
+        end: map(span.end),
     }
 }
 
@@ -2127,17 +2972,21 @@ impl SimpleEditApp {
     ) -> Element<'_, Message> {
         let search = self.show_search.then_some(&self.search);
         let marks = self.bookmark_lines();
+        // The context menu's actions (select/cut/copy/paste/format) all act on
+        // the raw buffer: it wraps the editor only — not the preview beside
+        // it, and not the preview alone, where it would act on text the user
+        // can't see.
+        let editor = || self.with_context_menu(self.editor.view(&self.config, search, marks), dark);
         if kind.is_none() {
-            return self.editor.view(&self.config, search, marks);
+            return editor();
         }
 
         match mode {
-            ViewMode::Raw => self.editor.view(&self.config, search, marks),
+            ViewMode::Raw => editor(),
             ViewMode::Preview => self.preview_view(dark),
             ViewMode::Split => row![
-                container(self.editor.view(&self.config, search, marks))
-                    .width(Length::FillPortion(54)),
-                container(Space::with_width(1))
+                container(editor()).width(Length::FillPortion(54)),
+                container(Space::new().width(1))
                     .height(Length::Fill)
                     .style(se_theme::rule(dark)),
                 container(self.preview_view(dark)).width(Length::FillPortion(46)),
@@ -2179,21 +3028,27 @@ impl SimpleEditApp {
                 button(text(t!("menu.edit_format").to_string()).size(12))
                     .padding([5, 11])
                     .on_press_maybe(has_formatter.then_some(Message::FormatFile))
-                    .style(iced::theme::Button::custom(se_theme::Outline { dark }))
+                    .style((se_theme::Outline { dark }).style())
                     .into()
             }
         };
 
         row![
-            text(name).size(13).font(se_theme::UI_SEMIBOLD),
-            text(dir).size(12).style(se_theme::muted_text(dark)),
-            Space::with_width(Length::Fill),
+            text(name)
+                .size(13)
+                .font(se_theme::UI_SEMIBOLD)
+                .shaping(iced::widget::text::Shaping::Advanced),
+            text(dir)
+                .size(12)
+                .color(se_theme::muted_text(dark))
+                .shaping(iced::widget::text::Shaping::Advanced),
+            Space::new().width(Length::Fill),
             right,
         ]
         .spacing(10)
         .padding([0, 14])
         .height(40)
-        .align_items(Alignment::Center)
+        .align_y(Alignment::Center)
         .into()
     }
 
@@ -2216,7 +3071,7 @@ impl SimpleEditApp {
             .as_deref()
             .map(crate::formatter::has_formatter)
             .unwrap_or(false);
-        let has_sel_ctx = self.editor.content.selection().is_some();
+        let has_sel_ctx = self.selection_info.is_some();
         let sh_select_all = self.config.shortcuts.select_all.display();
         let sh_format_all = self.config.shortcuts.format_code.display();
         // Cut/Copy/Paste are the platform's own keys, not configurable.
@@ -2307,7 +3162,7 @@ impl SimpleEditApp {
         let mut dirty: HashSet<PathBuf> = self
             .file_cache
             .iter()
-            .filter(|(_, entry)| entry.2)
+            .filter(|(_, entry)| entry.dirty)
             .map(|(path, _)| path.clone())
             .collect();
         if let (true, Some(current)) = (self.is_dirty, &self.current_file) {
@@ -2358,11 +3213,11 @@ impl SimpleEditApp {
                 column![
                     text(t!("preview.json_error").to_string())
                         .size(13)
-                        .style(se_theme::error_color(dark)),
+                        .color(se_theme::error_color(dark)),
                     text(err.clone())
                         .size(12)
                         .font(se_theme::MONO)
-                        .style(se_theme::muted_text(dark)),
+                        .color(se_theme::muted_text(dark)),
                 ]
                 .spacing(6),
             )
@@ -2370,7 +3225,7 @@ impl SimpleEditApp {
             .height(Length::Fill)
             .padding([16, 20])
             .into(),
-            PreviewDoc::None => container(Space::with_height(0))
+            PreviewDoc::None => container(Space::new().height(0))
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into(),
@@ -2378,669 +3233,54 @@ impl SimpleEditApp {
     }
 }
 
-// ─── Overlay views ──────────────────────────────────────────────────────────
+#[path = "app/file_io.rs"]
+mod file_io;
+use file_io::*;
+#[path = "app/views.rs"]
+mod views;
 
-impl SimpleEditApp {
-    fn language_picker_enabled(&self) -> bool {
-        match &self.current_file {
-            None => true,
-            Some(path) => {
-                if is_untitled(path) {
-                    return true;
-                }
-                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                // Enabled if the extension is NOT recognized (user must override)
-                !crate::editor::SUPPORTED_LANGUAGES
-                    .iter()
-                    .any(|(tok, _)| *tok == ext)
-            }
-        }
-    }
+#[cfg(test)]
+#[path = "app/tests.rs"]
+mod tests;
 
-    fn view_about_overlay(&self, dark: bool) -> Element<'_, Message> {
-        let p = se_theme::palette(dark);
-        let version = env!("CARGO_PKG_VERSION");
-        container(
-            column![
-                text("SimpleEdit").size(24).style(p.accent),
-                text(format!("v{}", version)).size(15).style(p.text),
-                text(t!("about.tagline").to_string())
-                    .size(12)
-                    .style(p.muted),
-                button(text(t!("about.close").to_string()).size(13))
-                    .padding([8, 24])
-                    .on_press(Message::CloseOverlay)
-                    .style(iced::theme::Button::custom(se_theme::GhostButton {
-                        dark,
-                        active: true,
-                    })),
-            ]
-            .spacing(12)
-            .align_items(Alignment::Center)
-            .padding(36)
-            .width(Length::Fill),
-        )
-        .width(320)
-        .style(se_theme::card(dark))
-        .into()
-    }
-
-    fn view_update_overlay(&self, dark: bool) -> Element<'_, Message> {
-        let p = se_theme::palette(dark);
-
-        let content: Element<'_, Message> = match &self.overlay {
-            ActiveOverlay::UpdateChecking => column![text(t!("update.checking").to_string())
-                .size(14)
-                .style(p.text),]
-            .spacing(12)
-            .align_items(Alignment::Center)
-            .padding(36)
-            .width(Length::Fill)
-            .into(),
-
-            ActiveOverlay::UpdateUpToDate => column![
-                text(t!("update.up_to_date").to_string())
-                    .size(16)
-                    .style(p.accent),
-                button(text(t!("about.close").to_string()).size(13))
-                    .padding([8, 24])
-                    .on_press(Message::CloseOverlay)
-                    .style(iced::theme::Button::custom(se_theme::GhostButton {
-                        dark,
-                        active: true,
-                    })),
-            ]
-            .spacing(12)
-            .align_items(Alignment::Center)
-            .padding(36)
-            .width(Length::Fill)
-            .into(),
-
-            ActiveOverlay::UpdateAvailable(version, notes) => {
-                let version = version.clone();
-                let mut body =
-                    column![
-                        text(t!("update.available", version = version.as_str()).to_string())
-                            .size(16)
-                            .style(p.accent)
-                    ]
-                    .spacing(16)
-                    .align_items(Alignment::Center);
-                if !notes.is_empty() {
-                    body = body.push(
-                        scrollable(changelog_list(dark, notes))
-                            .height(Length::Fixed(260.0))
-                            .width(Length::Fill),
-                    );
-                }
-                body.push(
-                    row![
-                        button(text(t!("about.close").to_string()).size(13))
-                            .padding([8, 20])
-                            .on_press(Message::CloseOverlay)
-                            .style(iced::theme::Button::custom(se_theme::GhostButton {
-                                dark,
-                                active: false,
-                            })),
-                        button(text(t!("update.download_install").to_string()).size(13))
-                            .padding([8, 20])
-                            .on_press(Message::ConfirmInstallUpdate(version))
-                            .style(iced::theme::Button::custom(se_theme::GhostButton {
-                                dark,
-                                active: true,
-                            })),
-                    ]
-                    .spacing(12),
-                )
-                .padding(28)
-                .width(Length::Fill)
-                .into()
-            }
-
-            ActiveOverlay::UpdateDownloading => column![text(t!("update.downloading").to_string())
-                .size(14)
-                .style(p.text),]
-            .spacing(12)
-            .align_items(Alignment::Center)
-            .padding(36)
-            .width(Length::Fill)
-            .into(),
-
-            ActiveOverlay::UpdateInstalling => column![text(t!("update.installing").to_string())
-                .size(14)
-                .style(p.text),]
-            .spacing(12)
-            .align_items(Alignment::Center)
-            .padding(36)
-            .width(Length::Fill)
-            .into(),
-
-            ActiveOverlay::UpdateError(e) => column![
-                text(t!("update.error").to_string())
-                    .size(14)
-                    .style(p.accent),
-                text(e.clone()).size(12).style(p.muted),
-                button(text(t!("about.close").to_string()).size(13))
-                    .padding([8, 24])
-                    .on_press(Message::CloseOverlay)
-                    .style(iced::theme::Button::custom(se_theme::GhostButton {
-                        dark,
-                        active: false,
-                    })),
-            ]
-            .spacing(12)
-            .align_items(Alignment::Center)
-            .padding(36)
-            .width(Length::Fill)
-            .into(),
-
-            _ => unreachable!(),
-        };
-
-        let width = if matches!(&self.overlay, ActiveOverlay::UpdateAvailable(_, n) if !n.is_empty())
-        {
-            480
-        } else {
-            360
-        };
-        container(content)
-            .width(width)
-            .style(se_theme::card(dark))
-            .into()
-    }
-
-    /// Records the running version; right after an update, opens the notes
-    /// of what it brought.
-    fn announce_new_version(&mut self) {
-        let current = env!("CARGO_PKG_VERSION");
-        let previous = std::mem::replace(&mut self.config.last_version, current.to_string());
-        if previous == current {
-            return;
-        }
-        self.config_dirty = true;
-        let upgraded = !previous.is_empty()
-            && !crate::changelog::between(crate::changelog::embedded(), &previous, current)
-                .is_empty();
-        if upgraded && self.overlay == ActiveOverlay::None {
-            self.overlay = ActiveOverlay::WhatsNew(previous);
-        }
-    }
-
-    /// The changelog in a card; `since` limits it to the releases after that
-    /// version.
-    fn changelog_card(
-        &self,
-        dark: bool,
-        title: String,
-        since: Option<&str>,
-    ) -> Element<'_, Message> {
-        let p = se_theme::palette(dark);
-        let mut entries = crate::changelog::embedded();
-        if let Some(since) = since {
-            entries = crate::changelog::between(entries, since, env!("CARGO_PKG_VERSION"));
-        }
-        container(
-            column![
-                text(title).size(18).style(p.accent),
-                scrollable(changelog_list(dark, &entries))
-                    .height(Length::Fixed(380.0))
-                    .width(Length::Fill),
-                button(text(t!("about.close").to_string()).size(13))
-                    .padding([8, 24])
-                    .on_press(Message::CloseOverlay)
-                    .style(iced::theme::Button::custom(se_theme::GhostButton {
-                        dark,
-                        active: true,
-                    })),
-            ]
-            .spacing(16)
-            .align_items(Alignment::Center)
-            .padding(28)
-            .width(Length::Fill),
-        )
-        .width(520)
-        .style(se_theme::card(dark))
-        .into()
-    }
-
-    fn view_confirm_overlay(&self, dark: bool, path: &Path) -> Element<'_, Message> {
-        let name = file_label(path);
-        confirm_card(
-            dark,
-            t!("confirm.title").to_string(),
-            t!("confirm.message", name = name.as_str()).to_string(),
-            t!("confirm.discard").to_string(),
-            Message::ConfirmDiscard(path.to_path_buf()),
-        )
-    }
-
-    fn view_overwrite_overlay(&self, dark: bool, path: &Path) -> Element<'_, Message> {
-        let name = file_label(path);
-        confirm_card(
-            dark,
-            t!("overwrite.title").to_string(),
-            t!("overwrite.message", name = name.as_str()).to_string(),
-            t!("overwrite.confirm").to_string(),
-            Message::ConfirmOverwrite,
-        )
-    }
-
-    fn view_goto_line_overlay(&self, dark: bool) -> Element<'_, Message> {
-        let p = se_theme::palette(dark);
-        container(
-            column![
-                text(t!("goto_line.title").to_string())
-                    .size(14)
-                    .style(p.text),
-                text_input(t!("goto_line.placeholder").as_ref(), &self.goto_line_input)
-                    .id(goto_line_id())
-                    .on_input(Message::GotoLineInputChanged)
-                    .on_submit(Message::GotoLineSubmit)
-                    .padding([8, 10])
-                    .size(14)
-                    .style(iced::theme::TextInput::Custom(Box::new(
-                        se_theme::Field::new(dark),
-                    ))),
-                row![
-                    button(text(t!("goto_line.cancel").to_string()).size(13))
-                        .padding([7, 16])
-                        .on_press(Message::CloseOverlay)
-                        .style(iced::theme::Button::custom(se_theme::GhostButton {
-                            dark,
-                            active: false,
-                        })),
-                    Space::with_width(Length::Fill),
-                    button(text(t!("goto_line.go").to_string()).size(13))
-                        .padding([7, 16])
-                        .on_press(Message::GotoLineSubmit)
-                        .style(iced::theme::Button::custom(se_theme::GhostButton {
-                            dark,
-                            active: true,
-                        })),
-                ]
-                .align_items(Alignment::Center),
-            ]
-            .spacing(14)
-            .padding(24),
-        )
-        .width(320)
-        .style(se_theme::card(dark))
-        .into()
-    }
-
-    fn view_language_picker_overlay(&self, dark: bool) -> Element<'_, Message> {
-        let p = se_theme::palette(dark);
-        let current_lang = self.editor.language.as_deref().unwrap_or("");
-
-        let mut items: Vec<Element<Message>> = vec![
-            // "None / auto" row
-            button(
-                row![
-                    text(t!("language.auto").to_string()).size(13),
-                    Space::with_width(Length::Fill),
-                    if current_lang.is_empty() {
-                        text("✓")
-                            .size(13)
-                            .style(p.accent)
-                            .shaping(iced::widget::text::Shaping::Advanced)
-                    } else {
-                        text("").size(13)
-                    },
-                ]
-                .align_items(Alignment::Center),
-            )
-            .padding([6, 12])
-            .width(Length::Fill)
-            .on_press(Message::SetLanguage(String::new()))
-            .style(iced::theme::Button::custom(se_theme::GhostButton {
-                dark,
-                active: current_lang.is_empty(),
-            }))
-            .into(),
-        ];
-
-        for (token, name) in crate::editor::SUPPORTED_LANGUAGES {
-            let is_current = current_lang == *token;
-            items.push(
-                button(
-                    row![
-                        text(*name).size(13),
-                        Space::with_width(Length::Fill),
-                        if is_current {
-                            text("✓")
-                                .size(13)
-                                .style(p.accent)
-                                .shaping(iced::widget::text::Shaping::Advanced)
-                        } else {
-                            text("").size(13)
-                        },
-                    ]
-                    .align_items(Alignment::Center),
-                )
-                .padding([6, 12])
-                .width(Length::Fill)
-                .on_press(Message::SetLanguage(token.to_string()))
-                .style(iced::theme::Button::custom(se_theme::GhostButton {
-                    dark,
-                    active: is_current,
-                }))
-                .into(),
-            );
-        }
-
-        container(
-            column![
-                text(t!("language.title").to_string())
-                    .size(14)
-                    .style(p.text),
-                scrollable(column(items).spacing(2).padding(4)).height(Length::Fixed(320.0)),
-            ]
-            .spacing(10)
-            .padding(16),
-        )
-        .width(260)
-        .style(se_theme::card(dark))
-        .into()
-    }
-
-    /// Help > Configure shortcuts: the same list as the Preferences page.
-    fn view_shortcuts_overlay(&self, dark: bool) -> Element<'_, Message> {
-        let p = se_theme::palette(dark);
-
-        container(
-            column![
-                row![
-                    text(t!("shortcuts.title").to_string())
-                        .size(14)
-                        .font(se_theme::UI_SEMIBOLD)
-                        .style(p.text),
-                    Space::with_width(Length::Fill),
-                    button(text("×").size(17))
-                        .padding([4, 8])
-                        .on_press(Message::CloseOverlay)
-                        .style(iced::theme::Button::custom(se_theme::GhostButton {
-                            dark,
-                            active: false,
-                        })),
-                ]
-                .align_items(Alignment::Center),
-                scrollable(crate::preferences::shortcuts_list(
-                    dark,
-                    &self.config,
-                    self.capturing,
-                ))
-                .style(iced::theme::Scrollable::Custom(Box::new(
-                    se_theme::Scrollbar { dark },
-                )))
-                .height(Length::Fixed(420.0)),
-            ]
-            .spacing(12)
-            .padding(20),
-        )
-        .width(460)
-        .style(se_theme::card(dark))
-        .into()
-    }
-
-    // ─── Session persistence ─────────────────────────────────────────────────
-
-    fn save_session(&mut self) {
-        use crate::session::{FileSession, Session};
-        self.bookmarks.save();
-        let files: Vec<FileSession> = self
-            .sidebar
-            .files()
-            .iter()
-            .map(|path| {
-                let (content, language, dirty) = if self.current_file.as_ref() == Some(path) {
-                    (
-                        crate::editor::buffer_text(&self.editor.content),
-                        self.editor.language.clone(),
-                        self.is_dirty,
-                    )
-                } else if let Some((c, l, d)) = self.file_cache.get(path) {
-                    (c.clone(), l.clone(), *d)
-                } else {
-                    (String::new(), None, false)
-                };
-                FileSession {
-                    path: path.to_str().unwrap_or("").to_string(),
-                    content: if is_untitled(path) || dirty {
-                        Some(content)
-                    } else {
-                        None
-                    },
-                    language,
-                    dirty,
-                }
-            })
-            .collect();
-
-        let session = Session {
-            files,
-            active_file: self
-                .current_file
-                .as_ref()
-                .and_then(|p| p.to_str())
-                .map(|s| s.to_string()),
-            untitled_counter: self.untitled_counter,
-        };
-        // Skip the write when nothing changed since the last one.
-        if let Some(json) = session.to_json() {
-            if json != self.last_session {
-                Session::write(&json);
-                self.last_session = json;
-            }
-        }
-    }
-
-    fn restore_session(&mut self, session: crate::session::Session) {
-        self.untitled_counter = session.untitled_counter.max(1);
-
-        for fs in &session.files {
-            let path = PathBuf::from(&fs.path);
-            let content = if let Some(c) = &fs.content {
-                c.clone()
-            } else if !is_untitled(&path) {
-                // A file deleted since the last run is dropped, not shown empty.
-                match std::fs::read_to_string(&path) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                }
-            } else {
-                String::new()
-            };
-            self.sidebar.add_file(path.clone());
-            self.file_cache
-                .insert(path, (content, fs.language.clone(), fs.dirty));
-        }
-
-        if self.sidebar.files().is_empty() {
-            // First launch (or nothing restorable): a blank untitled file
-            let path = untitled_path(1);
-            self.sidebar.add_file(path.clone());
-            self.current_file = Some(path);
-            self.untitled_counter = 1;
-            return;
-        }
-
-        // Activate the previously active file, or the first one left
-        let active_path = session
-            .active_file
-            .as_deref()
-            .map(PathBuf::from)
-            .filter(|p| self.file_cache.contains_key(p))
-            .or_else(|| self.sidebar.files().first().cloned());
-
-        if let Some(path) = active_path {
-            if let Some((content, language, dirty)) = self.file_cache.remove(&path) {
-                self.load_buffer(path, content, language, dirty);
-            }
-        }
-    }
-}
-
-// ─── Text manipulation helpers ──────────────────────────────────────────────
-
-/// The line-comment markers for a language token: (prefix, suffix). `None`
-/// for formats that have no comments at all.
-pub fn comment_style(language: Option<&str>) -> Option<(&'static str, &'static str)> {
-    match language {
-        Some("json") => None,
-        Some("html") | Some("xml") | Some("md") => Some(("<!-- ", " -->")),
-        Some("css") => Some(("/* ", " */")),
-        Some("py") | Some("rb") | Some("sh") | Some("r") | Some("toml") | Some("yaml") => {
-            Some(("# ", ""))
-        }
-        Some("sql") | Some("lua") => Some(("-- ", "")),
-        _ => Some(("// ", "")),
-    }
-}
-
-pub fn duplicate_line(text: &str, line_idx: usize) -> String {
-    let mut lines: Vec<String> = text.split('\n').map(|l| l.to_string()).collect();
-    if line_idx < lines.len() {
-        let copy = lines[line_idx].clone();
-        lines.insert(line_idx + 1, copy);
-    }
-    lines.join("\n")
-}
-
-/// Returns (new_text, new_cursor_line).
-pub fn move_line(text: &str, line_idx: usize, up: bool) -> (String, usize) {
-    let mut lines: Vec<String> = text.split('\n').map(|l| l.to_string()).collect();
-    if up {
-        if line_idx == 0 {
-            return (text.to_string(), line_idx);
-        }
-        lines.swap(line_idx, line_idx - 1);
-        (lines.join("\n"), line_idx - 1)
+/// What a tab is called: the file name, or "Untitled N".
+pub fn display_name(path: &Path) -> String {
+    if is_untitled(path) {
+        let n = path
+            .to_str()
+            .unwrap_or("")
+            .trim_start_matches("untitled://");
+        format!("{} {}", t!("app.untitled"), n)
     } else {
-        if line_idx + 1 >= lines.len() {
-            return (text.to_string(), line_idx);
-        }
-        lines.swap(line_idx, line_idx + 1);
-        (lines.join("\n"), line_idx + 1)
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "?".to_string())
     }
-}
-
-/// Returns (new_text, new_cursor_line).
-pub fn delete_line_op(text: &str, line_idx: usize) -> (String, usize) {
-    let mut lines: Vec<String> = text.split('\n').map(|l| l.to_string()).collect();
-    if line_idx >= lines.len() {
-        return (text.to_string(), line_idx);
-    }
-    lines.remove(line_idx);
-    let new_line = if lines.is_empty() {
-        0
-    } else {
-        line_idx.min(lines.len() - 1)
-    };
-    (lines.join("\n"), new_line)
-}
-
-fn is_commented(trimmed: &str, prefix: &str, suffix: &str) -> bool {
-    trimmed.starts_with(prefix.trim_end())
-        && (suffix.is_empty() || trimmed.ends_with(suffix.trim_start()))
-}
-
-/// Comments lines `first..=last`, or uncomments them if every non-blank one
-/// already is. Markers match with or without their padding space.
-pub fn toggle_comment_lines(
-    text: &str,
-    first: usize,
-    last: usize,
-    prefix: &str,
-    suffix: &str,
-) -> String {
-    let mut lines: Vec<String> = text.split('\n').map(|l| l.to_string()).collect();
-    let last = last.min(lines.len().saturating_sub(1));
-    if first > last {
-        return text.to_string();
-    }
-    let range = first..=last;
-    let all_commented = lines[range.clone()]
-        .iter()
-        .filter(|l| !l.trim().is_empty())
-        .all(|l| is_commented(l.trim(), prefix, suffix))
-        && lines[range.clone()].iter().any(|l| !l.trim().is_empty());
-
-    for line in &mut lines[range] {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
-        let content = line.trim();
-        *line = if all_commented {
-            let mut inner = content.strip_prefix(prefix.trim_end()).unwrap_or(content);
-            inner = inner.strip_prefix(' ').unwrap_or(inner);
-            if !suffix.is_empty() {
-                inner = inner.strip_suffix(suffix.trim_start()).unwrap_or(inner);
-                inner = inner.strip_suffix(' ').unwrap_or(inner);
-            }
-            format!("{indent}{inner}")
-        } else {
-            format!("{indent}{prefix}{content}{suffix}")
-        };
-    }
-    lines.join("\n")
-}
-
-/// Adds one `indent` to every non-empty line in `first..=last`.
-pub fn indent_lines(text: &str, first: usize, last: usize, indent: &str) -> String {
-    text.split('\n')
-        .enumerate()
-        .map(|(i, line)| {
-            if (first..=last).contains(&i) && !line.is_empty() {
-                format!("{indent}{line}")
-            } else {
-                line.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Removes up to one `indent` (or a tab) from the start of a line.
-fn dedent_one(line: &str, indent: &str) -> String {
-    if let Some(stripped) = line.strip_prefix(indent) {
-        stripped.to_string()
-    } else if let Some(stripped) = line.strip_prefix('\t') {
-        stripped.to_string()
-    } else {
-        let n = line
-            .chars()
-            .take(indent.len())
-            .take_while(|c| *c == ' ')
-            .count();
-        line[n..].to_string()
-    }
-}
-
-/// Removes one level of indentation from every line in `first..=last`.
-pub fn dedent_lines(text: &str, first: usize, last: usize, indent: &str) -> String {
-    text.split('\n')
-        .enumerate()
-        .map(|(i, line)| {
-            if (first..=last).contains(&i) {
-                dedent_one(line, indent)
-            } else {
-                line.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn file_label(path: &Path) -> String {
-    if is_untitled(path) {
-        t!("app.untitled").to_string()
-    } else {
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("?")
-            .to_string()
-    }
+    display_name(path)
+}
+
+/// `display_name` of each path, with the parent folder added to the ones
+/// that would otherwise read the same.
+pub fn unique_labels(paths: &[PathBuf]) -> Vec<String> {
+    let names: Vec<String> = paths.iter().map(|p| display_name(p)).collect();
+    paths
+        .iter()
+        .zip(&names)
+        .map(|(path, name)| {
+            let twins = names.iter().filter(|n| *n == name).count();
+            let parent = path
+                .parent()
+                .and_then(|d| d.file_name())
+                .map(|d| d.to_string_lossy().into_owned());
+            match parent {
+                Some(parent) if twins > 1 && !is_untitled(path) => format!("{name} — {parent}"),
+                _ => name.clone(),
+            }
+        })
+        .collect()
 }
 
 /// A small modal asking to confirm a destructive action (or cancel).
@@ -3054,26 +3294,29 @@ fn confirm_card(
     let p = se_theme::palette(dark);
     container(
         column![
-            text(title).size(15).style(p.text),
-            text(message).size(12).style(p.muted),
+            text(title).size(15).color(p.text),
+            text(message)
+                .size(12)
+                .color(p.muted)
+                .shaping(iced::widget::text::Shaping::Advanced),
             row![
                 button(text(t!("confirm.cancel").to_string()).size(13))
                     .padding([7, 16])
                     .on_press(Message::CloseOverlay)
-                    .style(iced::theme::Button::custom(se_theme::GhostButton {
-                        dark,
-                        active: true,
-                    })),
-                Space::with_width(Length::Fill),
+                    .style((se_theme::GhostButton { dark, active: true }).style()),
+                Space::new().width(Length::Fill),
                 button(text(confirm_label).size(13))
                     .padding([7, 16])
                     .on_press(confirm)
-                    .style(iced::theme::Button::custom(se_theme::GhostButton {
-                        dark,
-                        active: false,
-                    })),
+                    .style(
+                        (se_theme::GhostButton {
+                            dark,
+                            active: false,
+                        })
+                        .style()
+                    ),
             ]
-            .align_items(Alignment::Center),
+            .align_y(Alignment::Center),
         ]
         .spacing(14)
         .padding(24),
@@ -3085,7 +3328,7 @@ fn confirm_card(
 
 /// A 1px horizontal hairline.
 fn rule<'a>(dark: bool) -> Element<'a, Message> {
-    container(Space::with_height(1))
+    container(Space::new().height(1))
         .width(Length::Fill)
         .style(se_theme::rule(dark))
         .into()
@@ -3120,8 +3363,8 @@ fn short_dir(dir: &Path) -> String {
 /// Longest folder path shown in the toolbar, in characters.
 const MAX_DIR_CHARS: usize = 56;
 
-fn goto_line_id() -> text_input::Id {
-    text_input::Id::new("goto-line")
+fn goto_line_id() -> iced::widget::Id {
+    iced::widget::Id::new("goto-line")
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -3136,310 +3379,30 @@ pub fn is_untitled(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-// ─── File I/O ────────────────────────────────────────────────────────────────
-
-/// Reads a text file, refusing ones too large to edit comfortably.
-fn read_text(path: &Path) -> Result<String, String> {
-    let len = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
-    if len > MAX_OPEN_BYTES {
-        return Err(t!("status.err_too_large", mb = MAX_OPEN_BYTES / (1024 * 1024)).to_string());
-    }
-    std::fs::read_to_string(path).map_err(|e| e.to_string())
-}
-
-async fn open_file() -> Result<(PathBuf, String), String> {
-    let handle = rfd::AsyncFileDialog::new()
-        .set_title(t!("dialog.open_title").to_string())
-        .add_filter(
-            t!("dialog.filter_supported").to_string(),
-            &[
-                "txt",
-                "md",
-                "markdown",
-                "rst",
-                "rs",
-                "toml",
-                "lock",
-                "py",
-                "pyw",
-                "js",
-                "jsx",
-                "mjs",
-                "cjs",
-                "ts",
-                "tsx",
-                "html",
-                "htm",
-                "xhtml",
-                "css",
-                "scss",
-                "sass",
-                "less",
-                "json",
-                "json5",
-                "jsonc",
-                "yaml",
-                "yml",
-                "xml",
-                "svg",
-                "plist",
-                "sh",
-                "bash",
-                "zsh",
-                "fish",
-                "ps1",
-                "c",
-                "h",
-                "cpp",
-                "cc",
-                "cxx",
-                "hpp",
-                "hh",
-                "java",
-                "go",
-                "rb",
-                "php",
-                "swift",
-                "kt",
-                "kts",
-                "sql",
-                "lua",
-                "r",
-                "m",
-                "vb",
-                "cs",
-                "makefile",
-                "dockerfile",
-                "gitignore",
-                "env",
-                "conf",
-                "cfg",
-                "ini",
-                "properties",
-                "log",
-            ],
-        )
-        .add_filter(
-            t!("dialog.filter_text").to_string(),
-            &["txt", "md", "rst", "log"],
-        )
-        .add_filter(
-            t!("dialog.filter_source").to_string(),
-            &[
-                "rs", "py", "js", "ts", "jsx", "tsx", "c", "h", "cpp", "java", "go", "rb", "php",
-                "swift", "kt", "lua", "sql",
-            ],
-        )
-        .add_filter(
-            t!("dialog.filter_web").to_string(),
-            &["html", "htm", "css", "scss", "json", "xml", "svg"],
-        )
-        .add_filter(
-            t!("dialog.filter_config").to_string(),
-            &["toml", "yaml", "yml", "ini", "cfg", "conf", "env"],
-        )
-        .add_filter(t!("dialog.filter_all").to_string(), &["*"])
-        .pick_file()
-        .await
-        .ok_or_else(|| CANCELLED.to_string())?;
-
-    read_file(handle.path().to_path_buf()).await
-}
-
-async fn read_file(path: PathBuf) -> Result<(PathBuf, String), String> {
-    tokio::task::spawn_blocking(move || read_text(&path).map(|content| (path, content)))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-/// Writes `content` atomically; returns the path and exactly what was written.
-async fn save_file(path: PathBuf, content: String) -> Result<(PathBuf, String), String> {
-    tokio::task::spawn_blocking(move || {
-        crate::fsutil::write_atomic(&path, content.as_bytes(), false)
-            .map(|()| (path, content))
-            .map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())?
-}
-
-async fn save_file_as(content: String) -> Result<(PathBuf, String), String> {
-    let handle = rfd::AsyncFileDialog::new()
-        .set_title(t!("dialog.save_title").to_string())
-        .save_file()
-        .await
-        .ok_or_else(|| CANCELLED.to_string())?;
-
-    save_file(handle.path().to_path_buf(), content).await
-}
-
-/// Runs a save and reports it together with the tab it started from.
-fn save_command(
-    origin: Option<PathBuf>,
-    save: impl std::future::Future<Output = Result<(PathBuf, String), String>> + Send + 'static,
-) -> Command<Message> {
-    Command::perform(save, move |result| {
-        Message::FileSaved(origin.clone(), result)
-    })
-}
-
-#[cfg(test)]
-mod text_ops_tests {
-    use super::*;
-
-    #[test]
-    fn duplicate_line_middle() {
-        let text = "line1\nline2\nline3";
-        let result = duplicate_line(text, 1);
-        assert_eq!(result, "line1\nline2\nline2\nline3");
-    }
-
-    #[test]
-    fn duplicate_line_first() {
-        let text = "abc\ndef";
-        let result = duplicate_line(text, 0);
-        assert_eq!(result, "abc\nabc\ndef");
-    }
-
-    #[test]
-    fn move_line_up_basic() {
-        let text = "aaa\nbbb\nccc";
-        let (result, new_line) = move_line(text, 1, true);
-        assert_eq!(result, "bbb\naaa\nccc");
-        assert_eq!(new_line, 0);
-    }
-
-    #[test]
-    fn move_line_up_noop_at_top() {
-        let text = "aaa\nbbb";
-        let (result, new_line) = move_line(text, 0, true);
-        assert_eq!(result, "aaa\nbbb");
-        assert_eq!(new_line, 0);
-    }
-
-    #[test]
-    fn move_line_down_basic() {
-        let text = "aaa\nbbb\nccc";
-        let (result, new_line) = move_line(text, 0, false);
-        assert_eq!(result, "bbb\naaa\nccc");
-        assert_eq!(new_line, 1);
-    }
-
-    #[test]
-    fn delete_line_middle() {
-        let text = "aaa\nbbb\nccc";
-        let (result, new_line) = delete_line_op(text, 1);
-        assert_eq!(result, "aaa\nccc");
-        assert_eq!(new_line, 1);
-    }
-
-    #[test]
-    fn delete_line_last() {
-        let text = "aaa\nbbb";
-        let (result, new_line) = delete_line_op(text, 1);
-        assert_eq!(result, "aaa");
-        assert_eq!(new_line, 0);
-    }
-
-    #[test]
-    fn toggle_comment_add_and_remove_roundtrip() {
-        let text = "    let x = 1;";
-        let on = toggle_comment_lines(text, 0, 0, "// ", "");
-        assert_eq!(on, "    // let x = 1;");
-        assert_eq!(toggle_comment_lines(&on, 0, 0, "// ", ""), text);
-    }
-
-    #[test]
-    fn uncomment_accepts_markers_without_the_padding_space() {
-        assert_eq!(toggle_comment_lines("//foo", 0, 0, "// ", ""), "foo");
-        assert_eq!(toggle_comment_lines("#foo", 0, 0, "# ", ""), "foo");
-    }
-
-    #[test]
-    fn toggle_comment_covers_a_line_range_and_skips_blank_lines() {
-        let text = "a\n\nb\nc";
-        let on = toggle_comment_lines(text, 0, 2, "// ", "");
-        assert_eq!(on, "// a\n\n// b\nc");
-        assert_eq!(toggle_comment_lines(&on, 0, 2, "// ", ""), text);
-        // A mixed selection comments everything first.
-        assert_eq!(
-            toggle_comment_lines("// a\nb", 0, 1, "// ", ""),
-            "// // a\n// b"
-        );
-    }
-
-    #[test]
-    fn block_comment_styles_wrap_the_line() {
-        let on = toggle_comment_lines("p { }", 0, 0, "/* ", " */");
-        assert_eq!(on, "/* p { } */");
-        assert_eq!(toggle_comment_lines(&on, 0, 0, "/* ", " */"), "p { }");
-    }
-
-    #[test]
-    fn indent_lines_only_touches_the_range() {
-        let text = "a\n\nb\nc";
-        assert_eq!(indent_lines(text, 0, 2, "  "), "  a\n\n  b\nc");
-    }
-
-    #[test]
-    fn dedent_lines_basic_and_partial() {
-        assert_eq!(dedent_lines("    a\n    b", 0, 1, "    "), "a\nb");
-        assert_eq!(dedent_lines("  a\nb\n\tc", 0, 2, "    "), "a\nb\nc");
-        assert_eq!(dedent_lines("    a\n    b", 0, 0, "    "), "a\n    b");
-    }
-
-    #[test]
-    fn comment_style_by_language() {
-        assert_eq!(comment_style(Some("rs")), Some(("// ", "")));
-        assert_eq!(comment_style(Some("py")), Some(("# ", "")));
-        assert_eq!(comment_style(Some("sql")), Some(("-- ", "")));
-        assert_eq!(comment_style(Some("css")), Some(("/* ", " */")));
-        assert_eq!(comment_style(Some("html")), Some(("<!-- ", " -->")));
-        assert_eq!(comment_style(Some("json")), None);
-        assert_eq!(comment_style(None), Some(("// ", "")));
-    }
-}
-
-#[cfg(test)]
-mod short_dir_tests {
-    use super::*;
-
-    #[test]
-    fn a_long_folder_keeps_its_end_within_the_limit() {
-        let dir = Path::new("/very/long/folder/name")
-            .join("x".repeat(80))
-            .join("project");
-        let shown = short_dir(&dir);
-        assert_eq!(shown.chars().count(), MAX_DIR_CHARS);
-        assert!(shown.starts_with('…'));
-        assert!(shown.ends_with("/project/"));
-    }
-
-    #[test]
-    fn a_short_folder_is_left_alone() {
-        assert_eq!(short_dir(Path::new("/tmp/a")), "/tmp/a/");
-    }
-}
-
 /// Releases as a column: version and date, then each section and its changes.
 fn changelog_list<'a>(dark: bool, entries: &[crate::changelog::Entry]) -> Element<'a, Message> {
     let p = se_theme::palette(dark);
     let mut list = column![]
         .spacing(6)
         .width(Length::Fill)
-        .padding([0, 12, 0, 0]);
+        .padding(iced::Padding {
+            top: 0.0,
+            right: 12.0,
+            bottom: 0.0,
+            left: 0.0,
+        });
     for entry in entries {
-        list = list.push(Space::with_height(8));
+        list = list.push(Space::new().height(8));
         let head = if entry.date.is_empty() {
             format!("v{}", entry.version)
         } else {
             format!("v{} · {}", entry.version, entry.date)
         };
-        list = list.push(text(head).size(15).style(p.text));
+        list = list.push(text(head).size(15).color(p.text));
         for (title, changes) in &entry.sections {
-            list = list.push(text(title.clone()).size(12).style(p.accent));
+            list = list.push(text(title.clone()).size(12).color(p.accent));
             for change in changes {
-                list = list.push(text(format!("•  {change}")).size(13).style(p.muted));
+                list = list.push(text(format!("•  {change}")).size(13).color(p.muted));
             }
         }
     }

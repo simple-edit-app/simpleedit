@@ -1,266 +1,79 @@
-//! A card that floats over the top-right corner of some content.
-//!
-//! `iced_aw`'s `FloatingElement` does the same but its overlay never passes
-//! widget operations (focus, "which field has the keyboard") on to the
-//! floating element, so a text input inside it can't be focused from code.
-//! This one does.
+//! Layers over some content: a card in its top-right corner, a dropdown at a
+//! given point, a modal with a dimmed backdrop; plus a wrapper that reports
+//! where a right click landed.
 
 use iced::advanced::layout::{Layout, Limits, Node};
-use iced::advanced::overlay::{self, Group};
 use iced::advanced::widget::{Operation, Tree};
-use iced::advanced::{mouse, renderer, Clipboard, Shell, Widget};
-use iced::{event, Element, Event, Length, Point, Rectangle, Size, Vector};
+use iced::advanced::{mouse, overlay, renderer, Clipboard, Shell, Widget};
+use iced::widget::{container, mouse_area, opaque, stack};
+use iced::{Element, Event, Length, Padding, Point, Rectangle, Size, Vector};
 
 /// `underlay` with `card` floating `top` px below its top edge and `right`
 /// px inside its right edge.
-pub struct TopRight<'a, Message> {
-    underlay: Element<'a, Message>,
-    card: Element<'a, Message>,
+pub fn top_right<'a, Message: 'a>(
+    underlay: impl Into<Element<'a, Message>>,
+    card: impl Into<Element<'a, Message>>,
     top: f32,
     right: f32,
+) -> Element<'a, Message> {
+    stack![
+        underlay.into(),
+        container(card.into())
+            .width(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Right)
+            .padding(Padding {
+                top,
+                right,
+                ..Padding::ZERO
+            })
+    ]
+    .into()
 }
 
-impl<'a, Message> TopRight<'a, Message> {
-    pub fn new(
-        underlay: impl Into<Element<'a, Message>>,
-        card: impl Into<Element<'a, Message>>,
-        top: f32,
-        right: f32,
-    ) -> Self {
-        Self {
-            underlay: underlay.into(),
-            card: card.into(),
-            top,
-            right,
-        }
-    }
+/// `content` floating over `underlay`, its top-left corner at (`x`, `y`).
+pub fn at_point<'a, Message: 'a>(
+    underlay: impl Into<Element<'a, Message>>,
+    content: impl Into<Element<'a, Message>>,
+    x: f32,
+    y: f32,
+) -> Element<'a, Message> {
+    stack![
+        underlay.into(),
+        container(content.into()).padding(Padding {
+            top: y.max(0.0),
+            left: x.max(0.0),
+            ..Padding::ZERO
+        })
+    ]
+    .into()
 }
 
-impl<'a, Message: 'a> Widget<Message, iced::Theme, iced::Renderer> for TopRight<'a, Message> {
-    fn children(&self) -> Vec<Tree> {
-        vec![Tree::new(&self.underlay), Tree::new(&self.card)]
-    }
-
-    fn diff(&self, tree: &mut Tree) {
-        tree.diff_children(&[&self.underlay, &self.card]);
-    }
-
-    fn size(&self) -> Size<Length> {
-        self.underlay.as_widget().size()
-    }
-
-    // Not the default (`size`): a `lazy` underlay has no element yet while
-    // the view is being built, and its `size` would panic.
-    fn size_hint(&self) -> Size<Length> {
-        self.underlay.as_widget().size_hint()
-    }
-
-    fn layout(&self, tree: &mut Tree, renderer: &iced::Renderer, limits: &Limits) -> Node {
-        self.underlay
-            .as_widget()
-            .layout(&mut tree.children[0], renderer, limits)
-    }
-
-    fn on_event(
-        &mut self,
-        tree: &mut Tree,
-        event: Event,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        renderer: &iced::Renderer,
-        clipboard: &mut dyn Clipboard,
-        shell: &mut Shell<'_, Message>,
-        viewport: &Rectangle,
-    ) -> event::Status {
-        self.underlay.as_widget_mut().on_event(
-            &mut tree.children[0],
-            event,
-            layout,
-            cursor,
-            renderer,
-            clipboard,
-            shell,
-            viewport,
-        )
-    }
-
-    fn mouse_interaction(
-        &self,
-        tree: &Tree,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        viewport: &Rectangle,
-        renderer: &iced::Renderer,
-    ) -> mouse::Interaction {
-        self.underlay.as_widget().mouse_interaction(
-            &tree.children[0],
-            layout,
-            cursor,
-            viewport,
-            renderer,
-        )
-    }
-
-    fn draw(
-        &self,
-        tree: &Tree,
-        renderer: &mut iced::Renderer,
-        theme: &iced::Theme,
-        style: &renderer::Style,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        viewport: &Rectangle,
-    ) {
-        self.underlay.as_widget().draw(
-            &tree.children[0],
-            renderer,
-            theme,
-            style,
-            layout,
-            cursor,
-            viewport,
-        );
-    }
-
-    fn operate(
-        &self,
-        tree: &mut Tree,
-        layout: Layout<'_>,
-        renderer: &iced::Renderer,
-        operation: &mut dyn Operation<Message>,
-    ) {
-        self.underlay
-            .as_widget()
-            .operate(&mut tree.children[0], layout, renderer, operation);
-    }
-
-    fn overlay<'b>(
-        &'b mut self,
-        tree: &'b mut Tree,
-        layout: Layout<'_>,
-        renderer: &iced::Renderer,
-        translation: Vector,
-    ) -> Option<overlay::Element<'b, Message, iced::Theme, iced::Renderer>> {
-        let mut children = tree.children.iter_mut();
-        let mut group = Group::new();
-
-        if let Some(underlay) = self.underlay.as_widget_mut().overlay(
-            children.next().expect("underlay state"),
-            layout,
-            renderer,
-            translation,
-        ) {
-            group = group.push(underlay);
-        }
-
-        let card_state = children.next().expect("card state");
-        group = group.push(overlay::Element::new(Box::new(CardOverlay {
-            origin: layout.position() + translation,
-            bounds: layout.bounds(),
-            top: self.top,
-            right: self.right,
-            card: &mut self.card,
-            state: card_state,
-        })));
-
-        Some(group.overlay())
-    }
-}
-
-impl<'a, Message: 'a> From<TopRight<'a, Message>> for Element<'a, Message> {
-    fn from(floating: TopRight<'a, Message>) -> Self {
-        Element::new(floating)
-    }
-}
-
-struct CardOverlay<'a, 'b, Message> {
-    origin: Point,
-    bounds: Rectangle,
-    top: f32,
-    right: f32,
-    card: &'b mut Element<'a, Message>,
-    state: &'b mut Tree,
-}
-
-impl<'a, 'b, Message> overlay::Overlay<Message, iced::Theme, iced::Renderer>
-    for CardOverlay<'a, 'b, Message>
-{
-    fn layout(&mut self, renderer: &iced::Renderer, _bounds: Size) -> Node {
-        let limits = Limits::new(Size::ZERO, self.bounds.size())
-            .width(Length::Shrink)
-            .height(Length::Shrink);
-        let node = self.card.as_widget().layout(self.state, renderer, &limits);
-        let x = self.origin.x + self.bounds.width - node.bounds().width - self.right;
-        node.move_to(Point::new(x, self.origin.y + self.top))
-    }
-
-    fn draw(
-        &self,
-        renderer: &mut iced::Renderer,
-        theme: &iced::Theme,
-        style: &renderer::Style,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-    ) {
-        let bounds = layout.bounds();
-        self.card
-            .as_widget()
-            .draw(self.state, renderer, theme, style, layout, cursor, &bounds);
-    }
-
-    fn operate(
-        &mut self,
-        layout: Layout<'_>,
-        renderer: &iced::Renderer,
-        operation: &mut dyn Operation<Message>,
-    ) {
-        self.card
-            .as_widget()
-            .operate(self.state, layout, renderer, operation);
-    }
-
-    fn on_event(
-        &mut self,
-        event: Event,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        renderer: &iced::Renderer,
-        clipboard: &mut dyn Clipboard,
-        shell: &mut Shell<'_, Message>,
-    ) -> event::Status {
-        self.card.as_widget_mut().on_event(
-            self.state,
-            event,
-            layout,
-            cursor,
-            renderer,
-            clipboard,
-            shell,
-            &layout.bounds(),
-        )
-    }
-
-    fn mouse_interaction(
-        &self,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        viewport: &Rectangle,
-        renderer: &iced::Renderer,
-    ) -> mouse::Interaction {
-        self.card
-            .as_widget()
-            .mouse_interaction(self.state, layout, cursor, viewport, renderer)
-    }
-
-    fn overlay<'c>(
-        &'c mut self,
-        layout: Layout<'_>,
-        renderer: &iced::Renderer,
-    ) -> Option<overlay::Element<'c, Message, iced::Theme, iced::Renderer>> {
-        self.card
-            .as_widget_mut()
-            .overlay(self.state, layout, renderer, Vector::ZERO)
-    }
+/// `content` over `underlay` on a dimmed backdrop; a click on the backdrop
+/// sends `on_blur`, if any. `top` puts the content at the top (the palette)
+/// rather than in the middle.
+pub fn modal<'a, Message: Clone + 'a>(
+    underlay: impl Into<Element<'a, Message>>,
+    content: impl Into<Element<'a, Message>>,
+    on_blur: Option<Message>,
+    dark: bool,
+    top: bool,
+) -> Element<'a, Message> {
+    let content = opaque(content.into());
+    let backdrop = container(content)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(iced::alignment::Horizontal::Center)
+        .align_y(if top {
+            iced::alignment::Vertical::Top
+        } else {
+            iced::alignment::Vertical::Center
+        })
+        .style(crate::theme::scrim(dark));
+    let backdrop: Element<'a, Message> = match on_blur {
+        Some(message) => mouse_area(backdrop).on_press(message).into(),
+        None => backdrop.into(),
+    };
+    stack![underlay.into(), opaque(backdrop)].into()
 }
 
 /// Reports where a right click landed (relative to the content, ignoring a
@@ -306,23 +119,23 @@ impl<'a, Message: 'a> Widget<Message, iced::Theme, iced::Renderer> for RightClic
         self.content.as_widget().size_hint()
     }
 
-    fn layout(&self, tree: &mut Tree, renderer: &iced::Renderer, limits: &Limits) -> Node {
+    fn layout(&mut self, tree: &mut Tree, renderer: &iced::Renderer, limits: &Limits) -> Node {
         self.content
-            .as_widget()
+            .as_widget_mut()
             .layout(&mut tree.children[0], renderer, limits)
     }
 
-    fn on_event(
+    fn update(
         &mut self,
         tree: &mut Tree,
-        event: Event,
+        event: &Event,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         renderer: &iced::Renderer,
         clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
-    ) -> event::Status {
+    ) {
         if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) = event {
             if let Some(position) = cursor.position_in(layout.bounds()) {
                 if position.x < layout.bounds().width - self.exclude_right {
@@ -330,7 +143,7 @@ impl<'a, Message: 'a> Widget<Message, iced::Theme, iced::Renderer> for RightClic
                 }
             }
         }
-        self.content.as_widget_mut().on_event(
+        self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
             layout,
@@ -339,7 +152,7 @@ impl<'a, Message: 'a> Widget<Message, iced::Theme, iced::Renderer> for RightClic
             clipboard,
             shell,
             viewport,
-        )
+        );
     }
 
     fn mouse_interaction(
@@ -381,27 +194,32 @@ impl<'a, Message: 'a> Widget<Message, iced::Theme, iced::Renderer> for RightClic
     }
 
     fn operate(
-        &self,
+        &mut self,
         tree: &mut Tree,
         layout: Layout<'_>,
         renderer: &iced::Renderer,
-        operation: &mut dyn Operation<Message>,
+        operation: &mut dyn Operation,
     ) {
         self.content
-            .as_widget()
+            .as_widget_mut()
             .operate(&mut tree.children[0], layout, renderer, operation);
     }
 
     fn overlay<'b>(
         &'b mut self,
         tree: &'b mut Tree,
-        layout: Layout<'_>,
+        layout: Layout<'b>,
         renderer: &iced::Renderer,
+        viewport: &Rectangle,
         translation: Vector,
     ) -> Option<overlay::Element<'b, Message, iced::Theme, iced::Renderer>> {
-        self.content
-            .as_widget_mut()
-            .overlay(&mut tree.children[0], layout, renderer, translation)
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
     }
 }
 
