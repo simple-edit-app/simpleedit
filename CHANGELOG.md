@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.12.1] - 2026-10-20
+
+### Fixed
+- Launched from the desktop menu, the window now confirms the launch to GNOME, so the "loading" mouse cursor no longer lingers after the app has opened.
+
 ## [1.12.0] - 2026-10-20
 
 ### Added

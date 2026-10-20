@@ -1,5 +1,10 @@
 # Journal des modifications
 
+## [1.12.1] - 2026-10-20
+
+### Corrigé
+- Lancée depuis le menu du bureau, la fenêtre confirme maintenant le lancement à GNOME : le curseur de chargement ne reste plus affiché une fois l'application ouverte.
+
 ## [1.12.0] - 2026-10-20
 
 ### Ajouté
