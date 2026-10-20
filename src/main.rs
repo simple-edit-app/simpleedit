@@ -17,6 +17,7 @@ mod code_editor;
 mod config;
 mod editor;
 mod floating;
+mod folding;
 mod formatter;
 mod fsutil;
 mod history;

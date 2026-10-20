@@ -568,6 +568,11 @@ pub fn shortcuts_list(
             sc.prev_bookmark.display(),
         ),
         (
+            ShortcutTarget::ToggleFold,
+            t!("shortcuts.toggle_fold").to_string(),
+            sc.toggle_fold.display(),
+        ),
+        (
             ShortcutTarget::NewFile,
             t!("shortcuts.new_file").to_string(),
             sc.new_file.display(),

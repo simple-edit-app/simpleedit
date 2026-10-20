@@ -1,6 +1,6 @@
 [package]
 name = "simpleedit"
-version = "1.11.0"
+version = "1.12.0"
 edition = "2021"
 rust-version = "1.90"
 description = "A fast, stable, cross-platform text editor"
@@ -66,3 +66,4 @@ assets = [
 # without saving the session.
 [patch.crates-io]
 iced_winit = { path = "vendor/iced_winit" }
+iced_graphics = { path = "vendor/iced_graphics" }

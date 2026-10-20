@@ -425,6 +425,25 @@ fn menu_items(
                     disabled_item(label.to_string(), dark)
                 });
             }
+            items.push(separator(dark));
+            items.push(item(
+                t!("menu.fold_toggle").to_string(),
+                sc(&sh.toggle_fold),
+                dark,
+                Message::ToggleFold,
+            ));
+            items.push(item(
+                t!("menu.fold_all").to_string(),
+                None,
+                dark,
+                Message::FoldAll,
+            ));
+            items.push(item(
+                t!("menu.unfold_all").to_string(),
+                None,
+                dark,
+                Message::UnfoldAll,
+            ));
             items.extend([
                 separator(dark),
                 format_item,

@@ -236,6 +236,20 @@ impl EditorState {
             editor = editor.page_guide(config.page_guide_column, p.border);
         }
 
+        editor = editor.folding(
+            crate::code_editor::FoldPaint {
+                kind: crate::folding::Kind::of(self.language.as_deref()),
+                chevron: p.muted,
+                folded: p.accent,
+                marker_background: p.accent_soft,
+                tooltip: fold_tooltip(config),
+                tooltip_text: p.text,
+                tooltip_background: p.elevated,
+                tooltip_border: p.border_strong,
+            },
+            Message::FoldClick,
+        );
+
         if !bookmarks.is_empty() {
             editor = editor.bookmarks(crate::code_editor::BookmarkPaint {
                 lines: bookmarks.to_vec(),
@@ -262,6 +276,22 @@ impl EditorState {
         }
         editor.padding(padding(config)).into()
     }
+}
+
+/// What a fold chevron does, and with which keys.
+fn fold_tooltip(config: &Config) -> Vec<String> {
+    let ctrl = if cfg!(target_os = "macos") {
+        "⌘"
+    } else {
+        "Ctrl"
+    };
+    let shortcut = config.shortcuts.toggle_fold.display();
+    vec![
+        t!("fold.tip_click").to_string(),
+        t!("fold.tip_siblings", key = ctrl).to_string(),
+        t!("fold.tip_subtree").to_string(),
+        t!("fold.tip_cursor", shortcut = shortcut).to_string(),
+    ]
 }
 
 /// The editor's own padding (the gutter and the minimap come on top).

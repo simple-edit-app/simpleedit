@@ -30,6 +30,8 @@ use iced::{
     Size, Vector,
 };
 
+use crate::folding::{self, Folds, Kind, Regions, Scope};
+
 use std::cell::RefCell;
 use std::ops::DerefMut;
 use std::ops::Range;
@@ -104,6 +106,37 @@ pub struct BookmarkPaint {
     pub color: Color,
 }
 
+/// Folding: a chevron in the gutter at the head of each foldable block, and a
+/// marker after a folded one.
+#[derive(Debug, Clone)]
+pub struct FoldPaint {
+    /// What the language folds on.
+    pub kind: Kind,
+    /// Chevron of a block that is open.
+    pub chevron: Color,
+    /// Chevron and marker of a folded block.
+    pub folded: Color,
+    /// Behind the marker.
+    pub marker_background: Color,
+    /// What the pointer on a chevron explains, one line each.
+    pub tooltip: Vec<String>,
+    pub tooltip_text: Color,
+    pub tooltip_background: Color,
+    pub tooltip_border: Color,
+}
+
+/// What the app can ask of the folds of a [`Content`].
+#[derive(Debug, Clone, Copy)]
+pub enum FoldCommand {
+    /// Fold the block around the cursor, or unfold it.
+    AtCursor,
+    /// Fold every block (`true`) or unfold them all.
+    All(bool),
+    /// Fold or unfold the block headed by a line, with its siblings or
+    /// everything inside it.
+    Line(usize, Scope),
+}
+
 /// Width of the minimap.
 pub const MINIMAP_WIDTH: f32 = 84.0;
 /// Space above and below the miniature.
@@ -144,11 +177,13 @@ fn minimap_span(line: &str) -> Option<(usize, usize)> {
 
 /// Space between the gutter and the text.
 const GUTTER_GAP: f32 = 6.0;
+/// Width of the strip, at the right edge of the gutter, holding the chevrons.
+const CHEVRON_WIDTH: f32 = 22.0;
 
 /// Width of the gutter for a buffer of `lines` lines at text size `size`.
 fn gutter_width(size: f32, lines: usize) -> f32 {
     let digits = lines.max(1).to_string().len().max(2);
-    (digits as f32 * size * 0.6 + 26.0).max(46.0)
+    (digits as f32 * size * 0.6 + 34.0).max(54.0)
 }
 
 /// Where the text starts, from the widget's top-left corner: past the
@@ -221,6 +256,8 @@ where
     guide: Option<(usize, Color)>,
     minimap: Option<Minimap>,
     bookmarks: Option<BookmarkPaint>,
+    folding: Option<FoldPaint>,
+    on_fold: Option<Box<dyn Fn(usize, Scope) -> Message + 'a>>,
     style: Style,
     on_edit: Option<Box<dyn Fn(Action) -> Message + 'a>>,
     highlighter_settings: Highlighter::Settings,
@@ -243,6 +280,8 @@ impl<'a, Message, Theme> CodeEditor<'a, highlighter::PlainText, Message, Theme> 
             guide: None,
             minimap: None,
             bookmarks: None,
+            folding: None,
+            on_fold: None,
             style: Style {
                 background: Background::Color(Color::TRANSPARENT),
                 border: Border::default(),
@@ -329,6 +368,18 @@ where
         self
     }
 
+    /// Lets blocks fold (see [`FoldPaint`]); `on_fold` hears about a click on
+    /// a chevron, with how far it reaches.
+    pub fn folding(
+        mut self,
+        paint: FoldPaint,
+        on_fold: impl Fn(usize, Scope) -> Message + 'a,
+    ) -> Self {
+        self.folding = Some(paint);
+        self.on_fold = Some(Box::new(on_fold));
+        self
+    }
+
     pub fn highlight<H: text::Highlighter>(
         self,
         settings: H::Settings,
@@ -348,6 +399,8 @@ where
             guide: self.guide,
             minimap: self.minimap,
             bookmarks: self.bookmarks,
+            folding: self.folding,
+            on_fold: self.on_fold,
             style: self.style,
             on_edit: self.on_edit,
             highlighter_settings: settings,
@@ -563,6 +616,39 @@ where
         self.text_size.unwrap_or_else(|| renderer.default_size()).0
     }
 
+    /// The foldable line whose chevron is under `at` (relative to the
+    /// widget).
+    fn chevron_line_at(
+        &self,
+        at: Point,
+        padding: Padding,
+        renderer: &iced::Renderer,
+    ) -> Option<usize> {
+        self.folding.as_ref()?;
+        let right = padding.left - GUTTER_GAP;
+        if at.x < right - CHEVRON_WIDTH || at.x > right {
+            return None;
+        }
+        let internal = self.content.0.borrow();
+        let size = self.size_px(renderer);
+        let row = self.line_height.to_absolute(Pixels(size)).0;
+        let mut previous = None;
+        for run in internal.editor.buffer().layout_runs() {
+            let first = previous != Some(run.line_i);
+            previous = Some(run.line_i);
+            let top = padding.top + run.line_top;
+            if first
+                && run.line_height > 0.0
+                && at.y >= top
+                && at.y < top + row
+                && internal.regions.at(run.line_i).is_some()
+            {
+                return Some(run.line_i);
+            }
+        }
+        None
+    }
+
     /// The padding around the text proper: the user's padding plus the gutter.
     fn text_padding(&self, renderer: &iced::Renderer, lines: usize) -> Padding {
         let origin = text_origin(
@@ -600,6 +686,78 @@ struct Internal {
     /// Bumped by every edit, to know when cached per-line data is stale.
     revision: u64,
     wrapping: text::Wrapping,
+    folds: Folds,
+    regions: Arc<Regions>,
+    /// (revision, kind) the regions were found for.
+    regions_key: Option<(u64, Kind)>,
+    /// The cursor must not stay in folded lines: set by an edit or a jump,
+    /// acted on once the regions are up to date.
+    reveal_cursor: bool,
+}
+
+impl Internal {
+    /// Brings the blocks up to date with the text, drops the folds that lost
+    /// their block, and tells the editor which lines are folded away.
+    fn refresh_folds(&mut self, kind: Kind) {
+        if self.regions_key != Some((self.revision, kind)) {
+            let count = self.editor.line_count();
+            self.regions = Arc::new(if count > folding::MAX_LINES {
+                Regions::default()
+            } else {
+                let editor = &self.editor;
+                Regions::find(
+                    (0..count)
+                        .filter_map(|i| editor.line(i))
+                        .map(|line| line.text),
+                    kind,
+                )
+            });
+            self.regions_key = Some((self.revision, kind));
+            self.folds.prune(&self.regions);
+        }
+        if std::mem::take(&mut self.reveal_cursor) {
+            let line = self.editor.cursor().position.line;
+            let _ = self.folds.reveal(&self.regions, line);
+        }
+        self.editor
+            .set_hidden_lines(self.folds.hidden(&self.regions));
+    }
+
+    /// If the cursor is in folded lines, moves it out: below them when it
+    /// was moving down from `from`, else to the header.
+    fn step_out_of_folds(&mut self, from: usize) {
+        if self.folds.is_empty() {
+            return;
+        }
+        let cursor = self.editor.cursor();
+        let line = cursor.position.line;
+        let hidden = self.folds.hidden(&self.regions);
+        let Some(range) = hidden.iter().find(|r| r.contains(&line)) else {
+            return;
+        };
+        let target = if line >= from {
+            range.end
+        } else {
+            range.start - 1
+        };
+        let Some(text) = self.editor.line(target) else {
+            return;
+        };
+        let mut column = cursor.position.column.min(text.text.len());
+        while !text.text.is_char_boundary(column) {
+            column -= 1;
+        }
+        drop(text);
+        // `move_to` only ever sets a selection, never clears one; here the
+        // selection (if any) is meant to stay.
+        self.editor.move_to(Cursor {
+            position: Position {
+                line: target,
+                column,
+            },
+            selection: cursor.selection,
+        });
+    }
 }
 
 /// Ordered (line, byte) ends of a selection.
@@ -621,6 +779,10 @@ impl Content {
             is_dirty: true,
             revision: 0,
             wrapping: text::Wrapping::Word,
+            folds: Folds::default(),
+            regions: Arc::default(),
+            regions_key: None,
+            reveal_cursor: false,
         }))
     }
 
@@ -648,6 +810,9 @@ impl Content {
 
     fn perform_raw(&mut self, action: Action) {
         let internal = self.0.get_mut();
+        let from = internal.editor.cursor().position.line;
+        let lines_before = internal.editor.line_count();
+        let moves_cursor = !matches!(action, Action::Edit(_) | Action::Scroll { .. });
         // Remember the topmost line an edit may touch (the selection can
         // start above the cursor), for the highlighter.
         let touched = matches!(action, Action::Edit(_)).then(|| {
@@ -666,6 +831,12 @@ impl Content {
             let after = internal.editor.cursor().position.line;
             let top = before.min(after);
             internal.changed_from = Some(internal.changed_from.map_or(top, |c| c.min(top)));
+            // Folds below the edit move with their lines.
+            let delta = internal.editor.line_count() as isize - lines_before as isize;
+            internal.folds.shift(top, delta);
+            internal.reveal_cursor = true;
+        } else if moves_cursor {
+            internal.step_out_of_folds(from);
         }
         internal.is_dirty = true;
     }
@@ -716,7 +887,40 @@ impl Content {
                 selection: None,
             },
         });
+        // A jump (search, go to line, bookmark) opens what hides its target.
+        internal.reveal_cursor = true;
         internal.is_dirty = true;
+    }
+
+    /// Folds or unfolds blocks, for a text of the given kind.
+    pub fn fold(&self, kind: Kind, command: FoldCommand) {
+        let mut internal = self.0.borrow_mut();
+        internal.refresh_folds(kind);
+        let regions = Arc::clone(&internal.regions);
+        match command {
+            FoldCommand::AtCursor => {
+                let line = internal.editor.cursor().position.line;
+                if let Some(block) = regions.innermost(line) {
+                    internal.folds.toggle(&regions, block, Scope::One);
+                }
+            }
+            FoldCommand::All(fold) => internal.folds.set_all(&regions, fold),
+            FoldCommand::Line(line, scope) => {
+                if let Some(block) = regions.at(line) {
+                    internal.folds.toggle(&regions, block, scope);
+                }
+            }
+        }
+        internal.refresh_folds(kind);
+        internal.step_out_of_folds(usize::MAX);
+        internal.refresh_folds(kind);
+    }
+
+    /// The lines folded away now.
+    #[cfg(test)]
+    fn hidden_lines(&self) -> Vec<Range<usize>> {
+        let internal = self.0.borrow();
+        internal.folds.hidden(&internal.regions)
     }
 
     pub fn line(&self, index: usize) -> Option<impl std::ops::Deref<Target = str> + '_> {
@@ -854,6 +1058,9 @@ struct State<Highlighter: text::Highlighter> {
     partial_scroll: f32,
     /// A drag that started in the minimap.
     minimap_drag: bool,
+    modifiers: keyboard::Modifiers,
+    /// The line whose chevron the pointer is on.
+    hovered_fold: Option<usize>,
     highlighter: RefCell<Highlighter>,
     highlighter_settings: Highlighter::Settings,
     highlighter_format_address: usize,
@@ -891,6 +1098,8 @@ where
             drag_click: None,
             partial_scroll: 0.0,
             minimap_drag: false,
+            modifiers: keyboard::Modifiers::default(),
+            hovered_fold: None,
             highlighter: RefCell::new(Highlighter::new(&self.highlighter_settings)),
             highlighter_settings: self.highlighter_settings.clone(),
             highlighter_format_address: self.highlighter_format as usize,
@@ -940,6 +1149,10 @@ where
             state.highlighter.borrow_mut().change_line(line);
         }
 
+        if let Some(paint) = &self.folding {
+            internal.refresh_folds(paint.kind);
+        }
+
         let limits = limits.height(self.height);
         let padding = self.text_padding(renderer, internal.editor.line_count());
         let wrapping = internal.wrapping;
@@ -985,6 +1198,42 @@ where
 
         let state = tree.state.downcast_mut::<State<Highlighter>>();
         let padding = self.text_padding(renderer, self.content.line_count());
+
+        if let Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) = event {
+            state.modifiers = *modifiers;
+        }
+
+        if self.folding.is_some() {
+            let hovered = cursor
+                .position_in(layout.bounds())
+                .and_then(|at| self.chevron_line_at(at, padding, renderer));
+            if hovered != state.hovered_fold {
+                state.hovered_fold = hovered;
+                shell.request_redraw();
+            }
+        }
+
+        if let (Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), Some(on_fold)) =
+            (event, &self.on_fold)
+        {
+            let bounds = layout.bounds();
+            if let Some(line) = cursor
+                .position_in(bounds)
+                .and_then(|at| self.chevron_line_at(at, padding, renderer))
+            {
+                let modifiers = state.modifiers;
+                let scope = if modifiers.alt() {
+                    Scope::Subtree
+                } else if modifiers.command() {
+                    Scope::Siblings
+                } else {
+                    Scope::One
+                };
+                shell.publish(on_fold(line, scope));
+                shell.capture_event();
+                return;
+            }
+        }
 
         if self.minimap.is_some() {
             let rect = minimap_rect(layout.bounds());
@@ -1135,6 +1384,9 @@ where
         }
         let regex = self.search.as_ref().and_then(|p| p.regex.clone());
         for run in internal.editor.buffer().layout_runs() {
+            if run.line_height <= 0.0 {
+                continue;
+            }
             let top = bounds.y + padding.top + run.line_top;
             if let Some(highlight) = self.line_highlight.filter(|_| run.line_i == cursor_line) {
                 let left = origin.x - GUTTER_GAP;
@@ -1268,16 +1520,73 @@ where
             // One layout run per visual row: a wrapped line produces several
             // runs sharing a `line_i`, and only the first gets its number.
             for run in internal.editor.buffer().layout_runs() {
-                if previous == Some(run.line_i) {
+                if previous == Some(run.line_i) || run.line_height <= 0.0 {
                     continue;
                 }
                 previous = Some(run.line_i);
+
+                if let Some(fold) = &self.folding {
+                    if internal.regions.at(run.line_i).is_some() {
+                        let folded = internal.folds.is_folded(run.line_i);
+                        {
+                            let side = row_height.min(CHEVRON_WIDTH - 2.0);
+                            let button = Rectangle {
+                                x: column.x + width - CHEVRON_WIDTH / 2.0 - side / 2.0,
+                                y: bounds.y
+                                    + padding.top
+                                    + run.line_top
+                                    + (row_height - side) / 2.0,
+                                width: side,
+                                height: side,
+                            };
+                            if let Some(visible) = clip.intersection(&button) {
+                                renderer.fill_quad(
+                                    renderer::Quad {
+                                        bounds: visible,
+                                        border: iced::Border {
+                                            radius: 5.0.into(),
+                                            ..iced::Border::default()
+                                        },
+                                        ..renderer::Quad::default()
+                                    },
+                                    if folded {
+                                        fold.marker_background
+                                    } else {
+                                        Color {
+                                            a: fold.marker_background.a * 0.6,
+                                            ..fold.marker_background
+                                        }
+                                    },
+                                );
+                            }
+                            renderer.fill_text(
+                                text::Text {
+                                    content: if folded { "▸" } else { "▾" }.to_string(),
+                                    bounds: Size::new(CHEVRON_WIDTH, row_height),
+                                    size: Pixels(size * 1.5),
+                                    line_height: self.line_height,
+                                    font: self.font.unwrap_or(Font::MONOSPACE),
+                                    align_x: text::Alignment::Center,
+                                    align_y: alignment::Vertical::Center,
+                                    shaping: text::Shaping::Advanced,
+                                    wrapping: text::Wrapping::None,
+                                },
+                                Point::new(
+                                    column.x + width - CHEVRON_WIDTH / 2.0,
+                                    bounds.y + padding.top + run.line_top + row_height / 2.0,
+                                ),
+                                if folded { fold.folded } else { fold.chevron },
+                                clip,
+                            );
+                        }
+                    }
+                }
 
                 let number = (run.line_i + 1).to_string();
                 renderer.fill_text(
                     text::Text {
                         content: number.clone(),
-                        bounds: Size::new(width - 14.0, row_height),
+                        bounds: Size::new(width - CHEVRON_WIDTH, row_height),
                         size: Pixels(size),
                         line_height: self.line_height,
                         font: self.font.unwrap_or(Font::MONOSPACE),
@@ -1289,7 +1598,7 @@ where
                     // With right/centre alignment the position is the anchor of
                     // the text, not the corner of its bounds.
                     Point::new(
-                        column.x + width - 14.0,
+                        column.x + width - CHEVRON_WIDTH,
                         bounds.y + padding.top + run.line_top + row_height / 2.0,
                     ),
                     if run.line_i == cursor_line {
@@ -1308,7 +1617,7 @@ where
             let x = bounds.x + self.padding.left + 6.0;
             let mut previous = None;
             for run in internal.editor.buffer().layout_runs() {
-                if previous == Some(run.line_i) {
+                if previous == Some(run.line_i) || run.line_height <= 0.0 {
                     continue;
                 }
                 previous = Some(run.line_i);
@@ -1339,6 +1648,112 @@ where
                         marks.color,
                     );
                 }
+            }
+        }
+
+        // After a folded block's header, a marker for what is hidden.
+        if let Some(fold) = &self.folding {
+            let runs: Vec<_> = internal.editor.buffer().layout_runs().collect();
+            for (i, run) in runs.iter().enumerate() {
+                let last_row = runs.get(i + 1).is_none_or(|next| next.line_i != run.line_i);
+                if !last_row || run.line_height <= 0.0 || !internal.folds.is_folded(run.line_i) {
+                    continue;
+                }
+                let height = (row_height - 8.0).max(6.0);
+                let pill = Rectangle {
+                    x: origin.x + run.line_w + 8.0,
+                    y: bounds.y + padding.top + run.line_top + (row_height - height) / 2.0,
+                    width: 26.0,
+                    height,
+                };
+                if let Some(visible) = bounds.intersection(&pill) {
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: visible,
+                            border: iced::Border {
+                                radius: 4.0.into(),
+                                ..iced::Border::default()
+                            },
+                            ..renderer::Quad::default()
+                        },
+                        fold.marker_background,
+                    );
+                    renderer.fill_text(
+                        text::Text {
+                            content: "⋯".to_string(),
+                            bounds: pill.size(),
+                            size: Pixels(size * 0.9),
+                            line_height: self.line_height,
+                            font: self.font.unwrap_or(Font::MONOSPACE),
+                            align_x: text::Alignment::Center,
+                            align_y: alignment::Vertical::Center,
+                            shaping: text::Shaping::Advanced,
+                            wrapping: text::Wrapping::None,
+                        },
+                        pill.center(),
+                        fold.folded,
+                        visible,
+                    );
+                }
+            }
+        }
+
+        // What the chevron under the pointer can do, in a layer of its own
+        // (text and quads of the layer below would hide it).
+        if let (Some(line), Some(fold)) = (state.hovered_fold, &self.folding) {
+            let top = internal
+                .editor
+                .buffer()
+                .layout_runs()
+                .find(|run| run.line_i == line && run.line_height > 0.0)
+                .map(|run| bounds.y + padding.top + run.line_top);
+            if let Some(top) = top.filter(|_| !fold.tooltip.is_empty()) {
+                let text_size = 12.0;
+                let row = 18.0;
+                let pad = 8.0;
+                let chars = fold.tooltip.iter().map(|l| l.chars().count()).max();
+                let width = chars.unwrap_or(0) as f32 * text_size * 0.66 + 2.0 * pad;
+                let height = fold.tooltip.len() as f32 * row + 2.0 * pad;
+                let x = bounds.x + padding.left + 4.0;
+                let y = (top + row_height + 2.0).min(bounds.y + bounds.height - height - 4.0);
+                let card = Rectangle {
+                    x,
+                    y,
+                    width,
+                    height,
+                };
+                renderer.with_layer(bounds, |renderer| {
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: card,
+                            border: iced::Border {
+                                color: fold.tooltip_border,
+                                width: 1.0,
+                                radius: 6.0.into(),
+                            },
+                            ..renderer::Quad::default()
+                        },
+                        fold.tooltip_background,
+                    );
+                    for (i, line) in fold.tooltip.iter().enumerate() {
+                        renderer.fill_text(
+                            text::Text {
+                                content: line.clone(),
+                                bounds: Size::new(width - 2.0 * pad, row),
+                                size: Pixels(text_size),
+                                line_height: LineHeight::Absolute(Pixels(row)),
+                                font: self.font.unwrap_or(Font::MONOSPACE),
+                                align_x: text::Alignment::Left,
+                                align_y: alignment::Vertical::Top,
+                                shaping: text::Shaping::Advanced,
+                                wrapping: text::Wrapping::None,
+                            },
+                            Point::new(x + pad, y + pad + i as f32 * row),
+                            fold.tooltip_text,
+                            card,
+                        );
+                    }
+                });
             }
         }
 
@@ -1582,6 +1997,63 @@ mod tests {
         })
     }
 
+    const JSON: &str = "{\n  \"a\": [\n    1,\n    2\n  ],\n  \"b\": 1\n}\n";
+
+    fn json_kind() -> Kind {
+        Kind::of(Some("json"))
+    }
+
+    /// A text with its inner array folded: lines 2 and 3 are hidden.
+    fn folded_json() -> Content {
+        let mut content = Content::with_text(JSON);
+        content.select_bytes(1, 0, 0);
+        content.fold(json_kind(), FoldCommand::AtCursor);
+        content
+    }
+
+    #[test]
+    fn folding_the_block_at_the_cursor_hides_its_lines() {
+        let content = folded_json();
+        assert_eq!(content.hidden_lines(), vec![2..4]);
+        content.fold(json_kind(), FoldCommand::AtCursor);
+        assert!(content.hidden_lines().is_empty());
+    }
+
+    #[test]
+    fn fold_all_and_a_click_on_a_chevron() {
+        let content = Content::with_text(JSON);
+        content.fold(json_kind(), FoldCommand::All(true));
+        assert_eq!(content.hidden_lines(), vec![1..6]);
+        content.fold(json_kind(), FoldCommand::All(false));
+        content.fold(json_kind(), FoldCommand::Line(1, Scope::One));
+        assert_eq!(content.hidden_lines(), vec![2..4]);
+    }
+
+    #[test]
+    fn folding_moves_a_cursor_that_was_inside_to_the_header() {
+        let mut content = Content::with_text(JSON);
+        content.select_bytes(2, 1, 0);
+        content.fold(json_kind(), FoldCommand::All(true));
+        assert_eq!(content.cursor_position(), (0, 1));
+    }
+
+    #[test]
+    fn a_fold_follows_the_lines_added_above_it() {
+        let mut content = folded_json();
+        content.select_bytes(0, 0, 0);
+        content.perform(Action::Edit(Edit::Enter));
+        content.fold(json_kind(), FoldCommand::Line(99, Scope::One));
+        assert_eq!(content.hidden_lines(), vec![3..5]);
+    }
+
+    #[test]
+    fn jumping_into_a_fold_opens_it() {
+        let mut content = folded_json();
+        content.select_bytes(3, 0, 0);
+        content.fold(json_kind(), FoldCommand::Line(99, Scope::One));
+        assert!(content.hidden_lines().is_empty());
+    }
+
     fn focused_state() -> State<highlighter::PlainText> {
         State {
             is_focused: true,
@@ -1589,6 +2061,8 @@ mod tests {
             drag_click: None,
             partial_scroll: 0.0,
             minimap_drag: false,
+            modifiers: keyboard::Modifiers::default(),
+            hovered_fold: None,
             highlighter: RefCell::new(highlighter::PlainText::new(&())),
             highlighter_settings: (),
             highlighter_format_address: 0,
@@ -1655,7 +2129,7 @@ mod tests {
     #[test]
     fn gutter_has_a_minimum_width_and_grows_with_the_line_count() {
         assert_eq!(gutter_width(16.0, 5), gutter_width(16.0, 99));
-        assert_eq!(gutter_width(16.0, 5), 46.0);
+        assert_eq!(gutter_width(16.0, 5), 54.0);
         assert!(gutter_width(16.0, 999) > gutter_width(16.0, 99));
         assert!(gutter_width(16.0, 9999) > gutter_width(16.0, 999));
         assert!(gutter_width(30.0, 999) > gutter_width(12.0, 999));

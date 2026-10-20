@@ -154,6 +154,11 @@ pub enum Message {
     NextBookmark,
     PrevBookmark,
     ClearBookmarks,
+    ToggleFold,
+    FoldAll,
+    UnfoldAll,
+    /// A click on a chevron of the gutter (line of the block, how far it reaches).
+    FoldClick(usize, crate::folding::Scope),
     /// A right click over the text, relative to the editor.
     EditorRightClick(iced::Point),
     IndentSelection,
@@ -1653,7 +1658,7 @@ impl SimpleEditApp {
                 };
                 let sh = &self.config.shortcuts;
                 // Order matters: Ctrl+Shift+S must be tried before Ctrl+S.
-                let bindings: [(&ShortcutConfig, Message); 21] = [
+                let bindings: [(&ShortcutConfig, Message); 22] = [
                     (&sh.undo, Message::Undo),
                     (&sh.redo, Message::Redo),
                     (&sh.duplicate_line, Message::DuplicateLine),
@@ -1664,6 +1669,7 @@ impl SimpleEditApp {
                     (&sh.toggle_bookmark, Message::ToggleBookmark),
                     (&sh.prev_bookmark, Message::PrevBookmark),
                     (&sh.next_bookmark, Message::NextBookmark),
+                    (&sh.toggle_fold, Message::ToggleFold),
                     (&sh.save_as, Message::SaveFileAs),
                     (&sh.new_file, Message::NewFile),
                     (&sh.save_file, Message::SaveFile),
@@ -1737,6 +1743,22 @@ impl SimpleEditApp {
                 }
                 .to_string();
                 self.status_is_error = false;
+                Task::none()
+            }
+            Message::ToggleFold => {
+                self.fold(crate::code_editor::FoldCommand::AtCursor);
+                Task::none()
+            }
+            Message::FoldAll => {
+                self.fold(crate::code_editor::FoldCommand::All(true));
+                Task::none()
+            }
+            Message::UnfoldAll => {
+                self.fold(crate::code_editor::FoldCommand::All(false));
+                Task::none()
+            }
+            Message::FoldClick(line, scope) => {
+                self.fold(crate::code_editor::FoldCommand::Line(line, scope));
                 Task::none()
             }
             Message::EditorRightClick(at) => {
@@ -2191,6 +2213,11 @@ impl SimpleEditApp {
             .selection()
             .map_or(0, |s| s.matches('\n').count());
         (self.editor.content.line_count(), line.saturating_sub(above))
+    }
+
+    fn fold(&mut self, command: crate::code_editor::FoldCommand) {
+        let kind = crate::folding::Kind::of(self.editor.language.as_deref());
+        self.editor.content.fold(kind, command);
     }
 
     /// Moves the current file's bookmarks after an edit that changed the line

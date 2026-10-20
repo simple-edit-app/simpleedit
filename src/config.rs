@@ -26,6 +26,7 @@ pub enum ShortcutTarget {
     ToggleBookmark,
     NextBookmark,
     PrevBookmark,
+    ToggleFold,
 }
 
 /// How a key is named to the user.
@@ -171,6 +172,7 @@ pub struct Shortcuts {
     pub toggle_bookmark: ShortcutConfig,
     pub next_bookmark: ShortcutConfig,
     pub prev_bookmark: ShortcutConfig,
+    pub toggle_fold: ShortcutConfig,
 }
 
 fn default_duplicate_line() -> ShortcutConfig {
@@ -232,6 +234,7 @@ shortcut_slots! {
     ToggleBookmark => toggle_bookmark,
     NextBookmark => next_bookmark,
     PrevBookmark => prev_bookmark,
+    ToggleFold => toggle_fold,
 }
 
 impl Shortcuts {
@@ -282,6 +285,7 @@ impl Default for Shortcuts {
             toggle_bookmark: ShortcutConfig::ctrl("F2"),
             next_bookmark: ShortcutConfig::plain("F2"),
             prev_bookmark: ShortcutConfig::shift("F2"),
+            toggle_fold: ShortcutConfig::ctrl_shift("l"),
         }
     }
 }
@@ -633,6 +637,7 @@ mod tests {
         assert_eq!(sh.toggle_bookmark, ShortcutConfig::ctrl("F2"));
         assert_eq!(sh.next_bookmark, ShortcutConfig::plain("F2"));
         assert_eq!(sh.prev_bookmark, ShortcutConfig::shift("F2"));
+        assert_eq!(sh.toggle_fold, ShortcutConfig::ctrl_shift("l"));
     }
 
     #[test]
