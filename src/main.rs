@@ -60,6 +60,16 @@ fn main() -> iced::Result {
 
     let files = file_args(std::env::args_os().skip(1));
 
+    // winit clears the launcher's startup token when it creates its event
+    // loop; keep a copy so the window can be activated with it (iced_winit).
+    #[cfg(target_os = "linux")]
+    if let Some(token) =
+        std::env::var_os("XDG_ACTIVATION_TOKEN").or_else(|| std::env::var_os("DESKTOP_STARTUP_ID"))
+    {
+        // Single-threaded at this point.
+        std::env::set_var("SIMPLEEDIT_ACTIVATION_TOKEN", token);
+    }
+
     #[cfg(target_os = "linux")]
     let platform_specific = window::settings::PlatformSpecific {
         application_id: "simpleedit".to_string(),

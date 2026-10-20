@@ -138,6 +138,18 @@ pub fn window_attributes(
 
     #[cfg(target_os = "linux")]
     {
+        // The launcher's startup token, saved by the application before
+        // winit clears it: activating the window with it ends the launcher's
+        // "loading" cursor.
+        #[cfg(any(feature = "x11", feature = "wayland"))]
+        if let Ok(token) = std::env::var("SIMPLEEDIT_ACTIVATION_TOKEN") {
+            use winit::platform::startup_notify::WindowAttributesExtStartupNotify;
+            use winit::window::ActivationToken;
+
+            attributes =
+                attributes.with_activation_token(ActivationToken::from_raw(token));
+        }
+
         #[cfg(feature = "x11")]
         {
             use winit::platform::x11::WindowAttributesExtX11;
