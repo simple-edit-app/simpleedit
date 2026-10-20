@@ -1,5 +1,11 @@
 # Journal des modifications
 
+## [1.12.0] - 2026-10-20
+
+### Ajouté
+- Pliage de code : une flèche dans la marge plie ou déplie les blocs entre accolades (fonctions, objets et tableaux JSON), les commentaires, les blocs indentés (Python, YAML, HTML…), les sections Markdown et les blocs de code. Ctrl+clic plie aussi les blocs du même niveau, Alt+clic tout ce qu'ils contiennent ; une infobulle sur la flèche rappelle les touches.
+- « Replier / déplier le bloc » (Ctrl+Maj+L, modifiable), « Tout replier » et « Tout déplier » dans le menu Édition et la palette de commandes. Les flèches du clavier sautent les lignes pliées ; écrire dans un bloc plié, une recherche, « Aller à la ligne » ou un marque-page l'ouvre.
+
 ## [1.11.0] - 2026-10-20
 
 ### Ajouté

@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.12.0] - 2026-10-20
+
+### Added
+- Code folding: a chevron in the gutter folds or unfolds blocks between braces (functions, JSON objects and arrays), comment blocks, indented blocks (Python, YAML, HTML…), Markdown sections and code fences. Ctrl+click also folds the blocks of the same level, Alt+click everything inside; a tooltip on the chevron lists the keys.
+- "Fold / Unfold Block" (Ctrl+Shift+L, rebindable), "Fold All" and "Unfold All" in the Edit menu and the command palette. Arrow keys skip folded lines; typing in a folded block, a search, "Go to line" or a bookmark opens it.
+
 ## [1.11.0] - 2026-10-20
 
 ### Added
