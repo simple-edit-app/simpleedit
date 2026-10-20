@@ -350,6 +350,7 @@ impl Default for Config {
 
 /// The desktop portal's `color-scheme` (1 = dark, 2 = light, 0 = none),
 /// read from `gdbus`'s output such as `(<<uint32 1>>,)`.
+#[cfg(any(target_os = "linux", test))]
 fn parse_portal_color_scheme(output: &str) -> Option<bool> {
     let value = output.split("uint32").nth(1)?.trim_start();
     match value.chars().next()? {
