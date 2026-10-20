@@ -83,14 +83,14 @@ jobs:
       - run: cargo test
 
   msrv:
-    name: Minimum Rust version (1.89)
+    name: Minimum Rust version (1.90)
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
-          toolchain: "1.89"
+          toolchain: "1.90"
       - name: Install Linux deps
         run: |
           sudo apt-get update

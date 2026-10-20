@@ -84,7 +84,7 @@ where
     #[cfg(target_os = "macos")]
     {
         use winit::platform::macos::EventLoopBuilderExtMacOS;
-        builder.with_default_menu(false);
+        let _ = builder.with_default_menu(false);
     }
     let event_loop = builder.build().expect("Create event loop");
 
