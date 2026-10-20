@@ -112,6 +112,7 @@
   "menu.edit_toggle_comment": "Toggle Comment",
   "menu.edit_delete_line": "Delete Line",
   "menu.file_recents": "Recent Files",
+  "menu.file_recents_clear": "Clear",
   "preview.raw": "Raw",
   "preview.rendered": "Preview",
   "preview.split": "Split",

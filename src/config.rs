@@ -513,6 +513,10 @@ impl Config {
         }
     }
 
+    pub fn clear_recent(&mut self) {
+        self.recent_files.clear();
+    }
+
     /// Add a file to the recent files list (max 10, no duplicates, no untitled).
     pub fn add_recent(&mut self, path: &Path) {
         if path
@@ -656,6 +660,14 @@ mod tests {
             config.add_recent(&PathBuf::from(format!("/file{}.txt", i)));
         }
         assert_eq!(config.recent_files.len(), 10);
+    }
+
+    #[test]
+    fn clear_recent_empties_the_list() {
+        let mut config = Config::default();
+        config.add_recent(&PathBuf::from("/home/user/file.rs"));
+        config.clear_recent();
+        assert!(config.recent_files.is_empty());
     }
 
     #[test]

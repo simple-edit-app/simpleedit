@@ -143,10 +143,36 @@ pub fn dropdown_view(
     has_formatter: bool,
     lang_picker_enabled: bool,
     bookmarks: BookmarkState,
+    recents_open: bool,
 ) -> Element<'static, Message> {
+    let dark = config.dark_mode;
     let items = menu_items(menu, config, has_formatter, lang_picker_enabled, bookmarks);
-    container(column(items).spacing(1).padding(6).width(260))
-        .style(theme::card(config.dark_mode))
+    let card = container(column(items).spacing(1).padding(6).width(260)).style(theme::card(dark));
+    if menu == TopMenu::File && recents_open && !config.recent_files.is_empty() {
+        row![card, recents_submenu(config)].spacing(4).into()
+    } else {
+        card.into()
+    }
+}
+
+/// The recent files, then "Clear", in a card beside the File menu.
+fn recents_submenu(config: &Config) -> Element<'static, Message> {
+    let dark = config.dark_mode;
+    let recents: Vec<PathBuf> = config.recent_files.iter().map(PathBuf::from).collect();
+    let mut items: Vec<Element<'static, Message>> = recents
+        .iter()
+        .zip(crate::app::unique_labels(&recents))
+        .map(|(path, name)| item(name, None, dark, Message::OpenRecentFile(path.clone())))
+        .collect();
+    items.push(separator(dark));
+    items.push(item(
+        t!("menu.file_recents_clear").to_string(),
+        None,
+        dark,
+        Message::ClearRecents,
+    ));
+    container(column(items).spacing(1).padding(6).width(300))
+        .style(theme::card(dark))
         .into()
 }
 
@@ -249,20 +275,21 @@ fn menu_items(
                 ),
             ];
 
-            if !config.recent_files.is_empty() {
-                items.push(separator(dark));
-                items.push(disabled_item(t!("menu.file_recents").to_string(), dark));
-                let recents: Vec<PathBuf> = config.recent_files.iter().map(PathBuf::from).collect();
-                for (path, name) in recents.iter().zip(crate::app::unique_labels(&recents)) {
-                    items.push(item(
-                        name,
-                        None,
-                        dark,
-                        Message::OpenRecentFile(path.clone()),
-                    ));
-                }
-                items.push(separator(dark));
-            }
+            items.push(separator(dark));
+            let recents_at = items.len();
+            items.push(if config.recent_files.is_empty() {
+                disabled_item(t!("menu.file_recents").to_string(), dark)
+            } else {
+                mouse_area(item(
+                    t!("menu.file_recents").to_string(),
+                    Some("›".to_string()),
+                    dark,
+                    Message::SetRecents(true),
+                ))
+                .on_enter(Message::SetRecents(true))
+                .into()
+            });
+            items.push(separator(dark));
 
             items.push(item(
                 t!("menu.file_save").to_string(),
@@ -288,7 +315,20 @@ fn menu_items(
                 dark,
                 Message::Quit,
             ));
+            // Pointing at any other entry folds the submenu away.
             items
+                .into_iter()
+                .enumerate()
+                .map(|(i, entry)| {
+                    if i == recents_at {
+                        entry
+                    } else {
+                        mouse_area(entry)
+                            .on_enter(Message::SetRecents(false))
+                            .into()
+                    }
+                })
+                .collect()
         }
         TopMenu::Edit => {
             let format_item: Element<'static, Message> = if has_formatter {

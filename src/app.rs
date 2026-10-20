@@ -160,6 +160,8 @@ pub enum Message {
     DedentLine,
     // Recent files
     OpenRecentFile(PathBuf),
+    SetRecents(bool),
+    ClearRecents,
     /// Whether a search field had focus when an editor shortcut was pressed.
     ShortcutChecked(Box<Message>, bool),
     /// The user confirmed closing a tab that has unsaved changes.
@@ -214,6 +216,8 @@ pub struct SimpleEditApp {
     palette_query: String,
     palette_selected: usize,
     open_menu: Option<TopMenu>,
+    /// The recent files submenu of the File menu is showing.
+    recents_open: bool,
     /// Last known screen position of each menu button. Reused while a fresh
     /// query is in flight so switching menus doesn't flicker.
     menu_bounds: HashMap<TopMenu, iced::Rectangle>,
@@ -352,6 +356,7 @@ impl SimpleEditApp {
             palette_query: String::new(),
             palette_selected: 0,
             open_menu: None,
+            recents_open: false,
             menu_bounds: HashMap::new(),
             current_file: None,
             is_dirty: false,
@@ -457,6 +462,7 @@ impl SimpleEditApp {
                 | Message::MenuBounds(..)
                 | Message::ToggleMenu(_)
                 | Message::HoverMenu(_)
+                | Message::SetRecents(_)
                 | Message::SessionWritten(_)
                 | Message::PreviewTick
                 | Message::WindowResized(..)
@@ -743,6 +749,7 @@ impl SimpleEditApp {
                 has_fmt,
                 lang_override_enabled,
                 self.bookmark_state(),
+                self.recents_open,
             );
             crate::floating::at_point(base, dropdown, bounds.x, bounds.y + bounds.height)
         } else {
@@ -861,6 +868,7 @@ impl SimpleEditApp {
             &message,
             Message::ToggleMenu(_)
                 | Message::HoverMenu(_)
+                | Message::SetRecents(_)
                 | Message::MenuBounds(..)
                 | Message::ModifiersChanged { .. }
                 | Message::AutoSave
@@ -868,6 +876,9 @@ impl SimpleEditApp {
                 | Message::PreviewTick
                 | Message::WindowResized(..)
         );
+        if closes_menu || matches!(message, Message::ToggleMenu(_) | Message::HoverMenu(_)) {
+            self.recents_open = false;
+        }
         if closes_menu {
             // Escape on an open menu closes only that menu.
             if matches!(message, Message::EscapePressed) && self.open_menu.take().is_some() {
@@ -917,6 +928,15 @@ impl SimpleEditApp {
                 self.editor.content.perform(text_editor::Action::Select(
                     text_editor::Motion::DocumentEnd,
                 ));
+                Task::none()
+            }
+            Message::SetRecents(open) => {
+                self.recents_open = open;
+                Task::none()
+            }
+            Message::ClearRecents => {
+                self.config.clear_recent();
+                self.config.save();
                 Task::none()
             }
             Message::ToggleMenu(menu) => {

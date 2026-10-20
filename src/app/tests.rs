@@ -32,6 +32,19 @@ mod behavior_tests {
         app
     }
 
+    #[test]
+    fn the_recents_submenu_opens_and_closes_with_the_menu() {
+        let mut app = app();
+        let _ = app.handle(Message::ToggleMenu(TopMenu::File));
+        let _ = app.handle(Message::SetRecents(true));
+        assert!(app.recents_open);
+        let _ = app.handle(Message::SetRecents(false));
+        assert!(!app.recents_open);
+        let _ = app.handle(Message::SetRecents(true));
+        let _ = app.handle(Message::ToggleMenu(TopMenu::File));
+        assert!(!app.recents_open);
+    }
+
     fn type_text(app: &mut SimpleEditApp, text: &str) {
         for c in text.chars() {
             let _ = app.handle(Message::EditorAction(Action::Edit(Edit::Insert(c))));

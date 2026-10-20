@@ -112,6 +112,7 @@
   "menu.edit_toggle_comment": "Commenter/décommenter",
   "menu.edit_delete_line": "Supprimer la ligne",
   "menu.file_recents": "Fichiers récents",
+  "menu.file_recents_clear": "Effacer",
   "preview.raw": "Brut",
   "preview.rendered": "Aperçu",
   "preview.split": "Divisé",
