@@ -1,5 +1,32 @@
 # Changelog
 
+## [1.10.0] - 2026-10-20
+
+### Fixed
+- Windows (CRLF) files are no longer doubled when saved, and a missing final newline is kept as it was.
+- Tabs are no longer lost: Tab types a real tab in tab mode, and trailing tabs survive paste, undo and format.
+- A format result can no longer land in another tab or overwrite what you typed meanwhile.
+- A file changed on disk while it was in a background tab is now noticed before you save over it.
+- Relative paths given on the command line are resolved, so the session can't save into the wrong file; several files can be opened at once.
+- A damaged session file is set aside instead of being overwritten, and quitting warns if the session could not be saved.
+- Closing the last tab leaves a tab to type in; "Save As" onto an open tab with unsaved work is refused.
+- Alt+Up / Alt+Down move the line, and shortcuts keep working while the search field has the focus.
+- Search selects the right text after emoji, accents and right-to-left text; "Replace all" no longer drops a final blank line.
+- Undo, redo and line commands keep the cursor, the selection and the bookmarks; going back to the saved text clears the modified mark.
+- Comment toggling no longer breaks doc comments and shebangs; Kotlin, TSX and JSX format correctly.
+- Names in Chinese, Japanese, Arabic or with emoji display properly in the interface.
+
+### Added
+- Syntax highlighting for TypeScript, TSX, JSX, TOML, Swift and Kotlin, and more file types recognized by name or shebang.
+- Preference to turn word wrap off (faster on very long lines), and a hint to format a file that has one.
+- The command palette ignores accents: "pref" finds "Préférences".
+- Each tab remembers its cursor and scroll position.
+
+### Changed
+- Much faster on large files: jumping to a line, undo, line commands, search, the autosave and the undo history.
+- The command-line installer and updater check signatures strictly; Prettier is no longer downloaded behind your back; formatters run in the file's folder so project settings apply.
+- Built on iced 0.14, with updated dependencies fixing known security advisories.
+
 ## [1.9.0] - 2026-10-19
 
 ### Added
