@@ -29,6 +29,7 @@ pub enum ShortcutTarget {
     ToggleFold,
     NavBack,
     NavForward,
+    ToggleTerminal,
 }
 
 /// How a key is named to the user.
@@ -177,6 +178,7 @@ pub struct Shortcuts {
     pub toggle_fold: ShortcutConfig,
     pub nav_back: ShortcutConfig,
     pub nav_forward: ShortcutConfig,
+    pub toggle_terminal: ShortcutConfig,
 }
 
 /// Alt+←/→, or Ctrl+- / Ctrl+Shift+- where Alt+arrows move by word (macOS).
@@ -256,6 +258,7 @@ shortcut_slots! {
     ToggleFold => toggle_fold,
     NavBack => nav_back,
     NavForward => nav_forward,
+    ToggleTerminal => toggle_terminal,
 }
 
 impl Shortcuts {
@@ -309,6 +312,7 @@ impl Default for Shortcuts {
             toggle_fold: ShortcutConfig::ctrl_shift("l"),
             nav_back: default_nav_back(),
             nav_forward: default_nav_forward(),
+            toggle_terminal: ShortcutConfig::alt("F12"),
         }
     }
 }

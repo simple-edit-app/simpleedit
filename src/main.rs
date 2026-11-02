@@ -33,6 +33,7 @@ mod search;
 mod session;
 mod sidebar;
 mod tabs;
+mod terminal;
 mod text_ops;
 mod theme;
 mod updater;

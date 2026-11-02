@@ -25,6 +25,7 @@ pub enum PaletteCommand {
     GotoLine,
     SetLanguage,
     ToggleSidebar,
+    ToggleTerminal,
     ToggleTheme,
     Preferences,
     ToggleBookmark,
@@ -52,6 +53,7 @@ impl PaletteCommand {
             PaletteCommand::GotoLine => Message::OpenGotoLine,
             PaletteCommand::SetLanguage => Message::OpenLanguagePicker,
             PaletteCommand::ToggleSidebar => Message::ToggleSidebar,
+            PaletteCommand::ToggleTerminal => Message::ToggleTerminal,
             PaletteCommand::SaveFile => Message::SaveFile,
             PaletteCommand::SaveFileAs => Message::SaveFileAs,
             PaletteCommand::CloseFile => Message::CloseFile,
@@ -156,6 +158,12 @@ pub fn entries(config: &Config, has_formatter: bool, language_enabled: bool) -> 
             t!("palette.set_language").to_string(),
             None,
             language_enabled,
+        ),
+        entry(
+            PaletteCommand::ToggleTerminal,
+            t!("terminal.title").to_string(),
+            Some(sh.toggle_terminal.display()),
+            true,
         ),
         entry(
             PaletteCommand::ToggleSidebar,

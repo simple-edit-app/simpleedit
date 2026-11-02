@@ -131,6 +131,17 @@ pub enum Message {
     ToggleMenu(TopMenu),
     /// A click outside the open menu: it closes (nothing else happens).
     CloseMenu,
+    // Terminal
+    ToggleTerminal,
+    NewTerminal,
+    SelectTerminal(usize),
+    CloseTerminal(usize),
+    /// Time to repaint the terminal and drop the ones whose shell ended.
+    TerminalTick,
+    TerminalFocus(bool),
+    TerminalCopy(String),
+    TerminalPaste,
+    TerminalPasteText(Option<String>),
     /// The pointer entered a menu title: switches menus if one is already open.
     HoverMenu(TopMenu),
     /// Resolves the on-screen position of an open top menu's button, so its
@@ -292,6 +303,7 @@ pub struct SimpleEditApp {
     is_dirty: bool,
     is_formatting: bool,
     status_message: String,
+    terminal: crate::terminal::Panel,
     /// A language server to offer in the status bar, in place of the message.
     server_offer: Option<&'static crate::lsp_install::ServerInfo>,
     status_is_error: bool,
@@ -440,6 +452,7 @@ impl SimpleEditApp {
             is_dirty: false,
             is_formatting: false,
             status_message: t!("status.ready").to_string(),
+            terminal: Default::default(),
             server_offer: None,
             status_is_error: false,
             format_error: None,
@@ -548,6 +561,7 @@ impl SimpleEditApp {
                 | Message::SetRecents(_)
                 | Message::SessionWritten(_)
                 | Message::PreviewTick
+                | Message::TerminalTick
                 | Message::WindowResized(..)
         );
         let edits_text = !passive && !matches!(&message, Message::EditorAction(a) if !a.is_edit());
@@ -663,6 +677,12 @@ impl SimpleEditApp {
             subscriptions.push(
                 iced::time::every(std::time::Duration::from_millis(150))
                     .map(|_| Message::PreviewTick),
+            );
+        }
+        if self.terminal.open {
+            subscriptions.push(
+                iced::time::every(std::time::Duration::from_millis(33))
+                    .map(|_| Message::TerminalTick),
             );
         }
         iced::Subscription::batch(subscriptions)
@@ -791,6 +811,9 @@ impl SimpleEditApp {
         if let Some(errors) = error_panel {
             panel = panel.push(errors);
         }
+        if self.terminal.open {
+            panel = panel.push(self.terminal_panel(dark));
+        }
         let editor_panel = container(panel.push(status_bar))
             .width(Length::Fill)
             .height(Length::Fill)
@@ -807,11 +830,14 @@ impl SimpleEditApp {
             })
             .height(Length::Fill);
         if self.show_sidebar {
-            main_row = main_row.push(self.sidebar.view(
-                dark,
-                &self.current_file,
-                &self.dirty_files(),
-            ));
+            main_row = main_row.push(
+                column![
+                    self.sidebar
+                        .view(dark, &self.current_file, &self.dirty_files()),
+                    self.terminal_button(dark),
+                ]
+                .spacing(se_theme::PANEL_GAP),
+            );
         }
         main_row = main_row.push(editor_panel);
 
@@ -997,6 +1023,7 @@ impl SimpleEditApp {
                 | Message::AutoSave
                 | Message::SessionWritten(_)
                 | Message::PreviewTick
+                | Message::TerminalTick
                 | Message::WindowResized(..)
         );
         if closes_menu || matches!(message, Message::ToggleMenu(_) | Message::HoverMenu(_)) {
@@ -1261,6 +1288,60 @@ impl SimpleEditApp {
             },
             // The menu closed above, like for any message that isn't passive.
             Message::CloseMenu => Task::none(),
+            Message::ToggleTerminal => {
+                if self.terminal.open {
+                    self.terminal.open = false;
+                    self.terminal.focused = false;
+                } else {
+                    if self.terminal.tabs.is_empty() {
+                        self.new_terminal();
+                    }
+                    self.terminal.open = !self.terminal.tabs.is_empty();
+                    self.terminal.focused = self.terminal.open;
+                }
+                Task::none()
+            }
+            Message::NewTerminal => {
+                self.new_terminal();
+                self.terminal.open = !self.terminal.tabs.is_empty();
+                self.terminal.focused = self.terminal.open;
+                Task::none()
+            }
+            Message::SelectTerminal(index) => {
+                if index < self.terminal.tabs.len() {
+                    self.terminal.active = index;
+                    self.terminal.focused = true;
+                }
+                Task::none()
+            }
+            Message::CloseTerminal(index) => {
+                self.terminal.close(index);
+                Task::none()
+            }
+            Message::TerminalTick => {
+                self.terminal.prune_ended();
+                Task::none()
+            }
+            Message::TerminalFocus(focused) => {
+                self.terminal.focused = focused && self.terminal.open;
+                Task::none()
+            }
+            Message::TerminalCopy(text) => iced::clipboard::write(text),
+            Message::TerminalPaste => iced::clipboard::read().map(Message::TerminalPasteText),
+            Message::TerminalPasteText(text) => {
+                if let (Some(text), Some(session)) = (text, self.terminal.active_session()) {
+                    let bracketed = session
+                        .with_screen(|screen| screen.bracketed_paste())
+                        .unwrap_or(false);
+                    if bracketed {
+                        session.write(format!("\x1b[200~{text}\x1b[201~").as_bytes());
+                    } else {
+                        // A pasted line break is the Enter key.
+                        session.write(text.replace("\r\n", "\r").replace('\n', "\r").as_bytes());
+                    }
+                }
+                Task::none()
+            }
             Message::ConfirmOverwrite => {
                 self.overlay = ActiveOverlay::None;
                 // Take the new on-disk state as the baseline, then save.
@@ -1745,6 +1826,19 @@ impl SimpleEditApp {
                     self.capturing = None;
                     return Task::none();
                 }
+                // The terminal has the keyboard: it gets every key (it reads
+                // them itself), except the one that hides it.
+                if self.terminal.focused {
+                    let toggle = &self.config.shortcuts.toggle_terminal;
+                    if toggle.key.eq_ignore_ascii_case(&key)
+                        && toggle.ctrl == ctrl
+                        && toggle.alt == alt
+                        && toggle.shift == shift
+                    {
+                        return self.handle(Message::ToggleTerminal);
+                    }
+                    return Task::none();
+                }
                 // The palette: arrows move the selection (Enter is the
                 // field's own submit, Escape closes).
                 if self.overlay == ActiveOverlay::Palette {
@@ -1822,7 +1916,8 @@ impl SimpleEditApp {
                 };
                 let sh = &self.config.shortcuts;
                 // Order matters: Ctrl+Shift+S must be tried before Ctrl+S.
-                let bindings: [(&ShortcutConfig, Message); 24] = [
+                let bindings: [(&ShortcutConfig, Message); 25] = [
+                    (&sh.toggle_terminal, Message::ToggleTerminal),
                     (&sh.nav_back, Message::NavBack),
                     (&sh.nav_forward, Message::NavForward),
                     (&sh.undo, Message::Undo),
@@ -3022,6 +3117,21 @@ impl SimpleEditApp {
             Task::none()
         } else {
             self.close_path(path)
+        }
+    }
+
+    /// Opens a terminal in the project of the current file (or the home folder).
+    fn new_terminal(&mut self) {
+        let cwd = self
+            .current_file
+            .as_deref()
+            .filter(|p| !is_untitled(p))
+            .and_then(crate::definition::project_root)
+            .filter(|p| p.is_dir())
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("/"));
+        if let Err(error) = self.terminal.add(&cwd, &t!("terminal.local")) {
+            self.set_status(format!("{}: {error}", t!("status.error")), true);
         }
     }
 

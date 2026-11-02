@@ -15,7 +15,7 @@ name = "simpleedit"
 path = "src/main.rs"
 
 [dependencies]
-iced = { version = "0.14", features = ["advanced", "tokio", "lazy", "selector"] }
+iced = { version = "0.14", features = ["advanced", "tokio", "lazy", "selector", "canvas"] }
 iced_aw = { version = "0.14", default-features = false, features = ["context_menu", "wrap"] }
 syntect = { version = "5", default-features = false, features = ["default-syntaxes", "regex-onig"] }
 two-face = { version = "0.5", default-features = false, features = ["syntect-onig"] }
@@ -33,6 +33,8 @@ tokio = { version = "1", features = ["rt", "process", "io-util", "time", "sync"]
 sha2 = "0.10"
 ed25519-dalek = { version = "2", default-features = false }
 tempfile = "3"
+portable-pty = "0.9.0"
+vt100 = "0.18.1"
 
 
 # Text shaping and syntax highlighting are very slow unoptimized: jumping

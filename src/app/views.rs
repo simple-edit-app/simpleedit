@@ -323,6 +323,103 @@ impl SimpleEditApp {
         .into()
     }
 
+    /// The block under the file list: a button that shows or hides the terminal.
+    pub(super) fn terminal_button(&self, dark: bool) -> Element<'_, Message> {
+        let open = self.terminal.open;
+        container(
+            button(text(">_").size(13).font(se_theme::MONO))
+                .padding([5, 10])
+                .on_press(Message::ToggleTerminal)
+                // Open: the accent wash; closed: an outline, so it reads as a button.
+                .style(move |theme: &iced::Theme, status| {
+                    if open {
+                        (se_theme::GhostButton { dark, active: true }).style()(theme, status)
+                    } else {
+                        (se_theme::Outline { dark }).style()(theme, status)
+                    }
+                }),
+        )
+        .padding([6, 10])
+        .width(208)
+        .style(se_theme::panel(dark))
+        .into()
+    }
+
+    /// The terminals: a row of tabs, then the active one.
+    pub(super) fn terminal_panel(&self, dark: bool) -> Element<'_, Message> {
+        let p = se_theme::palette(dark);
+        let mut header = row![text(t!("terminal.title").to_string())
+            .size(12)
+            .font(se_theme::UI_SEMIBOLD)
+            .color(p.text)]
+        .spacing(8)
+        .align_y(Alignment::Center);
+        for (index, tab) in self.terminal.tabs.iter().enumerate() {
+            let active = index == self.terminal.active;
+            header = header.push(
+                button(
+                    row![
+                        text(tab.title.as_str()).size(12),
+                        button(text("×").size(13))
+                            .padding([0, 4])
+                            .on_press(Message::CloseTerminal(index))
+                            .style(
+                                (se_theme::GhostButton {
+                                    dark,
+                                    active: false,
+                                })
+                                .style(),
+                            ),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                )
+                .padding([3, 8])
+                .on_press(Message::SelectTerminal(index))
+                .style((se_theme::GhostButton { dark, active }).style()),
+            );
+        }
+        header = header
+            .push(
+                button(text("+").size(14))
+                    .padding([1, 8])
+                    .on_press(Message::NewTerminal)
+                    .style(
+                        (se_theme::GhostButton {
+                            dark,
+                            active: false,
+                        })
+                        .style(),
+                    ),
+            )
+            .push(Space::new().width(Length::Fill))
+            .push(
+                button(text("—").size(12))
+                    .padding([1, 8])
+                    .on_press(Message::ToggleTerminal)
+                    .style(
+                        (se_theme::GhostButton {
+                            dark,
+                            active: false,
+                        })
+                        .style(),
+                    ),
+            );
+        let body: Element<Message> = match self.terminal.active_session() {
+            Some(session) => crate::terminal::view(session, dark, self.terminal.focused),
+            None => Space::new().into(),
+        };
+        column![
+            container(Space::new().height(1))
+                .width(Length::Fill)
+                .style(se_theme::rule(dark)),
+            container(header).padding([4, 12]),
+            container(body).width(Length::Fill).height(Length::Fill),
+        ]
+        .height(Length::Fixed(300.0))
+        .into()
+    }
+
     /// Where a name is used, as a compact list under the top edge: file and
     /// line, the line itself, and the full path of the highlighted one.
     pub(super) fn view_references_overlay<'a>(

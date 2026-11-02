@@ -652,6 +652,11 @@ pub fn shortcuts_list(
             sc.nav_forward.display(),
         ),
         (
+            ShortcutTarget::ToggleTerminal,
+            t!("shortcuts.toggle_terminal").to_string(),
+            sc.toggle_terminal.display(),
+        ),
+        (
             ShortcutTarget::ToggleFold,
             t!("shortcuts.toggle_fold").to_string(),
             sc.toggle_fold.display(),

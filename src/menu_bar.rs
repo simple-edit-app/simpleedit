@@ -506,6 +506,12 @@ fn menu_items(
                     Message::ToggleSidebar,
                 ),
                 item(
+                    t!("terminal.title").to_string(),
+                    sc(&sh.toggle_terminal),
+                    dark,
+                    Message::ToggleTerminal,
+                ),
+                item(
                     if config.dark_mode {
                         t!("toolbar.light").to_string()
                     } else {

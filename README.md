@@ -15,6 +15,7 @@ A fast, stable, cross-platform text editor for **macOS** and **Linux**. Built in
 - **Go to definition** — Ctrl+click (Cmd+click on macOS) on a function, variable, class or interface jumps to where it is defined; on the definition itself, it lists where it is used. It only answers when it is sure
 - **Back / Forward** navigation (Alt+Left / Alt+Right, mouse buttons) across the places you jumped from, tabs included
 - **Language servers, optional** — Preferences › Language servers installs (and removes) the one of a language without administrator rights; the status bar offers it when you open a file. Without one, definitions are found by a careful pattern search
+- **Integrated terminal** — a `>_` button under the file list opens a terminal panel at the bottom, with tabs for several shells (Alt+F12, selection and copy / paste included)
 - **Code folding** — chevrons in the gutter fold blocks, comments and Markdown sections
 - **File sidebar** — open and switch between multiple files
 - **Search & Replace** with regex support
