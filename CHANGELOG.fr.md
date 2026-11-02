@@ -1,5 +1,14 @@
 # Journal des modifications
 
+## [1.1.0] - 2026-11-02
+
+### Ajouté
+- Une petite croix à droite de chaque fichier de la barre latérale ferme son onglet aussitôt, sans confirmation, même avec des modifications non enregistrées.
+- « Fermer les autres onglets » et « Fermer tous les onglets » dans le menu Fichier, la palette de commandes et le menu du clic droit sur un fichier de la barre latérale (là, « les autres » garde le fichier sur lequel vous avez cliqué). Une seule confirmation couvre tous les onglets modifiés.
+
+### Corrigé
+- Un clic n'importe où en dehors d'un menu ouvert le ferme, y compris sur les zones vides de la barre latérale, de la barre d'outils et de la barre d'état.
+
 ## [1.0.1] - 2026-11-02
 
 ### Corrigé

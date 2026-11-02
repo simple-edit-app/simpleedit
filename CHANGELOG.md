@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.1.0] - 2026-11-02
+
+### Added
+- A small cross beside each file in the sidebar closes its tab at once, without asking, even with unsaved changes.
+- "Close other tabs" and "Close all tabs" in the File menu, the command palette and the right-click menu of a file in the sidebar (there, "others" keeps the file you clicked). One confirmation covers all the tabs that have unsaved changes.
+
+### Fixed
+- A click anywhere outside an open menu closes it, including on empty parts of the sidebar, the toolbar and the status bar.
+
 ## [1.0.1] - 2026-11-02
 
 ### Fixed
