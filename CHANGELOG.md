@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.2.0] - 2026-11-02
+
+### Added
+- Integrated terminal: a `>_` button under the file list opens a terminal panel at the bottom of the window, with tabs to run several shells ("+" adds one, "×" closes one, "—" hides the panel). It starts in the project of the open file, supports colors, scrolling with the wheel, selection with the mouse, copy and paste (Ctrl+Shift+C / V, Cmd+C / V on macOS) and full-screen programs. Alt+F12 (rebindable), the View menu and the command palette toggle it.
+
 ## [1.1.0] - 2026-11-02
 
 ### Added

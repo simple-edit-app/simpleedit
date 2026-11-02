@@ -1,5 +1,10 @@
 # Journal des modifications
 
+## [1.2.0] - 2026-11-02
+
+### Ajouté
+- Terminal intégré : un bouton `>_` sous la liste des fichiers ouvre un panneau de terminal en bas de la fenêtre, avec des onglets pour lancer plusieurs shells (« + » en ajoute un, « × » en ferme un, « — » masque le panneau). Il démarre dans le projet du fichier ouvert et gère les couleurs, le défilement à la molette, la sélection à la souris, le copier-coller (Ctrl+Maj+C / V, Cmd+C / V sur macOS) et les programmes plein écran. Alt+F12 (modifiable), le menu Affichage et la palette de commandes l'ouvrent et le ferment.
+
 ## [1.1.0] - 2026-11-02
 
 ### Ajouté
