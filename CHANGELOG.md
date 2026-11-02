@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.0.1] - 2026-11-02
+
+### Fixed
+- Syntax highlighting no longer turns the rest of the file green after a template literal with `${…}` in JavaScript, TypeScript, JSX and TSX, and a JSX tag name that ends its line (`<button` followed by its attributes) is colored like its closing tag.
+- JSX, TypeScript, TSX, Kotlin, Swift, SCSS, Less and TOML now have their own grammar instead of a close relative's, and JSX files no longer end inside a phantom regular expression.
+
 ## [1.0.0] - 2026-11-02
 
 ### Added

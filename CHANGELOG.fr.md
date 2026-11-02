@@ -1,5 +1,11 @@
 # Journal des modifications
 
+## [1.0.1] - 2026-11-02
+
+### Corrigé
+- La coloration syntaxique ne rend plus le reste du fichier vert après un texte entre accents graves contenant `${…}` en JavaScript, TypeScript, JSX et TSX, et un nom de balise JSX en fin de ligne (`<button` suivi de ses attributs) a la même couleur que sa balise fermante.
+- JSX, TypeScript, TSX, Kotlin, Swift, SCSS, Less et TOML ont maintenant leur propre grammaire au lieu de celle d'un langage voisin, et les fichiers JSX ne finissent plus dans une fausse expression régulière.
+
 ## [1.0.0] - 2026-11-02
 
 ### Ajouté
