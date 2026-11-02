@@ -62,6 +62,33 @@ pub type Servers = (
     std::collections::HashSet<&'static str>,
 );
 
+/// What the arrows of a diff tab do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffNav {
+    PrevChange,
+    NextChange,
+    PrevFile,
+    NextFile,
+    ToggleSide,
+}
+
+/// A diff shown in an editor tab (`diff://N/title`): the repository, the
+/// files to walk through, where it is.
+pub struct DiffTabState {
+    pub repo: PathBuf,
+    pub viewer: crate::git_panel::Viewer,
+}
+
+/// The blame column of a file: what is drawn, and the commit of each line.
+pub struct BlameState {
+    pub path: PathBuf,
+    pub repo: PathBuf,
+    /// The path inside the repository.
+    pub relative: String,
+    pub annotations: crate::code_editor::Annotations,
+    pub shas: Vec<String>,
+}
+
 /// Which modal overlay (if any) is currently shown.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ActiveOverlay {
@@ -133,6 +160,20 @@ pub enum Message {
     ToggleMenu(TopMenu),
     /// A click outside the open menu: it closes (nothing else happens).
     CloseMenu,
+    // Git
+    ToggleGit,
+    Git(crate::git_panel::GitMsg),
+    /// A diff to show in an editor tab.
+    OpenDiffTab(crate::git_panel::DiffTab),
+    DiffTab(DiffNav),
+    // Blame
+    BlameFile,
+    BlameLoaded(
+        PathBuf,
+        Result<(PathBuf, String, Vec<crate::git::history::BlameLine>), String>,
+    ),
+    CloseBlame,
+    BlameLineClicked(usize),
     // Terminal
     ToggleTerminal,
     NewTerminal,
@@ -283,6 +324,7 @@ pub enum Message {
     ModifiersChanged {
         ctrl: bool,
         alt: bool,
+        shift: bool,
     },
     /// An in-document anchor link (`#slug`) was clicked in the Markdown
     /// preview.
@@ -327,6 +369,12 @@ pub struct SimpleEditApp {
     terminal: crate::terminal::Panel,
     scratch: crate::scratch::Panel,
     bookmark_panel: bookmark_panel::Panel,
+    git: crate::git_panel::Panel,
+    diff_tabs: HashMap<PathBuf, DiffTabState>,
+    diff_counter: u32,
+    blame: Option<BlameState>,
+    /// The last right click on the editor was in the gutter.
+    gutter_click: bool,
     /// A language server to offer in the status bar, in place of the message.
     server_offer: Option<&'static crate::lsp_install::ServerInfo>,
     status_is_error: bool,
@@ -411,6 +459,7 @@ pub struct SimpleEditApp {
     mod_ctrl: bool,
     /// Alt currently held, tracked for Alt+click on a chevron.
     mod_alt: bool,
+    mod_shift: bool,
 }
 
 /// Cap on the memory the undo history of one buffer may hold.
@@ -478,6 +527,11 @@ impl SimpleEditApp {
             terminal: Default::default(),
             scratch: crate::scratch::Panel::new(&config.scratch_dir),
             bookmark_panel: Default::default(),
+            git: Default::default(),
+            diff_tabs: HashMap::new(),
+            diff_counter: 0,
+            blame: None,
+            gutter_click: false,
             server_offer: None,
             status_is_error: false,
             format_error: None,
@@ -518,6 +572,7 @@ impl SimpleEditApp {
             pending_closers: Vec::new(),
             mod_ctrl: false,
             mod_alt: false,
+            mod_shift: false,
             config,
         }
     }
@@ -576,19 +631,20 @@ impl SimpleEditApp {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         // What the autosave and the preview have to look at again.
-        let passive = matches!(
-            &message,
-            Message::AutoSave
-                | Message::ModifiersChanged { .. }
-                | Message::MenuBounds(..)
-                | Message::ToggleMenu(_)
-                | Message::HoverMenu(_)
-                | Message::SetRecents(_)
-                | Message::SessionWritten(_)
-                | Message::PreviewTick
-                | Message::TerminalTick
-                | Message::WindowResized(..)
-        );
+        let passive = message.is_background()
+            || matches!(
+                &message,
+                Message::AutoSave
+                    | Message::ModifiersChanged { .. }
+                    | Message::MenuBounds(..)
+                    | Message::ToggleMenu(_)
+                    | Message::HoverMenu(_)
+                    | Message::SetRecents(_)
+                    | Message::SessionWritten(_)
+                    | Message::PreviewTick
+                    | Message::TerminalTick
+                    | Message::WindowResized(..)
+            );
         let edits_text = !passive && !matches!(&message, Message::EditorAction(a) if !a.is_edit());
         if edits_text {
             self.text_rev += 1;
@@ -678,6 +734,7 @@ impl SimpleEditApp {
                 Some(Message::ModifiersChanged {
                     ctrl: m.command(),
                     alt: m.alt(),
+                    shift: m.shift(),
                 })
             }
             // The window is closed through the app so the session is saved.
@@ -703,6 +760,12 @@ impl SimpleEditApp {
             subscriptions.push(
                 iced::time::every(std::time::Duration::from_millis(150))
                     .map(|_| Message::PreviewTick),
+            );
+        }
+        if self.git.open {
+            subscriptions.push(
+                iced::time::every(std::time::Duration::from_secs(2))
+                    .map(|_| Message::Git(crate::git_panel::GitMsg::Tick)),
             );
         }
         if self.terminal.open {
@@ -839,6 +902,8 @@ impl SimpleEditApp {
         }
         if self.terminal.open {
             panel = panel.push(self.terminal_panel(dark));
+        } else if self.git.open {
+            panel = panel.push(self.git.view(dark));
         }
         if self.scratch.open {
             panel = panel.push(self.scratch_panel(dark));
@@ -1031,6 +1096,15 @@ impl SimpleEditApp {
 // ─── Message handling ───────────────────────────────────────────────────────
 
 impl Message {
+    /// Answers of background work and timers: not an action of the user.
+    fn is_background(&self) -> bool {
+        match self {
+            Message::Git(msg) => msg.is_background(),
+            Message::BlameLoaded(..) => true,
+            _ => false,
+        }
+    }
+
     /// Shortcuts that act on the buffer and so shouldn't fire while a
     /// text field is being typed in.
     fn is_editor_shortcut(&self) -> bool {
@@ -1056,19 +1130,20 @@ impl SimpleEditApp {
         // fires a spurious ModifiersChanged right after the very click that
         // opens the menu, AutoSave ticks every 5s regardless of the UI, and
         // MenuBounds is this same open answering its own position query.
-        let closes_menu = !matches!(
-            &message,
-            Message::ToggleMenu(_)
-                | Message::HoverMenu(_)
-                | Message::SetRecents(_)
-                | Message::MenuBounds(..)
-                | Message::ModifiersChanged { .. }
-                | Message::AutoSave
-                | Message::SessionWritten(_)
-                | Message::PreviewTick
-                | Message::TerminalTick
-                | Message::WindowResized(..)
-        );
+        let closes_menu = !message.is_background()
+            && !matches!(
+                &message,
+                Message::ToggleMenu(_)
+                    | Message::HoverMenu(_)
+                    | Message::SetRecents(_)
+                    | Message::MenuBounds(..)
+                    | Message::ModifiersChanged { .. }
+                    | Message::AutoSave
+                    | Message::SessionWritten(_)
+                    | Message::PreviewTick
+                    | Message::TerminalTick
+                    | Message::WindowResized(..)
+            );
         if closes_menu || matches!(message, Message::ToggleMenu(_) | Message::HoverMenu(_)) {
             self.recents_open = false;
         }
@@ -1080,8 +1155,16 @@ impl SimpleEditApp {
             self.open_menu = None;
         }
 
+        if matches!(message, Message::Sidebar(_) | Message::NewFile) {
+            self.git.typing = false;
+        }
+
         match message {
             Message::EditorAction(action) => {
+                self.git.typing = false;
+                if action.is_edit() {
+                    self.blame = None;
+                }
                 // Without a tab there is nothing to edit (the next one is
                 // still being read).
                 if self.current_file.is_none() && action.is_edit() {
@@ -1337,6 +1420,51 @@ impl SimpleEditApp {
             },
             // The menu closed above, like for any message that isn't passive.
             Message::CloseMenu => Task::none(),
+            Message::BlameFile => self.start_blame(),
+            Message::BlameLoaded(path, result) => {
+                self.blame_loaded(path, result);
+                Task::none()
+            }
+            Message::CloseBlame => {
+                self.blame = None;
+                Task::none()
+            }
+            Message::BlameLineClicked(line) => self.blame_line_clicked(line),
+            Message::OpenDiffTab(tab) => self.open_diff_tab(tab),
+            Message::DiffTab(nav) => self.diff_nav(nav),
+            Message::ToggleGit => {
+                let ctx = crate::git_panel::Ctx {
+                    current_file: self.current_file.as_deref(),
+                    ctrl: self.mod_ctrl,
+                    shift: self.mod_shift,
+                };
+                let task = self.git.toggle(&ctx);
+                if self.git.open {
+                    // One tool panel at the bottom: the terminal steps aside.
+                    self.terminal.open = false;
+                    self.terminal.focused = false;
+                }
+                task
+            }
+            Message::Git(msg) => {
+                let ctx = crate::git_panel::Ctx {
+                    current_file: self.current_file.as_deref(),
+                    ctrl: self.mod_ctrl,
+                    shift: self.mod_shift,
+                };
+                // A diff may be the answer a tab in the editor waits for.
+                let tabs = if let crate::git_panel::GitMsg::DiffLoaded(token, result) = &msg {
+                    let tasks: Vec<_> = self
+                        .diff_tabs
+                        .values_mut()
+                        .map(|tab| tab.viewer.loaded(*token, result.clone()))
+                        .collect();
+                    Task::batch(tasks)
+                } else {
+                    Task::none()
+                };
+                Task::batch([self.git.update(msg, &ctx), tabs])
+            }
             Message::ToggleTerminal => {
                 if self.terminal.open {
                     self.terminal.open = false;
@@ -1351,6 +1479,7 @@ impl SimpleEditApp {
                         // One tool panel at the bottom.
                         self.scratch.open = false;
                         self.bookmark_panel.open = false;
+                        self.git.open = false;
                     }
                 }
                 Task::none()
@@ -1977,6 +2106,18 @@ impl SimpleEditApp {
                     self.capturing = None;
                     return Task::none();
                 }
+                // Typing a commit message: the app's shortcuts stay out of it.
+                if self.git.typing {
+                    let toggle = &self.config.shortcuts.toggle_git;
+                    if toggle.key.eq_ignore_ascii_case(&key)
+                        && toggle.ctrl == ctrl
+                        && toggle.alt == alt
+                        && toggle.shift == shift
+                    {
+                        return self.handle(Message::ToggleGit);
+                    }
+                    return Task::none();
+                }
                 // The terminal has the keyboard: it gets every key (it reads
                 // them itself), except the one that hides it.
                 if self.terminal.focused {
@@ -2067,7 +2208,8 @@ impl SimpleEditApp {
                 };
                 let sh = &self.config.shortcuts;
                 // Order matters: Ctrl+Shift+S must be tried before Ctrl+S.
-                let bindings: [(&ShortcutConfig, Message); 25] = [
+                let bindings: [(&ShortcutConfig, Message); 26] = [
+                    (&sh.toggle_git, Message::ToggleGit),
                     (&sh.toggle_terminal, Message::ToggleTerminal),
                     (&sh.nav_back, Message::NavBack),
                     (&sh.nav_forward, Message::NavForward),
@@ -2177,11 +2319,16 @@ impl SimpleEditApp {
                 Task::none()
             }
             Message::EditorRightClick(at) => {
+                let annotated = self.blame_shown();
+                let origin = crate::editor::text_origin(
+                    &self.config,
+                    self.editor.content.line_count(),
+                    annotated,
+                );
+                self.gutter_click = self.config.show_line_numbers && at.x < origin.x;
                 // The context menu acts on the clicked line: move the caret
                 // there, unless there is a selection to act on.
-                if self.editor.content.selection().is_none() {
-                    let origin =
-                        crate::editor::text_origin(&self.config, self.editor.content.line_count());
+                if self.editor.content.selection().is_none() && !self.gutter_click {
                     self.editor
                         .content
                         .perform(text_editor::Action::Click(at - origin));
@@ -2484,9 +2631,10 @@ impl SimpleEditApp {
                 }
                 Task::none()
             }
-            Message::ModifiersChanged { ctrl, alt } => {
+            Message::ModifiersChanged { ctrl, alt, shift } => {
                 self.mod_ctrl = ctrl;
                 self.mod_alt = alt;
+                self.mod_shift = shift;
                 Task::none()
             }
             Message::MarkdownLinkClicked(href) => {
@@ -3271,6 +3419,165 @@ impl SimpleEditApp {
         }
     }
 
+    /// Whether the blame column is drawn for the current file.
+    fn blame_shown(&self) -> bool {
+        self.blame
+            .as_ref()
+            .is_some_and(|b| self.current_file.as_ref() == Some(&b.path))
+    }
+
+    /// The blame column of the current file, for the editor.
+    fn blame_annotations(&self) -> Option<crate::code_editor::Annotations> {
+        self.blame
+            .as_ref()
+            .filter(|b| self.current_file.as_ref() == Some(&b.path))
+            .map(|b| b.annotations.clone())
+    }
+
+    /// "Annotate with Git Blame": asks git who changed each line.
+    fn start_blame(&mut self) -> Task<Message> {
+        let Some(path) = self.current_file.clone().filter(|p| !is_untitled(p)) else {
+            return Task::none();
+        };
+        Task::perform(
+            async move {
+                let root = crate::git::repo_root(&path)
+                    .await
+                    .ok_or_else(|| t!("git.no_repo").to_string())?;
+                let relative =
+                    relative_to(&root, &path).ok_or_else(|| t!("git.no_repo").to_string())?;
+                let lines = crate::git::history::blame(&root, &relative).await?;
+                Ok::<_, String>((path, (root, relative, lines)))
+            },
+            |result| match result {
+                Ok((path, data)) => Message::BlameLoaded(path, Ok(data)),
+                Err(error) => Message::BlameLoaded(PathBuf::new(), Err(error)),
+            },
+        )
+    }
+
+    fn blame_loaded(
+        &mut self,
+        path: PathBuf,
+        result: Result<(PathBuf, String, Vec<crate::git::history::BlameLine>), String>,
+    ) {
+        match result {
+            Ok((repo, relative, lines)) => {
+                let dark = self.config.dark_mode;
+                let p = se_theme::palette(dark);
+                // One tint per commit, from its hash.
+                let tints: [iced::Color; 6] = [
+                    iced::Color::from_rgba8(0x6e, 0xa8, 0xff, 0.16),
+                    iced::Color::from_rgba8(0x8f, 0xd1, 0x8f, 0.14),
+                    iced::Color::from_rgba8(0xff, 0x9b, 0x6b, 0.16),
+                    iced::Color::from_rgba8(0xc6, 0x8a, 0xe8, 0.16),
+                    iced::Color::from_rgba8(0xe6, 0xc0, 0x6a, 0.16),
+                    iced::Color::from_rgba8(0x5e, 0xcf, 0xd1, 0.16),
+                ];
+                let notes: Vec<crate::code_editor::Annotation> = lines
+                    .iter()
+                    .map(|l| {
+                        let tint = if l.committed() {
+                            let n = l
+                                .sha
+                                .bytes()
+                                .take(4)
+                                .fold(0usize, |a, b| a * 31 + b as usize);
+                            tints[n % tints.len()]
+                        } else {
+                            iced::Color::TRANSPARENT
+                        };
+                        let text = if l.committed() {
+                            format!(
+                                "{}  {}",
+                                crate::git_panel::stash::format_date(l.time),
+                                l.author
+                            )
+                        } else {
+                            t!("git.not_committed").to_string()
+                        };
+                        crate::code_editor::Annotation { text, tint }
+                    })
+                    .collect();
+                self.blame = Some(BlameState {
+                    path,
+                    repo,
+                    relative,
+                    annotations: crate::code_editor::Annotations {
+                        lines: std::sync::Arc::new(notes),
+                        text: p.muted,
+                    },
+                    shas: lines.iter().map(|l| l.sha.clone()).collect(),
+                });
+            }
+            Err(error) => self.set_status(error, true),
+        }
+    }
+
+    /// A click on a line of the blame column shows its commit in the Git panel.
+    fn blame_line_clicked(&mut self, line: usize) -> Task<Message> {
+        let Some(blame) = &self.blame else {
+            return Task::none();
+        };
+        let Some(sha) = blame.shas.get(line).cloned() else {
+            return Task::none();
+        };
+        if sha.chars().all(|c| c == '0') {
+            return Task::none();
+        }
+        let (repo, relative) = (blame.repo.clone(), blame.relative.clone());
+        self.terminal.open = false;
+        self.terminal.focused = false;
+        self.git.reveal_commit(sha, Some(relative), repo)
+    }
+
+    /// Opens a diff in an editor tab (one with the same title is reused).
+    fn open_diff_tab(&mut self, tab: crate::git_panel::DiffTab) -> Task<Message> {
+        let existing = self
+            .diff_tabs
+            .keys()
+            .find(|p| display_name(p) == format!("Δ {}", tab.title))
+            .cloned();
+        let path = existing.unwrap_or_else(|| {
+            self.diff_counter += 1;
+            PathBuf::from(format!("diff://{}/{}", self.diff_counter, tab.title))
+        });
+        let mut viewer = crate::git_panel::Viewer::default();
+        viewer.entries = tab.entries;
+        let load = viewer.open(&tab.repo, tab.start, crate::git_panel::Land::First);
+        self.diff_tabs.insert(
+            path.clone(),
+            DiffTabState {
+                repo: tab.repo,
+                viewer,
+            },
+        );
+        self.sidebar.add_file(path.clone());
+        let show = self.activate(path);
+        Task::batch([show, load])
+    }
+
+    /// The arrows of the diff tab in front.
+    fn diff_nav(&mut self, nav: DiffNav) -> Task<Message> {
+        let Some(path) = self.current_file.clone() else {
+            return Task::none();
+        };
+        let Some(tab) = self.diff_tabs.get_mut(&path) else {
+            return Task::none();
+        };
+        let repo = tab.repo.clone();
+        match nav {
+            DiffNav::NextChange => tab.viewer.next_change(&repo),
+            DiffNav::PrevChange => tab.viewer.prev_change(&repo),
+            DiffNav::NextFile => tab.viewer.next_file(&repo, crate::git_panel::Land::First),
+            DiffNav::PrevFile => tab.viewer.prev_file(&repo, crate::git_panel::Land::First),
+            DiffNav::ToggleSide => {
+                tab.viewer.side_by_side = !tab.viewer.side_by_side;
+                tab.viewer.scroll_to_change()
+            }
+        }
+    }
+
     /// Opens a terminal in the project of the current file (or the home folder).
     fn new_terminal(&mut self) {
         let cwd = self
@@ -3322,6 +3629,7 @@ impl SimpleEditApp {
         let index = self.sidebar.files().iter().position(|p| *p == path);
         self.file_cache.remove(&path);
         self.undo_cache.remove(&path);
+        self.diff_tabs.remove(&path);
         self.sidebar.remove_path(&path);
         // An untitled file is gone for good once closed; a saved one keeps
         // its bookmarks for the next time it is opened.
@@ -3830,13 +4138,31 @@ impl SimpleEditApp {
         mode: ViewMode,
         dark: bool,
     ) -> Element<'_, Message> {
+        if let Some(tab) = self
+            .current_file
+            .as_ref()
+            .and_then(|p| self.diff_tabs.get(p))
+        {
+            return crate::git_panel::diff_view::view(
+                &tab.viewer,
+                &crate::git_panel::diff_view::Nav::tab(),
+                dark,
+                t!("git.no_diff").to_string(),
+            );
+        }
         let search = self.show_search.then_some(&self.search);
         let marks = self.bookmark_lines();
         // The context menu's actions (select/cut/copy/paste/format) all act on
         // the raw buffer: it wraps the editor only — not the preview beside
         // it, and not the preview alone, where it would act on text the user
         // can't see.
-        let editor = || self.with_context_menu(self.editor.view(&self.config, search, marks), dark);
+        let editor = || {
+            self.with_context_menu(
+                self.editor
+                    .view(&self.config, search, marks, self.blame_annotations()),
+                dark,
+            )
+        };
         if kind.is_none() {
             return editor();
         }
@@ -3877,7 +4203,9 @@ impl SimpleEditApp {
             .map(short_dir)
             .unwrap_or_default();
 
+        let on_diff = self.current_file.as_deref().is_some_and(is_diff);
         let right: Element<Message> = match kind {
+            _ if on_diff => Space::new().into(),
             Some(kind) => crate::preview::segmented(kind, mode, dark),
             None => {
                 let has_formatter = self
@@ -3951,8 +4279,27 @@ impl SimpleEditApp {
         } else {
             0.0
         };
+        let gutter_menu = self.gutter_click;
+        let blame_on = self.blame_shown();
+        let lbl_blame = t!("git.blame").to_string();
+        let lbl_blame_close = t!("git.blame_close").to_string();
         let menu = iced_aw::ContextMenu::new(editor_widget, move || {
             use crate::menu_bar::{disabled_item, item, separator};
+            if gutter_menu {
+                let entry = if blame_on {
+                    item(lbl_blame_close.clone(), None, dark, Message::CloseBlame)
+                } else {
+                    item(lbl_blame.clone(), None, dark, Message::BlameFile)
+                };
+                return container(
+                    column![entry]
+                        .spacing(1)
+                        .padding(6)
+                        .width(Length::Fixed(264.0)),
+                )
+                .style(crate::theme::card(dark))
+                .into();
+            }
             let fmt_sel_el: Element<'static, Message> = if has_fmt_ctx && has_sel_ctx {
                 item(lbl_format_sel.clone(), None, dark, Message::FormatSelection)
             } else {
@@ -4107,7 +4454,12 @@ mod tests;
 
 /// What a tab is called: the file name, or "Untitled N".
 pub fn display_name(path: &Path) -> String {
-    if is_untitled(path) {
+    if is_diff(path) {
+        // diff://3/title
+        let rest = path.to_str().unwrap_or("").trim_start_matches("diff://");
+        let title = rest.split_once('/').map_or(rest, |(_, t)| t);
+        format!("Δ {title}")
+    } else if is_untitled(path) {
         let n = path
             .to_str()
             .unwrap_or("")
@@ -4266,10 +4618,27 @@ pub fn untitled_path(n: u32) -> PathBuf {
     PathBuf::from(format!("untitled://{}", n))
 }
 
+/// A tab that is not a file: an untitled buffer, or a diff.
 pub fn is_untitled(path: &Path) -> bool {
     path.to_str()
-        .map(|s| s.starts_with("untitled://"))
+        .map(|s| s.starts_with("untitled://") || s.starts_with("diff://"))
         .unwrap_or(false)
+}
+
+/// `path` relative to `root`, comparing real paths when a link is in the way.
+fn relative_to(root: &Path, path: &Path) -> Option<String> {
+    if let Ok(rel) = path.strip_prefix(root) {
+        return Some(rel.to_string_lossy().into_owned());
+    }
+    let (real, real_root) = (path.canonicalize().ok()?, root.canonicalize().ok()?);
+    real.strip_prefix(real_root)
+        .ok()
+        .map(|rel| rel.to_string_lossy().into_owned())
+}
+
+/// A tab that shows a diff (`diff://N/title`).
+pub fn is_diff(path: &Path) -> bool {
+    path.to_str().is_some_and(|s| s.starts_with("diff://"))
 }
 
 /// Releases as a column: version and date, then each section and its changes.

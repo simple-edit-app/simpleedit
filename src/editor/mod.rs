@@ -191,6 +191,7 @@ impl EditorState {
         config: &Config,
         search: Option<&SearchState>,
         bookmarks: &[usize],
+        blame: Option<crate::code_editor::Annotations>,
     ) -> Element<'a, Message> {
         let dark = config.dark_mode;
         self.content.set_wrapping(config.word_wrap);
@@ -235,6 +236,9 @@ impl EditorState {
         }
         if config.show_page_guide {
             editor = editor.page_guide(config.page_guide_column, p.border);
+        }
+        if let Some(blame) = blame {
+            editor = editor.annotations(blame, Message::BlameLineClicked);
         }
 
         editor = editor.folding(
@@ -311,9 +315,15 @@ fn padding(config: &Config) -> iced::Padding {
 /// Where the text starts inside the editor widget (top-left corner of the
 /// first character), to turn a position over the widget into a click on
 /// the text.
-pub fn text_origin(config: &Config, lines: usize) -> iced::Vector {
+pub fn text_origin(config: &Config, lines: usize, annotated: bool) -> iced::Vector {
     let size = config.font_size.clamp(8.0, 32.0);
-    crate::code_editor::text_origin(size, lines, config.show_line_numbers, padding(config))
+    crate::code_editor::text_origin(
+        size,
+        lines,
+        config.show_line_numbers,
+        annotated,
+        padding(config),
+    )
 }
 
 /// Row height relative to the text size (the design: 22px for 12.5px code).

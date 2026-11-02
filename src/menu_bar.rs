@@ -506,6 +506,12 @@ fn menu_items(
                     Message::ToggleSidebar,
                 ),
                 item(
+                    t!("git.title").to_string(),
+                    sc(&sh.toggle_git),
+                    dark,
+                    Message::ToggleGit,
+                ),
+                item(
                     t!("terminal.title").to_string(),
                     sc(&sh.toggle_terminal),
                     dark,

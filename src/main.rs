@@ -21,6 +21,8 @@ mod floating;
 mod folding;
 mod formatter;
 mod fsutil;
+mod git;
+mod git_panel;
 mod history;
 mod i18n;
 mod lsp;

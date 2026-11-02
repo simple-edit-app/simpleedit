@@ -708,6 +708,11 @@ pub fn shortcuts_list(
             sc.toggle_terminal.display(),
         ),
         (
+            ShortcutTarget::ToggleGit,
+            t!("shortcuts.toggle_git").to_string(),
+            sc.toggle_git.display(),
+        ),
+        (
             ShortcutTarget::ToggleFold,
             t!("shortcuts.toggle_fold").to_string(),
             sc.toggle_fold.display(),

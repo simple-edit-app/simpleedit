@@ -715,6 +715,108 @@ mod behavior_tests {
         assert!(app.open_menu.is_none());
     }
 
+    fn diff_tab(title: &str) -> crate::git_panel::DiffTab {
+        crate::git_panel::DiffTab {
+            repo: PathBuf::from("/tmp/no-such-repo"),
+            title: title.into(),
+            entries: Vec::new(),
+            start: 0,
+        }
+    }
+
+    #[test]
+    fn a_diff_opens_in_an_editor_tab_that_is_not_a_file_and_is_not_saved() {
+        let mut app = app();
+        let _ = app.handle(Message::OpenDiffTab(diff_tab("abc1234 fix")));
+        let path = app.current_file.clone().unwrap();
+        assert!(is_diff(&path));
+        assert!(is_untitled(&path), "no disk access for it");
+        assert!(app.diff_tabs.contains_key(&path));
+        assert_eq!(display_name(&path), "Δ abc1234 fix");
+        // The session forgets it.
+        let session = app.build_session();
+        assert!(session.files.iter().all(|f| !f.path.starts_with("diff://")));
+        assert!(session
+            .active_file
+            .as_deref()
+            .is_none_or(|p| !p.starts_with("diff://")));
+        // The same title reuses the tab.
+        let before = app.sidebar.files().len();
+        let _ = app.handle(Message::OpenDiffTab(diff_tab("abc1234 fix")));
+        assert_eq!(app.sidebar.files().len(), before);
+        // Closing it forgets its state.
+        let _ = app.handle(Message::Sidebar(crate::sidebar::SidebarMessage::CloseNow(
+            path.clone(),
+        )));
+        assert!(!app.diff_tabs.contains_key(&path));
+    }
+
+    #[test]
+    fn the_git_panel_and_the_terminal_take_turns_at_the_bottom() {
+        let mut app = app();
+        let _ = app.handle(Message::ToggleGit);
+        assert!(app.git.open);
+        let _ = app.handle(Message::ToggleTerminal);
+        assert!(app.terminal.open);
+        assert!(!app.git.open, "one tool panel at a time");
+        let _ = app.handle(Message::ToggleGit);
+        assert!(app.git.open);
+        assert!(!app.terminal.open);
+    }
+
+    #[test]
+    fn editing_the_text_drops_the_blame_column() {
+        let mut app = app();
+        type_text(&mut app, "one\ntwo");
+        let path = app.current_file.clone().unwrap();
+        app.blame = Some(BlameState {
+            path,
+            repo: PathBuf::from("/tmp"),
+            relative: "a".into(),
+            annotations: crate::code_editor::Annotations {
+                lines: std::sync::Arc::new(Vec::new()),
+                text: iced::Color::BLACK,
+            },
+            shas: vec![],
+        });
+        assert!(app.blame_shown());
+        type_text(&mut app, "x");
+        assert!(app.blame.is_none());
+    }
+
+    #[test]
+    fn a_right_click_in_the_gutter_is_told_from_one_in_the_text() {
+        let mut app = app();
+        type_text(&mut app, "a\nb");
+        let origin = crate::editor::text_origin(&app.config, 2, false);
+        let _ = app.handle(Message::EditorRightClick(iced::Point::new(
+            origin.x - 20.0,
+            origin.y + 5.0,
+        )));
+        assert!(app.gutter_click);
+        let _ = app.handle(Message::EditorRightClick(iced::Point::new(
+            origin.x + 30.0,
+            origin.y + 5.0,
+        )));
+        assert!(!app.gutter_click);
+    }
+
+    #[test]
+    fn the_git_panel_refreshing_itself_does_not_close_an_open_menu() {
+        use crate::git_panel::GitMsg;
+        let mut app = app();
+        let _ = app.handle(Message::ToggleMenu(TopMenu::File));
+        assert!(app.open_menu.is_some());
+        // What the open panel does by itself every two seconds.
+        let _ = app.update(Message::Git(GitMsg::Tick));
+        let _ = app.update(Message::Git(GitMsg::StatusLoaded(Ok(Default::default()))));
+        let _ = app.update(Message::Git(GitMsg::Done(Ok(String::new()))));
+        assert!(app.open_menu.is_some());
+        // A click on the panel is the user's: it closes the menu.
+        let _ = app.update(Message::Git(GitMsg::SelectTab(crate::git_panel::Tab::Log)));
+        assert!(app.open_menu.is_none());
+    }
+
     #[test]
     fn a_definition_never_used_says_so() {
         let mut app = app();

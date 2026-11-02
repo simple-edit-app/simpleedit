@@ -26,6 +26,7 @@ pub enum PaletteCommand {
     SetLanguage,
     ToggleSidebar,
     ToggleTerminal,
+    ToggleGit,
     ToggleTheme,
     Preferences,
     ToggleBookmark,
@@ -54,6 +55,7 @@ impl PaletteCommand {
             PaletteCommand::SetLanguage => Message::OpenLanguagePicker,
             PaletteCommand::ToggleSidebar => Message::ToggleSidebar,
             PaletteCommand::ToggleTerminal => Message::ToggleTerminal,
+            PaletteCommand::ToggleGit => Message::ToggleGit,
             PaletteCommand::SaveFile => Message::SaveFile,
             PaletteCommand::SaveFileAs => Message::SaveFileAs,
             PaletteCommand::CloseFile => Message::CloseFile,
@@ -158,6 +160,12 @@ pub fn entries(config: &Config, has_formatter: bool, language_enabled: bool) -> 
             t!("palette.set_language").to_string(),
             None,
             language_enabled,
+        ),
+        entry(
+            PaletteCommand::ToggleGit,
+            t!("git.title").to_string(),
+            Some(sh.toggle_git.display()),
+            true,
         ),
         entry(
             PaletteCommand::ToggleTerminal,

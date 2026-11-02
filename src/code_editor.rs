@@ -62,6 +62,25 @@ pub struct Gutter {
     pub current: Color,
 }
 
+/// One line of the blame column: who changed it and when, on a tint that
+/// identifies the commit.
+#[derive(Debug, Clone)]
+pub struct Annotation {
+    pub text: String,
+    pub tint: Color,
+}
+
+/// A column of text left of the line numbers (git blame).
+#[derive(Debug, Clone)]
+pub struct Annotations {
+    /// One per line of the buffer.
+    pub lines: std::sync::Arc<Vec<Annotation>>,
+    pub text: Color,
+}
+
+/// Width of the blame column.
+pub const ANNOTATION_WIDTH: f32 = 210.0;
+
 /// Wash over the cursor's line, with an accent bar on its left edge.
 #[derive(Debug, Clone, Copy)]
 pub struct LineHighlight {
@@ -188,9 +207,15 @@ fn gutter_width(size: f32, lines: usize) -> f32 {
 
 /// Where the text starts, from the widget's top-left corner: past the
 /// padding and the gutter.
-pub fn text_origin(size: f32, lines: usize, gutter: bool, padding: Padding) -> Vector {
+pub fn text_origin(
+    size: f32,
+    lines: usize,
+    gutter: bool,
+    annotated: bool,
+    padding: Padding,
+) -> Vector {
     let gutter = if gutter {
-        gutter_width(size, lines) + GUTTER_GAP
+        gutter_width(size, lines) + GUTTER_GAP + if annotated { ANNOTATION_WIDTH } else { 0.0 }
     } else {
         0.0
     };
@@ -256,6 +281,8 @@ where
     guide: Option<(usize, Color)>,
     minimap: Option<Minimap>,
     bookmarks: Option<BookmarkPaint>,
+    annotations: Option<Annotations>,
+    on_annotation: Option<Box<dyn Fn(usize) -> Message + 'a>>,
     folding: Option<FoldPaint>,
     on_fold: Option<Box<dyn Fn(usize, Scope) -> Message + 'a>>,
     on_definition: Option<Box<dyn Fn() -> Message + 'a>>,
@@ -281,6 +308,8 @@ impl<'a, Message, Theme> CodeEditor<'a, highlighter::PlainText, Message, Theme> 
             guide: None,
             minimap: None,
             bookmarks: None,
+            annotations: None,
+            on_annotation: None,
             folding: None,
             on_fold: None,
             on_definition: None,
@@ -326,6 +355,18 @@ where
     /// Shows line numbers, aligned with the text however it wraps or scrolls.
     pub fn gutter(mut self, gutter: Gutter) -> Self {
         self.gutter = Some(gutter);
+        self
+    }
+
+    /// A blame column left of the line numbers; a click on a line of it
+    /// sends `on_click(line)`.
+    pub fn annotations(
+        mut self,
+        annotations: Annotations,
+        on_click: impl Fn(usize) -> Message + 'a,
+    ) -> Self {
+        self.annotations = Some(annotations);
+        self.on_annotation = Some(Box::new(on_click));
         self
     }
 
@@ -408,6 +449,8 @@ where
             guide: self.guide,
             minimap: self.minimap,
             bookmarks: self.bookmarks,
+            annotations: self.annotations,
+            on_annotation: self.on_annotation,
             folding: self.folding,
             on_fold: self.on_fold,
             on_definition: self.on_definition,
@@ -628,6 +671,23 @@ where
 
     /// The foldable line whose chevron is under `at` (relative to the
     /// widget).
+    /// The line drawn at height `y` (from the widget's top).
+    fn line_at_y(&self, y: f32, padding: Padding, renderer: &iced::Renderer) -> Option<usize> {
+        let internal = self.content.0.borrow();
+        let size = self.size_px(renderer);
+        let row = self.line_height.to_absolute(Pixels(size)).0;
+        let mut previous = None;
+        for run in internal.editor.buffer().layout_runs() {
+            let first = previous != Some(run.line_i);
+            previous = Some(run.line_i);
+            let top = padding.top + run.line_top;
+            if first && run.line_height > 0.0 && y >= top && y < top + row {
+                return Some(run.line_i);
+            }
+        }
+        None
+    }
+
     fn chevron_line_at(
         &self,
         at: Point,
@@ -665,6 +725,7 @@ where
             self.size_px(renderer),
             lines,
             self.gutter.is_some(),
+            self.annotations.is_some(),
             self.padding,
         );
         Padding {
@@ -1245,6 +1306,22 @@ where
             }
         }
 
+        if let (Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), Some(on_note)) =
+            (event, &self.on_annotation)
+        {
+            let bounds = layout.bounds();
+            if let Some(at) = cursor.position_in(bounds) {
+                let from = self.padding.left;
+                if at.x >= from && at.x < from + ANNOTATION_WIDTH - 6.0 {
+                    if let Some(line) = self.line_at_y(at.y, padding, renderer) {
+                        shell.publish(on_note(line));
+                        shell.capture_event();
+                        return;
+                    }
+                }
+            }
+        }
+
         if self.minimap.is_some() {
             let rect = minimap_rect(layout.bounds());
             let target = match event {
@@ -1544,7 +1621,12 @@ where
         }
 
         if let Some(gutter) = self.gutter {
-            let width = gutter_width(size, internal.editor.line_count());
+            let extra = if self.annotations.is_some() {
+                ANNOTATION_WIDTH
+            } else {
+                0.0
+            };
+            let width = gutter_width(size, internal.editor.line_count()) + extra;
             let column = Rectangle {
                 x: bounds.x + self.padding.left,
                 y: bounds.y,
@@ -1618,6 +1700,45 @@ where
                     }
                 }
 
+                if let Some(blame) = &self.annotations {
+                    if let Some(note) = blame.lines.get(run.line_i) {
+                        let strip = Rectangle {
+                            x: column.x,
+                            y: bounds.y + padding.top + run.line_top,
+                            width: extra - 6.0,
+                            height: row_height,
+                        };
+                        if let Some(visible) = clip.intersection(&strip) {
+                            renderer.fill_quad(
+                                renderer::Quad {
+                                    bounds: visible,
+                                    ..renderer::Quad::default()
+                                },
+                                note.tint,
+                            );
+                        }
+                        renderer.fill_text(
+                            text::Text {
+                                content: note.text.clone(),
+                                bounds: Size::new(extra - 16.0, row_height),
+                                size: Pixels(size * 0.85),
+                                line_height: self.line_height,
+                                font: self.font.unwrap_or(Font::MONOSPACE),
+                                align_x: text::Alignment::Left,
+                                align_y: alignment::Vertical::Center,
+                                shaping: text::Shaping::Advanced,
+                                wrapping: text::Wrapping::None,
+                            },
+                            Point::new(
+                                column.x + 6.0,
+                                bounds.y + padding.top + run.line_top + row_height / 2.0,
+                            ),
+                            blame.text,
+                            strip.intersection(&clip).unwrap_or(clip),
+                        );
+                    }
+                }
+
                 let number = (run.line_i + 1).to_string();
                 renderer.fill_text(
                     text::Text {
@@ -1650,7 +1771,14 @@ where
         if let Some(marks) = &self.bookmarks {
             // A small flag at the left edge of the gutter (or of the text,
             // without line numbers), on the first row of each marked line.
-            let x = bounds.x + self.padding.left + 6.0;
+            let x = bounds.x
+                + self.padding.left
+                + 6.0
+                + if self.annotations.is_some() {
+                    ANNOTATION_WIDTH
+                } else {
+                    0.0
+                };
             let mut previous = None;
             for run in internal.editor.buffer().layout_runs() {
                 if previous == Some(run.line_i) || run.line_height <= 0.0 {
