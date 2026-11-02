@@ -86,6 +86,8 @@ pub enum ActiveOverlay {
     UpdateError(String),
     /// Closing this tab would discard unsaved changes.
     ConfirmClose(PathBuf),
+    /// Closing these tabs would discard unsaved changes in some of them.
+    ConfirmCloseMany(Vec<PathBuf>, usize),
     /// The session couldn't be written: quitting would lose unsaved buffers.
     ConfirmQuit(String),
     /// Saving would overwrite changes made to the file outside the editor.
@@ -113,6 +115,12 @@ pub enum Message {
     FileSaved(Option<PathBuf>, Result<(PathBuf, String), String>),
     NewFile,
     CloseFile,
+    /// Closes every tab but this one (none: all of them).
+    CloseTabs(Option<PathBuf>),
+    /// Closes every tab but the active one.
+    CloseOtherTabs,
+    /// The user confirmed closing these tabs although some have unsaved changes.
+    ConfirmDiscardMany(Vec<PathBuf>),
     ToggleSearch,
     ToggleSidebar,
     TogglePreferences,
@@ -121,6 +129,8 @@ pub enum Message {
     ToggleTheme,
     InsertTab,
     ToggleMenu(TopMenu),
+    /// A click outside the open menu: it closes (nothing else happens).
+    CloseMenu,
     /// The pointer entered a menu title: switches menus if one is already open.
     HoverMenu(TopMenu),
     /// Resolves the on-screen position of an open top menu's button, so its
@@ -834,7 +844,20 @@ impl SimpleEditApp {
                 self.bookmark_state(),
                 self.recents_open,
             );
-            crate::floating::at_point(base, dropdown, bounds.x, bounds.y + bounds.height)
+            // Under the dropdown and below the menu bar (its titles stay
+            // clickable), anywhere else closes the menu.
+            let outside = column![
+                Space::new().height(bounds.y + bounds.height),
+                iced::widget::mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
+                    .on_press(Message::CloseMenu)
+                    .on_right_press(Message::CloseMenu),
+            ];
+            crate::floating::at_point(
+                iced::widget::stack![base, outside],
+                dropdown,
+                bounds.x,
+                bounds.y + bounds.height,
+            )
         } else {
             base
         };
@@ -904,6 +927,9 @@ impl SimpleEditApp {
                         self.view_overwrite_overlay(dark, path)
                     }
                     ActiveOverlay::ConfirmClose(path) => self.view_confirm_overlay(dark, path),
+                    ActiveOverlay::ConfirmCloseMany(paths, modified) => {
+                        self.view_confirm_many_overlay(dark, paths, *modified)
+                    }
                     ActiveOverlay::ConfirmQuit(error) => confirm_card(
                         dark,
                         t!("quit.title").to_string(),
@@ -1223,10 +1249,18 @@ impl SimpleEditApp {
                 }
                 Task::none()
             }
+            Message::CloseOtherTabs => self.handle(Message::CloseTabs(self.current_file.clone())),
+            Message::CloseTabs(keep) => self.request_close_many(keep),
+            Message::ConfirmDiscardMany(paths) => {
+                self.overlay = ActiveOverlay::None;
+                self.close_many(paths)
+            }
             Message::CloseFile => match self.current_file.clone() {
                 Some(path) => self.request_close(path),
                 None => Task::none(),
             },
+            // The menu closed above, like for any message that isn't passive.
+            Message::CloseMenu => Task::none(),
             Message::ConfirmOverwrite => {
                 self.overlay = ActiveOverlay::None;
                 // Take the new on-disk state as the baseline, then save.
@@ -1277,6 +1311,8 @@ impl SimpleEditApp {
             Message::Sidebar(msg) => match self.sidebar.update(msg) {
                 SidebarAction::OpenFile(path) => self.activate(path),
                 SidebarAction::CloseFile(path) => self.request_close(path),
+                // The cross asks nothing, even with unsaved changes.
+                SidebarAction::CloseNow(path) => self.close_path(path),
                 // Only offered for the active file.
                 SidebarAction::SaveFile => self.handle(Message::SaveFile),
                 SidebarAction::SaveFileAs => self.start_save_as(self.current_file.clone()),
@@ -2987,6 +3023,37 @@ impl SimpleEditApp {
         } else {
             self.close_path(path)
         }
+    }
+
+    /// Closes every tab but `keep` (none: all of them), asking once first if
+    /// some of them hold unsaved changes.
+    fn request_close_many(&mut self, keep: Option<PathBuf>) -> Task<Message> {
+        let targets: Vec<PathBuf> = self
+            .sidebar
+            .files()
+            .iter()
+            .filter(|p| Some(*p) != keep.as_ref())
+            .cloned()
+            .collect();
+        if targets.is_empty() {
+            return Task::none();
+        }
+        // The tab that stays is the one in front.
+        let show = match keep {
+            Some(path) if self.current_file.as_ref() != Some(&path) => self.activate(path),
+            _ => Task::none(),
+        };
+        let modified = targets.iter().filter(|p| self.is_path_dirty(p)).count();
+        if modified > 0 {
+            self.overlay = ActiveOverlay::ConfirmCloseMany(targets, modified);
+            show
+        } else {
+            Task::batch([show, self.close_many(targets)])
+        }
+    }
+
+    fn close_many(&mut self, paths: Vec<PathBuf>) -> Task<Message> {
+        Task::batch(paths.into_iter().map(|path| self.close_path(path)))
     }
 
     /// Removes a tab and, if it was the active one, switches to its neighbour.

@@ -18,6 +18,8 @@ pub enum PaletteCommand {
     SaveFile,
     SaveFileAs,
     CloseFile,
+    CloseOtherTabs,
+    CloseAllTabs,
     Find,
     FormatCode,
     GotoLine,
@@ -53,6 +55,8 @@ impl PaletteCommand {
             PaletteCommand::SaveFile => Message::SaveFile,
             PaletteCommand::SaveFileAs => Message::SaveFileAs,
             PaletteCommand::CloseFile => Message::CloseFile,
+            PaletteCommand::CloseOtherTabs => Message::CloseOtherTabs,
+            PaletteCommand::CloseAllTabs => Message::CloseTabs(None),
             // The theme flips: the palette knows only the command, so the
             // app resolves the target (see `Message::ToggleTheme`).
             PaletteCommand::ToggleTheme => Message::ToggleTheme,
@@ -175,6 +179,18 @@ pub fn entries(config: &Config, has_formatter: bool, language_enabled: bool) -> 
             PaletteCommand::CloseFile,
             t!("menu.file_close").to_string(),
             Some(sh.close_file.display()),
+            true,
+        ),
+        entry(
+            PaletteCommand::CloseOtherTabs,
+            t!("menu.file_close_others").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::CloseAllTabs,
+            t!("menu.file_close_all").to_string(),
+            None,
             true,
         ),
         entry(

@@ -177,6 +177,7 @@ impl SimpleEditApp {
             | ActiveOverlay::Shortcuts
             | ActiveOverlay::Palette
             | ActiveOverlay::ConfirmClose(_)
+            | ActiveOverlay::ConfirmCloseMany(..)
             | ActiveOverlay::ConfirmQuit(_)
             | ActiveOverlay::ConfirmOverwrite(_) => Space::new().height(0).into(),
         };
@@ -252,6 +253,21 @@ impl SimpleEditApp {
             t!("confirm.message", name = name.as_str()).to_string(),
             t!("confirm.discard").to_string(),
             Message::ConfirmDiscard(path.to_path_buf()),
+        )
+    }
+
+    pub(super) fn view_confirm_many_overlay(
+        &self,
+        dark: bool,
+        paths: &[PathBuf],
+        modified: usize,
+    ) -> Element<'_, Message> {
+        confirm_card(
+            dark,
+            t!("confirm.title").to_string(),
+            t!("confirm.many", n = modified).to_string(),
+            t!("confirm.discard").to_string(),
+            Message::ConfirmDiscardMany(paths.to_vec()),
         )
     }
 

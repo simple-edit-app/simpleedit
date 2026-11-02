@@ -310,6 +310,18 @@ fn menu_items(
                 Message::CloseFile,
             ));
             items.push(item(
+                t!("menu.file_close_others").to_string(),
+                None,
+                dark,
+                Message::CloseOtherTabs,
+            ));
+            items.push(item(
+                t!("menu.file_close_all").to_string(),
+                None,
+                dark,
+                Message::CloseTabs(None),
+            ));
+            items.push(item(
                 t!("menu.file_quit").to_string(),
                 sc(&sh.quit),
                 dark,

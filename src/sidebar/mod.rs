@@ -12,6 +12,8 @@ use crate::theme;
 pub enum SidebarMessage {
     OpenFile(PathBuf),
     RemoveFile(PathBuf),
+    /// The cross beside a file: closes it at once, unsaved changes included.
+    CloseNow(PathBuf),
     RequestSave,
     RequestSaveAs,
 }
@@ -21,6 +23,7 @@ pub enum SidebarAction {
     None,
     OpenFile(PathBuf),
     CloseFile(PathBuf),
+    CloseNow(PathBuf),
     SaveFile,
     SaveFileAs,
 }
@@ -76,6 +79,13 @@ impl SidebarState {
                     SidebarAction::None
                 }
             }
+            SidebarMessage::CloseNow(path) => {
+                if self.files.contains(&path) {
+                    SidebarAction::CloseNow(path)
+                } else {
+                    SidebarAction::None
+                }
+            }
             SidebarMessage::RequestSave => SidebarAction::SaveFile,
             SidebarMessage::RequestSaveAs => SidebarAction::SaveFileAs,
         }
@@ -89,6 +99,8 @@ impl SidebarState {
         dirty: &HashSet<PathBuf>,
     ) -> Element<'_, Message> {
         let lbl_close = t!("sidebar.close").to_string();
+        let lbl_close_others = t!("menu.file_close_others").to_string();
+        let lbl_close_all = t!("menu.file_close_all").to_string();
         let lbl_save = t!("sidebar.save").to_string();
         let lbl_save_as = t!("sidebar.save_as").to_string();
         let p = theme::palette(dark);
@@ -114,6 +126,7 @@ impl SidebarState {
                 let is_dirty = dirty.contains(path);
                 let path_clone = path.clone();
                 let close_path = path.clone();
+                let close_now = path.clone();
 
                 let ext_color = if is_selected { p.accent } else { p.muted };
                 let marker: Element<Message> = if is_dirty {
@@ -136,6 +149,18 @@ impl SidebarState {
                             .shaping(iced::widget::text::Shaping::Advanced)
                             .width(Length::Fill),
                         marker,
+                        button(text("×").size(14).color(ext_color))
+                            .padding([0, 5])
+                            .on_press(Message::Sidebar(SidebarMessage::CloseNow(
+                                close_now.clone()
+                            )))
+                            .style(
+                                (theme::GhostButton {
+                                    dark,
+                                    active: false
+                                })
+                                .style()
+                            ),
                     ]
                     .spacing(8)
                     .align_y(Alignment::Center),
@@ -153,6 +178,8 @@ impl SidebarState {
 
                 // Build context menu labels (owned Strings for 'static closure)
                 let lbl_close = lbl_close.clone();
+                let lbl_close_others = lbl_close_others.clone();
+                let lbl_close_all = lbl_close_all.clone();
                 let lbl_save = lbl_save.clone();
                 let lbl_save_as = lbl_save_as.clone();
 
@@ -184,6 +211,11 @@ impl SidebarState {
                                     close_path.clone(),
                                 ))),
                             ),
+                            ctx_item(
+                                lbl_close_others.clone(),
+                                Some(Message::CloseTabs(Some(close_path.clone()))),
+                            ),
+                            ctx_item(lbl_close_all.clone(), Some(Message::CloseTabs(None))),
                             ctx_item(
                                 lbl_save.clone(),
                                 is_active.then_some(Message::Sidebar(SidebarMessage::RequestSave)),
@@ -277,6 +309,21 @@ mod tests {
         assert_eq!(sidebar.files.len(), 1);
         sidebar.remove_path(std::path::Path::new("/tmp/a.rs"));
         assert!(sidebar.files.is_empty());
+    }
+
+    #[test]
+    fn the_cross_closes_a_known_file_at_once() {
+        let mut sidebar = SidebarState::new();
+        sidebar.add_file(PathBuf::from("/tmp/a.rs"));
+        assert!(matches!(
+            sidebar.update(SidebarMessage::CloseNow(PathBuf::from("/tmp/a.rs"))),
+            SidebarAction::CloseNow(_)
+        ));
+        // A tab that is already gone is ignored.
+        assert!(matches!(
+            sidebar.update(SidebarMessage::CloseNow(PathBuf::from("/tmp/other.rs"))),
+            SidebarAction::None
+        ));
     }
 
     #[test]

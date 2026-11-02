@@ -535,6 +535,69 @@ mod behavior_tests {
     }
 
     #[test]
+    fn the_cross_beside_a_file_closes_it_without_asking_even_when_modified() {
+        let mut app = app();
+        type_text(&mut app, "unsaved work");
+        let path = app.current_file.clone().unwrap();
+        assert!(app.is_path_dirty(&path));
+        let _ = app.handle(Message::Sidebar(crate::sidebar::SidebarMessage::CloseNow(
+            path.clone(),
+        )));
+        assert!(matches!(app.overlay, ActiveOverlay::None));
+        // The work is gone; the last tab is replaced by a blank one.
+        assert!(!app.is_dirty);
+        assert_eq!(crate::editor::buffer_text(&app.editor.content), "");
+    }
+
+    #[test]
+    fn closing_the_other_tabs_keeps_the_active_one_and_asks_once_for_modified_ones() {
+        let mut app = app();
+        type_text(&mut app, "first");
+        let first = app.current_file.clone().unwrap();
+        let _ = app.handle(Message::NewFile);
+        let second = app.current_file.clone().unwrap();
+        let _ = app.handle(Message::NewFile);
+        let third = app.current_file.clone().unwrap();
+        assert_eq!(app.sidebar.files().len(), 3);
+        // The active (third) tab stays; the modified first one needs an answer.
+        let _ = app.handle(Message::CloseOtherTabs);
+        assert!(matches!(
+            app.overlay,
+            ActiveOverlay::ConfirmCloseMany(ref paths, 1) if paths == &[first.clone(), second.clone()]
+        ));
+        assert_eq!(app.sidebar.files().len(), 3);
+        let _ = app.handle(Message::ConfirmDiscardMany(vec![first, second]));
+        assert!(matches!(app.overlay, ActiveOverlay::None));
+        assert_eq!(app.sidebar.files(), std::slice::from_ref(&third));
+        assert_eq!(app.current_file, Some(third));
+    }
+
+    #[test]
+    fn closing_clean_tabs_needs_no_answer_and_all_leaves_a_blank_tab() {
+        let mut app = app();
+        let _ = app.handle(Message::NewFile);
+        let _ = app.handle(Message::NewFile);
+        let keep = app.sidebar.files()[0].clone();
+        let _ = app.handle(Message::CloseTabs(Some(keep.clone())));
+        assert!(matches!(app.overlay, ActiveOverlay::None));
+        assert_eq!(app.sidebar.files(), &[keep]);
+        let _ = app.handle(Message::CloseTabs(None));
+        assert!(matches!(app.overlay, ActiveOverlay::None));
+        // The editor is never left without a tab.
+        assert_eq!(app.sidebar.files().len(), 1);
+        assert!(app.current_file.is_some());
+    }
+
+    #[test]
+    fn a_click_outside_closes_the_open_menu() {
+        let mut app = app();
+        let _ = app.handle(Message::ToggleMenu(TopMenu::File));
+        assert!(app.open_menu.is_some());
+        let _ = app.handle(Message::CloseMenu);
+        assert!(app.open_menu.is_none());
+    }
+
+    #[test]
     fn a_definition_never_used_says_so() {
         let mut app = app();
         app.overlay = ActiveOverlay::References(RefList::searching("lonely".into()));
