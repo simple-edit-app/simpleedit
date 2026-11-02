@@ -16,7 +16,7 @@ use syntect::highlighting::{
 };
 use syntect::parsing;
 
-static SYNTAXES: Lazy<parsing::SyntaxSet> = Lazy::new(parsing::SyntaxSet::load_defaults_nonewlines);
+static SYNTAXES: Lazy<parsing::SyntaxSet> = Lazy::new(two_face::syntax::extra_newlines);
 
 static DARK: Lazy<highlighting::Theme> = Lazy::new(|| build_theme(true));
 static LIGHT: Lazy<highlighting::Theme> = Lazy::new(|| build_theme(false));
@@ -93,19 +93,14 @@ pub struct Highlighter {
     current_line: usize,
 }
 
-/// The grammar that colors a language token: its own when syntect ships one,
-/// else a close relative (TypeScript reads as JavaScript, Kotlin and Swift
-/// as Java, TOML as shell for its comments, strings and numbers).
+/// The grammar that colors a language token (the extended set of `two-face`
+/// has TypeScript, TSX / JSX, Kotlin, Swift, SCSS, Less and TOML of its own).
 fn syntax_for(token: &str) -> &'static parsing::SyntaxReference {
-    let grammar = match token {
-        "ts" | "tsx" | "jsx" => "js",
-        "scss" | "less" => "css",
-        "kt" | "swift" => "java",
-        "toml" => "sh",
-        other => other,
-    };
+    // The Babel grammar loses itself in JSX (a `/` of a closing tag read as
+    // the start of a regular expression); TSX reads the same files soundly.
+    let token = if token == "jsx" { "tsx" } else { token };
     SYNTAXES
-        .find_syntax_by_token(grammar)
+        .find_syntax_by_token(token)
         .unwrap_or_else(|| SYNTAXES.find_syntax_plain_text())
 }
 
@@ -188,18 +183,26 @@ impl text::Highlighter for Highlighter {
 
         let (parser, stack) = self.caches.last_mut().expect("Caches must not be empty");
 
-        let ops = parser.parse_line(line, &SYNTAXES).unwrap_or_default();
+        // The grammars are written for lines that end with a newline (a tag
+        // name last on its line, a `$` anchor…): give them one, and keep
+        // only what lies inside the line.
+        let terminated = format!("{line}\n");
+        let ops = parser
+            .parse_line(&terminated, &SYNTAXES)
+            .unwrap_or_default();
 
         let highlighter = &self.highlighter;
+        let line_len = line.len();
 
         let spans: Vec<(Range<usize>, Highlight)> = ScopeRangeIterator {
             ops,
-            line_length: line.len(),
+            line_length: terminated.len(),
             index: 0,
             last_str_index: 0,
         }
         .filter_map(|(range, scope)| {
             let _ = stack.apply(&scope);
+            let range = range.start.min(line_len)..range.end.min(line_len);
 
             if range.is_empty() {
                 None
@@ -347,6 +350,9 @@ impl Iterator for ScopeRangeIterator {
 }
 
 #[cfg(test)]
+mod samples;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use text::Highlighter as _;
@@ -366,6 +372,213 @@ mod tests {
             .iter()
             .find(|(t, _)| t.contains(needle))
             .and_then(|(_, c)| *c)
+    }
+
+    /// Colors of each line of a snippet, one highlighter for all of them.
+    fn colors_of_lines(ext: &str, text: &str) -> Vec<Vec<(String, Option<Color>)>> {
+        let mut h = Highlighter::new(&Settings {
+            dark: true,
+            extension: ext.to_string(),
+        });
+        text.lines()
+            .map(|line| {
+                h.highlight_line(line)
+                    .map(|(r, hl)| (line[r].to_string(), hl.0))
+                    .collect()
+            })
+            .collect()
+    }
+
+    const SCREENSHOT_JS: &str = r#"  if (parsedJson?.elements.length > 1) {
+    let thumbnailUrl = null;
+    if (parsedJson?.elements[1].thumbnail) {
+      thumbnailUrl = parsedJson?.elements[1].thumbnail;
+    } else {
+      const ImagesOfSequence1 = parsedJson?.elements[1].elements.filter(
+        (element) => element.type === IMAGE_TYPE,
+      );
+      if (ImagesOfSequence1.length > 0) {
+        thumbnailUrl = `${ImagesOfSequence1[0].source}/width=200,height=200`;
+      }
+    }
+
+    if (thumbnailUrl) {
+      await updateVideoThumbnailData(videoId, thumbnailUrl);
+    }
+  }
+
+  const currentDomain = currentVideo?.domain;
+  if (currentDomain.name !== parsedJson?.advertiser) {
+    await updateDomainNameData(currentVideo.domainId, parsedJson?.advertiser);
+  }
+"#;
+
+    #[test]
+    fn code_after_a_template_literal_is_not_colored_as_a_string() {
+        let s = crate::theme::syntax(true);
+        for ext in ["js", "jsx", "ts", "tsx"] {
+            let lines = colors_of_lines(ext, SCREENSHOT_JS);
+            let last = lines.len() - 1;
+            for (n, line) in lines.iter().enumerate().skip(12) {
+                for (text, color) in line {
+                    if text.trim().is_empty() || text.starts_with('"') {
+                        continue;
+                    }
+                    assert_ne!(
+                        *color,
+                        Some(s.string),
+                        "{ext}: line {n}: {text:?} in {line:?}"
+                    );
+                }
+            }
+            assert!(last > 12);
+        }
+    }
+
+    const SCREENSHOT_TSX: &str = r#"export const EditorButton = ({
+  children,
+  type = 'default',
+}: EditorButtonProps) => {
+  const primaryClassName = `text-white ${!disabled && 'hover:bg-gray-800'}`;
+  return (
+    <button
+      title={title ?? ''}
+      className={cn(
+        `relative w-[120px] ${!disabled && 'hover:bg-gray-100'}`,
+        type === 'primary' ? primaryClassName : '',
+        className,
+      )}
+      onClick={onClick}
+    >
+      {children}
+    </button>
+  );
+};
+
+const next = 1;
+"#;
+
+    #[test]
+    fn jsx_tags_are_colored_alike_and_strings_stop_at_their_end() {
+        let s = crate::theme::syntax(true);
+        for ext in ["tsx", "jsx"] {
+            let lines = colors_of_lines(ext, SCREENSHOT_TSX);
+            let at = |needle: &str| {
+                SCREENSHOT_TSX
+                    .lines()
+                    .position(|l| l.contains(needle))
+                    .unwrap()
+            };
+            let tag = |line: usize| color_of(&lines[line], "button");
+            let (open, close) = (tag(at("<button")), tag(at("</button>")));
+            assert_eq!(open, close, "{ext}: opening and closing tag differ");
+            assert!(
+                open.is_some(),
+                "{ext}: the tag is not colored: {:?} / {:?}",
+                lines[at("<button")],
+                lines[at("</button>")]
+            );
+            let next = &lines[lines.len() - 1];
+            assert_eq!(
+                color_of(next, "const"),
+                color_of(&lines[4], "const"),
+                "{ext}"
+            );
+            assert_ne!(color_of(next, "next"), Some(s.string), "{ext}");
+            assert_eq!(color_of(next, "1"), Some(s.number), "{ext}");
+        }
+    }
+
+    /// Runs the highlighter over real code and reports the files that end
+    /// inside a string, a comment or a block: in valid source everything is
+    /// closed by the last line, so an open scope there means the grammar lost
+    /// its way: `HIGHLIGHT_CORPUS=/path/a:/path/b cargo test highlight_corpus -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn highlight_corpus_ends_every_file_outside_any_scope() {
+        use std::collections::BTreeMap;
+        let Ok(roots) = std::env::var("HIGHLIGHT_CORPUS") else {
+            return;
+        };
+        const SKIPPED: [&str; 9] = [
+            "node_modules",
+            "target",
+            ".git",
+            "vendor",
+            "dist",
+            "build",
+            ".next",
+            ".venv",
+            "__pycache__",
+        ];
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if path.is_dir() {
+                    if !SKIPPED.contains(&name.as_str()) {
+                        walk(&path, out);
+                    }
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        for root in roots.split(':') {
+            walk(std::path::Path::new(root), &mut files);
+        }
+        let mut scanned: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut open_at_end: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+        for path in files {
+            let Some(token) = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .and_then(crate::editor::extension_to_token)
+            else {
+                continue;
+            };
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            if text.len() > 300_000 {
+                continue;
+            }
+            *scanned.entry(token).or_default() += 1;
+            let mut h = Highlighter::new(&Settings {
+                dark: true,
+                extension: token.to_string(),
+            });
+            for line in text.lines() {
+                h.highlight_line(line).count();
+            }
+            let stack = &h.caches.last().expect("a cache").1;
+            // Open blocks and groups at the end are harmless (a header cut
+            // short, a Markdown paragraph); what hurts is a string, a comment
+            // or a regular expression that never ends.
+            let swallowing = |scope: &parsing::Scope| {
+                let name = scope.build_string();
+                ["string.", "comment.", "regexp"]
+                    .iter()
+                    .any(|k| name.contains(k))
+            };
+            if stack.scopes.iter().any(swallowing) {
+                open_at_end
+                    .entry(token)
+                    .or_default()
+                    .push(format!("{} => {stack}", path.display()));
+            }
+        }
+        eprintln!("SCANNED {scanned:?}");
+        for (token, list) in &open_at_end {
+            eprintln!("OPEN {token}: {} of {}", list.len(), scanned[token]);
+            for f in list.iter().take(8) {
+                eprintln!("  {f}");
+            }
+        }
     }
 
     #[test]
@@ -455,10 +668,12 @@ mod tests {
     }
 
     #[test]
-    fn languages_without_their_own_grammar_use_a_close_relative() {
-        assert_eq!(super::syntax_for("tsx").name, "JavaScript");
-        assert_eq!(super::syntax_for("scss").name, "CSS");
-        assert_eq!(super::syntax_for("kt").name, "Java");
+    fn every_language_has_its_own_grammar_and_unknown_ones_stay_plain() {
+        assert_eq!(super::syntax_for("tsx").name, "TypeScriptReact");
+        assert_eq!(super::syntax_for("ts").name, "TypeScript");
+        assert_eq!(super::syntax_for("jsx").name, "TypeScriptReact");
+        assert_eq!(super::syntax_for("scss").name, "SCSS");
+        assert_eq!(super::syntax_for("kt").name, "Kotlin");
         assert_eq!(super::syntax_for("unknown").name, "Plain Text");
     }
 }

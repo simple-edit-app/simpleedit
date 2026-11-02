@@ -318,7 +318,7 @@ pub fn text_origin(config: &Config, lines: usize) -> iced::Vector {
 /// Row height relative to the text size (the design: 22px for 12.5px code).
 const LINE_HEIGHT: f32 = 1.7;
 
-fn extension_to_token(ext: &str) -> Option<&'static str> {
+pub(crate) fn extension_to_token(ext: &str) -> Option<&'static str> {
     match ext.to_ascii_lowercase().as_str() {
         "rs" => Some("rs"),
         "py" | "pyw" => Some("py"),
