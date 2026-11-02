@@ -1,0 +1,665 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SimpleEdit — A fast, clean, cross-platform text editor</title>
+  <meta name="description" content="SimpleEdit is a fast, clean text editor written in Rust for macOS and Linux." />
+  <meta name="color-scheme" content="dark light" />
+  <style>
+    /* Fonts are served from this site (no request to Google's servers). */
+    @font-face { font-family: 'Instrument Sans'; font-weight: 400; font-style: normal; font-display: swap; src: url('fonts/InstrumentSans-Regular.ttf') format('truetype'); }
+    @font-face { font-family: 'Instrument Sans'; font-weight: 500; font-style: normal; font-display: swap; src: url('fonts/InstrumentSans-Medium.ttf') format('truetype'); }
+    @font-face { font-family: 'Instrument Sans'; font-weight: 600; font-style: normal; font-display: swap; src: url('fonts/InstrumentSans-SemiBold.ttf') format('truetype'); }
+    @font-face { font-family: 'Instrument Sans'; font-weight: 700; font-style: normal; font-display: swap; src: url('fonts/InstrumentSans-Bold.ttf') format('truetype'); }
+    @font-face { font-family: 'JetBrains Mono'; font-weight: 400; font-style: normal; font-display: swap; src: url('fonts/JetBrainsMono-Regular.ttf') format('truetype'); }
+    @font-face { font-family: 'JetBrains Mono'; font-weight: 500; font-style: normal; font-display: swap; src: url('fonts/JetBrainsMono-Medium.ttf') format('truetype'); }
+
+    /* SimpleEdit — "Nocturne" design tokens (see design/tokens/tokens.css) */
+    :root {
+      --font-ui: 'Instrument Sans', system-ui, sans-serif;
+      --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+
+      --r-panel: 14px;  /* feature cards, code boxes */
+      --r-big: 18px;    /* editor mock-up */
+      --r-row: 10px;    /* buttons, inputs */
+      --r-sm: 8px;      /* logo, chips */
+      --r-pill: 99px;
+    }
+
+    /* Dark (default) */
+    :root, [data-theme='dark'] {
+      --bg: #07090E;
+      --side: #0F121B;
+      --panel: #121622;
+      --elev: #1A1F2E;
+      --line: #222839;
+      --line-2: #2D3550;
+      --text: #E9ECF4;
+      --mute: #8089A0;
+      --gutter: #444C64;
+      --acc: #FF9B6B;
+      --acc-ink: #1A0C05;
+      --acc-soft: rgba(255,155,107,.14);
+      --shadow-float: 0 18px 50px rgba(0,0,0,.5);
+
+      --syn-keyword: #FF9B6B;
+      --syn-string: #9BE3A4;
+      --syn-function: #7CB6FF;
+      --syn-number: #F5D07A;
+      --syn-comment: #566079;
+      --syn-type: #C4A6FF;
+    }
+
+    /* Light: follows the system unless forced with data-theme */
+    @media (prefers-color-scheme: light) {
+      :root:not([data-theme]) {
+        --bg: #E9ECF3;
+        --side: #F7F8FB;
+        --panel: #FFFFFF;
+        --elev: #FFFFFF;
+        --line: #DDE1EA;
+        --line-2: #C9CFDC;
+        --text: #131724;
+        --mute: #6B7388;
+        --gutter: #B3B9C8;
+        --acc: #D2561F;
+        --acc-ink: #FFFFFF;
+        --acc-soft: rgba(210,86,31,.10);
+        --shadow-float: 0 14px 40px rgba(30,30,50,.14);
+
+        --syn-keyword: #D2561F;
+        --syn-string: #1E8A4A;
+        --syn-function: #2563C9;
+        --syn-number: #A5780B;
+        --syn-comment: #9AA2B5;
+        --syn-type: #7A4FD0;
+      }
+    }
+    [data-theme='light'] {
+      --bg: #E9ECF3;
+      --side: #F7F8FB;
+      --panel: #FFFFFF;
+      --elev: #FFFFFF;
+      --line: #DDE1EA;
+      --line-2: #C9CFDC;
+      --text: #131724;
+      --mute: #6B7388;
+      --gutter: #B3B9C8;
+      --acc: #D2561F;
+      --acc-ink: #FFFFFF;
+      --acc-soft: rgba(210,86,31,.10);
+      --shadow-float: 0 14px 40px rgba(30,30,50,.14);
+
+      --syn-keyword: #D2561F;
+      --syn-string: #1E8A4A;
+      --syn-function: #2563C9;
+      --syn-number: #A5780B;
+      --syn-comment: #9AA2B5;
+      --syn-type: #7A4FD0;
+    }
+
+    /* Traffic lights (both themes) */
+    :root { --tl-close: #FF5F57; --tl-min: #FEBC2E; --tl-max: #28C840; }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body {
+      font-family: var(--font-ui);
+      font-size: 13px;
+      line-height: 1.5;
+      background: var(--bg);
+      color: var(--text);
+      -webkit-font-smoothing: antialiased;
+    }
+    a { color: inherit; text-decoration: none; }
+    code { font-family: var(--font-mono); }
+
+    /* Language: every text exists in both languages; the page's lang picks one. */
+    html[lang='fr'] [data-lang='en'],
+    html[lang='en'] [data-lang='fr'] { display: none !important; }
+
+    /* ── Nav ─────────────────────────────────────────────── */
+    .nav {
+      display: flex;
+      align-items: center;
+      gap: 28px;
+      padding: 22px 56px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 700;
+      font-size: 17px;
+    }
+    .brand-mark {
+      width: 26px;
+      height: 26px;
+      border-radius: var(--r-sm);
+      background: var(--acc);
+      color: var(--acc-ink);
+      display: grid;
+      place-items: center;
+      font-size: 14px;
+    }
+    .nav-spacer { flex: 1; }
+    .nav a.link { color: var(--mute); font-size: 13px; transition: color 120ms ease; }
+    .nav a.link:hover { color: var(--text); }
+    .lang-switch {
+      display: flex;
+      padding: 2px;
+      gap: 2px;
+      background: var(--elev);
+      border: 1px solid var(--line);
+      border-radius: var(--r-pill);
+      font-size: 12px;
+    }
+    .lang-btn {
+      font: inherit;
+      color: var(--mute);
+      background: none;
+      border: none;
+      padding: 3px 10px;
+      border-radius: var(--r-pill);
+      cursor: pointer;
+      transition: background 120ms ease, color 120ms ease;
+    }
+    .lang-btn:hover { color: var(--text); }
+    .lang-btn.active { background: var(--acc-soft); color: var(--acc); }
+    .btn-pill {
+      padding: 8px 16px;
+      border-radius: var(--r-pill);
+      background: var(--text);
+      color: var(--bg);
+      font-weight: 600;
+      transition: opacity 120ms ease;
+    }
+    .btn-pill:hover { opacity: .88; }
+
+    /* ── Hero ────────────────────────────────────────────── */
+    .hero {
+      padding: 46px 56px 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+      gap: 20px;
+    }
+    .pill-badge {
+      padding: 5px 12px;
+      border: 1px solid var(--line-2);
+      border-radius: var(--r-pill);
+      color: var(--mute);
+      font-size: 12px;
+    }
+    .hero h1 {
+      font-size: 58px;
+      line-height: 1.02;
+      font-weight: 700;
+      letter-spacing: -.035em;
+      max-width: 820px;
+      text-wrap: balance;
+    }
+    .hero .lead {
+      font-size: 17px;
+      color: var(--mute);
+      max-width: 560px;
+      line-height: 1.5;
+    }
+    .cta { display: flex; gap: 10px; margin-top: 6px; flex-wrap: wrap; justify-content: center; }
+    .btn {
+      display: inline-block;
+      padding: 12px 20px;
+      border-radius: var(--r-row);
+      font-weight: 500;
+      font-size: 13px;
+      transition: background 120ms ease, border-color 120ms ease, opacity 120ms ease;
+    }
+    .btn-primary { background: var(--acc); color: var(--acc-ink); font-weight: 600; }
+    .btn-primary:hover { opacity: .9; }
+    .btn-outline { border: 1px solid var(--line-2); }
+    .btn-outline:hover { background: var(--acc-soft); border-color: var(--acc); }
+
+    /* A command in a mono box, with its copy button */
+    .cmd {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      max-width: 100%;
+      font-family: var(--font-mono);
+      font-size: 12.5px;
+      padding: 11px 16px;
+      border-radius: var(--r-row);
+      background: var(--panel);
+      border: 1px solid var(--line);
+      color: var(--mute);
+      text-align: left;
+    }
+    .cmd .prompt { color: var(--acc); flex: none; }
+    .cmd code {
+      flex: 1;
+      min-width: 0;
+      font-size: inherit;
+      color: inherit;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .copy-btn {
+      flex: none;
+      font: inherit;
+      font-family: var(--font-ui);
+      font-size: 11.5px;
+      color: var(--mute);
+      background: none;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 3px 9px;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: color 120ms ease, border-color 120ms ease, background 120ms ease;
+    }
+    .copy-btn:hover { color: var(--text); border-color: var(--line-2); background: var(--acc-soft); }
+    .copy-btn.copied { color: var(--acc); border-color: var(--acc); }
+
+    /* ── Editor mock-up ──────────────────────────────────── */
+    .mock {
+      margin: 40px 56px 0;
+      border: 1px solid var(--line-2);
+      border-bottom: none;
+      border-radius: var(--r-big) var(--r-big) 0 0;
+      background: var(--panel);
+      height: 250px;
+      overflow: hidden;
+      box-shadow: var(--shadow-float);
+    }
+    .mock-bar {
+      height: 36px;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      padding: 0 14px;
+      border-bottom: 1px solid var(--line);
+    }
+    .mock-bar i { width: 10px; height: 10px; border-radius: 50%; display: block; }
+    .mock-bar .name { margin-left: 14px; color: var(--mute); font-size: 12px; }
+    .mock-code {
+      display: flex;
+      padding-top: 8px;
+      font-family: var(--font-mono);
+      font-size: 12.5px;
+      line-height: 22px;
+      font-variant-ligatures: none;
+    }
+    .mock-nums { width: 46px; text-align: right; padding-right: 14px; color: var(--gutter); flex: none; }
+    .mock-lines { white-space: pre; overflow: hidden; }
+    .k { color: var(--syn-keyword); }
+    .s { color: var(--syn-string); }
+    .f { color: var(--syn-function); }
+    .n { color: var(--syn-number); }
+    .c { color: var(--syn-comment); }
+    .t { color: var(--syn-type); }
+
+    /* ── Sections ────────────────────────────────────────── */
+    .section {
+      padding: 60px 56px;
+      background: var(--side);
+      border-top: 1px solid var(--line);
+    }
+    .section h2 {
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: -.01em;
+      margin-bottom: 22px;
+    }
+    .features {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+    }
+    .feature {
+      padding: 22px;
+      border: 1px solid var(--line);
+      border-radius: var(--r-panel);
+      background: var(--panel);
+    }
+    .feature .num { font-family: var(--font-mono); font-size: 11px; color: var(--acc); margin-bottom: 12px; }
+    .feature h3 { font-weight: 600; font-size: 16px; margin-bottom: 6px; }
+    .feature p { color: var(--mute); line-height: 1.5; }
+
+    .install { background: var(--bg); }
+    .install-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      align-items: start;
+    }
+    .install-block {
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: var(--r-panel);
+      background: var(--panel);
+    }
+    .install-block.wide { grid-column: 1 / -1; }
+    .install-label {
+      color: var(--text);
+      font-weight: 600;
+      font-size: 13px;
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .install-block .cmd { background: var(--bg); }
+    /* Long install commands wrap instead of being cut off. */
+    .install-block .cmd code { white-space: normal; word-break: break-all; }
+    .badge-recommended {
+      padding: 2px 9px;
+      border-radius: var(--r-pill);
+      background: var(--acc-soft);
+      color: var(--acc);
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .install-note { color: var(--mute); font-size: 12px; line-height: 1.5; margin-top: 10px; }
+    .install-note code {
+      font-size: 11.5px;
+      background: var(--bg);
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      padding: 1px 5px;
+    }
+    .downloads { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 18px; }
+
+    /* ── Footer ──────────────────────────────────────────── */
+    footer {
+      padding: 22px 56px;
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+      color: var(--mute);
+      font-size: 12px;
+      border-top: 1px solid var(--line);
+    }
+    footer .grow { flex: 1; }
+    footer a { transition: color 120ms ease; }
+    footer a:hover { color: var(--text); }
+
+    /* ── Small screens ───────────────────────────────────── */
+    @media (max-width: 900px) {
+      .nav { padding: 18px 24px; gap: 16px; flex-wrap: wrap; }
+      .nav a.link { display: none; }
+      .hero { padding: 36px 24px 0; }
+      .hero h1 { font-size: 40px; }
+      .mock { margin: 32px 24px 0; }
+      .section { padding: 44px 24px; }
+      .features, .install-grid { grid-template-columns: 1fr; }
+      footer { padding: 20px 24px; }
+    }
+    @media (max-width: 520px) {
+      .hero h1 { font-size: 32px; }
+      .hero .lead { font-size: 15px; }
+    }
+  </style>
+</head>
+<body>
+
+<header class="nav">
+  <a class="brand" href="#top"><span class="brand-mark">S</span>SimpleEdit</a>
+  <div class="nav-spacer"></div>
+  <a class="link" href="#features"><span data-lang="en">Features</span><span data-lang="fr">Fonctionnalités</span></a>
+  <a class="link" href="#install">Installation</a>
+  <a class="link" href="https://github.com/simple-edit-app/simpleedit">GitHub</a>
+  <div class="lang-switch" role="group" aria-label="Language">
+    <button class="lang-btn" data-set-lang="en" onclick="setLang('en')">EN</button>
+    <button class="lang-btn" data-set-lang="fr" onclick="setLang('fr')">FR</button>
+  </div>
+  <a class="btn-pill" href="#install"><span data-lang="en">Download</span><span data-lang="fr">Télécharger</span></a>
+</header>
+
+<main id="top">
+<section class="hero">
+  <span class="pill-badge">Open source · MIT · macOS &amp; Linux</span>
+  <h1>
+    <span data-lang="en">A fast, clean, cross-platform text editor</span>
+    <span data-lang="fr">Un éditeur de texte rapide, propre et multiplateforme</span>
+  </h1>
+  <p class="lead">
+    <span data-lang="en">Written in Rust. Syntax highlighting for 30+ languages, regex search, Markdown preview.</span>
+    <span data-lang="fr">Écrit en Rust. Coloration syntaxique pour plus de 60 langages, recherche avec regex, aperçu Markdown.</span>
+  </p>
+  <div class="cta">
+    <a class="btn btn-primary" href="https://github.com/simple-edit-app/simpleedit/releases/latest"><span data-lang="en">Download for macOS</span><span data-lang="fr">Télécharger pour macOS</span></a>
+    <a class="btn btn-outline" href="https://github.com/simple-edit-app/simpleedit/releases/latest">Linux x86_64</a>
+  </div>
+  <div class="cmd">
+    <span class="prompt">$</span>
+    <code>curl -fsSL https://raw.githubusercontent.com/simple-edit-app/simpleedit/main/install.sh | bash</code>
+    <button class="copy-btn" onclick="copyCode(this)"><span data-lang="en">Copy</span><span data-lang="fr">Copier</span></button>
+  </div>
+</section>
+
+<div class="mock" aria-hidden="true">
+  <div class="mock-bar">
+    <i style="background:var(--tl-close)"></i><i style="background:var(--tl-min)"></i><i style="background:var(--tl-max)"></i>
+    <span class="name">theme.rs</span>
+  </div>
+  <div class="mock-code">
+    <div class="mock-nums">1<br>2<br>3<br>4<br>5<br>6<br>7<br>8<br>9<br>10</div>
+    <div class="mock-lines"><span class="c">// Palette de couleurs</span>
+<span class="k">pub struct </span><span class="t">Palette</span> {
+    <span class="k">pub </span>bg: <span class="t">Color</span>,
+    <span class="k">pub </span>accent: <span class="t">Color</span>,
+}
+
+<span class="k">pub fn </span><span class="f">palette</span>(dark: <span class="t">bool</span>) -&gt; <span class="t">Palette</span> {
+    <span class="k">if </span>dark {
+        <span class="t">Palette</span> {
+            bg: <span class="f">rgb</span>(<span class="n">0x14</span>, <span class="n">0x15</span>, <span class="n">0x1A</span>),</div>
+  </div>
+</div>
+</main>
+
+<section class="section" id="features">
+  <h2 style="position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)"><span data-lang="en">Features</span><span data-lang="fr">Fonctionnalités</span></h2>
+  <div class="features">
+    <div class="feature">
+      <div class="num">01</div>
+      <h3><span data-lang="en">Syntax highlighting</span><span data-lang="fr">Coloration syntaxique</span></h3>
+      <p><span data-lang="en">30+ languages via TextMate grammars.</span><span data-lang="fr">30+ langages via des grammaires TextMate.</span></p>
+    </div>
+    <div class="feature">
+      <div class="num">02</div>
+      <h3><span data-lang="en">Search and replace</span><span data-lang="fr">Recherche et remplacement</span></h3>
+      <p><span data-lang="en">Regular expressions, case sensitivity.</span><span data-lang="fr">Expressions régulières, sensibilité à la casse.</span></p>
+    </div>
+    <div class="feature">
+      <div class="num">03</div>
+      <h3><span data-lang="en">Dark and light</span><span data-lang="fr">Sombre et clair</span></h3>
+      <p><span data-lang="en">Two themes, remembered between launches.</span><span data-lang="fr">Deux thèmes, réglage mémorisé entre les lancements.</span></p>
+    </div>
+    <div class="feature">
+      <div class="num">04</div>
+      <h3><span data-lang="en">English and French</span><span data-lang="fr">Français et English</span></h3>
+      <p><span data-lang="en">Language selectable in the preferences.</span><span data-lang="fr">Langue modifiable dans les préférences.</span></p>
+    </div>
+    <div class="feature">
+      <div class="num">05</div>
+      <h3><span data-lang="en">Code formatting</span><span data-lang="fr">Formatage du code</span></h3>
+      <p><span data-lang="en">prettier, rustfmt and other external tools.</span><span data-lang="fr">prettier, rustfmt et autres outils externes.</span></p>
+    </div>
+    <div class="feature">
+      <div class="num">06</div>
+      <h3><span data-lang="en">Native binaries</span><span data-lang="fr">Binaires natifs</span></h3>
+      <p><span data-lang="en">macOS (Apple Silicon) and Linux x86_64.</span><span data-lang="fr">macOS (Apple Silicon) et Linux x86_64.</span></p>
+    </div>
+    <div class="feature">
+      <div class="num">07</div>
+      <h3><span data-lang="en">Go to definition</span><span data-lang="fr">Aller à la définition</span></h3>
+      <p><span data-lang="en">Ctrl+click (Cmd+click on macOS) jumps to a definition, or lists where it is used. Back and forward walk your jumps.</span><span data-lang="fr">Ctrl+clic (Cmd+clic sur macOS) mène à la définition, ou liste les endroits où elle est utilisée. Retour et avance parcourent vos sauts.</span></p>
+    </div>
+    <div class="feature">
+      <div class="num">08</div>
+      <h3><span data-lang="en">Language servers, optional</span><span data-lang="fr">Serveurs de langage, facultatifs</span></h3>
+      <p><span data-lang="en">Install the one of a language in a click for exact results; without it, a safe pattern search.</span><span data-lang="fr">Installez celui d'un langage en un clic pour des résultats exacts ; sans lui, une recherche de motifs prudente.</span></p>
+    </div>
+    <div class="feature">
+      <div class="num">09</div>
+      <h3><span data-lang="en">Code folding</span><span data-lang="fr">Pliage de code</span></h3>
+      <p><span data-lang="en">Fold functions, blocks, comments and Markdown sections from the gutter.</span><span data-lang="fr">Pliez fonctions, blocs, commentaires et sections Markdown depuis la marge.</span></p>
+    </div>
+  </div>
+</section>
+
+<section class="section install" id="install">
+  <h2>Installation</h2>
+  <div class="install-grid">
+
+    <div class="install-block wide">
+      <p class="install-label">
+        <span data-lang="en">Install (macOS &amp; Linux):</span><span data-lang="fr">Installer (macOS &amp; Linux) :</span>
+        <span class="badge-recommended"><span data-lang="en">Recommended</span><span data-lang="fr">Recommandé</span></span>
+      </p>
+      <div class="cmd">
+        <span class="prompt">$</span>
+        <code>curl -fsSL https://raw.githubusercontent.com/simple-edit-app/simpleedit/main/install.sh | bash</code>
+        <button class="copy-btn" onclick="copyCode(this)"><span data-lang="en">Copy</span><span data-lang="fr">Copier</span></button>
+      </div>
+    </div>
+
+    <div class="install-block">
+      <p class="install-label"><span data-lang="en">macOS — Homebrew:</span><span data-lang="fr">macOS — Homebrew :</span></p>
+      <div class="cmd">
+        <span class="prompt">$</span>
+        <code>brew install --cask simple-edit-app/tap/simpleedit</code>
+        <button class="copy-btn" onclick="copyCode(this)"><span data-lang="en">Copy</span><span data-lang="fr">Copier</span></button>
+      </div>
+    </div>
+
+    <div class="install-block">
+      <p class="install-label"><span data-lang="en">Linux — .deb (install):</span><span data-lang="fr">Linux — .deb (installer) :</span></p>
+      <div class="cmd">
+        <span class="prompt">$</span>
+        <code>curl -fsSL https://api.github.com/repos/simple-edit-app/simpleedit/releases/latest | sed -n 's/.*"browser_download_url": *"\([^"]*\.deb\)".*/\1/p' | xargs curl -fsSLO &amp;&amp; sudo apt install ./simpleedit_*.deb</code>
+        <button class="copy-btn" onclick="copyCode(this)"><span data-lang="en">Copy</span><span data-lang="fr">Copier</span></button>
+      </div>
+    </div>
+
+    <div class="install-block wide">
+      <p class="install-label"><span data-lang="en">Linux — AppImage (install):</span><span data-lang="fr">Linux — AppImage (installer) :</span></p>
+      <div class="cmd">
+        <span class="prompt">$</span>
+        <code>curl -fsSL https://api.github.com/repos/simple-edit-app/simpleedit/releases/latest | sed -n 's/.*"browser_download_url": *"\([^"]*\.AppImage\)".*/\1/p' | xargs curl -fsSLO &amp;&amp; chmod +x simpleedit-*.AppImage &amp;&amp; ./simpleedit-*.AppImage</code>
+        <button class="copy-btn" onclick="copyCode(this)"><span data-lang="en">Copy</span><span data-lang="fr">Copier</span></button>
+      </div>
+      <p class="install-note">
+        <span data-lang="en">Portable — no installation needed. To add it to your app menu, move it into <code>~/.local/bin</code> and drop a <code>.desktop</code> entry (or use a tool like AppImageLauncher).</span>
+        <span data-lang="fr">Portable — aucune installation requise. Pour l’ajouter à votre menu d’applications, déplacez-le dans <code>~/.local/bin</code> et ajoutez une entrée <code>.desktop</code> (ou utilisez un outil comme AppImageLauncher).</span>
+      </p>
+    </div>
+
+    <div class="install-block wide">
+      <p class="install-label"><span data-lang="en">Uninstall (macOS &amp; Linux):</span><span data-lang="fr">Désinstaller (macOS &amp; Linux) :</span></p>
+      <div class="cmd">
+        <span class="prompt">$</span>
+        <code>curl -fsSL https://raw.githubusercontent.com/simple-edit-app/simpleedit/main/uninstall.sh | bash</code>
+        <button class="copy-btn" onclick="copyCode(this)"><span data-lang="en">Copy</span><span data-lang="fr">Copier</span></button>
+      </div>
+      <p class="install-note">
+        <span data-lang="en">Detects how SimpleEdit was installed — Homebrew cask, <code>.deb</code> package or plain binary — and removes it. Your settings and session are left untouched — delete <code>~/.config/simpleedit</code> and <code>~/.local/share/simpleedit</code> (the session, which holds the text of your unsaved files) on Linux, or <code>~/Library/Application&nbsp;Support/simpleedit</code> on macOS, to remove them too.</span>
+        <span data-lang="fr">Détecte le mode d’installation — cask Homebrew, paquet <code>.deb</code> ou binaire simple — et le supprime. Vos réglages et votre session sont conservés — supprimez <code>~/.config/simpleedit</code> et <code>~/.local/share/simpleedit</code> (la session, qui contient le texte de vos fichiers non enregistrés) sous Linux, ou <code>~/Library/Application&nbsp;Support/simpleedit</code> sous macOS, pour les effacer aussi.</span>
+      </p>
+    </div>
+
+    <div class="install-block">
+      <p class="install-label"><span data-lang="en">macOS — Homebrew (uninstall):</span><span data-lang="fr">macOS — Homebrew (désinstaller) :</span></p>
+      <div class="cmd">
+        <span class="prompt">$</span>
+        <code>brew uninstall --cask simpleedit</code>
+        <button class="copy-btn" onclick="copyCode(this)"><span data-lang="en">Copy</span><span data-lang="fr">Copier</span></button>
+      </div>
+      <p class="install-note">
+        <span data-lang="en">Also drop your settings: <code>brew uninstall --zap --cask simpleedit</code></span>
+        <span data-lang="fr">Pour aussi supprimer vos réglages : <code>brew uninstall --zap --cask simpleedit</code></span>
+      </p>
+    </div>
+
+    <div class="install-block">
+      <p class="install-label"><span data-lang="en">Linux — .deb (uninstall):</span><span data-lang="fr">Linux — .deb (désinstaller) :</span></p>
+      <div class="cmd">
+        <span class="prompt">$</span>
+        <code>sudo apt remove simpleedit</code>
+        <button class="copy-btn" onclick="copyCode(this)"><span data-lang="en">Copy</span><span data-lang="fr">Copier</span></button>
+      </div>
+      <p class="install-note">
+        <span data-lang="en">No apt? Use <code>sudo dpkg -r simpleedit</code> instead.</span>
+        <span data-lang="fr">Pas d’apt ? Utilisez <code>sudo dpkg -r simpleedit</code> à la place.</span>
+      </p>
+    </div>
+
+    <div class="install-block wide">
+      <p class="install-label"><span data-lang="en">Linux — AppImage (uninstall):</span><span data-lang="fr">Linux — AppImage (désinstaller) :</span></p>
+      <div class="cmd">
+        <span class="prompt">$</span>
+        <code>rm -f simpleedit.AppImage ~/.local/bin/simpleedit.AppImage ~/.local/share/applications/simpleedit.desktop</code>
+        <button class="copy-btn" onclick="copyCode(this)"><span data-lang="en">Copy</span><span data-lang="fr">Copier</span></button>
+      </div>
+      <p class="install-note">
+        <span data-lang="en">Removes the AppImage from the current directory and, if you integrated it, from <code>~/.local/bin</code> and your app menu.</span>
+        <span data-lang="fr">Supprime l’AppImage du dossier courant et, si vous l’aviez intégré, de <code>~/.local/bin</code> et de votre menu d’applications.</span>
+      </p>
+    </div>
+
+  </div>
+
+  <div class="downloads">
+    <a class="btn btn-outline" href="https://github.com/simple-edit-app/simpleedit/releases/latest"><span data-lang="en">Download .tar.gz (macOS)</span><span data-lang="fr">Télécharger .tar.gz (macOS)</span></a>
+    <a class="btn btn-outline" href="https://github.com/simple-edit-app/simpleedit/releases/latest"><span data-lang="en">Download .deb (Linux)</span><span data-lang="fr">Télécharger .deb (Linux)</span></a>
+    <a class="btn btn-outline" href="https://github.com/simple-edit-app/simpleedit/releases/latest"><span data-lang="en">Download .AppImage (Linux)</span><span data-lang="fr">Télécharger .AppImage (Linux)</span></a>
+  </div>
+</section>
+
+<footer>
+  <span class="grow">© SimpleEdit · <span data-lang="en">MIT License</span><span data-lang="fr">Licence MIT</span></span>
+  <span>
+    <a href="https://github.com/simple-edit-app/simpleedit">GitHub</a> ·
+    <a href="https://github.com/simple-edit-app/simpleedit/releases">Releases</a> ·
+    <a href="https://github.com/simple-edit-app/simpleedit/issues">Issues</a> ·
+    <a href="https://github.com/simple-edit-app/homebrew-tap">Homebrew</a>
+  </span>
+</footer>
+
+<script>
+  function copyCode(btn) {
+    const code = btn.parentElement.querySelector('code');
+    navigator.clipboard.writeText(code.textContent).then(() => {
+      const label = btn.innerHTML;
+      btn.textContent = '✓';
+      btn.classList.add('copied');
+      setTimeout(() => { btn.innerHTML = label; btn.classList.remove('copied'); }, 1500);
+    });
+  }
+
+  function setLang(lang) {
+    document.documentElement.lang = lang;
+    document.querySelectorAll('[data-set-lang]').forEach(btn => {
+      btn.classList.toggle('active', btn.dataset.setLang === lang);
+    });
+    try { localStorage.setItem('lang', lang); } catch (e) {}
+  }
+
+  // The visitor's last choice, else the browser's language (French or English).
+  (function () {
+    let lang = null;
+    try { lang = localStorage.getItem('lang'); } catch (e) {}
+    if (lang !== 'fr' && lang !== 'en') {
+      lang = (navigator.language || 'en').toLowerCase().startsWith('fr') ? 'fr' : 'en';
+    }
+    setLang(lang);
+  })();
+</script>
+
+</body>
+</html>

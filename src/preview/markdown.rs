@@ -1,0 +1,1372 @@
+//! A small block-level Markdown parser and its iced renderer.
+//!
+//! Deliberately partial: it covers what a text editor preview needs
+//! (headings, paragraphs, lists, quotes, fenced code, rules and the common
+//! inline markers) and renders everything else as plain text.
+
+use std::collections::HashMap;
+
+use iced::{
+    advanced::{
+        layout, overlay, renderer,
+        widget::{operation, Id as WidgetId, Operation, Tree},
+        Clipboard, Layout, Shell, Widget,
+    },
+    alignment::Horizontal,
+    mouse,
+    widget::{column, container, mouse_area, row, scrollable, text, Space},
+    Color, Element, Event, Font, Length, Rectangle, Size, Task, Theme, Vector,
+};
+
+use crate::app::Message;
+use crate::theme;
+
+/// Inline emphasis of a run of text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Style {
+    Plain,
+    Bold,
+    Italic,
+    BoldItalic,
+    Code,
+    Link,
+}
+
+/// A run of text sharing one inline style.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Span {
+    pub text: String,
+    pub style: Style,
+    /// The `(url)` half of a `[label](url)` link; `None` for every other
+    /// style.
+    pub href: Option<String>,
+}
+
+impl Span {
+    fn new(text: impl Into<String>, style: Style) -> Self {
+        Self {
+            text: text.into(),
+            style,
+            href: None,
+        }
+    }
+
+    fn link(text: impl Into<String>, href: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            style: Style::Link,
+            href: Some(href.into()),
+        }
+    }
+}
+
+/// A GFM table column's declared alignment (from its separator cell, e.g.
+/// `:---:`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Align {
+    Left,
+    Center,
+    Right,
+}
+
+impl From<Align> for Horizontal {
+    fn from(align: Align) -> Self {
+        match align {
+            Align::Left => Horizontal::Left,
+            Align::Center => Horizontal::Center,
+            Align::Right => Horizontal::Right,
+        }
+    }
+}
+
+/// A top-level Markdown block.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Block {
+    Heading {
+        level: u8,
+        spans: Vec<Span>,
+    },
+    Paragraph(Vec<Span>),
+    Quote(Vec<Span>),
+    ListItem {
+        depth: usize,
+        marker: String,
+        spans: Vec<Span>,
+    },
+    Code(String),
+    Rule,
+    Table {
+        alignments: Vec<Align>,
+        header: Vec<Vec<Span>>,
+        rows: Vec<Vec<Vec<Span>>>,
+    },
+}
+
+// ─── Parsing ────────────────────────────────────────────────────────────────
+
+/// Splits a Markdown document into blocks.
+pub fn parse(src: &str) -> Vec<Block> {
+    let mut blocks: Vec<Block> = Vec::new();
+    let mut para: Vec<String> = Vec::new();
+    let mut quote: Vec<String> = Vec::new();
+    let mut code: Option<Vec<String>> = None;
+
+    // A table's second line (the separator) is what confirms the first line
+    // was a header, not a paragraph — indexed access lets us peek ahead for
+    // it and then consume as many further rows as belong to the table.
+    let lines: Vec<&str> = src.lines().collect();
+    let mut idx = 0;
+
+    while idx < lines.len() {
+        let raw = lines[idx];
+
+        // Inside a fenced block everything is literal until the closing fence.
+        if let Some(buf) = code.as_mut() {
+            if is_fence(raw.trim_start()) {
+                blocks.push(Block::Code(buf.join("\n")));
+                code = None;
+            } else {
+                buf.push(raw.to_string());
+            }
+            idx += 1;
+            continue;
+        }
+
+        let line = raw.trim_end();
+        let trimmed = line.trim_start();
+
+        if is_fence(trimmed) {
+            flush_para(&mut para, &mut blocks);
+            flush_quote(&mut quote, &mut blocks);
+            code = Some(Vec::new());
+            idx += 1;
+        } else if trimmed.is_empty() {
+            flush_para(&mut para, &mut blocks);
+            flush_quote(&mut quote, &mut blocks);
+            idx += 1;
+        } else if is_rule(trimmed) {
+            flush_para(&mut para, &mut blocks);
+            flush_quote(&mut quote, &mut blocks);
+            blocks.push(Block::Rule);
+            idx += 1;
+        } else if let Some((level, rest)) = heading(trimmed) {
+            flush_para(&mut para, &mut blocks);
+            flush_quote(&mut quote, &mut blocks);
+            blocks.push(Block::Heading {
+                level,
+                spans: parse_inline(rest),
+            });
+            idx += 1;
+        } else if let Some(rest) = trimmed.strip_prefix('>') {
+            flush_para(&mut para, &mut blocks);
+            quote.push(rest.trim_start().to_string());
+            idx += 1;
+        } else if is_table_row(trimmed)
+            && lines
+                .get(idx + 1)
+                .is_some_and(|next| table_separator(next).is_some())
+        {
+            flush_para(&mut para, &mut blocks);
+            flush_quote(&mut quote, &mut blocks);
+            let alignments = table_separator(lines[idx + 1]).unwrap_or_default();
+            let header = table_cells(trimmed)
+                .iter()
+                .map(|cell| parse_inline(cell))
+                .collect();
+            idx += 2;
+
+            let mut rows = Vec::new();
+            while idx < lines.len() {
+                let row = lines[idx].trim();
+                if row.is_empty() || !is_table_row(row) {
+                    break;
+                }
+                rows.push(
+                    table_cells(row)
+                        .iter()
+                        .map(|cell| parse_inline(cell))
+                        .collect(),
+                );
+                idx += 1;
+            }
+            blocks.push(Block::Table {
+                alignments,
+                header,
+                rows,
+            });
+        } else if let Some((depth, marker, rest)) = list_item(line) {
+            flush_para(&mut para, &mut blocks);
+            flush_quote(&mut quote, &mut blocks);
+            blocks.push(Block::ListItem {
+                depth,
+                marker,
+                spans: parse_inline(rest),
+            });
+            idx += 1;
+        } else {
+            flush_quote(&mut quote, &mut blocks);
+            para.push(trimmed.to_string());
+            idx += 1;
+        }
+    }
+
+    if let Some(buf) = code {
+        blocks.push(Block::Code(buf.join("\n")));
+    }
+    flush_para(&mut para, &mut blocks);
+    flush_quote(&mut quote, &mut blocks);
+    blocks
+}
+
+fn flush_para(para: &mut Vec<String>, blocks: &mut Vec<Block>) {
+    if !para.is_empty() {
+        blocks.push(Block::Paragraph(parse_inline(&para.join(" "))));
+        para.clear();
+    }
+}
+
+fn flush_quote(quote: &mut Vec<String>, blocks: &mut Vec<Block>) {
+    if !quote.is_empty() {
+        blocks.push(Block::Quote(parse_inline(&quote.join(" "))));
+        quote.clear();
+    }
+}
+
+fn is_fence(line: &str) -> bool {
+    line.starts_with("```") || line.starts_with("~~~")
+}
+
+fn is_rule(line: &str) -> bool {
+    let stripped: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+    stripped.len() >= 3
+        && ['-', '*', '_']
+            .iter()
+            .any(|c| stripped.chars().all(|ch| ch == *c))
+}
+
+/// `## Title` → `(2, "Title")`.
+fn heading(line: &str) -> Option<(u8, &str)> {
+    let level = line.chars().take_while(|c| *c == '#').count();
+    if level == 0 || level > 6 {
+        return None;
+    }
+    let rest = &line[level..];
+    if rest.is_empty() {
+        return Some((level as u8, ""));
+    }
+    rest.strip_prefix(' ')
+        .map(|r| (level as u8, r.trim_start()))
+}
+
+/// `  - item` → `(depth, "•", "item")`; `2. item` → `(depth, "2.", "item")`.
+fn list_item(line: &str) -> Option<(usize, String, &str)> {
+    let indent: usize = line
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .map(|c| if c == '\t' { 4 } else { 1 })
+        .sum();
+    let rest = line.trim_start();
+
+    for bullet in ['-', '*', '+'] {
+        if let Some(body) = rest.strip_prefix(bullet).and_then(|r| r.strip_prefix(' ')) {
+            return Some((indent / 2, "•".to_string(), body.trim_start()));
+        }
+    }
+
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() || digits.len() > 9 {
+        return None;
+    }
+    let after = &rest[digits.len()..];
+    for sep in ['.', ')'] {
+        if let Some(body) = after.strip_prefix(sep).and_then(|r| r.strip_prefix(' ')) {
+            return Some((indent / 2, format!("{}{}", digits, sep), body.trim_start()));
+        }
+    }
+    None
+}
+
+/// A line that could plausibly be a table row — the real test is whether the
+/// *next* line is a valid separator (see [`table_separator`]).
+fn is_table_row(line: &str) -> bool {
+    line.contains('|')
+}
+
+/// `| :--- | ---: | :---: |` → one [`Align`] per column; `None` if the line
+/// isn't a valid separator row (each cell must be dashes, optionally with a
+/// leading and/or trailing colon).
+fn table_separator(line: &str) -> Option<Vec<Align>> {
+    if !is_table_row(line) {
+        return None;
+    }
+    let cells = table_cells(line);
+    if cells.is_empty() {
+        return None;
+    }
+    cells
+        .iter()
+        .map(|cell| {
+            let left = cell.starts_with(':');
+            let right = cell.ends_with(':');
+            let dashes = cell.trim_matches(':');
+            (!dashes.is_empty() && dashes.chars().all(|c| c == '-')).then_some(
+                match (left, right) {
+                    (true, true) => Align::Center,
+                    (false, true) => Align::Right,
+                    _ => Align::Left,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Splits a table row into its cell texts: drops one leading/trailing `|`
+/// (the conventional outer pipes), and keeps a `|` from splitting the row
+/// when it's escaped (`\|`) or inside a `` `code span` ``.
+fn table_cells(line: &str) -> Vec<String> {
+    let trimmed = line.trim();
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut in_code = false;
+    let mut i = 0;
+
+    while i < chars.len() {
+        match chars[i] {
+            '\\' if i + 1 < chars.len() && chars[i + 1] == '|' => {
+                cell.push('|');
+                i += 2;
+            }
+            '`' => {
+                in_code = !in_code;
+                cell.push('`');
+                i += 1;
+            }
+            '|' if !in_code => {
+                cells.push(cell.trim().to_string());
+                cell.clear();
+                i += 1;
+            }
+            c => {
+                cell.push(c);
+                i += 1;
+            }
+        }
+    }
+    cells.push(cell.trim().to_string());
+
+    if trimmed.starts_with('|') && cells.first().is_some_and(String::is_empty) {
+        cells.remove(0);
+    }
+    if trimmed.ends_with('|') && cells.last().is_some_and(String::is_empty) {
+        cells.pop();
+    }
+    cells
+}
+
+/// Longest line given inline (bold, links…) parsing.
+const MAX_INLINE_CHARS: usize = 200_000;
+
+/// Delimiters already known to have no (valid) partner from some position
+/// on, so an unmatched opener repeated thousands of times (`*a *a *a …`)
+/// doesn't rescan the rest of the line each time.
+#[derive(Default)]
+struct Misses(std::collections::HashMap<String, usize>);
+
+impl Misses {
+    fn known(&self, key: &str, from: usize) -> bool {
+        self.0.get(key).is_some_and(|miss| from >= *miss)
+    }
+
+    fn record(&mut self, key: &str, from: usize) {
+        let entry = self.0.entry(key.to_string()).or_insert(from);
+        *entry = (*entry).min(from);
+    }
+}
+
+/// Splits a line into styled inline spans.
+pub fn parse_inline(src: &str) -> Vec<Span> {
+    let chars: Vec<char> = src.chars().collect();
+    // Past this, a line is shown as plain text.
+    if chars.len() > MAX_INLINE_CHARS {
+        return vec![Span::new(src, Style::Plain)];
+    }
+    let mut misses = Misses::default();
+    let mut spans: Vec<Span> = Vec::new();
+    let mut buf = String::new();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\\' if i + 1 < chars.len() => {
+                buf.push(chars[i + 1]);
+                i += 2;
+            }
+            '`' => match find_cached(&chars, i + 1, "`", &mut misses) {
+                Some(end) => {
+                    push_plain(&mut spans, &mut buf);
+                    spans.push(Span::new(collect(&chars, i + 1, end), Style::Code));
+                    i = end + 1;
+                }
+                None => {
+                    buf.push(c);
+                    i += 1;
+                }
+            },
+            '*' | '_' => {
+                let run = chars[i..].iter().take_while(|ch| **ch == c).count().min(3);
+                let start = i + run;
+                match emphasis_end(&chars, i, c, run, &mut misses) {
+                    Some(end) => {
+                        push_plain(&mut spans, &mut buf);
+                        let style = match run {
+                            1 => Style::Italic,
+                            2 => Style::Bold,
+                            _ => Style::BoldItalic,
+                        };
+                        spans.push(Span::new(collect(&chars, start, end), style));
+                        i = end + run;
+                    }
+                    None => {
+                        buf.push(c);
+                        i += 1;
+                    }
+                }
+            }
+            '[' | '!' => {
+                let open = if c == '!' { i + 1 } else { i };
+                let is_link = chars.get(open) == Some(&'[');
+                match is_link.then(|| link(&chars, open, &mut misses)).flatten() {
+                    Some((label, href, end)) => {
+                        push_plain(&mut spans, &mut buf);
+                        spans.push(Span::link(label, href));
+                        i = end;
+                    }
+                    None => {
+                        buf.push(c);
+                        i += 1;
+                    }
+                }
+            }
+            _ => {
+                buf.push(c);
+                i += 1;
+            }
+        }
+    }
+
+    push_plain(&mut spans, &mut buf);
+    spans
+}
+
+/// Where the emphasis opened at `i` closes, if it does.
+///
+/// Follows the two rules that matter in practice: the delimiters must hug the
+/// emphasized text (so `2 * 3 * 4` stays arithmetic), and `_` only delimits at
+/// a word boundary (so `snake_case_name` stays one word).
+fn emphasis_end(
+    chars: &[char],
+    i: usize,
+    marker: char,
+    run: usize,
+    misses: &mut Misses,
+) -> Option<usize> {
+    let start = i + run;
+    if chars.get(start).is_none_or(|c| c.is_whitespace()) {
+        return None;
+    }
+    if marker == '_' && i > 0 && chars[i - 1].is_alphanumeric() {
+        return None;
+    }
+
+    let delim: String = std::iter::repeat_n(marker, run).collect();
+    let key = format!("emphasis {delim}");
+    let first = start + 1;
+    if misses.known(&key, first) {
+        return None;
+    }
+    let mut from = first;
+    while let Some(end) = find(chars, from, &delim) {
+        let closes = !chars[end - 1].is_whitespace()
+            && (marker != '_' || chars.get(end + run).is_none_or(|c| !c.is_alphanumeric()));
+        if closes {
+            return Some(end);
+        }
+        from = end + 1;
+    }
+    misses.record(&key, first);
+    None
+}
+
+/// Parses `[label](url)` starting at the `[`; returns the label, the url,
+/// and the index just past the closing `)`.
+fn link(chars: &[char], start: usize, misses: &mut Misses) -> Option<(String, String, usize)> {
+    let close = find_cached(chars, start + 1, "]", misses)?;
+    if chars.get(close + 1) != Some(&'(') {
+        return None;
+    }
+    let end = find_cached(chars, close + 2, ")", misses)?;
+    Some((
+        collect(chars, start + 1, close),
+        collect(chars, close + 2, end),
+        end + 1,
+    ))
+}
+
+/// `find`, remembering a failure: no occurrence after `from` means none
+/// after any later position either.
+fn find_cached(chars: &[char], from: usize, needle: &str, misses: &mut Misses) -> Option<usize> {
+    if misses.known(needle, from) {
+        return None;
+    }
+    let found = find(chars, from, needle);
+    if found.is_none() {
+        misses.record(needle, from);
+    }
+    found
+}
+
+/// Index of the next occurrence of `needle` at or after `from`.
+fn find(chars: &[char], from: usize, needle: &str) -> Option<usize> {
+    let needle: Vec<char> = needle.chars().collect();
+    if from >= chars.len() || needle.is_empty() {
+        return None;
+    }
+    (from..=chars.len().saturating_sub(needle.len()))
+        .find(|i| chars[*i..*i + needle.len()] == needle[..])
+}
+
+fn collect(chars: &[char], from: usize, to: usize) -> String {
+    chars[from..to].iter().collect()
+}
+
+fn push_plain(spans: &mut Vec<Span>, buf: &mut String) {
+    if !buf.is_empty() {
+        spans.push(Span::new(std::mem::take(buf), Style::Plain));
+    }
+}
+
+// ─── Anchors ────────────────────────────────────────────────────────────────
+//
+// A TOC link like `[Bugs](#4-bugs-fonctionnels)` targets a heading by a slug
+// GitHub derives from its text. We regenerate the same slugs from our parsed
+// headings and, on click, scroll the preview's own `scrollable` to whichever
+// one matches.
+
+/// GitHub's heading-to-anchor algorithm: lowercase, drop anything but
+/// letters, digits, underscores, spaces and hyphens, turn spaces into
+/// hyphens.
+fn slugify(text: &str) -> String {
+    let mut slug = String::new();
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            slug.extend(c.to_lowercase());
+        } else if c == ' ' || c == '-' {
+            slug.push('-');
+        } else if c == '_' {
+            slug.push('_');
+        }
+    }
+    slug
+}
+
+/// An anchor as written in a link: `%C3%A9` is `é`.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The plain text of a heading's spans, markers already stripped by the
+/// inline parser — exactly what GitHub slugifies.
+fn heading_text(spans: &[Span]) -> String {
+    spans.iter().map(|s| s.text.as_str()).collect()
+}
+
+/// One slug per block — `Some` only for headings — with GitHub's collision
+/// rule: a slug repeated later in the document gets `-1`, `-2`, ... appended.
+fn assign_slugs(blocks: &[Block]) -> Vec<Option<String>> {
+    let mut seen: HashMap<String, u32> = HashMap::new();
+    blocks
+        .iter()
+        .map(|block| {
+            let Block::Heading { spans, .. } = block else {
+                return None;
+            };
+            let base = slugify(&heading_text(spans));
+            let count = seen.entry(base.clone()).or_insert(0);
+            let slug = if *count == 0 {
+                base
+            } else {
+                format!("{base}-{count}")
+            };
+            *count += 1;
+            Some(slug)
+        })
+        .collect()
+}
+
+/// Stable id of the preview's own scrollable, so a link click can scroll it.
+pub fn scrollable_id() -> iced::widget::Id {
+    iced::widget::Id::new("markdown-preview")
+}
+
+fn anchor_id(slug: &str) -> iced::widget::Id {
+    iced::widget::Id::from(format!("md-anchor-{slug}"))
+}
+
+/// Walks the widget tree to find how far a heading's anchor sits below the
+/// top of the preview's scrollable content — the `y` a `scrollable::scroll_to`
+/// needs. Container/scrollable bounds from `Operation::container` /
+/// `::scrollable` are given in unscrolled content space, so this is a plain
+/// subtraction; no need to know the current scroll position at all.
+struct FindHeadingOffset {
+    scrollable_id: WidgetId,
+    target_id: WidgetId,
+    scrollable_top: Option<f32>,
+    offset: Option<f32>,
+}
+
+impl Operation<Option<f32>> for FindHeadingOffset {
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<Option<f32>>)) {
+        // Found: nothing below the heading (or after it) matters.
+        if self.offset.is_none() {
+            operate(self);
+        }
+    }
+
+    fn container(&mut self, id: Option<&WidgetId>, bounds: Rectangle) {
+        if self.offset.is_none() && id == Some(&self.target_id) {
+            if let Some(top) = self.scrollable_top {
+                self.offset = Some(bounds.y - top);
+            }
+        }
+    }
+
+    fn scrollable(
+        &mut self,
+        id: Option<&WidgetId>,
+        bounds: Rectangle,
+        _content_bounds: Rectangle,
+        _translation: Vector,
+        _state: &mut dyn operation::Scrollable,
+    ) {
+        if id == Some(&self.scrollable_id) {
+            self.scrollable_top = Some(bounds.y);
+        }
+    }
+
+    fn finish(&self) -> operation::Outcome<Option<f32>> {
+        operation::Outcome::Some(self.offset)
+    }
+}
+
+/// A `Task` resolving to the target heading's offset for `href`
+/// (`#some-slug`), or `None` if it names no heading in the current document.
+pub fn find_offset_command(href: &str) -> Task<Option<f32>> {
+    let slug = percent_decode(href.trim_start_matches('#')).to_lowercase();
+    iced::advanced::widget::operate(FindHeadingOffset {
+        scrollable_id: scrollable_id(),
+        target_id: anchor_id(&slug),
+        scrollable_top: None,
+        offset: None,
+    })
+}
+
+// ─── Rendering ──────────────────────────────────────────────────────────────
+
+const BODY_SIZE: f32 = 14.0;
+
+fn heading_size(level: u8) -> f32 {
+    match level {
+        1 => 28.0,
+        2 => 17.0,
+        3 => 15.0,
+        _ => 14.0,
+    }
+}
+
+/// The title is bold, the other headings semibold.
+fn heading_font(level: u8) -> Font {
+    if level == 1 {
+        theme::UI_BOLD
+    } else {
+        theme::UI_SEMIBOLD
+    }
+}
+
+fn bold_font() -> Font {
+    theme::UI_BOLD
+}
+
+fn italic_font() -> Font {
+    theme::UI_ITALIC
+}
+
+fn bold_italic_font() -> Font {
+    theme::UI_BOLD_ITALIC
+}
+
+/// The rendered document, scrollable.
+pub fn view(blocks: &[Block], dark: bool) -> Element<'static, Message> {
+    let slugs = assign_slugs(blocks);
+    let body: Vec<Element<'static, Message>> = blocks
+        .iter()
+        .zip(slugs.iter())
+        .map(|(b, slug)| block_view(b, dark, slug.as_deref()))
+        .collect();
+
+    scrollable(
+        container(column(body).spacing(12))
+            .width(Length::Fill)
+            .padding([22, 28]),
+    )
+    .style(theme::Scrollbar { dark }.style())
+    .id(scrollable_id())
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
+}
+
+fn block_view(block: &Block, dark: bool, slug: Option<&str>) -> Element<'static, Message> {
+    let p = theme::palette(dark);
+    match block {
+        Block::Heading { level, spans } => {
+            let heading = spans_view(
+                spans,
+                heading_size(*level),
+                p.text,
+                dark,
+                heading_font(*level),
+            );
+            match slug {
+                Some(slug) => container(heading).id(anchor_id(slug)).into(),
+                None => heading,
+            }
+        }
+        Block::Paragraph(spans) => spans_view(spans, BODY_SIZE, p.text, dark, theme::UI),
+        Block::Quote(spans) => container(spans_view(spans, BODY_SIZE, p.text, dark, theme::UI))
+            .width(Length::Fill)
+            .padding([10, 14])
+            .style(theme::quote_block(dark))
+            .into(),
+        Block::ListItem {
+            depth,
+            marker,
+            spans,
+        } => {
+            // Bullets are a small accent dot; numbers stay muted text.
+            let marker: Element<'static, Message> = if marker == "•" {
+                container(container(Space::new().width(5).height(5)).style(theme::dot(p.accent)))
+                    .padding(iced::Padding {
+                        top: 8.0,
+                        right: 0.0,
+                        bottom: 0.0,
+                        left: 0.0,
+                    })
+                    .into()
+            } else {
+                text(marker.clone())
+                    .size(BODY_SIZE)
+                    .color(theme::muted_text(dark))
+                    .into()
+            };
+            row![
+                Space::new().width(Length::Fixed(*depth as f32 * 18.0)),
+                marker,
+                Space::new().width(Length::Fixed(10.0)),
+                spans_view(spans, BODY_SIZE, p.text, dark, theme::UI),
+            ]
+            .into()
+        }
+        Block::Code(code) => container(
+            text(code.clone())
+                .size(12.0)
+                .font(theme::MONO)
+                .color(p.text)
+                .shaping(iced::widget::text::Shaping::Advanced),
+        )
+        .width(Length::Fill)
+        .padding([12, 14])
+        .style(theme::code_block(dark))
+        .into(),
+        Block::Rule => container(Space::new().height(1))
+            .width(Length::Fill)
+            .style(theme::rule(dark))
+            .into(),
+        Block::Table {
+            alignments,
+            header,
+            rows,
+        } => table_view(alignments, header, rows, dark),
+    }
+}
+
+/// A GFM table. Cells size to their own content (not stretched to fill the
+/// pane, matching how these render elsewhere), so a wide table scrolls
+/// horizontally rather than forcing every column down to an unreadable
+/// width.
+fn table_view(
+    alignments: &[Align],
+    header: &[Vec<Span>],
+    rows: &[Vec<Vec<Span>>],
+    dark: bool,
+) -> Element<'static, Message> {
+    let p = theme::palette(dark);
+    let columns = header
+        .len()
+        .max(rows.iter().map(Vec::len).max().unwrap_or(0));
+
+    let cell = move |spans: &[Span], is_header: bool| -> Element<'static, Message> {
+        let font = if is_header { bold_font() } else { theme::UI };
+        container(spans_view(spans, BODY_SIZE, p.text, dark, font))
+            .padding([6, 10])
+            .into()
+    };
+
+    // The body rows are looked up by index; the data is shared by every
+    // column's cell builder.
+    let body: std::sync::Arc<Vec<Vec<Vec<Span>>>> = std::sync::Arc::new(rows.to_vec());
+    let table_columns = (0..columns).map(|col| {
+        let header_spans = header.get(col).map(Vec::as_slice).unwrap_or(&[]);
+        let body = std::sync::Arc::clone(&body);
+        let align: iced::alignment::Horizontal = alignments
+            .get(col)
+            .copied()
+            .map(Into::into)
+            .unwrap_or(iced::alignment::Horizontal::Left);
+        iced::widget::table::column(cell(header_spans, true), move |row: usize| {
+            let spans = body[row].get(col).map(Vec::as_slice).unwrap_or(&[]);
+            cell(spans, false)
+        })
+        .align_x(align)
+    });
+
+    let grid = iced::widget::table(table_columns, 0..rows.len())
+        .padding(0)
+        .separator_x(0)
+        .separator_y(1);
+
+    wheel_gate(
+        scrollable(container(grid).style(theme::table_border(dark)))
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::default(),
+            ))
+            .width(Length::Fill),
+    )
+}
+
+/// Lets a wheel-scroll event through to a horizontal-only `scrollable` (used
+/// above for a wide table) only when it's mostly horizontal; a mostly-
+/// vertical one is left `Ignored` instead of being handed to the child at
+/// all, so the preview's own (outer, vertical) scrollable gets it next.
+///
+/// `scrollable` otherwise captures *every* wheel event over its bounds
+/// unconditionally — even one entirely on an axis it doesn't scroll — which
+/// is what made hovering a table block scrolling the rest of the document.
+struct WheelGate<'a> {
+    content: Element<'a, Message>,
+}
+
+fn wheel_gate<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    Element::new(WheelGate {
+        content: content.into(),
+    })
+}
+
+impl<'a> Widget<Message, Theme, iced::Renderer> for WheelGate<'a> {
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_ref(&self.content));
+    }
+
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &iced::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &iced::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        if let Event::Mouse(mouse::Event::WheelScrolled { delta }) = event {
+            let (x, y) = match delta {
+                mouse::ScrollDelta::Lines { x, y } | mouse::ScrollDelta::Pixels { x, y } => (x, y),
+            };
+            if y.abs() >= x.abs() {
+                return;
+            }
+        }
+
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &iced::Renderer,
+    ) -> mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut iced::Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &iced::Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, Message, Theme, iced::Renderer>> {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+}
+
+/// Lays out spans as a wrapping run of words. iced 0.12 has no rich text
+/// widget, so each word is its own text widget; fragments that are not
+/// separated by whitespace in the source (`**bold**,`) are grouped into one
+/// unspaced row so the punctuation stays glued to the word.
+fn spans_view(
+    spans: &[Span],
+    size: f32,
+    color: Color,
+    dark: bool,
+    base_font: Font,
+) -> Element<'static, Message> {
+    let accent = theme::accent_color(dark);
+    let mut clusters: Vec<Element<'static, Message>> = Vec::new();
+    let mut cluster: Vec<Element<'static, Message>> = Vec::new();
+
+    for span in spans {
+        if span.text.starts_with(char::is_whitespace) && !cluster.is_empty() {
+            clusters.push(row(std::mem::take(&mut cluster)).into());
+        }
+        for (i, word) in span.text.split_whitespace().enumerate() {
+            if i > 0 && !cluster.is_empty() {
+                clusters.push(row(std::mem::take(&mut cluster)).into());
+            }
+            // Advanced shaping is what makes cosmic-text fall back to another
+            // installed font for a glyph missing from `base_font` — emoji chief
+            // among them, which live in a dedicated color-emoji font.
+            let widget = text(word.to_string())
+                .size(size)
+                .shaping(iced::widget::text::Shaping::Advanced);
+            let widget = match span.style {
+                Style::Plain => widget.font(base_font).color(color),
+                Style::Bold => widget.font(bold_font()).color(color),
+                Style::Italic => widget.font(italic_font()).color(color),
+                Style::BoldItalic => widget.font(bold_italic_font()).color(color),
+                Style::Code => widget.font(theme::MONO).size(size - 1.5).color(color),
+                Style::Link => widget.font(base_font).color(accent),
+            };
+            // Only in-document anchors (`#slug`) are wired up to jump
+            // anywhere; an external link stays styled but inert.
+            let element: Element<'static, Message> = match &span.href {
+                Some(href) if href.starts_with('#') => mouse_area(widget)
+                    .interaction(mouse::Interaction::Pointer)
+                    .on_press(Message::MarkdownLinkClicked(href.clone()))
+                    .into(),
+                _ => widget.into(),
+            };
+            cluster.push(element);
+        }
+        if span.text.ends_with(char::is_whitespace) && !cluster.is_empty() {
+            clusters.push(row(std::mem::take(&mut cluster)).into());
+        }
+    }
+    if !cluster.is_empty() {
+        clusters.push(row(cluster).into());
+    }
+
+    iced_aw::Wrap::with_elements(clusters)
+        .spacing(size * 0.28)
+        .line_spacing(5.0)
+        .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plain(text: &str) -> Vec<Span> {
+        vec![Span::new(text, Style::Plain)]
+    }
+
+    #[test]
+    fn very_long_lines_are_left_as_plain_text() {
+        let line = "*a ".repeat(MAX_INLINE_CHARS);
+        let spans = parse_inline(&line);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].style, Style::Plain);
+    }
+
+    #[test]
+    fn unmatched_markers_repeated_many_times_stay_linear() {
+        let started = std::time::Instant::now();
+        for unit in ["*a ", "`a ", "[a ", "_a ", "**a "] {
+            let line = unit.repeat(30_000);
+            let spans = parse_inline(&line);
+            assert!(!spans.is_empty());
+        }
+        // Quadratic scanning took seconds per line; this takes milliseconds.
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn parses_headings() {
+        assert_eq!(
+            parse("# Title"),
+            vec![Block::Heading {
+                level: 1,
+                spans: plain("Title")
+            }]
+        );
+        assert_eq!(
+            parse("### Deep"),
+            vec![Block::Heading {
+                level: 3,
+                spans: plain("Deep")
+            }]
+        );
+    }
+
+    #[test]
+    fn hash_without_space_is_not_a_heading() {
+        assert_eq!(parse("#hashtag"), vec![Block::Paragraph(plain("#hashtag"))]);
+    }
+
+    #[test]
+    fn joins_paragraph_lines_and_splits_on_blank() {
+        assert_eq!(
+            parse("one\ntwo\n\nthree"),
+            vec![
+                Block::Paragraph(plain("one two")),
+                Block::Paragraph(plain("three")),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_fenced_code_verbatim() {
+        let blocks = parse("```rust\nlet x = *y;\n```");
+        assert_eq!(blocks, vec![Block::Code("let x = *y;".to_string())]);
+    }
+
+    #[test]
+    fn unclosed_fence_still_yields_a_code_block() {
+        assert_eq!(parse("```\nabc"), vec![Block::Code("abc".to_string())]);
+    }
+
+    #[test]
+    fn parses_lists() {
+        assert_eq!(
+            parse("- a\n  - b\n3. c"),
+            vec![
+                Block::ListItem {
+                    depth: 0,
+                    marker: "•".to_string(),
+                    spans: plain("a")
+                },
+                Block::ListItem {
+                    depth: 1,
+                    marker: "•".to_string(),
+                    spans: plain("b")
+                },
+                Block::ListItem {
+                    depth: 0,
+                    marker: "3.".to_string(),
+                    spans: plain("c")
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_quotes_and_rules() {
+        assert_eq!(
+            parse("> quoted\n> more\n\n---"),
+            vec![Block::Quote(plain("quoted more")), Block::Rule]
+        );
+    }
+
+    #[test]
+    fn dashes_inside_a_list_are_not_a_rule() {
+        assert!(matches!(parse("- a")[0], Block::ListItem { .. }));
+    }
+
+    #[test]
+    fn parses_inline_emphasis() {
+        assert_eq!(
+            parse_inline("a **b** c *d* `e` ***f***"),
+            vec![
+                Span::new("a ", Style::Plain),
+                Span::new("b", Style::Bold),
+                Span::new(" c ", Style::Plain),
+                Span::new("d", Style::Italic),
+                Span::new(" ", Style::Plain),
+                Span::new("e", Style::Code),
+                Span::new(" ", Style::Plain),
+                Span::new("f", Style::BoldItalic),
+            ]
+        );
+    }
+
+    #[test]
+    fn unmatched_markers_stay_literal() {
+        assert_eq!(parse_inline("2 * 3 * 4"), plain("2 * 3 * 4"));
+        assert_eq!(parse_inline("a_b"), plain("a_b"));
+        assert_eq!(parse_inline("*dangling"), plain("*dangling"));
+    }
+
+    #[test]
+    fn underscores_inside_a_word_are_literal() {
+        assert_eq!(parse_inline("snake_case_name"), plain("snake_case_name"));
+        assert_eq!(
+            parse_inline("an _emphasized_ word"),
+            vec![
+                Span::new("an ", Style::Plain),
+                Span::new("emphasized", Style::Italic),
+                Span::new(" word", Style::Plain),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_links_and_images() {
+        assert_eq!(
+            parse_inline("see [docs](http://x) and ![pic](y.png)"),
+            vec![
+                Span::new("see ", Style::Plain),
+                Span::link("docs", "http://x"),
+                Span::new(" and ", Style::Plain),
+                Span::link("pic", "y.png"),
+            ]
+        );
+    }
+
+    #[test]
+    fn bracket_without_url_stays_literal() {
+        assert_eq!(parse_inline("[todo]"), plain("[todo]"));
+    }
+
+    #[test]
+    fn backslash_escapes_markers() {
+        assert_eq!(parse_inline(r"\*not bold\*"), plain("*not bold*"));
+    }
+
+    #[test]
+    fn empty_document_has_no_blocks() {
+        assert!(parse("").is_empty());
+        assert!(parse("\n\n").is_empty());
+    }
+
+    #[test]
+    fn parses_a_table() {
+        let blocks = parse("| A | B |\n| --- | --- |\n| 1 | 2 |\n| 3 | 4 |");
+        assert_eq!(
+            blocks,
+            vec![Block::Table {
+                alignments: vec![Align::Left, Align::Left],
+                header: vec![plain("A"), plain("B")],
+                rows: vec![vec![plain("1"), plain("2")], vec![plain("3"), plain("4")],],
+            }]
+        );
+    }
+
+    #[test]
+    fn table_survives_without_outer_pipes() {
+        let blocks = parse("A | B\n--- | ---\n1 | 2");
+        assert_eq!(
+            blocks,
+            vec![Block::Table {
+                alignments: vec![Align::Left, Align::Left],
+                header: vec![plain("A"), plain("B")],
+                rows: vec![vec![plain("1"), plain("2")]],
+            }]
+        );
+    }
+
+    #[test]
+    fn table_reads_column_alignment() {
+        let blocks = parse("| L | C | R |\n| :--- | :---: | ---: |\n| a | b | c |");
+        let Block::Table { alignments, .. } = &blocks[0] else {
+            panic!("expected a table");
+        };
+        assert_eq!(alignments, &[Align::Left, Align::Center, Align::Right]);
+    }
+
+    #[test]
+    fn table_stops_at_a_blank_line() {
+        let blocks = parse("| A |\n| --- |\n| 1 |\n\nafter");
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(blocks[0], Block::Table { .. }));
+        assert_eq!(blocks[1], Block::Paragraph(plain("after")));
+    }
+
+    #[test]
+    fn a_lone_pipe_row_without_a_separator_stays_a_paragraph() {
+        let blocks = parse("A | B\nnot a separator");
+        assert_eq!(
+            blocks,
+            vec![Block::Paragraph(parse_inline("A | B not a separator"))]
+        );
+    }
+
+    #[test]
+    fn table_cells_split_on_unescaped_pipes_only() {
+        assert_eq!(
+            table_cells(r"| `a|b` | c\|d |"),
+            vec!["`a|b`".to_string(), r"c|d".to_string()]
+        );
+    }
+
+    #[test]
+    fn unclosed_emphasis_does_not_make_parsing_quadratic() {
+        let line = "*a ".repeat(6_000);
+        let started = std::time::Instant::now();
+        parse_inline(&line);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn ragged_rows_are_kept_as_parsed_not_padded() {
+        // table_view gives the table as many columns as its widest row (the
+        // header included) and leaves the short rows' cells empty; nothing is
+        // cut. The parser just records what's actually there.
+        let blocks = parse("| A | B |\n| --- | --- |\n| 1 |\n| 2 | 3 | 4 |");
+        let Block::Table { rows, .. } = &blocks[0] else {
+            panic!("expected a table");
+        };
+        assert_eq!(rows[0], vec![plain("1")]);
+        assert_eq!(rows[1], vec![plain("2"), plain("3"), plain("4")]);
+    }
+
+    #[test]
+    fn slugify_matches_github() {
+        assert_eq!(slugify("Bugs fonctionnels"), "bugs-fonctionnels");
+        assert_eq!(
+            slugify("1. Inventaire et santé mesurée"),
+            "1-inventaire-et-santé-mesurée"
+        );
+        assert_eq!(slugify("Qualité, tests, CI"), "qualité-tests-ci");
+    }
+
+    #[test]
+    fn slugify_keeps_underscores() {
+        assert_eq!(slugify("my_heading"), "my_heading");
+        assert_eq!(slugify("snake_case & more"), "snake_case--more");
+    }
+
+    #[test]
+    fn anchors_are_percent_decoded() {
+        assert_eq!(percent_decode("caf%C3%A9"), "café");
+        assert_eq!(percent_decode("100%"), "100%");
+        assert_eq!(percent_decode("a%2"), "a%2");
+        assert_eq!(percent_decode("a%zzb"), "a%zzb");
+    }
+
+    #[test]
+    fn assign_slugs_only_tags_headings() {
+        let blocks = parse("# Title\n\ntext\n\n## Title");
+        let slugs = assign_slugs(&blocks);
+        assert_eq!(
+            slugs,
+            vec![
+                Some("title".to_string()),
+                None,
+                // GitHub's collision rule: repeated slugs get -1, -2, ...
+                Some("title-1".to_string()),
+            ]
+        );
+    }
+}

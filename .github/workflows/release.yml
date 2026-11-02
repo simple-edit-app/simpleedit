@@ -1,0 +1,246 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: simpleedit
+  # Passed to scripts through the environment, never interpolated into them.
+  TAG: ${{ github.ref_name }}
+
+jobs:
+  check-version:
+    name: Tag matches Cargo.toml
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # The .deb is named after Cargo.toml, the other assets after the tag, and
+      # the in-app updater looks for simpleedit_<tag>-1_amd64.deb.
+      - run: |
+          CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"(.*)"/\1/')
+          if [ "v${CARGO_VERSION}" != "$TAG" ]; then
+            echo "::error::Tag $TAG does not match the version in Cargo.toml (v${CARGO_VERSION})"
+            exit 1
+          fi
+
+  build-macos:
+    name: Build macOS (Apple Silicon)
+    needs: check-version
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin
+      - name: Build
+        run: cargo build --release --target aarch64-apple-darwin
+      - name: Package tarball
+        run: |
+          cd target/aarch64-apple-darwin/release
+          tar czf simpleedit-${TAG}-aarch64-apple-darwin.tar.gz ${{ env.BINARY_NAME }}
+          mv simpleedit-*.tar.gz ${{ github.workspace }}/
+      - name: Build .app bundle
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          APP="SimpleEdit.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+          cp target/aarch64-apple-darwin/release/${{ env.BINARY_NAME }} "$APP/Contents/MacOS/"
+          chmod +x "$APP/Contents/MacOS/${{ env.BINARY_NAME }}"
+
+          # .icns from the existing PNG, sized down from the largest square available
+          mkdir -p simpleedit.iconset
+          for size in 16 32 128 256 512; do
+            sips -z $size $size assets/simpleedit.png \
+              --out "simpleedit.iconset/icon_${size}x${size}.png" >/dev/null
+            sips -z $((size*2)) $((size*2)) assets/simpleedit.png \
+              --out "simpleedit.iconset/icon_${size}x${size}@2x.png" >/dev/null
+          done
+          iconutil -c icns simpleedit.iconset -o "$APP/Contents/Resources/simpleedit.icns"
+          rm -rf simpleedit.iconset
+
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>SimpleEdit</string>
+            <key>CFBundleDisplayName</key><string>SimpleEdit</string>
+            <key>CFBundleIdentifier</key><string>app.simpleedit.SimpleEdit</string>
+            <key>CFBundleVersion</key><string>${VERSION}</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+            <key>CFBundleExecutable</key><string>${{ env.BINARY_NAME }}</string>
+            <key>CFBundleIconFile</key><string>simpleedit</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>CFBundleDocumentTypes</key>
+            <array>
+              <dict>
+                <key>CFBundleTypeName</key><string>Text Document</string>
+                <key>CFBundleTypeRole</key><string>Editor</string>
+                <key>LSItemContentTypes</key>
+                <array><string>public.text</string><string>public.source-code</string></array>
+              </dict>
+            </array>
+          </dict>
+          </plist>
+          PLIST
+
+          # Ad-hoc signature: unsigned bundles are rejected outright on Apple Silicon
+          codesign --force --deep --sign - "$APP"
+          ditto -c -k --keepParent "$APP" \
+            "simpleedit-${TAG}-macos-aarch64.zip"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: simpleedit-macos-aarch64
+          path: |
+            simpleedit-*.tar.gz
+            simpleedit-*-macos-aarch64.zip
+
+  build-linux:
+    name: Build Linux (x86_64)
+    needs: check-version
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libvulkan-dev
+      - name: Build binary
+        run: cargo build --release
+      - name: Package tarball
+        run: |
+          cd target/release
+          tar czf simpleedit-${TAG}-x86_64-linux.tar.gz ${{ env.BINARY_NAME }}
+          mv simpleedit-*.tar.gz ${{ github.workspace }}/
+      - name: Build DEB
+        run: |
+          cargo install --locked --version 3.8.0 cargo-deb
+          cargo deb
+          cp target/debian/*.deb ${{ github.workspace }}/
+      - name: Build AppImage
+        run: |
+          mkdir -p AppDir/usr/bin
+          cp target/release/${{ env.BINARY_NAME }} AppDir/usr/bin/
+          cp assets/simpleedit.desktop AppDir/
+          cp assets/simpleedit.png AppDir/
+          ln -s usr/bin/${{ env.BINARY_NAME }} AppDir/AppRun
+
+          curl -fsSL -o appimagetool https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  appimagetool" | sha256sum -c -
+          chmod +x appimagetool
+          ./appimagetool --appimage-extract-and-run AppDir simpleedit-${TAG}-x86_64.AppImage
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: simpleedit-linux
+          path: |
+            simpleedit-*.tar.gz
+            *.deb
+            *.AppImage
+
+  release:
+    name: Create GitHub Release
+    needs: [build-macos, build-linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          merge-multiple: true
+      # The in-app updater and install.sh verify downloads against this file.
+      - name: Generate checksums
+        run: sha256sum simpleedit-*.tar.gz simpleedit-*-macos-aarch64.zip *.deb *.AppImage > SHA256SUMS
+      # Ed25519 signature over SHA256SUMS; the app embeds the public key and
+      # refuses an update whose checksums aren't signed by it.
+      - name: Sign checksums
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          # install.sh and the in-app updater both refuse unsigned releases, so
+          # publishing one would only break them.
+          if [ -z "$UPDATE_SIGNING_KEY" ]; then
+            echo "::error::UPDATE_SIGNING_KEY is not set — refusing to release without SHA256SUMS.sig."
+            exit 1
+          fi
+          umask 077
+          printf '%s\n' "$UPDATE_SIGNING_KEY" > update-key.pem
+          openssl pkeyutl -sign -inkey update-key.pem -rawin -in SHA256SUMS -out SHA256SUMS.sig
+          rm -f update-key.pem
+      - name: Create Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          files: |
+            simpleedit-*.tar.gz
+            simpleedit-*-macos-aarch64.zip
+            *.deb
+            *.AppImage
+            SHA256SUMS
+            SHA256SUMS.sig
+          generate_release_notes: true
+          draft: false
+
+  update-tap:
+    name: Update Homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # The `secrets` context is not available in a job-level `if:`, so the
+      # presence of the PAT is resolved here and gates the steps below.
+      - name: Look for a tap token
+        id: tap
+        env:
+          TAP_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          if [ -n "$TAP_TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::TAP_GITHUB_TOKEN is not set — skipping the Homebrew cask bump. Update Casks/simpleedit.rb by hand."
+          fi
+      - name: Check out the tap
+        if: steps.tap.outputs.enabled == 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: simple-edit-app/homebrew-tap
+          # PAT with `contents: write` on the tap repo.
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+      - name: Bump cask to ${{ github.ref_name }}
+        if: steps.tap.outputs.enabled == 'true'
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          ZIP="simpleedit-${GITHUB_REF_NAME}-macos-aarch64.zip"
+          URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/${ZIP}"
+
+          curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors -o "$ZIP" "$URL"
+          SHA=$(sha256sum "$ZIP" | cut -d' ' -f1)
+          rm -f "$ZIP"
+
+          sed -i -E "s|^  version \".*\"|  version \"${VERSION}\"|" Casks/simpleedit.rb
+          sed -i -E "s|^  sha256 \".*\"|  sha256 \"${SHA}\"|"      Casks/simpleedit.rb
+
+          grep -q "\"${VERSION}\"" Casks/simpleedit.rb || { echo "version bump failed"; exit 1; }
+          grep -q "\"${SHA}\"" Casks/simpleedit.rb     || { echo "sha256 bump failed"; exit 1; }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/simpleedit.rb
+          git diff --staged --quiet || git commit -m "simpleedit ${VERSION}"
+          git push

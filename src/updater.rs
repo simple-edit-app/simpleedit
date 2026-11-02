@@ -1,0 +1,430 @@
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use sha2::{Digest, Sha256};
+
+const REPO: &str = "simple-edit-app/simpleedit";
+const RELEASES_API: &str =
+    "https://api.github.com/repos/simple-edit-app/simpleedit/releases/latest";
+/// Public half of the release signing key (Ed25519). `SHA256SUMS` must carry
+/// a valid signature from it, so a tampered release can't vouch for itself.
+const SIGNING_PUBLIC_KEY: [u8; 32] = [
+    0x99, 0x9a, 0xef, 0x9a, 0x8e, 0x99, 0xcd, 0x86, 0xd9, 0x0f, 0x6e, 0x6e, 0xed, 0xd3, 0x2c, 0xc7,
+    0xa7, 0x66, 0xf4, 0x77, 0x32, 0xad, 0x6f, 0xe2, 0x8e, 0x0c, 0x15, 0x6f, 0x8b, 0xe3, 0x7a, 0x4b,
+];
+/// Refuse absurdly large downloads.
+const MAX_DOWNLOAD: usize = 300 * 1024 * 1024;
+
+/// Strict `MAJOR.MINOR.PATCH`. Anything else — pre-releases, path
+/// separators, garbage from a tampered API response — is rejected, so a
+/// version string can't be used to build a hostile URL or file name.
+pub fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = s.split('.');
+    let mut next = || {
+        let p = parts.next()?;
+        (!p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| p.parse().ok())
+            .flatten()
+    };
+    let v = (next()?, next()?, next()?);
+    parts.next().is_none().then_some(v)
+}
+
+fn is_newer(latest: &str, current: &str) -> bool {
+    match (parse_version(latest), parse_version(current)) {
+        (Some(l), Some(c)) => l > c,
+        _ => false,
+    }
+}
+
+fn client(timeout: Duration) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .user_agent("simpleedit-updater")
+        .timeout(timeout)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
+/// Fetches `url` and reads at most `max` bytes of the body: a declared length
+/// over the cap is refused up front, and an undeclared one is cut off as soon
+/// as it grows past it, rather than buffering whatever the server sends.
+async fn fetch_limited(client: &reqwest::Client, url: &str, max: usize) -> Result<Vec<u8>, String> {
+    let mut response = client
+        .get(url)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| e.to_string())?;
+    if response
+        .content_length()
+        .is_some_and(|len| len > max as u64)
+    {
+        return Err(t!("update.err_checksum").to_string());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        body.extend_from_slice(&chunk);
+        if body.len() > max {
+            return Err(t!("update.err_checksum").to_string());
+        }
+    }
+    Ok(body)
+}
+
+/// Largest changelog worth reading; anything bigger is ignored.
+const MAX_CHANGELOG: usize = 512 * 1024;
+
+/// What changed between this version and `latest`, from the changelog
+/// published with that release. Best effort: the update is still offered
+/// when the notes can't be fetched.
+async fn release_notes(latest: &str) -> Vec<crate::changelog::Entry> {
+    let url = format!(
+        "https://raw.githubusercontent.com/{REPO}/v{latest}/{}",
+        crate::changelog::file_name(&rust_i18n::locale())
+    );
+    let fetched = async {
+        let bytes = fetch_limited(&client(Duration::from_secs(15))?, &url, MAX_CHANGELOG).await?;
+        Ok::<_, String>(String::from_utf8_lossy(&bytes).into_owned())
+    };
+    let Ok(text) = fetched.await else {
+        return Vec::new();
+    };
+    crate::changelog::between(
+        crate::changelog::parse(&text),
+        env!("CARGO_PKG_VERSION"),
+        latest,
+    )
+}
+
+/// The newer version and what it changes, if there is one.
+pub async fn check_for_update() -> Result<Option<(String, Vec<crate::changelog::Entry>)>, String> {
+    let json: serde_json::Value = client(Duration::from_secs(15))?
+        .get(RELEASES_API)
+        .send()
+        .await
+        .and_then(|r| r.error_for_status())
+        .map_err(|e| e.to_string())?
+        .json()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let tag = json["tag_name"]
+        .as_str()
+        .ok_or_else(|| t!("update.err_api").to_string())?;
+
+    let latest = tag.trim_start_matches('v');
+    if parse_version(latest).is_none() {
+        return Err(t!("update.err_api").to_string());
+    }
+
+    if is_newer(latest, env!("CARGO_PKG_VERSION")) {
+        Ok(Some((latest.to_string(), release_notes(latest).await)))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn asset_name(version: &str) -> String {
+    format!("simpleedit_{}-1_amd64.deb", version)
+}
+
+#[cfg(target_os = "macos")]
+fn asset_name(version: &str) -> String {
+    format!("simpleedit-v{}-aarch64-apple-darwin.tar.gz", version)
+}
+
+/// In-app install only works for the package this binary came from: a .deb
+/// in /usr/bin on Linux, the copy in /usr/local/bin on macOS. Anything else
+/// (snap, AppImage, Homebrew cask, another architecture) would have the
+/// update installed somewhere the running app isn't.
+#[cfg(target_os = "linux")]
+fn install_supported() -> Result<(), String> {
+    let ok = cfg!(target_arch = "x86_64")
+        && Path::new("/usr/bin/dpkg").exists()
+        && std::env::current_exe()
+            .map(|p| p.starts_with("/usr/bin"))
+            .unwrap_or(false);
+    if ok {
+        Ok(())
+    } else {
+        Err(t!("update.err_unsupported").to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn install_supported() -> Result<(), String> {
+    let ok = cfg!(target_arch = "aarch64")
+        && std::env::current_exe()
+            .map(|p| p == Path::new("/usr/local/bin/simpleedit"))
+            .unwrap_or(false);
+    if ok {
+        Ok(())
+    } else {
+        Err(t!("update.err_unsupported").to_string())
+    }
+}
+
+/// The hash `SHA256SUMS` lists for `asset` (`<hash>  <name>` or
+/// `<hash> *<name>` lines, as `sha256sum` writes them).
+fn expected_hash(sums: &str, asset: &str) -> Option<String> {
+    sums.lines().find_map(|line| {
+        let (hash, name) = line.split_once(char::is_whitespace)?;
+        (name.trim().trim_start_matches('*') == asset).then(|| hash.to_ascii_lowercase())
+    })
+}
+
+fn verify_signature(message: &[u8], signature: &[u8]) -> bool {
+    use ed25519_dalek::{Signature, VerifyingKey};
+    let (Ok(key), Ok(sig)) = (
+        VerifyingKey::from_bytes(&SIGNING_PUBLIC_KEY),
+        <[u8; 64]>::try_from(signature).map(|b| Signature::from_bytes(&b)),
+    ) else {
+        return false;
+    };
+    key.verify_strict(message, &sig).is_ok()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Largest `SHA256SUMS` or signature worth reading.
+const MAX_SUMS: usize = 64 * 1024;
+
+/// Downloads the release asset into a fresh private directory and checks it
+/// against the release's `SHA256SUMS`. Returns the path of the verified file
+/// and the hash it was verified against (checked again at install time).
+pub async fn download_update(version: String) -> Result<(PathBuf, String), String> {
+    if parse_version(&version).is_none() {
+        return Err(t!("update.err_api").to_string());
+    }
+    install_supported()?;
+
+    let asset = asset_name(&version);
+    let base = format!("https://github.com/{REPO}/releases/download/v{version}");
+    let client = client(Duration::from_secs(300))?;
+
+    let sums = fetch_limited(&client, &format!("{base}/SHA256SUMS"), MAX_SUMS).await?;
+    let sig = fetch_limited(&client, &format!("{base}/SHA256SUMS.sig"), MAX_SUMS).await?;
+    if !verify_signature(&sums, &sig) {
+        return Err(t!("update.err_signature").to_string());
+    }
+    let sums = String::from_utf8_lossy(&sums).into_owned();
+    let expected =
+        expected_hash(&sums, &asset).ok_or_else(|| t!("update.err_checksum").to_string())?;
+
+    let bytes = fetch_limited(&client, &format!("{base}/{asset}"), MAX_DOWNLOAD).await?;
+    if sha256_hex(&bytes) != expected {
+        return Err(t!("update.err_checksum").to_string());
+    }
+
+    // A fresh 0700 directory: nobody else can pre-create or swap the file
+    // between this write and the privileged install. It is kept only once
+    // the file is in it; any failure removes it on the way out.
+    let dir = tempfile::Builder::new()
+        .prefix("simpleedit-update-")
+        .tempdir()
+        .map_err(|e| e.to_string())?;
+    let dest = dir.path().join(&asset);
+    std::fs::write(&dest, &bytes).map_err(|e| e.to_string())?;
+    let kept = dir.keep();
+    Ok((kept.join(&asset), expected))
+}
+
+/// Installs the downloaded package. `expected` is the hash it was verified
+/// against: the file is hashed again right before it is used.
+pub async fn install_update(path: PathBuf, expected: String) -> Result<(), String> {
+    let result = tokio::task::spawn_blocking({
+        let path = path.clone();
+        move || install_blocking(&path, &expected)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    result
+}
+
+/// Whether the file still has the hash it was verified with.
+fn still_verified(path: &Path, expected: &str) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    if sha256_hex(&bytes) == expected {
+        Ok(())
+    } else {
+        Err(t!("update.err_checksum").to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn install_blocking(path: &Path, expected: &str) -> Result<(), String> {
+    still_verified(path, expected)?;
+    // The package sits in a directory of the user's, so a program running as
+    // the same user could swap it once the privileged part has started. Root
+    // therefore copies it somewhere only root can write, checks the copy
+    // against the hash and installs that copy.
+    let script = r#"set -e
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+cp -- "$2" "$tmp/update.deb"
+echo "$1  $tmp/update.deb" | sha256sum -c - >/dev/null
+dpkg -i "$tmp/update.deb""#;
+    let status = std::process::Command::new("pkexec")
+        .args(["sh", "-c", script, "sh", expected])
+        .arg(path)
+        .status()
+        .map_err(|e| e.to_string())?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(t!("update.err_install", tool = "pkexec dpkg").to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn install_blocking(path: &Path, expected: &str) -> Result<(), String> {
+    still_verified(path, expected)?;
+    let tmp_dir = path
+        .parent()
+        .map(|d| d.join("extract"))
+        .ok_or_else(|| t!("update.err_extract").to_string())?;
+    std::fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
+
+    let ok = std::process::Command::new("tar")
+        .arg("-xzf")
+        .arg(path)
+        .arg("-C")
+        .arg(&tmp_dir)
+        .status()
+        .map_err(|e| e.to_string())?
+        .success();
+
+    if !ok {
+        return Err(t!("update.err_extract").to_string());
+    }
+
+    // The privileged step copies the binary next to its destination (a place
+    // only an administrator can write), checks that copy against the hash
+    // taken here and only then moves it into place. The paths and the hash
+    // go in as AppleScript arguments and are quoted by `quoted form of`,
+    // never spliced into the script text.
+    let binary = tmp_dir.join("simpleedit");
+    let binary_hash =
+        sha256_hex(&std::fs::read(&binary).map_err(|_| t!("update.err_extract").to_string())?);
+    let ok = std::process::Command::new("osascript")
+        .args([
+            "-e",
+            "on run argv",
+            "-e",
+            "set src to quoted form of (item 1 of argv)",
+            "-e",
+            "set digest to quoted form of (item 2 of argv)",
+            "-e",
+            "do shell script \"cp \" & src & \" /usr/local/bin/simpleedit.new && echo \" & digest & \"'  /usr/local/bin/simpleedit.new' | shasum -a 256 -c - >/dev/null && chmod +x /usr/local/bin/simpleedit.new && mv -f /usr/local/bin/simpleedit.new /usr/local/bin/simpleedit\" with administrator privileges",
+            "-e",
+            "end run",
+        ])
+        .arg(&binary)
+        .arg(&binary_hash)
+        .status()
+        .map_err(|e| e.to_string())?
+        .success();
+
+    if ok {
+        Ok(())
+    } else {
+        Err(t!("update.err_install", tool = "osascript").to_string())
+    }
+}
+
+/// Re-executes the just-installed binary and exits this process.
+///
+/// The `Ok` case never actually returns — a successful respawn calls
+/// `process::exit` immediately. The `Err` case lets the caller show the
+/// user something instead of the app just vanishing, which is what used to
+/// happen: the spawn failure was silently swallowed.
+pub fn restart() -> Result<(), String> {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("simpleedit"));
+
+    // A package manager (dpkg, etc.) replaces the binary file in place while
+    // this process is still running it. On Linux that makes current_exe()
+    // report something like "/usr/bin/simpleedit (deleted)": the kernel's
+    // way of saying the path this process was loaded from no longer has a
+    // directory entry, even though a freshly installed file now sits at
+    // that same path. Command::new() on that literal string can't find
+    // anything there, so fall back to the bare name and let PATH resolve
+    // the new file instead.
+    let exe = if exe.exists() {
+        exe
+    } else {
+        PathBuf::from("simpleedit")
+    };
+
+    std::process::Command::new(&exe)
+        .spawn()
+        .map_err(|e| t!("update.err_restart", error = e.to_string()).to_string())?;
+    std::process::exit(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn versions_are_parsed_strictly() {
+        assert_eq!(parse_version("1.5.0"), Some((1, 5, 0)));
+        for bad in [
+            "1.5",
+            "1.5.0.1",
+            "1.5.0-rc1",
+            "../1.0.0",
+            "1..0",
+            "v1.0.0",
+            "",
+        ] {
+            assert_eq!(parse_version(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn newer_means_strictly_greater_and_valid() {
+        assert!(is_newer("1.10.0", "1.9.9"));
+        assert!(!is_newer("1.5.0", "1.5.0"));
+        assert!(!is_newer("1.6.0-beta", "1.5.0"));
+        assert!(!is_newer("garbage", "1.5.0"));
+    }
+
+    #[test]
+    fn expected_hash_finds_the_asset_line() {
+        let sums = "ABC123  other.deb\nDEF456 *simpleedit.deb\n";
+        assert_eq!(
+            expected_hash(sums, "simpleedit.deb").as_deref(),
+            Some("def456")
+        );
+        assert_eq!(expected_hash(sums, "missing.deb"), None);
+    }
+
+    #[test]
+    fn signature_verifies_only_for_the_signed_message() {
+        let sig: Vec<u8> = (0..128)
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&"4263c802c9311a3da734c16666f6f474d81360c9bbe75cdcee330b4bfd58c694931d9933178d6e899f3e7c27d90e7e2a5ddf85dc2cdebcc1fea68c7426af9405"[i..i + 2], 16).unwrap())
+            .collect();
+        assert!(verify_signature(b"simpleedit-test-message", &sig));
+        assert!(!verify_signature(b"simpleedit-test-messagE", &sig));
+        assert!(!verify_signature(b"simpleedit-test-message", &sig[..63]));
+    }
+
+    #[test]
+    fn sha256_matches_a_known_digest() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+}
