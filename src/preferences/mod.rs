@@ -2,7 +2,9 @@
 //! Appearance, Shortcuts, Language, Updates) and settings cards on the right.
 
 use iced::{
-    widget::{button, column, container, pick_list, row, scrollable, slider, text, Space},
+    widget::{
+        button, column, container, pick_list, row, scrollable, slider, text, text_input, Space,
+    },
     Alignment, Element, Length, Padding,
 };
 
@@ -28,6 +30,8 @@ pub enum PreferencesMessage {
     ShowMinimapToggled(bool),
     WordWrapToggled(bool),
     LocaleChanged(String),
+    /// The scratch folder being typed (applied on Enter).
+    ScratchDirTyped(String),
 }
 
 /// The pages of the navigation column.
@@ -111,12 +115,14 @@ pub struct ServerStatus {
 
 pub struct PreferencesState {
     pub page: PrefsPage,
+    pub scratch_draft: String,
 }
 
 impl PreferencesState {
-    pub fn from_config(_config: &Config) -> Self {
+    pub fn from_config(config: &Config) -> Self {
         Self {
             page: PrefsPage::Editor,
+            scratch_draft: config.scratch_dir.clone(),
         }
     }
 
@@ -163,6 +169,10 @@ impl PreferencesState {
             }
             PreferencesMessage::WordWrapToggled(v) => {
                 config.word_wrap = v;
+            }
+            PreferencesMessage::ScratchDirTyped(v) => {
+                self.scratch_draft = v;
+                return false;
             }
             PreferencesMessage::LocaleChanged(v) => {
                 config.locale = v.clone();
@@ -247,6 +257,7 @@ impl PreferencesState {
         let page: Element<Message> = match self.page {
             PrefsPage::Editor => column![
                 self.editor_card(config, dark),
+                self.scratch_card(dark),
                 self.language_card(config, dark)
             ]
             .spacing(14)
@@ -448,6 +459,46 @@ impl PreferencesState {
         card_of_rows(
             dark,
             vec![setting_row(t!("prefs.theme").to_string(), control.into())],
+        )
+    }
+
+    /// Where scratch files are kept.
+    fn scratch_card(&self, dark: bool) -> Element<'_, Message> {
+        let field = text_input(
+            crate::scratch::default_dir().to_string_lossy().as_ref(),
+            &self.scratch_draft,
+        )
+        .on_input(|v| Message::Preferences(PreferencesMessage::ScratchDirTyped(v)))
+        .on_submit(Message::SetScratchDir(self.scratch_draft.clone()))
+        .padding([6, 10])
+        .size(13)
+        .width(300)
+        .style(theme::Field::new(dark).style());
+        let small = |label: String, msg: Message| {
+            button(text(label).size(12))
+                .padding([6, 12])
+                .on_press(msg)
+                .style((theme::Outline { dark }).style())
+        };
+        let control = row![
+            field,
+            small(
+                t!("prefs.scratch_browse").to_string(),
+                Message::PickScratchDir
+            ),
+            small(
+                t!("prefs.scratch_reset").to_string(),
+                Message::SetScratchDir(String::new())
+            ),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+        card_of_rows(
+            dark,
+            vec![setting_row(
+                t!("prefs.scratch_dir").to_string(),
+                control.into(),
+            )],
         )
     }
 

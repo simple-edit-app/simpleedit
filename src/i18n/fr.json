@@ -260,5 +260,21 @@
   "key.escape": "Échap",
   "palette.toggle_theme": "Changer de thème",
   "prefs.page_guide_column": "Colonne du guide de page",
-  "status.second_window": "Une autre fenêtre SimpleEdit est ouverte : celle-ci n'enregistre pas la session"
+  "status.second_window": "Une autre fenêtre SimpleEdit est ouverte : celle-ci n'enregistre pas la session",
+  "scratch.title": "Fichiers scratch",
+  "scratch.name_placeholder": "Nom",
+  "scratch.create": "Créer",
+  "scratch.empty": "Aucun fichier scratch.",
+  "scratch.delete": "Supprimer",
+  "scratch.err_name": "Donne un nom au fichier.",
+  "scratch.err_invalid": "Ce nom n'est pas valide pour un fichier.",
+  "scratch.err_exists": "Un fichier scratch porte déjà ce nom.",
+  "scratch.err_missing": "Ce fichier n'existe plus.",
+  "scratch.folder_title": "Dossier des fichiers scratch",
+  "prefs.scratch_dir": "Dossier des fichiers scratch",
+  "prefs.scratch_browse": "Parcourir…",
+  "prefs.scratch_reset": "Par défaut",
+  "scratch.no_ext": "Sans extension",
+  "scratch.delete_title": "Supprimer le fichier scratch",
+  "scratch.delete_message": "Supprimer %{name} ? Le fichier sera définitivement supprimé."
 }

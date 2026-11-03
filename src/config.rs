@@ -350,6 +350,8 @@ pub struct Config {
     pub last_version: String,
     pub shortcuts: Shortcuts,
     pub recent_files: Vec<String>,
+    /// Where scratch files are kept; empty: the default folder.
+    pub scratch_dir: String,
 }
 
 impl Default for Config {
@@ -375,6 +377,7 @@ impl Default for Config {
             last_version: String::new(),
             shortcuts: Shortcuts::default(),
             recent_files: Vec::new(),
+            scratch_dir: String::new(),
         }
     }
 }

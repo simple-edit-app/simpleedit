@@ -266,6 +266,92 @@ mod behavior_tests {
         assert_eq!(text(&app), "one\n");
     }
 
+    /// An app whose scratch folder is a temporary one, with a scratch file
+    /// open in the editor.
+    fn app_on_scratch() -> (SimpleEditApp, tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app();
+        app.scratch.dir = dir.path().join("scratches");
+        let _ = app.handle(Message::ScratchName("notes".into()));
+        let _ = app.handle(Message::ScratchExt(crate::scratch::Ext(Some("md"))));
+        let _ = app.handle(Message::ScratchCreate);
+        let path = app.scratch.dir.join("notes.md");
+        assert!(path.is_file());
+        // The read the app asked for.
+        let _ = app.handle(Message::TabRead(Ok(Loaded {
+            path: path.clone(),
+            text: String::new(),
+            format: TextFormat::default(),
+            stamp: DiskStamp::of(&path),
+        })));
+        (app, dir, path)
+    }
+
+    #[test]
+    fn a_scratch_file_is_made_open_and_kept_out_of_the_file_list() {
+        let (app, _dir, path) = app_on_scratch();
+        assert_eq!(app.current_file.as_ref(), Some(&path));
+        assert!(!app.sidebar.files().contains(&path));
+        assert_eq!(app.scratch.files, vec![path]);
+        assert!(app.scratch.name.is_empty());
+    }
+
+    #[test]
+    fn a_scratch_file_is_saved_by_itself_and_never_closes() {
+        let (mut app, _dir, path) = app_on_scratch();
+        type_text(&mut app, "hello");
+        assert!(app.is_dirty);
+        let _ = app.handle(Message::AutoSave);
+        assert!(!app.is_dirty);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
+        let _ = app.handle(Message::CloseFile);
+        assert_eq!(app.current_file.as_ref(), Some(&path));
+    }
+
+    #[test]
+    fn typing_in_a_scratch_file_is_written_before_leaving_it() {
+        let (mut app, _dir, path) = app_on_scratch();
+        type_text(&mut app, "kept");
+        let other = PathBuf::from("/x/other.txt");
+        app.stash_current();
+        app.load_buffer(other, CachedBuffer::blank());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "kept\n");
+    }
+
+    #[test]
+    fn deleting_a_scratch_file_removes_it_and_its_buffer() {
+        let (mut app, _dir, path) = app_on_scratch();
+        let _ = app.handle(Message::ScratchAskDelete(path.clone()));
+        // Nothing goes before the user confirms.
+        assert!(matches!(
+            app.overlay,
+            ActiveOverlay::ConfirmScratchDelete(_)
+        ));
+        assert!(path.exists());
+        let _ = app.handle(Message::ScratchDelete(path.clone()));
+        assert!(!path.exists());
+        assert!(app.scratch.files.is_empty());
+        assert_ne!(app.current_file.as_ref(), Some(&path));
+    }
+
+    #[test]
+    fn changing_the_folder_moves_the_scratch_files_along() {
+        let (mut app, dir, path) = app_on_scratch();
+        type_text(&mut app, "moved");
+        let target = dir.path().join("elsewhere");
+        let _ = app.handle(Message::SetScratchDir(
+            target.to_string_lossy().into_owned(),
+        ));
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read_to_string(target.join("notes.md")).unwrap(),
+            "moved\n"
+        );
+        assert_eq!(app.scratch.dir, target);
+        assert_eq!(app.scratch.files, vec![target.join("notes.md")]);
+        assert_eq!(app.config.scratch_dir, target.to_string_lossy());
+    }
+
     #[test]
     fn a_reload_never_overwrites_unsaved_typing() {
         let mut app = app();

@@ -260,5 +260,21 @@
   "key.escape": "Esc",
   "palette.toggle_theme": "Switch theme",
   "prefs.page_guide_column": "Page guide column",
-  "status.second_window": "Another SimpleEdit window is open: this one doesn't save the session"
+  "status.second_window": "Another SimpleEdit window is open: this one doesn't save the session",
+  "scratch.title": "Scratch files",
+  "scratch.name_placeholder": "Name",
+  "scratch.create": "Create",
+  "scratch.empty": "No scratch file.",
+  "scratch.delete": "Delete",
+  "scratch.err_name": "Give the file a name.",
+  "scratch.err_invalid": "This name is not valid for a file.",
+  "scratch.err_exists": "A scratch file with this name already exists.",
+  "scratch.err_missing": "This file no longer exists.",
+  "scratch.folder_title": "Scratch files folder",
+  "prefs.scratch_dir": "Scratch files folder",
+  "prefs.scratch_browse": "Browse…",
+  "prefs.scratch_reset": "Default",
+  "scratch.no_ext": "No extension",
+  "scratch.delete_title": "Delete scratch file",
+  "scratch.delete_message": "Delete %{name}? The file will be removed for good."
 }

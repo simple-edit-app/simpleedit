@@ -179,6 +179,7 @@ impl SimpleEditApp {
             | ActiveOverlay::ConfirmClose(_)
             | ActiveOverlay::ConfirmCloseMany(..)
             | ActiveOverlay::ConfirmQuit(_)
+            | ActiveOverlay::ConfirmScratchDelete(_)
             | ActiveOverlay::ConfirmOverwrite(_) => Space::new().height(0).into(),
         };
 
@@ -323,13 +324,13 @@ impl SimpleEditApp {
         .into()
     }
 
-    /// The block under the file list: a button that shows or hides the terminal.
+    /// The block under the file list: buttons that show or hide the terminal
+    /// and the scratch files.
     pub(super) fn terminal_button(&self, dark: bool) -> Element<'_, Message> {
-        let open = self.terminal.open;
-        container(
-            button(text(">_").size(13).font(se_theme::MONO))
+        let tool = |label: Element<'static, Message>, open: bool, msg: Message| {
+            button(label)
                 .padding([5, 10])
-                .on_press(Message::ToggleTerminal)
+                .on_press(msg)
                 // Open: the accent wash; closed: an outline, so it reads as a button.
                 .style(move |theme: &iced::Theme, status| {
                     if open {
@@ -337,11 +338,150 @@ impl SimpleEditApp {
                     } else {
                         (se_theme::Outline { dark }).style()(theme, status)
                     }
-                }),
+                })
+        };
+        container(
+            row![
+                tool(
+                    text(">_").size(13).font(se_theme::MONO).into(),
+                    self.terminal.open,
+                    Message::ToggleTerminal
+                ),
+                tool(
+                    crate::scratch::icon(if self.scratch.open {
+                        se_theme::palette(dark).accent
+                    } else {
+                        se_theme::palette(dark).text
+                    }),
+                    self.scratch.open,
+                    Message::ToggleScratch
+                ),
+            ]
+            .spacing(6),
         )
         .padding([6, 10])
         .width(208)
         .style(se_theme::panel(dark))
+        .into()
+    }
+
+    /// The scratch files: a form to make one, then the list.
+    pub(super) fn scratch_panel(&self, dark: bool) -> Element<'_, Message> {
+        let p = se_theme::palette(dark);
+        let scratch = &self.scratch;
+        let ghost = move |active: bool| (se_theme::GhostButton { dark, active }).style();
+        let can_create = !scratch.name.trim().is_empty();
+        let mut create = button(text(t!("scratch.create").to_string()).size(12.5))
+            .padding([5, 12])
+            .style((se_theme::Primary { dark }).style());
+        if can_create {
+            create = create.on_press(Message::ScratchCreate);
+        }
+        let header = row![
+            text(t!("scratch.title").to_string())
+                .size(12)
+                .font(se_theme::UI_SEMIBOLD)
+                .color(p.text),
+            Space::new().width(8),
+            text_input(&t!("scratch.name_placeholder"), &scratch.name)
+                .on_input(Message::ScratchName)
+                .on_submit(Message::ScratchCreate)
+                .padding([5, 8])
+                .size(13)
+                .width(200)
+                .style(se_theme::Field::new(dark).style()),
+            iced::widget::pick_list(
+                crate::scratch::Ext::all(),
+                Some(scratch.ext),
+                Message::ScratchExt
+            )
+            .padding([5, 10])
+            .width(150)
+            .text_size(13)
+            .style(se_theme::Select { dark }.style())
+            .menu_style(se_theme::Select { dark }.menu_style()),
+            create,
+            Space::new().width(Length::Fill),
+            button(text("—").size(12))
+                .padding([1, 8])
+                .on_press(Message::ToggleScratch)
+                .style(ghost(false)),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+
+        let current = self.current_file.as_ref();
+        let mut list = column![].spacing(1);
+        if scratch.files.is_empty() {
+            list = list.push(
+                text(t!("scratch.empty").to_string())
+                    .size(12.5)
+                    .color(p.muted),
+            );
+        }
+        for path in &scratch.files {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let open = button(
+                text(name)
+                    .size(13)
+                    .shaping(iced::widget::text::Shaping::Advanced),
+            )
+            .padding([4, 8])
+            .width(Length::Fill)
+            .on_press(Message::ScratchOpen(path.clone()))
+            .style(
+                (se_theme::SidebarRow {
+                    dark,
+                    selected: current == Some(path),
+                })
+                .style(),
+            );
+            let delete_label = t!("scratch.delete").to_string();
+            let target = path.clone();
+            let menu = iced_aw::ContextMenu::new(open, move || {
+                container(
+                    button(text(delete_label.clone()).size(13))
+                        .padding([7, 10])
+                        .width(Length::Fixed(160.0))
+                        .on_press(Message::ScratchAskDelete(target.clone()))
+                        .style(
+                            (se_theme::MenuItem {
+                                dark,
+                                radius: se_theme::R_SM,
+                                highlighted: false,
+                            })
+                            .style(),
+                        ),
+                )
+                .padding(6)
+                .style(se_theme::card(dark))
+                .into()
+            });
+            list = list.push(menu);
+        }
+        let mut body = column![header].spacing(8);
+        if let Some(error) = &scratch.error {
+            body = body.push(
+                text(error.as_str())
+                    .size(12)
+                    .color(se_theme::error_color(dark)),
+            );
+        }
+        body = body.push(
+            scrollable(container(list).padding([0, 4]).width(Length::Fill))
+                .style(se_theme::Scrollbar { dark }.style())
+                .height(Length::Fill),
+        );
+        column![
+            container(Space::new().height(1))
+                .width(Length::Fill)
+                .style(se_theme::rule(dark)),
+            container(body).padding([8, 12]).height(Length::Fill),
+        ]
+        .height(Length::Fixed(300.0))
         .into()
     }
 
@@ -729,6 +869,7 @@ impl SimpleEditApp {
             active_file: self
                 .current_file
                 .as_ref()
+                .filter(|p| !self.is_scratch(p))
                 .map(|p| p.to_string_lossy().into_owned()),
             untitled_counter: self.untitled_counter,
         }
@@ -737,6 +878,8 @@ impl SimpleEditApp {
     /// Writes the session now, and reports a failure: closing the app relies
     /// on it to keep unsaved buffers.
     pub(super) fn save_session_now(&mut self) -> Result<(), String> {
+        // Closing the app also writes the scratch file being typed in.
+        self.flush_scratch();
         if !self.session_owner {
             return Ok(());
         }

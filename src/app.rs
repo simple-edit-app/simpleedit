@@ -92,6 +92,8 @@ pub enum ActiveOverlay {
     ConfirmQuit(String),
     /// Saving would overwrite changes made to the file outside the editor.
     ConfirmOverwrite(PathBuf),
+    /// A scratch file is about to be deleted for good.
+    ConfirmScratchDelete(PathBuf),
 }
 
 #[derive(Debug, Clone)]
@@ -134,6 +136,18 @@ pub enum Message {
     // Terminal
     ToggleTerminal,
     NewTerminal,
+    // Scratch files
+    ToggleScratch,
+    ScratchName(String),
+    ScratchExt(crate::scratch::Ext),
+    ScratchCreate,
+    ScratchOpen(PathBuf),
+    ScratchAskDelete(PathBuf),
+    ScratchDelete(PathBuf),
+    PickScratchDir,
+    ScratchDirChosen(Option<PathBuf>),
+    /// Keeps the scratch files in this folder ("" for the default one).
+    SetScratchDir(String),
     SelectTerminal(usize),
     CloseTerminal(usize),
     /// Time to repaint the terminal and drop the ones whose shell ended.
@@ -304,6 +318,7 @@ pub struct SimpleEditApp {
     is_formatting: bool,
     status_message: String,
     terminal: crate::terminal::Panel,
+    scratch: crate::scratch::Panel,
     /// A language server to offer in the status bar, in place of the message.
     server_offer: Option<&'static crate::lsp_install::ServerInfo>,
     status_is_error: bool,
@@ -453,6 +468,7 @@ impl SimpleEditApp {
             is_formatting: false,
             status_message: t!("status.ready").to_string(),
             terminal: Default::default(),
+            scratch: crate::scratch::Panel::new(&config.scratch_dir),
             server_offer: None,
             status_is_error: false,
             format_error: None,
@@ -814,6 +830,9 @@ impl SimpleEditApp {
         if self.terminal.open {
             panel = panel.push(self.terminal_panel(dark));
         }
+        if self.scratch.open {
+            panel = panel.push(self.scratch_panel(dark));
+        }
         let editor_panel = container(panel.push(status_bar))
             .width(Length::Fill)
             .height(Length::Fill)
@@ -953,6 +972,13 @@ impl SimpleEditApp {
                         self.view_overwrite_overlay(dark, path)
                     }
                     ActiveOverlay::ConfirmClose(path) => self.view_confirm_overlay(dark, path),
+                    ActiveOverlay::ConfirmScratchDelete(path) => confirm_card(
+                        dark,
+                        t!("scratch.delete_title").to_string(),
+                        t!("scratch.delete_message", name = file_label(path).as_str()).to_string(),
+                        t!("scratch.delete").to_string(),
+                        Message::ScratchDelete(path.clone()),
+                    ),
                     ActiveOverlay::ConfirmCloseMany(paths, modified) => {
                         self.view_confirm_many_overlay(dark, paths, *modified)
                     }
@@ -1249,7 +1275,9 @@ impl SimpleEditApp {
                                 }
                             }
                         }
-                        self.sidebar.add_file(path.clone());
+                        if !self.is_scratch(&path) {
+                            self.sidebar.add_file(path.clone());
+                        }
                         let saved_fp = fingerprint(&saved);
                         let stamp = DiskStamp::of(&path);
                         if from_current {
@@ -1267,8 +1295,10 @@ impl SimpleEditApp {
                             entry.saved_fp = Some(saved_fp);
                             entry.stamp = stamp;
                         }
-                        self.config.add_recent(&path);
-                        self.config_dirty = true;
+                        if !self.is_scratch(&path) {
+                            self.config.add_recent(&path);
+                            self.config_dirty = true;
+                        }
                         self.set_status(t!("status.file_saved"), false);
                     }
                     Err(e) if e == CANCELLED => {}
@@ -1283,6 +1313,8 @@ impl SimpleEditApp {
                 self.close_many(paths)
             }
             Message::CloseFile => match self.current_file.clone() {
+                // Scratch files stay until they are deleted.
+                Some(path) if self.is_scratch(&path) => Task::none(),
                 Some(path) => self.request_close(path),
                 None => Task::none(),
             },
@@ -1298,9 +1330,83 @@ impl SimpleEditApp {
                     }
                     self.terminal.open = !self.terminal.tabs.is_empty();
                     self.terminal.focused = self.terminal.open;
+                    if self.terminal.open {
+                        // One tool panel at the bottom.
+                        self.scratch.open = false;
+                    }
                 }
                 Task::none()
             }
+            Message::ToggleScratch => {
+                self.scratch.open = !self.scratch.open;
+                if self.scratch.open {
+                    self.terminal.open = false;
+                    self.terminal.focused = false;
+                    self.scratch.refresh();
+                    self.scratch.error = None;
+                }
+                Task::none()
+            }
+            Message::ScratchName(name) => {
+                self.scratch.name = name;
+                self.scratch.error = None;
+                Task::none()
+            }
+            Message::ScratchExt(ext) => {
+                self.scratch.ext = ext;
+                self.scratch.error = None;
+                Task::none()
+            }
+            Message::ScratchCreate => {
+                match crate::scratch::create(
+                    &self.scratch.dir,
+                    &self.scratch.name,
+                    self.scratch.ext.as_str(),
+                ) {
+                    Ok(path) => {
+                        self.scratch.name.clear();
+                        self.scratch.error = None;
+                        self.scratch.refresh();
+                        self.open_scratch(path)
+                    }
+                    Err(e) => {
+                        self.scratch.error = Some(e);
+                        Task::none()
+                    }
+                }
+            }
+            Message::ScratchOpen(path) => self.open_scratch(path),
+            Message::ScratchAskDelete(path) => {
+                self.overlay = ActiveOverlay::ConfirmScratchDelete(path);
+                Task::none()
+            }
+            Message::ScratchDelete(path) => {
+                self.overlay = ActiveOverlay::None;
+                let command = self.close_path(path.clone());
+                self.bookmarks.clear(&path);
+                if let Err(e) = std::fs::remove_file(&path) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        self.scratch.error = Some(e.to_string());
+                    }
+                }
+                self.scratch.refresh();
+                command
+            }
+            Message::PickScratchDir => Task::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .set_title(t!("scratch.folder_title").to_string())
+                        .pick_folder()
+                        .await
+                        .map(|h| h.path().to_path_buf())
+                },
+                Message::ScratchDirChosen,
+            ),
+            Message::ScratchDirChosen(Some(dir)) => {
+                self.set_scratch_dir(dir.to_string_lossy().into_owned())
+            }
+            Message::ScratchDirChosen(None) => Task::none(),
+            Message::SetScratchDir(dir) => self.set_scratch_dir(dir),
             Message::NewTerminal => {
                 self.new_terminal();
                 self.terminal.open = !self.terminal.tabs.is_empty();
@@ -1684,6 +1790,7 @@ impl SimpleEditApp {
                 Task::none()
             }
             Message::AutoSave => {
+                self.flush_scratch();
                 if self.config_dirty {
                     self.config_dirty = false;
                     self.config.save();
@@ -3221,9 +3328,86 @@ impl SimpleEditApp {
         Task::none()
     }
 
+    /// Whether `path` is one of the scratch files.
+    fn is_scratch(&self, path: &Path) -> bool {
+        crate::scratch::is_scratch(&self.scratch.dir, path)
+    }
+
+    /// Writes the scratch file in front if it was typed in: they are saved by
+    /// themselves, with no question asked.
+    fn flush_scratch(&mut self) {
+        let Some(path) = self.current_file.clone().filter(|p| self.is_scratch(p)) else {
+            return;
+        };
+        if !self.is_dirty || self.changed_on_disk(&path) {
+            return;
+        }
+        let content = crate::editor::buffer_text(&self.editor.content);
+        let bytes = self.format.encode(&content);
+        match crate::fsutil::write_atomic(&path, bytes.as_bytes(), false) {
+            Ok(()) => {
+                self.is_dirty = false;
+                self.saved_fp = Some(fingerprint(&content));
+                self.disk_stamp = DiskStamp::of(&path);
+                self.external_warned = false;
+                self.size_for = None;
+            }
+            Err(e) => self.set_status(format!("{}: {e}", t!("status.error")), true),
+        }
+    }
+
+    /// Shows a scratch file in the editor (it has no tab of its own).
+    fn open_scratch(&mut self, path: PathBuf) -> Task<Message> {
+        if !path.is_file() {
+            self.scratch.error = Some(t!("scratch.err_missing").to_string());
+            self.scratch.refresh();
+            return Task::none();
+        }
+        self.flush_scratch();
+        self.activate(path)
+    }
+
+    /// Keeps the scratch files elsewhere: they move along with it.
+    fn set_scratch_dir(&mut self, setting: String) -> Task<Message> {
+        let setting = setting.trim().to_string();
+        self.preferences.scratch_draft = setting.clone();
+        let (old, new) = (self.scratch.dir.clone(), crate::scratch::dir_of(&setting));
+        if old == new {
+            self.config.scratch_dir = setting;
+            self.config_dirty = true;
+            return Task::none();
+        }
+        self.flush_scratch();
+        // Their buffers are closed first: the files are about to move.
+        let open: Vec<PathBuf> = self
+            .file_cache
+            .keys()
+            .chain(self.current_file.as_ref())
+            .filter(|p| self.is_scratch(p))
+            .cloned()
+            .collect();
+        let mut tasks: Vec<Task<Message>> = open.into_iter().map(|p| self.close_path(p)).collect();
+        match crate::scratch::relocate(&old, &new) {
+            Ok(_) => {
+                self.config.scratch_dir = setting;
+                self.config_dirty = true;
+                self.scratch.dir = new;
+                self.scratch.error = None;
+            }
+            Err(e) => {
+                self.preferences.scratch_draft = self.config.scratch_dir.clone();
+                self.set_status(format!("{}: {e}", t!("status.error")), true);
+            }
+        }
+        self.scratch.refresh();
+        tasks.push(self.ensure_tab());
+        Task::batch(tasks)
+    }
+
     /// Parks the active buffer (text, cursor, scroll, language, dirty flag,
     /// undo history) so another file can take the editor.
     fn stash_current(&mut self) {
+        self.flush_scratch();
         if let Some(current) = self.current_file.clone() {
             let content = std::mem::take(&mut self.editor.content);
             self.file_cache.insert(
@@ -3261,7 +3445,9 @@ impl SimpleEditApp {
             .restore_language(buffer.language, &path, &first_line);
         self.reset_view_mode();
         self.view_mode = buffer.view_mode;
-        self.sidebar.add_file(path.clone());
+        if !self.is_scratch(&path) {
+            self.sidebar.add_file(path.clone());
+        }
         let (undo, redo) = self.undo_cache.remove(&path).unwrap_or_default();
         self.undo_stack = undo;
         self.redo_stack = redo;
@@ -3312,8 +3498,10 @@ impl SimpleEditApp {
                 buffer
             }
         };
-        self.config.add_recent(&path);
-        self.config_dirty = true;
+        if !self.is_scratch(&path) {
+            self.config.add_recent(&path);
+            self.config_dirty = true;
+        }
         self.load_buffer(path.clone(), buffer);
         if warn_changed {
             self.external_warned = true;

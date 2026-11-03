@@ -29,6 +29,7 @@ mod menu_bar;
 mod palette;
 mod preferences;
 mod preview;
+mod scratch;
 mod search;
 mod session;
 mod sidebar;
