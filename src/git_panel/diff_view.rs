@@ -428,7 +428,6 @@ fn body<'a>(args: Body<'a>) -> Element<'a, Message> {
     let p = se_theme::palette(dark);
     let mut rows: Vec<Element<'a, Message>> = Vec::new();
     let mut longest = 0usize;
-    let truncated;
     // In front of each row: the arrow that rolls back the block it opens.
     let with_arrow =
         |element: Element<'a, Message>, block: Option<usize>| -> Element<'a, Message> {
@@ -459,7 +458,7 @@ fn body<'a>(args: Body<'a>) -> Element<'a, Message> {
         }
     };
 
-    if side_by_side {
+    let truncated = if side_by_side {
         let side = diff.side_rows();
         let blocks = diff.side_row_blocks();
         let heights = side_heights(diff, columns);
@@ -576,7 +575,7 @@ fn body<'a>(args: Body<'a>) -> Element<'a, Message> {
             }
         }
         rows.push(Space::new().height(after).into());
-        truncated = side.len() > MAX_ROWS;
+        side.len() > MAX_ROWS
     } else {
         let flat = diff.rows();
         let blocks = diff.row_blocks();
@@ -644,8 +643,8 @@ fn body<'a>(args: Body<'a>) -> Element<'a, Message> {
             }
         }
         rows.push(Space::new().height(after).into());
-        truncated = flat.len() > MAX_ROWS;
-    }
+        flat.len() > MAX_ROWS
+    };
     if truncated {
         rows.push(
             container(
