@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.5.0] - 2026-11-03
+
+### Added
+- Git panel (button with the branch icon under the file list, or its shortcut) with four tabs. **Commit**: staged and unstaged files, a commit message, Amend, Commit and Push, and the diff of the open file. **Stash**: save, apply, pop and drop. **Log**: the commit graph per branch with the files and message of a commit, copy hash, cherry-pick, revert, drop, squash and reword. **Branches**: local and remote branches and tags, to create, check out, merge, rebase, push, force push (with lease) and delete.
+- Diffs open side by side by default, wrapped to the window, or unified (a button with a tooltip switches). Text can be selected by character (a double click picks a word) and copied (Ctrl+C, Ctrl+A, right click). Arrows bring a block of changes back, also for staged files. A diff can open in an editor tab, be compared with the current file, and be followed with Ctrl+Z.
+- A Git submenu on a file (file list and editor right click): stage, commit this file, diff, compare with a branch, a tag or a revision, and the file's history.
+- Changed lines are marked in the gutter and next to the scrollbar. A click on a bar shows a single arrow that puts the change back.
+- Conflicts (rebase, merge, cherry-pick, revert): a pop-up at the top announces them with a button that settles them, and goes away by itself once they are settled or the operation is given up. Each conflicted file opens in three columns with an editable result, one-click resolution of a side, automatic resolution of the simple conflicts, undo and redo.
+- Blame in the gutter, and a button to show the commit of a line in the log.
+- Files are saved automatically a moment after the last edit (an option in the Preferences).
+
+### Fixed
+- Rolling back a staged rename brings the old name back; a removed line that starts with `-- ` stays in the diff; the last commit can be dropped; rewording the last commit no longer adds what is staged; the history of a file is drawn as one line.
+
 ## [1.4.0] - 2026-11-03
 
 ### Added

@@ -1,5 +1,19 @@
 # Journal des modifications
 
+## [1.5.0] - 2026-11-03
+
+### Ajouté
+- Panneau Git (bouton à l'icône de branche sous la liste des fichiers, ou son raccourci) avec quatre onglets. **Commit** : fichiers indexés et modifiés, message de commit, Modifier le dernier commit, Commit et Push, et le diff du fichier ouvert. **Stash** : enregistrer, appliquer, retirer et supprimer. **Log** : le graphe des commits par branche avec les fichiers et le message d'un commit, copier le hash, cherry-pick, revert, supprimer, regrouper (squash) et renommer le message. **Branches** : branches locales et distantes et tags, pour créer, basculer, fusionner, rebaser, pousser, forcer le push (avec protection) et supprimer.
+- Les diffs s'ouvrent par défaut côte à côte, adaptés à la largeur de la fenêtre, ou en vue unifiée (un bouton avec infobulle bascule). On peut sélectionner le texte au caractère (un double-clic prend un mot) et le copier (Ctrl+C, Ctrl+A, clic droit). Des flèches remettent un bloc de changements, y compris pour les fichiers indexés. Un diff peut s'ouvrir dans un onglet de l'éditeur, être comparé au fichier actuel, et se suivre avec Ctrl+Z.
+- Un sous-menu Git sur un fichier (liste des fichiers et clic droit de l'éditeur) : indexer, commit de ce fichier, diff, comparer avec une branche, un tag ou une révision, et l'historique du fichier.
+- Les lignes modifiées sont marquées dans la gouttière et à côté de la barre de défilement. Un clic sur une barre affiche une flèche unique qui remet le changement.
+- Conflits (rebase, merge, cherry-pick, revert) : une alerte en haut les annonce avec un bouton pour les résoudre, et disparaît toute seule dès qu'ils sont résolus ou que l'opération est abandonnée. Chaque fichier en conflit s'ouvre en trois colonnes avec un résultat modifiable, la résolution d'un côté en un clic, la résolution automatique des conflits simples, annuler et rétablir.
+- Blame dans la gouttière, et un bouton pour montrer le commit d'une ligne dans le log.
+- Les fichiers s'enregistrent tout seuls un instant après la dernière modification (une option des Préférences).
+
+### Corrigé
+- Annuler un renommage indexé remet l'ancien nom ; une ligne supprimée qui commence par `-- ` reste dans le diff ; le dernier commit peut être supprimé ; renommer le dernier commit n'y ajoute plus ce qui est indexé ; l'historique d'un fichier se dessine sur une seule ligne.
+
 ## [1.4.0] - 2026-11-03
 
 ### Ajouté
