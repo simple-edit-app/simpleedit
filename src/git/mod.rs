@@ -4,9 +4,11 @@
 //! is parsed here (porcelain formats, never what a human is meant to read).
 //! Commands are async so the window never waits for one.
 
+pub mod conflicts;
 pub mod diff;
 pub mod graph;
 pub mod history;
+pub mod marks;
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -123,9 +125,20 @@ pub struct Change {
     pub kind: Kind,
 }
 
+/// A long operation git was left in the middle of (conflicts to settle).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Operation {
+    Merge,
+    Rebase,
+    CherryPick,
+    Revert,
+}
+
 /// The state of the working tree.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Status {
+    /// What is in progress, if anything is.
+    pub operation: Option<Operation>,
     pub branch: String,
     pub upstream: Option<String>,
     pub ahead: u32,
@@ -148,7 +161,164 @@ pub async fn status(repo: &Path) -> Result<Status, String> {
         ],
     )
     .await?;
-    Ok(parse_status(&out))
+    let mut status = parse_status(&out);
+    status.operation = operation(repo).await;
+    Ok(status)
+}
+
+/// What the repository is in the middle of.
+pub async fn operation(repo: &Path) -> Option<Operation> {
+    let dir = run(repo, &["rev-parse", "--absolute-git-dir"]).await.ok()?;
+    let dir = PathBuf::from(dir.trim());
+    // A rebase replays commits with cherry-picks: it comes first.
+    if dir.join("rebase-merge").exists() || dir.join("rebase-apply").exists() {
+        Some(Operation::Rebase)
+    } else if dir.join("MERGE_HEAD").exists() {
+        Some(Operation::Merge)
+    } else if dir.join("CHERRY_PICK_HEAD").exists() {
+        Some(Operation::CherryPick)
+    } else if dir.join("REVERT_HEAD").exists() {
+        Some(Operation::Revert)
+    } else {
+        None
+    }
+}
+
+impl Status {
+    /// The files in conflict.
+    pub fn conflicts(&self) -> impl Iterator<Item = &Change> {
+        self.unstaged.iter().filter(|c| c.kind == Kind::Conflict)
+    }
+}
+
+/// What an operation says when it stops on conflicts (they are left in place
+/// to settle).
+pub const CONFLICT: &str = "conflict";
+
+/// Whether any file is in conflict.
+pub async fn has_conflicts(repo: &Path) -> bool {
+    run(repo, &["diff", "--name-only", "--diff-filter=U"])
+        .await
+        .is_ok_and(|out| !out.trim().is_empty())
+}
+
+/// Ends a failed operation: with conflicts it stays in progress (the answer
+/// is [`CONFLICT`]), else `abort` puts everything back.
+pub async fn stopped(repo: &Path, error: String, abort: &[&str]) -> String {
+    if has_conflicts(repo).await {
+        CONFLICT.to_string()
+    } else {
+        let _ = run(repo, abort).await;
+        error
+    }
+}
+
+/// Keeps one side of a conflicted file and marks it settled. `rebasing`:
+/// git's "ours" is then the branch being rebased onto, not the user's work.
+pub async fn accept(repo: &Path, path: &str, yours: bool, rebasing: bool) -> Result<(), String> {
+    let side = if yours != rebasing {
+        "--ours"
+    } else {
+        "--theirs"
+    };
+    match run(repo, &["checkout", side, "--", path]).await {
+        Ok(_) => run(repo, &["add", "--", path]).await.map(|_| ()),
+        // That side deleted the file: keeping it means deleting.
+        Err(_) => run(repo, &["rm", "-f", "--", path]).await.map(|_| ()),
+    }
+}
+
+/// The conflicted text of a file rebuilt from the three versions git keeps
+/// (base, ours, theirs), with the base shown in each conflict.
+pub async fn merge_text(repo: &Path, path: &str) -> Option<String> {
+    let base = run(repo, &["show", &format!(":1:{path}")])
+        .await
+        .unwrap_or_default();
+    let ours = run(repo, &["show", &format!(":2:{path}")]).await.ok()?;
+    let theirs = run(repo, &["show", &format!(":3:{path}")]).await.ok()?;
+    let dir = tempfile::tempdir().ok()?;
+    let write = |name: &str, text: &str| -> Option<String> {
+        let file = dir.path().join(name);
+        std::fs::write(&file, text).ok()?;
+        Some(file.to_string_lossy().into_owned())
+    };
+    let (ours, base, theirs) = (
+        write("ours", &ours)?,
+        write("base", &base)?,
+        write("theirs", &theirs)?,
+    );
+    // The exit status counts the conflicts: only the text matters.
+    let out = run_allow_failure(
+        repo,
+        &[
+            "merge-file",
+            "-p",
+            "--diff3",
+            "-L",
+            "yours",
+            "-L",
+            "base",
+            "-L",
+            "theirs",
+            &ours,
+            &base,
+            &theirs,
+        ],
+    )
+    .await;
+    (!out.is_empty()).then_some(out)
+}
+
+/// Writes the settled text of a conflicted file and marks it settled.
+pub async fn resolve_with(repo: &Path, path: &str, text: &str) -> Result<(), String> {
+    std::fs::write(repo.join(path), text).map_err(|e| format!("{path}: {e}"))?;
+    run(repo, &["add", "--", path]).await.map(|_| ())
+}
+
+/// Goes on with an operation whose conflicts are settled.
+pub async fn continue_operation(repo: &Path, operation: Operation) -> Result<(), String> {
+    let result = match operation {
+        Operation::Merge => run(repo, &["commit", "--no-edit"]).await,
+        Operation::Rebase => run(repo, &["rebase", "--continue"]).await,
+        Operation::CherryPick => run(repo, &["cherry-pick", "--continue"]).await,
+        Operation::Revert => run(repo, &["revert", "--continue"]).await,
+    };
+    match result {
+        Ok(_) => Ok(()),
+        // The next commit of a rebase may conflict in turn.
+        Err(e) if has_conflicts(repo).await => {
+            let _ = e;
+            Err(CONFLICT.to_string())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Gives an operation up: everything is as it was before.
+pub async fn abort_operation(repo: &Path, operation: Operation) -> Result<(), String> {
+    let args: &[&str] = match operation {
+        Operation::Merge => &["merge", "--abort"],
+        Operation::Rebase => &["rebase", "--abort"],
+        Operation::CherryPick => &["cherry-pick", "--abort"],
+        Operation::Revert => &["revert", "--abort"],
+    };
+    run(repo, args).await.map(|_| ())
+}
+
+/// Merges a branch into the current one.
+pub async fn merge_branch(repo: &Path, branch: &str) -> Result<(), String> {
+    match run(repo, &["merge", "--no-edit", branch]).await {
+        Ok(_) => Ok(()),
+        Err(e) => Err(stopped(repo, e, &["merge", "--abort"]).await),
+    }
+}
+
+/// Replays the current branch on top of another.
+pub async fn rebase_onto(repo: &Path, branch: &str) -> Result<(), String> {
+    match run(repo, &["rebase", branch]).await {
+        Ok(_) => Ok(()),
+        Err(e) => Err(stopped(repo, e, &["rebase", "--abort"]).await),
+    }
 }
 
 pub fn parse_status(out: &str) -> Status {
@@ -221,6 +391,11 @@ fn push_xy(status: &mut Status, xy: &[u8], path: &str, from: Option<String>) {
     }
 }
 
+/// What HEAD has of a file (`None`: it is not there, or there is no commit).
+pub async fn head_text(repo: &Path, relative: &str) -> Option<String> {
+    run(repo, &["show", &format!("HEAD:{relative}")]).await.ok()
+}
+
 // ─── Index and working tree ─────────────────────────────────────────────────
 
 pub async fn stage(repo: &Path, paths: &[String]) -> Result<(), String> {
@@ -268,6 +443,35 @@ pub async fn rollback(repo: &Path, change: &Change, staged: bool) -> Result<(), 
         .map(|_| ()),
         _ => run(repo, &["restore", "--", path]).await.map(|_| ()),
     }
+}
+
+/// Puts one block of changes of the working tree back as it was.
+pub async fn rollback_block(
+    repo: &Path,
+    path: &str,
+    diff: &FileDiff,
+    index: usize,
+) -> Result<(), String> {
+    let blocks = diff.blocks();
+    let block = blocks
+        .get(index)
+        .ok_or_else(|| "no such change".to_string())?;
+    let target = repo.join(path);
+    let text = std::fs::read_to_string(&target).map_err(|e| format!("{path}: {e}"))?;
+    let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut lines: Vec<String> = text.split_inclusive('\n').map(str::to_string).collect();
+    let end = block.at + block.added.len();
+    // What the diff saw must still be there.
+    let current: Vec<&str> = lines
+        .get(block.at..end)
+        .map(|l| l.iter().map(|s| s.trim_end_matches(['\n', '\r'])).collect())
+        .ok_or_else(|| "the file changed since this diff".to_string())?;
+    if current != block.added.iter().map(String::as_str).collect::<Vec<_>>() {
+        return Err("the file changed since this diff".to_string());
+    }
+    let old: Vec<String> = block.removed.iter().map(|l| format!("{l}{eol}")).collect();
+    lines.splice(block.at..end, old);
+    std::fs::write(&target, lines.concat()).map_err(|e| format!("{path}: {e}"))
 }
 
 /// Deletes a file and tells git: `git rm`, or a plain delete when untracked.
@@ -596,6 +800,177 @@ mod tests {
         };
         block(rollback(repo.path(), &change, false)).unwrap();
         assert!(!repo.path().join("n.txt").exists());
+    }
+
+    #[test]
+    fn one_block_of_changes_can_be_rolled_back_alone() {
+        let repo = Repo::new();
+        repo.write(
+            "a.txt",
+            "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n",
+        );
+        repo.commit_all("first");
+        // Three blocks: a change, a removal, an addition.
+        repo.write(
+            "a.txt",
+            "one\nTWO\nthree\nfour\nfive\nsix\nseven\nnine\nten\nextra\n",
+        );
+        let diff = block(diff_of(repo.path(), &Source::Unstaged, "a.txt")).unwrap();
+        assert_eq!(diff.blocks().len(), 3);
+        // The last block first, then the removal, then the first one.
+        block(rollback_block(repo.path(), "a.txt", &diff, 2)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+            "one\nTWO\nthree\nfour\nfive\nsix\nseven\nnine\nten\n"
+        );
+        let diff = block(diff_of(repo.path(), &Source::Unstaged, "a.txt")).unwrap();
+        block(rollback_block(repo.path(), "a.txt", &diff, 1)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+            "one\nTWO\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n"
+        );
+        let diff = block(diff_of(repo.path(), &Source::Unstaged, "a.txt")).unwrap();
+        block(rollback_block(repo.path(), "a.txt", &diff, 0)).unwrap();
+        assert!(block(status(repo.path())).unwrap().unstaged.is_empty());
+    }
+
+    #[test]
+    fn a_stale_diff_is_refused_instead_of_corrupting_the_file() {
+        let repo = Repo::new();
+        repo.write("a.txt", "one\ntwo\nthree\n");
+        repo.commit_all("first");
+        repo.write("a.txt", "one\nTWO\nthree\n");
+        let diff = block(diff_of(repo.path(), &Source::Unstaged, "a.txt")).unwrap();
+        repo.write("a.txt", "one\nsomething else\nthree\n");
+        assert!(block(rollback_block(repo.path(), "a.txt", &diff, 0)).is_err());
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+            "one\nsomething else\nthree\n"
+        );
+    }
+
+    /// `a.txt` changed on both `main` and `side`, from the same base.
+    fn conflicting() -> Repo {
+        let repo = Repo::new();
+        repo.write("a.txt", "1\n2\n3\n");
+        repo.commit_all("base");
+        repo.git(&["checkout", "-q", "-b", "side"]);
+        repo.write("a.txt", "1\nside\n3\n");
+        repo.commit_all("side change");
+        repo.git(&["checkout", "-q", "main"]);
+        repo.write("a.txt", "1\nmain\n3\n");
+        repo.commit_all("main change");
+        repo
+    }
+
+    fn read(repo: &Repo) -> String {
+        std::fs::read_to_string(repo.path().join("a.txt")).unwrap()
+    }
+
+    #[test]
+    fn a_merge_that_conflicts_is_settled_by_keeping_a_side_then_continued() {
+        let repo = conflicting();
+        assert_eq!(
+            block(merge_branch(repo.path(), "side")).unwrap_err(),
+            CONFLICT
+        );
+        let now = block(status(repo.path())).unwrap();
+        assert_eq!(now.operation, Some(Operation::Merge));
+        assert_eq!(
+            now.conflicts().map(|c| c.path.as_str()).collect::<Vec<_>>(),
+            vec!["a.txt"]
+        );
+        // In a merge, "yours" is the branch we are on.
+        block(accept(repo.path(), "a.txt", true, false)).unwrap();
+        assert_eq!(read(&repo), "1\nmain\n3\n");
+        block(continue_operation(repo.path(), Operation::Merge)).unwrap();
+        assert_eq!(block(operation(repo.path())), None);
+        assert_eq!(
+            repo.git(&["log", "-1", "--format=%P"])
+                .split_whitespace()
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn during_a_rebase_yours_is_the_commit_being_replayed() {
+        let repo = conflicting();
+        repo.git(&["checkout", "-q", "side"]);
+        assert_eq!(
+            block(rebase_onto(repo.path(), "main")).unwrap_err(),
+            CONFLICT
+        );
+        let now = block(status(repo.path())).unwrap();
+        assert_eq!(now.operation, Some(Operation::Rebase));
+        // "Yours" = my commit ("side"), although git calls it theirs here.
+        block(accept(repo.path(), "a.txt", true, true)).unwrap();
+        assert_eq!(read(&repo), "1\nside\n3\n");
+        block(continue_operation(repo.path(), Operation::Rebase)).unwrap();
+        assert_eq!(block(operation(repo.path())), None);
+        assert_eq!(
+            repo.git(&["log", "--format=%s"]).lines().next(),
+            Some("side change")
+        );
+    }
+
+    #[test]
+    fn a_cherry_pick_that_conflicts_can_take_their_side_or_be_aborted() {
+        let repo = conflicting();
+        let side = repo.git(&["rev-parse", "side"]).trim().to_string();
+        assert_eq!(
+            block(history::cherry_pick(
+                repo.path(),
+                std::slice::from_ref(&side)
+            ))
+            .unwrap_err(),
+            CONFLICT
+        );
+        assert_eq!(block(operation(repo.path())), Some(Operation::CherryPick));
+        block(abort_operation(repo.path(), Operation::CherryPick)).unwrap();
+        assert_eq!(read(&repo), "1\nmain\n3\n");
+        assert_eq!(block(operation(repo.path())), None);
+        // Again, and this time theirs is taken.
+        let _ = block(history::cherry_pick(repo.path(), &[side]));
+        block(accept(repo.path(), "a.txt", false, false)).unwrap();
+        assert_eq!(read(&repo), "1\nside\n3\n");
+        block(continue_operation(repo.path(), Operation::CherryPick)).unwrap();
+        assert_eq!(block(operation(repo.path())), None);
+    }
+
+    #[test]
+    fn the_three_versions_rebuild_a_conflict_that_shows_its_base() {
+        let repo = conflicting();
+        let _ = block(merge_branch(repo.path(), "side"));
+        let text = block(merge_text(repo.path(), "a.txt")).expect("a merge");
+        let merge = conflicts::parse(&text, false).unwrap();
+        let chunk = merge.conflicts().next().unwrap();
+        assert_eq!(chunk.yours, vec!["main"]);
+        assert_eq!(chunk.theirs, vec!["side"]);
+        assert_eq!(chunk.base.as_deref(), Some(&["2".to_string()][..]));
+    }
+
+    #[test]
+    fn a_hand_made_resolution_is_written_and_staged() {
+        let repo = conflicting();
+        let _ = block(merge_branch(repo.path(), "side"));
+        let text = std::fs::read_to_string(repo.path().join("a.txt")).unwrap();
+        let mut merge = conflicts::parse(&text, false).unwrap();
+        for chunk in merge.conflicts_mut() {
+            chunk.set(conflicts::Side::Yours, conflicts::Pick::Taken);
+            chunk.set(conflicts::Side::Theirs, conflicts::Pick::Taken);
+        }
+        block(resolve_with(repo.path(), "a.txt", &merge.render())).unwrap();
+        assert_eq!(read(&repo), "1\nmain\nside\n3\n");
+        assert_eq!(block(status(repo.path())).unwrap().conflicts().count(), 0);
+        block(continue_operation(repo.path(), Operation::Merge)).unwrap();
+    }
+
+    #[test]
+    fn a_merge_that_fails_without_conflicts_is_aborted_cleanly() {
+        let repo = conflicting();
+        assert!(block(merge_branch(repo.path(), "no-such-branch")).is_err());
+        assert_eq!(block(operation(repo.path())), None);
     }
 
     #[test]

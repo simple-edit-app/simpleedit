@@ -204,7 +204,9 @@ impl Panel {
         )
         .on_press(Message::Git(GitMsg::MessageFocused));
 
+        let banner = self.conflict_banner(dark);
         let left = column![
+            banner.unwrap_or_else(|| Space::new().into()),
             scrollable(container(list).padding([2, 6]))
                 .style(se_theme::Scrollbar { dark }.style())
                 .height(Length::Fill),

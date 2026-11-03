@@ -192,6 +192,7 @@ impl EditorState {
         search: Option<&SearchState>,
         bookmarks: &[usize],
         blame: Option<crate::code_editor::Annotations>,
+        changes: Option<crate::code_editor::ChangePaint>,
     ) -> Element<'a, Message> {
         let dark = config.dark_mode;
         self.content.set_wrapping(config.word_wrap);
@@ -236,6 +237,9 @@ impl EditorState {
         }
         if config.show_page_guide {
             editor = editor.page_guide(config.page_guide_column, p.border);
+        }
+        if let Some(changes) = changes {
+            editor = editor.changes(changes);
         }
         if let Some(blame) = blame {
             editor = editor.annotations(blame, Message::BlameLineClicked);
@@ -437,7 +441,7 @@ pub mod statusbar {
         pub tab_width: usize,
         /// A language server that could be installed: its language, and
         /// what the button sends.
-        pub offer: Option<(&'static str, Message)>,
+        pub offer: Option<(String, String, Message)>,
     }
 
     pub(super) fn size_label(b: u64) -> String {
@@ -503,13 +507,11 @@ pub mod statusbar {
             .push(text(lang_label).size(11.5).color(p.text));
 
         let message: Element<'a, Message> = match info.offer {
-            Some((language, install)) => row![
-                text(t!("status.server_offer", language = language).to_string())
-                    .size(11.5)
-                    .color(muted),
-                button(text(t!("prefs.server_install").to_string()).size(11.5))
+            Some((message, label, action)) => row![
+                text(message).size(11.5).color(muted),
+                button(text(label).size(11.5))
                     .padding([1, 8])
-                    .on_press(install)
+                    .on_press(action)
                     .style((theme::GhostButton { dark, active: true }).style()),
             ]
             .spacing(8)

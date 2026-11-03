@@ -385,6 +385,31 @@ mod behavior_tests {
     }
 
     #[test]
+    fn a_background_tab_changed_on_disk_keeps_its_old_text_undoable() {
+        let mut app = app();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "base\n").unwrap();
+        let loaded = |text: &str| Loaded {
+            path: file.clone(),
+            text: text.into(),
+            format: TextFormat::default(),
+            stamp: DiskStamp::of(&file),
+        };
+        let _ = app.handle(Message::TabRead(Ok(loaded("base\n"))));
+        type_text(&mut app, "edit");
+        let edited = text(&app);
+        // Another tab takes the editor; the file is rolled back meanwhile.
+        app.is_dirty = false;
+        app.stash_current();
+        app.load_buffer(dir.path().join("other.txt"), CachedBuffer::blank());
+        let _ = app.handle(Message::TabRead(Ok(loaded("base\n"))));
+        assert_eq!(text(&app), "base\n");
+        let _ = app.handle(Message::Undo);
+        assert_eq!(text(&app), edited);
+    }
+
+    #[test]
     fn a_reload_never_overwrites_unsaved_typing() {
         let mut app = app();
         let file = PathBuf::from("/x/a.txt");
@@ -815,6 +840,145 @@ mod behavior_tests {
         // A click on the panel is the user's: it closes the menu.
         let _ = app.update(Message::Git(GitMsg::SelectTab(crate::git_panel::Tab::Log)));
         assert!(app.open_menu.is_none());
+    }
+
+    /// A modified file with a place on disk, edited a while ago.
+    fn dirty_real_file(app: &mut SimpleEditApp, dir: &Path) -> PathBuf {
+        let path = dir.join("a.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        app.current_file = Some(path.clone());
+        app.disk_stamp = DiskStamp::of(&path);
+        app.is_dirty = true;
+        app.last_edit = std::time::Instant::now() - std::time::Duration::from_secs(5);
+        path
+    }
+
+    fn app_with_autosave_off() -> SimpleEditApp {
+        let config = Config {
+            auto_save: false,
+            ..Config::default()
+        };
+        let mut app = SimpleEditApp::blank(config);
+        let _ = app.restore_session(crate::session::Session::default());
+        app
+    }
+
+    #[test]
+    fn a_modified_file_is_saved_by_itself_after_a_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app();
+        dirty_real_file(&mut app, dir.path());
+        let _ = app.handle(Message::AutoSave);
+        assert!(app.autosaving, "a save was started");
+    }
+
+    #[test]
+    fn autosave_waits_for_the_pause_and_respects_the_setting_and_untitled_files() {
+        let dir = tempfile::tempdir().unwrap();
+        // Still typing.
+        let mut typing = app();
+        dirty_real_file(&mut typing, dir.path());
+        typing.last_edit = std::time::Instant::now();
+        let _ = typing.handle(Message::AutoSave);
+        assert!(!typing.autosaving);
+        // Turned off.
+        let mut off = app_with_autosave_off();
+        dirty_real_file(&mut off, dir.path());
+        let _ = off.handle(Message::AutoSave);
+        assert!(!off.autosaving);
+        // Nothing to save: an untitled tab is not a file.
+        let mut untitled = app();
+        untitled.is_dirty = true;
+        untitled.last_edit = std::time::Instant::now() - std::time::Duration::from_secs(5);
+        let _ = untitled.handle(Message::AutoSave);
+        assert!(!untitled.autosaving);
+    }
+
+    #[test]
+    fn autosave_never_writes_over_a_file_that_changed_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app();
+        let path = dirty_real_file(&mut app, dir.path());
+        std::fs::write(&path, "changed elsewhere, and longer\n").unwrap();
+        let _ = app.handle(Message::AutoSave);
+        assert!(!app.autosaving);
+    }
+
+    #[test]
+    fn changed_lines_are_marked_against_what_head_has() {
+        let mut app = app();
+        type_text(&mut app, "one\ntwo\nthree");
+        let path = app.current_file.clone().unwrap();
+        app.marks = Some(MarksState {
+            path,
+            base: Some("one\ntwo\n".into()),
+            marks: Default::default(),
+            rev: u64::MAX,
+        });
+        app.refresh_marks_now();
+        let paint = app.change_paint().expect("something changed");
+        assert_eq!(paint.added.as_slice(), &[2]);
+        // Back to what HEAD has: nothing to paint.
+        app.marks.as_mut().unwrap().base = Some("one\ntwo\nthree".into());
+        app.marks.as_mut().unwrap().rev = u64::MAX;
+        app.refresh_marks_now();
+        assert!(app.change_paint().is_none());
+    }
+
+    fn merge_spec() -> crate::git_panel::MergeSpec {
+        let text = "a\n<<<<<<< HEAD\nmine\n=======\ntheirs\n>>>>>>> t\nb\n";
+        crate::git_panel::MergeSpec {
+            repo: PathBuf::from("/tmp/no-such-repo"),
+            path: "dir/f.txt".into(),
+            merge: crate::git::conflicts::parse(text, false).unwrap(),
+        }
+    }
+
+    #[test]
+    fn a_conflicted_file_opens_in_a_tab_that_is_not_a_file_and_is_not_remembered() {
+        let mut app = app();
+        let _ = app.handle(Message::OpenMergeTab(std::sync::Arc::new(merge_spec())));
+        let path = app.current_file.clone().unwrap();
+        assert!(is_merge(&path) && is_virtual(&path) && is_untitled(&path));
+        assert_eq!(display_name(&path), "⇄ f.txt");
+        assert!(app.merge_tabs.contains_key(&path));
+        let session = app.build_session();
+        assert!(session
+            .files
+            .iter()
+            .all(|f| !f.path.starts_with("merge://")));
+        // The same file reuses its tab.
+        let before = app.sidebar.files().len();
+        let _ = app.handle(Message::OpenMergeTab(std::sync::Arc::new(merge_spec())));
+        assert_eq!(app.sidebar.files().len(), before);
+        // Settling a conflict in it, then closing it.
+        let _ = app.handle(Message::Merge(crate::git_panel::merge::MergeMsg::All(
+            crate::git::conflicts::Side::Yours,
+        )));
+        assert_eq!(app.merge_tabs[&path].merge.unresolved(), 0);
+        let _ = app.handle(Message::Sidebar(crate::sidebar::SidebarMessage::CloseNow(
+            path.clone(),
+        )));
+        assert!(!app.merge_tabs.contains_key(&path));
+    }
+
+    #[test]
+    fn the_conflicts_dialog_only_opens_when_there_are_conflicts() {
+        let mut app = app();
+        let _ = app.handle(Message::OpenConflicts);
+        assert!(matches!(app.overlay, ActiveOverlay::None));
+        let mut status = crate::git::Status::default();
+        status.unstaged.push(crate::git::Change {
+            path: "a.txt".into(),
+            from: None,
+            kind: crate::git::Kind::Conflict,
+        });
+        app.git.status = Some(status);
+        let _ = app.handle(Message::OpenConflicts);
+        assert!(matches!(app.overlay, ActiveOverlay::Conflicts));
+        // The status bar leads there too.
+        let offer = app.status_offer().expect("an offer");
+        assert!(matches!(offer.2, Message::OpenConflicts));
     }
 
     #[test]

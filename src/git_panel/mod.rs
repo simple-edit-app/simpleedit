@@ -4,10 +4,12 @@
 //! work itself is done by [`crate::git`], always off the interface thread:
 //! each action is a task that answers with a message.
 
+pub mod conflicts_view;
 pub mod diff_view;
 pub mod icon;
 pub mod log;
 pub mod log_view;
+pub mod merge;
 pub mod stash;
 pub mod stash_view;
 pub mod view;
@@ -53,6 +55,9 @@ pub struct Viewer {
     pub change: usize,
     pub side_by_side: bool,
     land: Option<Land>,
+    /// The load under way only looks for a newer diff of the open file: it
+    /// changes nothing if there is none, and moves no scrollbar.
+    silent: bool,
     /// The id of this viewer's last request: a late answer for another file
     /// (or another viewer) is ignored.
     token: u64,
@@ -72,6 +77,7 @@ impl Default for Viewer {
             change: 0,
             side_by_side: false,
             land: None,
+            silent: false,
             token: 0,
             scroll: iced::widget::Id::unique(),
         }
@@ -115,6 +121,7 @@ impl Viewer {
         self.diff = None;
         self.change = 0;
         self.land = Some(land);
+        self.silent = false;
         self.token = TOKENS.fetch_add(1, Ordering::Relaxed);
         let token = self.token;
         let repo = repo.to_path_buf();
@@ -170,9 +177,32 @@ impl Viewer {
         }
     }
 
+    /// Looks at the open file again, quietly: the diff changes on screen only
+    /// if the file did (a save, a stage, a rollback made elsewhere).
+    pub fn refresh(&mut self, repo: &Path) -> Task<Message> {
+        let Some(entry) = self.current().cloned() else {
+            return Task::none();
+        };
+        self.token = TOKENS.fetch_add(1, Ordering::Relaxed);
+        self.silent = true;
+        let (token, repo) = (self.token, repo.to_path_buf());
+        Task::perform(
+            async move { git::diff_of(&repo, &entry.source, &entry.change.path).await },
+            move |result| Message::Git(GitMsg::DiffLoaded(token, result)),
+        )
+    }
+
     /// The answer of a load.
     pub fn loaded(&mut self, token: u64, result: Result<FileDiff, String>) -> Task<Message> {
         if token != self.token {
+            return Task::none();
+        }
+        if std::mem::take(&mut self.silent) {
+            if self.diff.as_ref() == Some(&result) {
+                return Task::none();
+            }
+            self.diff = Some(result);
+            self.change = self.change.min(self.changes().saturating_sub(1));
             return Task::none();
         }
         self.diff = Some(result);
@@ -283,6 +313,14 @@ pub struct Ctx<'a> {
     pub shift: bool,
 }
 
+/// A conflicted file to settle by hand, in an editor tab.
+#[derive(Debug)]
+pub struct MergeSpec {
+    pub repo: PathBuf,
+    pub path: String,
+    pub merge: crate::git::conflicts::Merge,
+}
+
 /// A diff to open in the editor: the files to walk through and where to
 /// start.
 #[derive(Debug, Clone)]
@@ -297,6 +335,8 @@ pub struct DiffTab {
 pub enum GitMsg {
     /// Time to look again (the panel is open).
     Tick,
+    /// A file was saved: look again at once.
+    Refresh,
     Detected(Option<PathBuf>, Option<PathBuf>),
     StatusLoaded(Result<Status, String>),
     SelectTab(Tab),
@@ -315,6 +355,17 @@ pub enum GitMsg {
     Delete(usize),
     JumpToSource(usize),
     DiffInEditor(usize),
+    /// Puts one block of changes of the open file back as it was.
+    RollbackBlock(usize),
+    // Conflicts
+    /// Keep your side (`true`) or theirs of a conflicted file.
+    AcceptSide(String, bool),
+    /// Settle a conflicted file by hand, in three columns.
+    OpenMerge(String),
+    ContinueOperation,
+    AbortOperation,
+    MergeBranch(String),
+    RebaseOnto(String),
     // Committing
     MessageAction(text_editor::Action),
     MessageFocused,
@@ -365,6 +416,7 @@ impl GitMsg {
         matches!(
             self,
             GitMsg::Tick
+                | GitMsg::Refresh
                 | GitMsg::Detected(..)
                 | GitMsg::StatusLoaded(_)
                 | GitMsg::DiffLoaded(..)
@@ -381,6 +433,17 @@ impl GitMsg {
 }
 
 impl Panel {
+    /// The status, and the diff the tab shows, looked at again.
+    fn look_again(&mut self, ctx: &Ctx) -> Task<Message> {
+        let repo = self.repo.clone();
+        let more = match (self.tab, repo) {
+            (Tab::Stash, _) => self.load_stashes(),
+            (Tab::Commit, Some(repo)) => self.viewer.refresh(&repo),
+            _ => Task::none(),
+        };
+        Task::batch([self.refresh(ctx), more])
+    }
+
     pub fn toggle(&mut self, ctx: &Ctx) -> Task<Message> {
         self.open = !self.open;
         if self.open {
@@ -497,12 +560,9 @@ impl Panel {
                 if self.busy {
                     return Task::none();
                 }
-                let more = match self.tab {
-                    Tab::Stash => self.load_stashes(),
-                    _ => Task::none(),
-                };
-                Task::batch([self.refresh(ctx), more])
+                self.look_again(ctx)
             }
+            GitMsg::Refresh => self.look_again(ctx),
             GitMsg::Detected(dir, root) => {
                 self.probed = dir;
                 self.searched = true;
@@ -634,6 +694,86 @@ impl Panel {
                     Ok(String::new())
                 })
             }
+            GitMsg::RollbackBlock(block) => {
+                let Some(entry) = self.viewer.current().cloned() else {
+                    return Task::none();
+                };
+                let Some(diff) = self.viewer.file_diff().cloned() else {
+                    return Task::none();
+                };
+                if entry.source != Source::Unstaged {
+                    return Task::none();
+                }
+                self.act(move |repo| async move {
+                    git::rollback_block(&repo, &entry.change.path, &diff, block).await?;
+                    Ok(String::new())
+                })
+            }
+            GitMsg::AcceptSide(path, yours) => {
+                let rebasing = self
+                    .status
+                    .as_ref()
+                    .is_some_and(|s| s.operation == Some(git::Operation::Rebase));
+                self.act(move |repo| async move {
+                    git::accept(&repo, &path, yours, rebasing).await?;
+                    Ok(String::new())
+                })
+            }
+            GitMsg::OpenMerge(path) => {
+                let Some(repo) = self.repo.clone() else {
+                    return Task::none();
+                };
+                let rebasing = self
+                    .status
+                    .as_ref()
+                    .is_some_and(|s| s.operation == Some(git::Operation::Rebase));
+                Task::perform(
+                    async move {
+                        // Rebuilt from the three versions (so each conflict knows
+                        // its base); the file's own markers if there are none.
+                        let rebuilt = git::merge_text(&repo, &path).await;
+                        let merge = rebuilt
+                            .and_then(|text| git::conflicts::parse(&text, rebasing))
+                            .or_else(|| {
+                                std::fs::read_to_string(repo.join(&path))
+                                    .ok()
+                                    .and_then(|text| git::conflicts::parse(&text, rebasing))
+                            })
+                            .ok_or_else(|| t!("git.not_mergeable").to_string())?;
+                        Ok::<_, String>(MergeSpec { repo, path, merge })
+                    },
+                    |result| match result {
+                        Ok(spec) => Message::OpenMergeTab(std::sync::Arc::new(spec)),
+                        Err(error) => Message::Git(GitMsg::Done(Err(error))),
+                    },
+                )
+            }
+            GitMsg::ContinueOperation => {
+                let Some(op) = self.status.as_ref().and_then(|s| s.operation) else {
+                    return Task::none();
+                };
+                self.act(move |repo| async move {
+                    git::continue_operation(&repo, op).await?;
+                    Ok(String::new())
+                })
+            }
+            GitMsg::AbortOperation => {
+                let Some(op) = self.status.as_ref().and_then(|s| s.operation) else {
+                    return Task::none();
+                };
+                self.act(move |repo| async move {
+                    git::abort_operation(&repo, op).await?;
+                    Ok(String::new())
+                })
+            }
+            GitMsg::MergeBranch(branch) => self.act(move |repo| async move {
+                git::merge_branch(&repo, &branch).await?;
+                Ok(String::new())
+            }),
+            GitMsg::RebaseOnto(branch) => self.act(move |repo| async move {
+                git::rebase_onto(&repo, &branch).await?;
+                Ok(String::new())
+            }),
             GitMsg::DiffInEditor(index) => {
                 let Some(repo) = self.repo.clone() else {
                     return Task::none();
@@ -726,6 +866,7 @@ impl Panel {
             }
             GitMsg::Done(result) => {
                 self.busy = false;
+                let mut opened: Option<Message> = None;
                 match result {
                     Ok(text) => {
                         if let Some(old) = text.strip_prefix('\u{1}') {
@@ -749,15 +890,28 @@ impl Panel {
                             _ => self.notice = None,
                         }
                     }
+                    // Conflicts are not a failure: they are to be settled.
+                    Err(error) if error == git::CONFLICT => {
+                        self.notice = Some((t!("git.conflicts_to_settle").to_string(), false));
+                        opened = Some(Message::OpenConflicts);
+                    }
                     Err(error) => self.notice = Some((error, true)),
                 }
-                // Look again at once, from the same place.
-                self.probed = if self.repo.is_some() {
-                    self.probed.clone()
-                } else {
-                    None
+                // Look again at once, whatever the tab shows.
+                let more = match self.tab {
+                    Tab::Commit => match self.repo.clone() {
+                        // The open file changed under its diff.
+                        Some(repo) => self.viewer.reload(&repo),
+                        None => Task::none(),
+                    },
+                    Tab::Stash => self.load_stashes(),
+                    Tab::Log => {
+                        let rev = self.log.shown.clone().unwrap_or_else(|| "HEAD".into());
+                        Task::batch([self.load_refs(), self.show_log(&rev)])
+                    }
                 };
-                self.load_status()
+                let dialog = opened.map_or_else(Task::none, Task::done);
+                Task::batch([self.load_status(), more, dialog])
             }
             GitMsg::StashesLoaded(result) => self.stashes_loaded(result),
             GitMsg::SelectStash(index) => self.select_stash(index),
@@ -819,5 +973,79 @@ impl Panel {
                 Task::none()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry() -> Entry {
+        Entry {
+            source: Source::Unstaged,
+            change: Change {
+                path: "a.txt".into(),
+                from: None,
+                kind: Kind::Modified,
+            },
+            staged: false,
+        }
+    }
+
+    fn diff(lines: &[&str]) -> FileDiff {
+        let mut text = String::from("diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n");
+        text.push_str(&format!("@@ -1,1 +1,{} @@\n keep\n", lines.len() + 1));
+        for line in lines {
+            text.push_str(&format!("+{line}\n"));
+        }
+        crate::git::parse_diff(&text).pop().unwrap()
+    }
+
+    fn viewer_on(first: FileDiff) -> Viewer {
+        let mut viewer = Viewer {
+            entries: vec![entry()],
+            index: Some(0),
+            ..Viewer::default()
+        };
+        viewer.token = 7;
+        viewer.diff = Some(Ok(first));
+        viewer
+    }
+
+    #[test]
+    fn a_quiet_refresh_shows_the_new_diff_of_a_file_whose_status_did_not_change() {
+        let mut viewer = viewer_on(diff(&["one"]));
+        let _ = viewer.refresh(Path::new("/no/such/repo"));
+        assert!(viewer.silent);
+        let token = viewer.token;
+        // The same file, edited again and saved: another diff.
+        let _ = viewer.loaded(token, Ok(diff(&["one", "two", "three"])));
+        assert_eq!(viewer.file_diff().unwrap().added(), 3);
+        assert!(!viewer.silent);
+    }
+
+    #[test]
+    fn a_quiet_refresh_that_finds_nothing_new_leaves_everything_alone() {
+        let mut viewer = viewer_on(diff(&["one"]));
+        viewer.change = 0;
+        let _ = viewer.refresh(Path::new("/no/such/repo"));
+        let token = viewer.token;
+        let _ = viewer.loaded(token, Ok(diff(&["one"])));
+        assert_eq!(viewer.file_diff().unwrap().added(), 1);
+        assert_eq!(viewer.change, 0);
+        // A stale answer (another request was made since) is ignored.
+        let _ = viewer.refresh(Path::new("/no/such/repo"));
+        let _ = viewer.loaded(token, Ok(diff(&["x", "y"])));
+        assert_eq!(viewer.file_diff().unwrap().added(), 1);
+    }
+
+    #[test]
+    fn the_current_change_stays_valid_when_the_diff_shrinks() {
+        let mut viewer = viewer_on(diff(&["one"]));
+        viewer.change = 5;
+        let _ = viewer.refresh(Path::new("/no/such/repo"));
+        let token = viewer.token;
+        let _ = viewer.loaded(token, Ok(diff(&["one", "two"])));
+        assert_eq!(viewer.change, 0);
     }
 }

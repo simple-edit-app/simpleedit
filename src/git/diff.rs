@@ -33,6 +33,18 @@ pub struct FileDiff {
     pub hunks: Vec<Hunk>,
 }
 
+/// A block of consecutive changed lines, as the file stands now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Block {
+    /// 0-based index, in the current file, of the first line it covers (or
+    /// of the place where removed lines used to be).
+    pub at: usize,
+    /// The new lines it holds.
+    pub added: Vec<String>,
+    /// The old lines it replaces.
+    pub removed: Vec<String>,
+}
+
 /// A row of the unified layout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Row<'a> {
@@ -140,6 +152,52 @@ impl FileDiff {
             in_change = changed;
         }
         starts
+    }
+
+    /// The blocks of changes, in file order (the same ones the arrows visit).
+    pub fn blocks(&self) -> Vec<Block> {
+        let mut blocks = Vec::new();
+        for hunk in &self.hunks {
+            // `@@ -a,b +c,d @@`: where the new side starts.
+            let start = hunk
+                .header
+                .split(' ')
+                .find_map(|p| p.strip_prefix('+'))
+                .and_then(|n| n.split(',').next())
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or(1);
+            let mut at = start.saturating_sub(1);
+            let mut current: Option<Block> = None;
+            for line in &hunk.lines {
+                match line.tag {
+                    Tag::Context => {
+                        blocks.extend(current.take());
+                        at += 1;
+                    }
+                    Tag::Added => {
+                        current
+                            .get_or_insert_with(|| Block {
+                                at,
+                                added: Vec::new(),
+                                removed: Vec::new(),
+                            })
+                            .added
+                            .push(line.text.clone());
+                        at += 1;
+                    }
+                    Tag::Removed => current
+                        .get_or_insert_with(|| Block {
+                            at,
+                            added: Vec::new(),
+                            removed: Vec::new(),
+                        })
+                        .removed
+                        .push(line.text.clone()),
+                }
+            }
+            blocks.extend(current);
+        }
+        blocks
     }
 
     /// For each row of [`rows`](Self::rows): the block of changes it is in.
@@ -328,6 +386,26 @@ Binary files a/b.bin and b/b.bin differ
         let side = a.side_row_blocks();
         assert_eq!(side.len(), a.side_rows().len());
         assert_eq!(side.iter().flatten().max(), Some(&1));
+    }
+
+    #[test]
+    fn blocks_know_where_they_are_and_what_they_replace() {
+        let a = &parse_diff(DIFF)[0];
+        let blocks = a.blocks();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].at, 1);
+        assert_eq!(blocks[0].added, vec!["new two", "extra"]);
+        assert_eq!(blocks[0].removed, vec!["old two"]);
+        assert_eq!(blocks[1].at, 21);
+        assert_eq!(blocks[1].removed, vec!["gone"]);
+        // A removal on its own sits before the line that follows it.
+        let only = &parse_diff(
+            "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,3 +1,2 @@\n keep\n-gone\n tail\n",
+        )[0];
+        let b = only.blocks();
+        assert_eq!(b[0].at, 1);
+        assert!(b[0].added.is_empty());
+        assert_eq!(b[0].removed, vec!["gone".to_string()]);
     }
 
     #[test]

@@ -15,6 +15,8 @@ const FONT: f32 = 12.0;
 /// JetBrains Mono's advance at 12 px.
 const CHAR_W: f32 = FONT * 0.6;
 const NUMBER_W: f32 = 44.0;
+/// The column of rollback arrows.
+const ARROW_W: f32 = 24.0;
 /// A diff longer than this many rows is cut (a widget per row).
 const MAX_ROWS: usize = 4000;
 
@@ -26,6 +28,8 @@ pub struct Nav {
     pub prev_file: Message,
     pub next_file: Message,
     pub toggle_side: Message,
+    /// The arrow that puts a block of changes back (the working tree's diff).
+    pub rollback: Option<fn(usize) -> Message>,
 }
 
 impl Nav {
@@ -36,6 +40,7 @@ impl Nav {
             prev_file: Message::Git(GitMsg::PrevFile),
             next_file: Message::Git(GitMsg::NextFile),
             toggle_side: Message::Git(GitMsg::ToggleSideBySide),
+            rollback: Some(|block| Message::Git(GitMsg::RollbackBlock(block))),
         }
     }
 
@@ -47,6 +52,7 @@ impl Nav {
             prev_file: Message::DiffTab(DiffNav::PrevFile),
             next_file: Message::DiffTab(DiffNav::NextFile),
             toggle_side: Message::DiffTab(DiffNav::ToggleSide),
+            rollback: Some(|block| Message::DiffTab(DiffNav::Apply(block))),
         }
     }
 }
@@ -138,12 +144,42 @@ fn body<'a>(
     current: usize,
     side_by_side: bool,
     scroll: &iced::widget::Id,
+    rollback: Option<fn(usize) -> Message>,
     dark: bool,
 ) -> Element<'a, Message> {
     let c = colors(dark);
     let p = se_theme::palette(dark);
     let mut rows: Vec<Element<'a, Message>> = Vec::new();
     let mut longest = 0usize;
+    // In front of each row: the arrow that rolls back the block it opens.
+    let with_arrow =
+        |element: Element<'a, Message>, block: Option<usize>| -> Element<'a, Message> {
+            let Some(make) = rollback else {
+                return element;
+            };
+            let arrow: Element<'a, Message> = match block {
+                Some(b) => button(text("↶").size(13).color(se_theme::palette(dark).muted))
+                    .padding([0, 4])
+                    .height(Length::Fixed(ROW_HEIGHT))
+                    .on_press(make(b))
+                    .style(
+                        (se_theme::GhostButton {
+                            dark,
+                            active: false,
+                        })
+                        .style(),
+                    )
+                    .into(),
+                None => Space::new().width(Length::Fixed(ARROW_W)).into(),
+            };
+            row![container(arrow).width(Length::Fixed(ARROW_W)), element].into()
+        };
+    let starts = |blocks: &[Option<usize>], i: usize| -> Option<usize> {
+        match blocks.get(i).copied().flatten() {
+            Some(b) if i == 0 || blocks.get(i - 1).copied().flatten() != Some(b) => Some(b),
+            _ => None,
+        }
+    };
 
     if side_by_side {
         let side = diff.side_rows();
@@ -162,7 +198,7 @@ fn body<'a>(
                 SideRow::Hunk(header) => rows.push(cell(
                     Some(c.hunk),
                     code(header.to_string(), p.muted),
-                    half * 2.0,
+                    half * 2.0 + if rollback.is_some() { ARROW_W } else { 0.0 },
                 )),
                 SideRow::Pair(left, right) => {
                     let side_cell = |line: Option<&'a crate::git::diff::Line>, old: bool| {
@@ -185,7 +221,36 @@ fn body<'a>(
                             half,
                         )
                     };
-                    rows.push(row![side_cell(*left, true), side_cell(*right, false)].into());
+                    // The chevron that carries a change across sits between the sides.
+                    let middle: Element<'a, Message> = match (rollback, starts(&blocks, i)) {
+                        (Some(make), Some(b)) => iced::widget::tooltip(
+                            button(text("»").size(13).color(p.accent))
+                                .padding([0, 4])
+                                .height(Length::Fixed(ROW_HEIGHT))
+                                .on_press(make(b))
+                                .style(
+                                    (se_theme::GhostButton {
+                                        dark,
+                                        active: false,
+                                    })
+                                    .style(),
+                                ),
+                            container(text(t!("git.apply_here").to_string()).size(12))
+                                .padding([3, 8])
+                                .style(se_theme::tooltip(dark)),
+                            iced::widget::tooltip::Position::Top,
+                        )
+                        .into(),
+                        _ => Space::new().into(),
+                    };
+                    let middle = container(middle).width(Length::Fixed(if rollback.is_some() {
+                        ARROW_W
+                    } else {
+                        0.0
+                    }));
+                    rows.push(
+                        row![side_cell(*left, true), middle, side_cell(*right, false)].into(),
+                    );
                 }
             }
         }
@@ -201,9 +266,10 @@ fn body<'a>(
         for (i, row_) in flat.iter().enumerate().take(MAX_ROWS) {
             let now = blocks.get(i).copied().flatten() == Some(current);
             match row_ {
-                Row::Hunk(header) => {
-                    rows.push(cell(Some(c.hunk), code(header.to_string(), p.muted), width))
-                }
+                Row::Hunk(header) => rows.push(with_arrow(
+                    cell(Some(c.hunk), code(header.to_string(), p.muted), width),
+                    None,
+                )),
                 Row::Line(line) => {
                     let (background, marker) = match (line.tag, now) {
                         (Tag::Added, false) => (Some(c.added), "+"),
@@ -212,15 +278,18 @@ fn body<'a>(
                         (Tag::Removed, true) => (Some(c.removed_now), "-"),
                         _ => (None, " "),
                     };
-                    rows.push(cell(
-                        background,
-                        row![
-                            number(line.old_no, c.number),
-                            number(line.new_no, c.number),
-                            code(format!("{marker} {}", expand(&line.text)), p.text),
-                        ]
-                        .into(),
-                        width,
+                    rows.push(with_arrow(
+                        cell(
+                            background,
+                            row![
+                                number(line.old_no, c.number),
+                                number(line.new_no, c.number),
+                                code(format!("{marker} {}", expand(&line.text)), p.text),
+                            ]
+                            .into(),
+                            width,
+                        ),
+                        starts(&blocks, i),
                     ));
                 }
             }
@@ -339,6 +408,17 @@ pub fn view<'a>(viewer: &'a Viewer, nav: &Nav, dark: bool, empty: String) -> Ele
             viewer.change,
             viewer.side_by_side,
             &viewer.scroll,
+            // Only the working tree's own diff can be rolled back by block.
+            viewer
+                .current()
+                .is_some_and(|e| {
+                    matches!(
+                        e.source,
+                        crate::git::Source::Unstaged | crate::git::Source::Tree(_)
+                    )
+                })
+                .then_some(nav.rollback)
+                .flatten(),
             dark,
         ),
         (Some(Err(error)), _) => centered(error.clone(), dark),

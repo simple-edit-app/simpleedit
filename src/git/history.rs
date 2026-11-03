@@ -456,11 +456,12 @@ async fn rebase_with(repo: &Path, base: Option<&str>, todo: &str) -> Result<(), 
         &[("GIT_SEQUENCE_EDITOR", &editor), ("GIT_EDITOR", "true")],
     )
     .await;
-    if result.is_err() {
-        // Leave the repository as it was.
-        let _ = run(repo, &["rebase", "--abort"]).await;
+    match result {
+        Ok(_) => Ok(()),
+        // Conflicts stay to be settled; any other failure leaves things as
+        // they were.
+        Err(e) => Err(super::stopped(repo, e, &["rebase", "--abort"]).await),
     }
-    result.map(|_| ())
 }
 
 /// The commits of `base..HEAD`, oldest first.
@@ -586,22 +587,20 @@ async fn oldest_of(repo: &Path, shas: &[String]) -> Result<String, String> {
 pub async fn revert(repo: &Path, shas: &[String]) -> Result<(), String> {
     let mut args = vec!["revert", "--no-edit"];
     args.extend(shas.iter().map(String::as_str));
-    let result = run(repo, &args).await;
-    if result.is_err() {
-        let _ = run(repo, &["revert", "--abort"]).await;
+    match run(repo, &args).await {
+        Ok(_) => Ok(()),
+        Err(e) => Err(super::stopped(repo, e, &["revert", "--abort"]).await),
     }
-    result.map(|_| ())
 }
 
 /// Copies commits (oldest first) onto the current branch.
 pub async fn cherry_pick(repo: &Path, shas: &[String]) -> Result<(), String> {
     let mut args = vec!["cherry-pick"];
     args.extend(shas.iter().map(String::as_str));
-    let result = run(repo, &args).await;
-    if result.is_err() {
-        let _ = run(repo, &["cherry-pick", "--abort"]).await;
+    match run(repo, &args).await {
+        Ok(_) => Ok(()),
+        Err(e) => Err(super::stopped(repo, e, &["cherry-pick", "--abort"]).await),
     }
-    result.map(|_| ())
 }
 
 #[cfg(test)]
@@ -813,7 +812,8 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_revert_leaves_the_repository_as_it_was() {
+    fn a_revert_that_conflicts_stays_in_progress_until_it_is_aborted() {
+        use super::super::{abort_operation, status, Operation, CONFLICT};
         let repo = Repo::new();
         repo.write("a.txt", "one\n");
         repo.commit_all("first");
@@ -823,7 +823,12 @@ mod tests {
         repo.commit_all("third");
         let all = shas(&repo);
         // Reverting "second" conflicts with "third".
-        block(revert(repo.path(), &[all[1].clone()])).unwrap_err();
+        let error = block(revert(repo.path(), &[all[1].clone()])).unwrap_err();
+        assert_eq!(error, CONFLICT);
+        let now = block(status(repo.path())).unwrap();
+        assert_eq!(now.operation, Some(Operation::Revert));
+        assert_eq!(now.conflicts().count(), 1);
+        block(abort_operation(repo.path(), Operation::Revert)).unwrap();
         assert_eq!(
             std::fs::read_to_string(repo.path().join("a.txt")).unwrap(),
             "three\n"

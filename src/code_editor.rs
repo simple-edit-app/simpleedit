@@ -78,6 +78,20 @@ pub struct Annotations {
     pub text: Color,
 }
 
+/// Lines that differ from the last commit: a bar between the gutter and the
+/// text, a tick beside the scrollbar.
+#[derive(Debug, Clone)]
+pub struct ChangePaint {
+    /// 0-based, sorted.
+    pub added: std::sync::Arc<Vec<usize>>,
+    pub modified: std::sync::Arc<Vec<usize>>,
+    /// The line each removal sits before.
+    pub deleted: std::sync::Arc<Vec<usize>>,
+    pub added_color: Color,
+    pub modified_color: Color,
+    pub deleted_color: Color,
+}
+
 /// Width of the blame column.
 pub const ANNOTATION_WIDTH: f32 = 210.0;
 
@@ -281,6 +295,7 @@ where
     guide: Option<(usize, Color)>,
     minimap: Option<Minimap>,
     bookmarks: Option<BookmarkPaint>,
+    changes: Option<ChangePaint>,
     annotations: Option<Annotations>,
     on_annotation: Option<Box<dyn Fn(usize) -> Message + 'a>>,
     folding: Option<FoldPaint>,
@@ -308,6 +323,7 @@ impl<'a, Message, Theme> CodeEditor<'a, highlighter::PlainText, Message, Theme> 
             guide: None,
             minimap: None,
             bookmarks: None,
+            changes: None,
             annotations: None,
             on_annotation: None,
             folding: None,
@@ -355,6 +371,12 @@ where
     /// Shows line numbers, aligned with the text however it wraps or scrolls.
     pub fn gutter(mut self, gutter: Gutter) -> Self {
         self.gutter = Some(gutter);
+        self
+    }
+
+    /// Bars for the lines that changed since the last commit.
+    pub fn changes(mut self, changes: ChangePaint) -> Self {
+        self.changes = Some(changes);
         self
     }
 
@@ -449,6 +471,7 @@ where
             guide: self.guide,
             minimap: self.minimap,
             bookmarks: self.bookmarks,
+            changes: self.changes,
             annotations: self.annotations,
             on_annotation: self.on_annotation,
             folding: self.folding,
@@ -626,6 +649,26 @@ where
                     scale.max(3.0),
                     marks.color,
                 );
+            }
+        }
+
+        // Changed lines: a thin tick on the right edge.
+        if let Some(changes) = &self.changes {
+            for (lines_of, color) in [
+                (&changes.added, changes.added_color),
+                (&changes.modified, changes.modified_color),
+                (&changes.deleted, changes.deleted_color),
+            ] {
+                for &line in lines_of.iter().filter(|l| **l <= lines) {
+                    quad(
+                        renderer,
+                        rect.x + rect.width - 3.0,
+                        top + line as f32 * scale,
+                        3.0,
+                        scale.max(2.0),
+                        color,
+                    );
+                }
             }
         }
 
@@ -1765,6 +1808,71 @@ where
                     },
                     clip,
                 );
+            }
+        }
+
+        if let (Some(changes), Some(_)) = (&self.changes, self.gutter) {
+            // Between the numbers and the text, on every row of a changed line.
+            let extra = if self.annotations.is_some() {
+                ANNOTATION_WIDTH
+            } else {
+                0.0
+            };
+            let x = bounds.x
+                + self.padding.left
+                + gutter_width(size, internal.editor.line_count())
+                + extra
+                + 1.0;
+            let mut previous = None;
+            for run in internal.editor.buffer().layout_runs() {
+                if run.line_height <= 0.0 {
+                    continue;
+                }
+                let first = previous != Some(run.line_i);
+                previous = Some(run.line_i);
+                let color = if changes.added.binary_search(&run.line_i).is_ok() {
+                    Some(changes.added_color)
+                } else if changes.modified.binary_search(&run.line_i).is_ok() {
+                    Some(changes.modified_color)
+                } else {
+                    None
+                };
+                let y = bounds.y + padding.top + run.line_top;
+                if let Some(color) = color {
+                    let bar = Rectangle {
+                        x,
+                        y,
+                        width: 3.0,
+                        height: row_height,
+                    };
+                    if let Some(bar) = bounds.intersection(&bar) {
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds: bar,
+                                ..renderer::Quad::default()
+                            },
+                            color,
+                        );
+                    }
+                }
+                // Lines removed just before this one: a small wedge on its top edge.
+                if first && changes.deleted.binary_search(&run.line_i).is_ok() {
+                    let wedge = Rectangle {
+                        x,
+                        y: y - 1.0,
+                        width: 7.0,
+                        height: 2.0,
+                    };
+                    if let Some(wedge) = bounds.intersection(&wedge) {
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds: wedge,
+                                ..renderer::Quad::default()
+                            },
+                            changes.deleted_color,
+                        );
+                    }
+                }
             }
         }
 

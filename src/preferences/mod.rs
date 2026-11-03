@@ -26,6 +26,7 @@ pub enum PreferencesMessage {
     AutocompleteQuotesToggled(bool),
     HighlightCurrentLineToggled(bool),
     ShowPageGuideToggled(bool),
+    AutoSaveToggled(bool),
     PageGuideColumnChanged(usize),
     ShowMinimapToggled(bool),
     WordWrapToggled(bool),
@@ -163,6 +164,9 @@ impl PreferencesState {
             }
             PreferencesMessage::ShowPageGuideToggled(v) => {
                 config.show_page_guide = v;
+            }
+            PreferencesMessage::AutoSaveToggled(v) => {
+                config.auto_save = v;
             }
             PreferencesMessage::ShowMinimapToggled(v) => {
                 config.show_minimap = v;
@@ -407,6 +411,11 @@ impl PreferencesState {
                 t!("prefs.highlight_current_line").to_string(),
                 config.highlight_current_line,
                 PreferencesMessage::HighlightCurrentLineToggled,
+            ),
+            toggle(
+                t!("prefs.auto_save").to_string(),
+                config.auto_save,
+                PreferencesMessage::AutoSaveToggled,
             ),
             toggle(
                 t!("prefs.show_page_guide").to_string(),

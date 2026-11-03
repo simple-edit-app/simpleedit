@@ -175,6 +175,7 @@ impl SimpleEditApp {
             | ActiveOverlay::LanguagePicker
             | ActiveOverlay::References(_)
             | ActiveOverlay::Shortcuts
+            | ActiveOverlay::Conflicts
             | ActiveOverlay::Palette
             | ActiveOverlay::ConfirmClose(_)
             | ActiveOverlay::ConfirmCloseMany(..)
@@ -845,7 +846,7 @@ impl SimpleEditApp {
             .sidebar
             .files()
             .iter()
-            .filter(|path| !is_diff(path))
+            .filter(|path| !is_virtual(path))
             .map(|path| {
                 let current = self.current_file.as_ref() == Some(path);
                 let cached = self.file_cache.get(path);
@@ -891,7 +892,7 @@ impl SimpleEditApp {
             active_file: self
                 .current_file
                 .as_ref()
-                .filter(|p| !self.is_scratch(p) && !is_diff(p))
+                .filter(|p| !self.is_scratch(p) && !is_virtual(p))
                 .map(|p| p.to_string_lossy().into_owned()),
             untitled_counter: self.untitled_counter,
         }

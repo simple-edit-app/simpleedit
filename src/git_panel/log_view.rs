@@ -383,6 +383,8 @@ impl Panel {
     ) -> Element<'a, Message> {
         let checkout = t!("git.checkout").to_string();
         let diff = t!("git.diff_tree").to_string();
+        let merge = t!("git.merge_into", name = branch.name.as_str()).to_string();
+        let rebase = t!("git.rebase_onto", name = branch.name.as_str()).to_string();
         let name = branch.name.clone();
         let current = branch.current;
         iced_aw::ContextMenu::new(target, move || {
@@ -410,6 +412,14 @@ impl Panel {
                         (!current).then(|| GitMsg::Checkout(name.clone())),
                     ),
                     item(diff.clone(), Some(GitMsg::BranchDiff(name.clone()))),
+                    item(
+                        merge.clone(),
+                        (!current).then(|| GitMsg::MergeBranch(name.clone())),
+                    ),
+                    item(
+                        rebase.clone(),
+                        (!current).then(|| GitMsg::RebaseOnto(name.clone())),
+                    ),
                 ]
                 .spacing(1)
                 .padding(6),

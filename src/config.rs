@@ -342,6 +342,8 @@ pub struct Config {
     pub page_guide_column: usize,
     /// A miniature of the whole file along the editor's right edge.
     pub show_minimap: bool,
+    /// Modified files are written to disk by themselves, a moment after the last edit.
+    pub auto_save: bool,
     /// Long lines wrap at the edge; off, they run past it (faster on huge lines).
     pub word_wrap: bool,
     pub locale: String,
@@ -374,6 +376,7 @@ impl Default for Config {
             page_guide_column: 80,
             show_minimap: true,
             word_wrap: true,
+            auto_save: true,
             locale: "en".to_string(),
             show_sidebar: true,
             window_width: 1200.0,
