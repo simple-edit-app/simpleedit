@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.3.0] - 2026-11-03
+
+### Added
+- Scratch files: a button under the file list opens a panel to create notes and trials outside any project: a name and an extension picked from an alphabetical list (or none). They are saved as you type, never close, stay out of the file list and last until you delete them (right click, Delete, with a confirmation). Their folder can be changed in the Preferences, and the files move along with it.
+
 ## [1.2.0] - 2026-11-02
 
 ### Added

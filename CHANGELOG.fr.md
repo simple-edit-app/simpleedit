@@ -1,5 +1,10 @@
 # Journal des modifications
 
+## [1.3.0] - 2026-11-03
+
+### Ajouté
+- Fichiers scratch : un bouton sous la liste des fichiers ouvre un panneau pour créer des notes et des essais hors de tout projet : un nom et une extension choisie dans une liste alphabétique (ou aucune). Ils s'enregistrent pendant la frappe, ne se ferment jamais, restent hors de la liste des fichiers et durent jusqu'à leur suppression (clic droit, Supprimer, avec confirmation). Leur dossier se change dans les Préférences, et les fichiers le suivent.
+
 ## [1.2.0] - 2026-11-02
 
 ### Ajouté
