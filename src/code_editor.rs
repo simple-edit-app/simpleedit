@@ -1275,6 +1275,20 @@ where
             }
         }
 
+        // A right click puts the cursor on the line it hit, so the context
+        // menu (bookmark, ...) acts on that line; a selection is left alone
+        // so that Copy and Cut still have it.
+        if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) = event {
+            if self.content.selection().is_none() {
+                if let Some(position) = cursor.position_in(layout.bounds()) {
+                    shell.publish(on_edit(Action::Click(
+                        position - Vector::new(padding.left, padding.top),
+                    )));
+                }
+            }
+            return;
+        }
+
         let Some(update) = Update::from_event(event, state, layout.bounds(), padding, cursor)
         else {
             return;
@@ -1646,29 +1660,35 @@ where
                 if marks.lines.binary_search(&run.line_i).is_err() {
                     continue;
                 }
-                let height = 11.0_f32.min(row_height);
-                let flag = Rectangle {
-                    x,
-                    y: bounds.y + padding.top + run.line_top + (row_height - height) / 2.0,
-                    width: 7.0,
-                    height,
-                };
-                if let Some(flag) = bounds.intersection(&flag) {
-                    renderer.fill_quad(
-                        renderer::Quad {
-                            bounds: flag,
-                            border: iced::Border {
-                                radius: iced::border::Radius::default()
-                                    .top_left(2.0)
-                                    .top_right(2.0)
-                                    .bottom_right(1.0)
-                                    .bottom_left(1.0),
-                                ..iced::Border::default()
+                // The ribbon of the bookmarks panel: a body with a notch cut
+                // in its foot, in 2 px steps.
+                let height = 12.0_f32.min(row_height);
+                let top = bounds.y + padding.top + run.line_top + (row_height - height) / 2.0;
+                let width = 8.0;
+                let body = height - 6.0;
+                let mut pieces = vec![(0.0, 0.0, width, body)];
+                for (step, gap) in [2.0_f32, 4.0, 6.0].into_iter().enumerate() {
+                    let y = body + step as f32 * 2.0;
+                    let side = (width - gap) / 2.0;
+                    pieces.push((0.0, y, side, 2.0));
+                    pieces.push((width - side, y, side, 2.0));
+                }
+                for (dx, dy, w, h) in pieces {
+                    let piece = Rectangle {
+                        x: x + dx,
+                        y: top + dy,
+                        width: w,
+                        height: h,
+                    };
+                    if let Some(piece) = bounds.intersection(&piece) {
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds: piece,
+                                ..renderer::Quad::default()
                             },
-                            ..renderer::Quad::default()
-                        },
-                        marks.color,
-                    );
+                            marks.color,
+                        );
+                    }
                 }
             }
         }

@@ -97,12 +97,15 @@ impl SidebarState {
         dark: bool,
         current_file: &Option<PathBuf>,
         dirty: &HashSet<PathBuf>,
+        marked: &HashSet<PathBuf>,
     ) -> Element<'_, Message> {
         let lbl_close = t!("sidebar.close").to_string();
         let lbl_close_others = t!("menu.file_close_others").to_string();
         let lbl_close_all = t!("menu.file_close_all").to_string();
         let lbl_save = t!("sidebar.save").to_string();
         let lbl_save_as = t!("sidebar.save_as").to_string();
+        let lbl_bookmark_add = t!("sidebar.bookmark_add").to_string();
+        let lbl_bookmark_remove = t!("sidebar.bookmark_remove").to_string();
         let p = theme::palette(dark);
 
         let labels = crate::app::unique_labels(&self.files);
@@ -182,6 +185,12 @@ impl SidebarState {
                 let lbl_close_all = lbl_close_all.clone();
                 let lbl_save = lbl_save.clone();
                 let lbl_save_as = lbl_save_as.clone();
+                let lbl_bookmark = if marked.contains(path) {
+                    lbl_bookmark_remove.clone()
+                } else {
+                    lbl_bookmark_add.clone()
+                };
+                let bookmark_path = path.clone();
 
                 iced_aw::ContextMenu::new(row_button, move || {
                     let ctx_item =
@@ -224,6 +233,11 @@ impl SidebarState {
                                 lbl_save_as.clone(),
                                 is_active
                                     .then_some(Message::Sidebar(SidebarMessage::RequestSaveAs)),
+                            ),
+                            ctx_item(
+                                lbl_bookmark.clone(),
+                                (!crate::app::is_untitled(&bookmark_path))
+                                    .then(|| Message::ToggleFileBookmark(bookmark_path.clone())),
                             ),
                         ]
                         .spacing(1)

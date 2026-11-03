@@ -353,6 +353,38 @@ mod behavior_tests {
     }
 
     #[test]
+    fn a_double_click_on_a_bookmarked_line_goes_there() {
+        use super::bookmark_panel::Target;
+        let mut app = app();
+        let path = app.current_file.clone().unwrap();
+        type_text(&mut app, "one\ntwo\nthree");
+        app.bookmarks.toggle(&path, 0);
+        let target = Target::Line(path, 0);
+        // One click only selects.
+        let _ = app.handle(Message::BookmarkClick(target.clone()));
+        assert_eq!(app.bookmark_panel.selected.as_ref(), Some(&target));
+        assert_eq!(app.editor.content.cursor_position().0, 2);
+        let _ = app.handle(Message::BookmarkClick(target));
+        assert_eq!(app.editor.content.cursor_position().0, 0);
+    }
+
+    #[test]
+    fn bookmarks_are_deleted_from_the_panel_and_files_added_from_the_list() {
+        use super::bookmark_panel::Target;
+        let mut app = app();
+        let file = PathBuf::from("/x/a.rs");
+        app.bookmarks.toggle(&file, 4);
+        let _ = app.handle(Message::ToggleFileBookmark(file.clone()));
+        assert!(app.bookmarks.marked_paths().contains(&file));
+        let _ = app.handle(Message::BookmarkDelete(Target::Line(file.clone(), 4)));
+        assert!(app.bookmarks.lines(&file).is_empty());
+        // The file itself stays until its own row is deleted.
+        assert!(app.bookmarks.marked_paths().contains(&file));
+        let _ = app.handle(Message::BookmarkDelete(Target::File(file.clone())));
+        assert!(app.bookmarks.entries().is_empty());
+    }
+
+    #[test]
     fn a_reload_never_overwrites_unsaved_typing() {
         let mut app = app();
         let file = PathBuf::from("/x/a.txt");

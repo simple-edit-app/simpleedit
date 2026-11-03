@@ -276,5 +276,13 @@
   "prefs.scratch_reset": "Default",
   "scratch.no_ext": "No extension",
   "scratch.delete_title": "Delete scratch file",
-  "scratch.delete_message": "Delete %{name}? The file will be removed for good."
+  "scratch.delete_message": "Delete %{name}? The file will be removed for good.",
+  "bookmarks.title": "Bookmarks",
+  "bookmarks.empty": "No bookmarks.",
+  "bookmarks.delete": "Delete",
+  "bookmarks.err_missing": "This file no longer exists.",
+  "sidebar.bookmark_add": "Add to bookmarks",
+  "sidebar.bookmark_remove": "Remove from bookmarks",
+  "status.file_bookmark_added": "File added to the bookmarks",
+  "status.file_bookmark_removed": "File removed from the bookmarks"
 }

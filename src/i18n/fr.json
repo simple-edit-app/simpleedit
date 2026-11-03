@@ -276,5 +276,13 @@
   "prefs.scratch_reset": "Par défaut",
   "scratch.no_ext": "Sans extension",
   "scratch.delete_title": "Supprimer le fichier scratch",
-  "scratch.delete_message": "Supprimer %{name} ? Le fichier sera définitivement supprimé."
+  "scratch.delete_message": "Supprimer %{name} ? Le fichier sera définitivement supprimé.",
+  "bookmarks.title": "Marque-pages",
+  "bookmarks.empty": "Aucun marque-page.",
+  "bookmarks.delete": "Supprimer",
+  "bookmarks.err_missing": "Ce fichier n'existe plus.",
+  "sidebar.bookmark_add": "Ajouter aux marque-pages",
+  "sidebar.bookmark_remove": "Retirer des marque-pages",
+  "status.file_bookmark_added": "Fichier ajouté aux marque-pages",
+  "status.file_bookmark_removed": "Fichier retiré des marque-pages"
 }

@@ -138,6 +138,13 @@ pub enum Message {
     NewTerminal,
     // Scratch files
     ToggleScratch,
+    // Bookmarks panel
+    ToggleBookmarkPanel,
+    BookmarkClick(bookmark_panel::Target),
+    BookmarkFold(PathBuf),
+    BookmarkDelete(bookmark_panel::Target),
+    /// Bookmarks a file as a whole, or takes it out.
+    ToggleFileBookmark(PathBuf),
     ScratchName(String),
     ScratchExt(crate::scratch::Ext),
     ScratchCreate,
@@ -319,6 +326,7 @@ pub struct SimpleEditApp {
     status_message: String,
     terminal: crate::terminal::Panel,
     scratch: crate::scratch::Panel,
+    bookmark_panel: bookmark_panel::Panel,
     /// A language server to offer in the status bar, in place of the message.
     server_offer: Option<&'static crate::lsp_install::ServerInfo>,
     status_is_error: bool,
@@ -469,6 +477,7 @@ impl SimpleEditApp {
             status_message: t!("status.ready").to_string(),
             terminal: Default::default(),
             scratch: crate::scratch::Panel::new(&config.scratch_dir),
+            bookmark_panel: Default::default(),
             server_offer: None,
             status_is_error: false,
             format_error: None,
@@ -594,6 +603,7 @@ impl SimpleEditApp {
             self.refresh_preview();
         }
         self.refresh_file_size();
+        self.refresh_bookmark_panel();
         if !passive {
             self.refresh_selection_info();
         }
@@ -833,6 +843,9 @@ impl SimpleEditApp {
         if self.scratch.open {
             panel = panel.push(self.scratch_panel(dark));
         }
+        if self.bookmark_panel.open {
+            panel = panel.push(self.bookmark_panel_view(dark));
+        }
         let editor_panel = container(panel.push(status_bar))
             .width(Length::Fill)
             .height(Length::Fill)
@@ -851,8 +864,12 @@ impl SimpleEditApp {
         if self.show_sidebar {
             main_row = main_row.push(
                 column![
-                    self.sidebar
-                        .view(dark, &self.current_file, &self.dirty_files()),
+                    self.sidebar.view(
+                        dark,
+                        &self.current_file,
+                        &self.dirty_files(),
+                        &self.bookmarks.marked_paths(),
+                    ),
                     self.terminal_button(dark),
                 ]
                 .spacing(se_theme::PANEL_GAP),
@@ -1333,6 +1350,7 @@ impl SimpleEditApp {
                     if self.terminal.open {
                         // One tool panel at the bottom.
                         self.scratch.open = false;
+                        self.bookmark_panel.open = false;
                     }
                 }
                 Task::none()
@@ -1342,9 +1360,35 @@ impl SimpleEditApp {
                 if self.scratch.open {
                     self.terminal.open = false;
                     self.terminal.focused = false;
+                    self.bookmark_panel.open = false;
                     self.scratch.refresh();
                     self.scratch.error = None;
                 }
+                Task::none()
+            }
+            Message::ToggleBookmarkPanel => {
+                self.bookmark_panel.open = !self.bookmark_panel.open;
+                if self.bookmark_panel.open {
+                    self.terminal.open = false;
+                    self.terminal.focused = false;
+                    self.scratch.open = false;
+                    self.refresh_bookmark_texts(true);
+                }
+                Task::none()
+            }
+            Message::BookmarkClick(target) => self.bookmark_click(target),
+            Message::BookmarkFold(path) => {
+                if !self.bookmark_panel.collapsed.remove(&path) {
+                    self.bookmark_panel.collapsed.insert(path);
+                }
+                Task::none()
+            }
+            Message::BookmarkDelete(target) => {
+                self.delete_bookmark(target);
+                Task::none()
+            }
+            Message::ToggleFileBookmark(path) => {
+                self.toggle_file_bookmark(path);
                 Task::none()
             }
             Message::ScratchName(name) => {
@@ -4052,6 +4096,8 @@ impl SimpleEditApp {
 #[path = "app/file_io.rs"]
 mod file_io;
 use file_io::*;
+#[path = "app/bookmark_panel.rs"]
+mod bookmark_panel;
 #[path = "app/views.rs"]
 mod views;
 

@@ -254,7 +254,8 @@ impl EditorState {
         if !bookmarks.is_empty() {
             editor = editor.bookmarks(crate::code_editor::BookmarkPaint {
                 lines: bookmarks.to_vec(),
-                color: crate::theme::syntax(dark).function,
+                // The yellow of the bookmarks panel.
+                color: iced::Color::from_rgb8(0xf2, 0xc0, 0x4c),
             });
         }
         if config.show_minimap {

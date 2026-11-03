@@ -356,6 +356,18 @@ impl SimpleEditApp {
                     self.scratch.open,
                     Message::ToggleScratch
                 ),
+                tool(
+                    super::bookmark_panel::ribbon(
+                        if self.bookmark_panel.open {
+                            se_theme::palette(dark).accent
+                        } else {
+                            se_theme::palette(dark).text
+                        },
+                        false
+                    ),
+                    self.bookmark_panel.open,
+                    Message::ToggleBookmarkPanel
+                ),
             ]
             .spacing(6),
         )

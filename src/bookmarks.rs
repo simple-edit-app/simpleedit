@@ -5,7 +5,7 @@
 //! above them.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -13,8 +13,24 @@ pub struct Bookmarks {
     /// Sorted, duplicate-free lines by file path. A file without bookmarks
     /// has no entry.
     files: BTreeMap<String, Vec<usize>>,
+    /// Files bookmarked as a whole.
+    #[serde(default)]
+    marked: BTreeSet<String>,
     #[serde(skip)]
     dirty: bool,
+    /// Grows with every change, so a view can tell when to look again.
+    #[serde(skip)]
+    pub rev: u64,
+}
+
+/// What the bookmarks panel lists for one file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    pub path: PathBuf,
+    /// The file itself is bookmarked.
+    pub marked: bool,
+    /// Its bookmarked lines (0-based).
+    pub lines: Vec<usize>,
 }
 
 fn key(path: &Path) -> String {
@@ -22,6 +38,50 @@ fn key(path: &Path) -> String {
 }
 
 impl Bookmarks {
+    fn touch(&mut self) {
+        self.dirty = true;
+        self.rev += 1;
+    }
+
+    /// Bookmarks or unbookmarks a whole file. Returns whether it is
+    /// bookmarked afterwards.
+    pub fn toggle_file(&mut self, path: &Path) -> bool {
+        let k = key(path);
+        let added = !self.marked.remove(&k);
+        if added {
+            self.marked.insert(k);
+        }
+        self.touch();
+        added
+    }
+
+    /// The files bookmarked as a whole.
+    pub fn marked_paths(&self) -> HashSet<PathBuf> {
+        self.marked.iter().map(PathBuf::from).collect()
+    }
+
+    /// Removes a file's own bookmark and all its line bookmarks.
+    pub fn remove_entry(&mut self, path: &Path) {
+        let marked = self.marked.remove(&key(path));
+        let lines = self.files.remove(&key(path)).is_some();
+        if marked || lines {
+            self.touch();
+        }
+    }
+
+    /// Every bookmarked file, by path, with what is bookmarked in it.
+    pub fn entries(&self) -> Vec<Entry> {
+        let paths: BTreeSet<&String> = self.files.keys().chain(self.marked.iter()).collect();
+        paths
+            .into_iter()
+            .map(|k| Entry {
+                path: PathBuf::from(k),
+                marked: self.marked.contains(k),
+                lines: self.files.get(k).cloned().unwrap_or_default(),
+            })
+            .collect()
+    }
+
     fn store() -> Option<PathBuf> {
         crate::fsutil::data_dir().map(|d| d.join("simpleedit").join("bookmarks.json"))
     }
@@ -60,11 +120,12 @@ impl Bookmarks {
     /// Forgets the bookmarks of files that no longer exist (untitled buffers
     /// are not files).
     pub fn prune_missing(&mut self) {
-        let before = self.files.len();
-        self.files
-            .retain(|path, _| path.starts_with("untitled://") || Path::new(path).exists());
-        if self.files.len() != before {
-            self.dirty = true;
+        let before = self.files.len() + self.marked.len();
+        let kept = |path: &str| path.starts_with("untitled://") || Path::new(path).exists();
+        self.files.retain(|path, _| kept(path));
+        self.marked.retain(|path| kept(path));
+        if self.files.len() + self.marked.len() != before {
+            self.touch();
         }
     }
 
@@ -94,14 +155,14 @@ impl Bookmarks {
         if lines.is_empty() {
             self.files.remove(&key(path));
         }
-        self.dirty = true;
+        self.touch();
         added
     }
 
     /// Removes every bookmark of a file.
     pub fn clear(&mut self, path: &Path) {
         if self.files.remove(&key(path)).is_some() {
-            self.dirty = true;
+            self.touch();
         }
     }
 
@@ -110,7 +171,11 @@ impl Bookmarks {
     pub fn rename(&mut self, from: &Path, to: &Path) {
         if let Some(lines) = self.files.remove(&key(from)) {
             self.files.insert(key(to), lines);
-            self.dirty = true;
+            self.touch();
+        }
+        if self.marked.remove(&key(from)) {
+            self.marked.insert(key(to));
+            self.touch();
         }
     }
 
@@ -156,6 +221,7 @@ impl Bookmarks {
         if *lines != moved {
             *lines = moved;
             self.dirty = true;
+            self.rev += 1;
         }
         if lines.is_empty() {
             self.files.remove(&key(path));
@@ -197,6 +263,7 @@ impl Bookmarks {
         if *lines != moved {
             *lines = moved;
             self.dirty = true;
+            self.rev += 1;
         }
         if lines.is_empty() {
             self.files.remove(&key(path));
@@ -322,5 +389,47 @@ mod tests {
         let back: Bookmarks = serde_json::from_str(&json).unwrap();
         assert_eq!(back.lines(&file()), &[3, 9]);
         assert!(!back.dirty);
+    }
+
+    #[test]
+    fn a_whole_file_can_be_bookmarked_next_to_its_lines() {
+        let mut b = with(&[3]);
+        let other = PathBuf::from("/x/other.rs");
+        assert!(b.toggle_file(&other));
+        assert!(b.marked_paths().contains(&other));
+        assert!(b.toggle_file(&file()));
+        let entries = b.entries();
+        // By path: /tmp/a.rs first.
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, file());
+        assert!(entries[0].marked && entries[0].lines == vec![3]);
+        assert_eq!(entries[1].path, other);
+        assert!(entries[1].marked && entries[1].lines.is_empty());
+        assert!(!b.toggle_file(&other));
+        assert!(!b.marked_paths().contains(&other));
+    }
+
+    #[test]
+    fn removing_an_entry_drops_the_file_mark_and_the_lines() {
+        let mut b = with(&[1, 2]);
+        b.toggle_file(&file());
+        let before = b.rev;
+        b.remove_entry(&file());
+        assert!(b.entries().is_empty());
+        assert!(b.rev > before);
+    }
+
+    #[test]
+    fn file_marks_follow_a_rename_and_survive_a_reload() {
+        let mut b = Bookmarks::default();
+        b.toggle_file(&file());
+        let to = PathBuf::from("/x/renamed.rs");
+        b.rename(&file(), &to);
+        assert!(b.marked_paths().contains(&to) && !b.marked_paths().contains(&file()));
+        let back: Bookmarks = serde_json::from_str(&serde_json::to_string(&b).unwrap()).unwrap();
+        assert!(back.marked_paths().contains(&to));
+        // Bookmarks saved before file marks existed still load.
+        let old: Bookmarks = serde_json::from_str(r#"{"files":{"/a":[1]}}"#).unwrap();
+        assert_eq!(old.lines(Path::new("/a")), &[1]);
     }
 }

@@ -17,6 +17,7 @@ A fast, stable, cross-platform text editor for **macOS** and **Linux**. Built in
 - **Language servers, optional** — Preferences › Language servers installs (and removes) the one of a language without administrator rights; the status bar offers it when you open a file. Without one, definitions are found by a careful pattern search
 - **Integrated terminal** — a `>_` button under the file list opens a terminal panel at the bottom, with tabs for several shells (Alt+F12, selection and copy / paste included)
 - **Scratch files** — a `Scratch` button under the file list opens a panel to create notes and trials (name + extension); they are saved as you type, never close, and stay until you delete them. Their folder can be changed in the Preferences
+- **Bookmarks panel** — a bookmark button under the file list opens a panel listing every bookmarked file with its bookmarked lines (`58: some code`); double-click a file or a line to open it (at the line). Add a file from the right click menu of the file list, a line from the right click menu of the editor; delete from the panel with a right click. Bookmarks show as a yellow ribbon in the gutter and a yellow mark in the minimap
 - **Code folding** — chevrons in the gutter fold blocks, comments and Markdown sections
 - **File sidebar** — open and switch between multiple files
 - **Search & Replace** with regex support
