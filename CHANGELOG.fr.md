@@ -1,5 +1,11 @@
 # Journal des modifications
 
+## [1.4.0] - 2026-11-03
+
+### Ajouté
+- Panneau des marque-pages : un bouton sous la liste des fichiers ouvre un panneau avec chaque fichier marqué et, dessous, ses lignes marquées (`58: du code`). Un double-clic ouvre le fichier, ou le fichier à la ligne choisie. On ajoute un fichier depuis le clic droit de la liste des fichiers, une ligne depuis le clic droit de l'éditeur (le curseur va maintenant sur la ligne cliquée). Un clic droit dans le panneau supprime un marque-page.
+- Les marque-pages s'affichent en ruban jaune dans la gouttière et en repère jaune dans l'aperçu à droite.
+
 ## [1.3.0] - 2026-11-03
 
 ### Ajouté

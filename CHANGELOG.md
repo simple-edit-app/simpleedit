@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.4.0] - 2026-11-03
+
+### Added
+- Bookmarks panel: a button under the file list opens a panel with every bookmarked file and, under it, its bookmarked lines (`58: some code`). A double click opens the file, or the file at the chosen line. A file is added from the right click menu of the file list, a line from the right click menu of the editor (the cursor now goes to the line that was clicked). A right click in the panel deletes a bookmark.
+- Bookmarks are shown as a yellow ribbon in the gutter and a yellow mark in the minimap.
+
 ## [1.3.0] - 2026-11-03
 
 ### Added
