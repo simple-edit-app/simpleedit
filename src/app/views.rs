@@ -181,6 +181,8 @@ impl SimpleEditApp {
             | ActiveOverlay::ConfirmCloseMany(..)
             | ActiveOverlay::ConfirmQuit(_)
             | ActiveOverlay::ConfirmScratchDelete(_)
+            | ActiveOverlay::GitFile(_)
+            | ActiveOverlay::GitPick(_)
             | ActiveOverlay::ConfirmOverwrite(_) => Space::new().height(0).into(),
         };
 
@@ -463,7 +465,7 @@ impl SimpleEditApp {
             );
             let delete_label = t!("scratch.delete").to_string();
             let target = path.clone();
-            let menu = iced_aw::ContextMenu::new(open, move || {
+            let menu = crate::pointer_area::context_menu(open, move || {
                 container(
                     button(text(delete_label.clone()).size(13))
                         .padding([7, 10])

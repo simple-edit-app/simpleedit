@@ -157,7 +157,7 @@ impl Panel {
         let apply = t!("git.stash_apply").to_string();
         let pop = t!("git.stash_pop").to_string();
         let drop = t!("git.stash_drop").to_string();
-        iced_aw::ContextMenu::new(target, move || {
+        crate::pointer_area::context_menu(target, move || {
             let item = |label: String, msg: GitMsg| -> Element<'static, Message> {
                 button(text(label).size(13))
                     .padding([7, 10])
@@ -185,6 +185,5 @@ impl Panel {
             .style(se_theme::card(dark))
             .into()
         })
-        .into()
     }
 }

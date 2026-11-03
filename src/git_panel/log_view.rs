@@ -387,7 +387,7 @@ impl Panel {
         let rebase = t!("git.rebase_onto", name = branch.name.as_str()).to_string();
         let name = branch.name.clone();
         let current = branch.current;
-        iced_aw::ContextMenu::new(target, move || {
+        crate::pointer_area::context_menu(target, move || {
             let item = |label: String, msg: Option<GitMsg>| -> Element<'static, Message> {
                 let mut b = button(text(label).size(13))
                     .padding([7, 10])
@@ -427,7 +427,6 @@ impl Panel {
             .style(se_theme::card(dark))
             .into()
         })
-        .into()
     }
 
     // ─── The commits ────────────────────────────────────────────────────────
@@ -437,7 +436,41 @@ impl Panel {
         let log = &self.log;
         let avail = log.availability();
         let mut list = column![].spacing(0);
-        for (i, commit) in log.commits.iter().enumerate() {
+        if let Some(file) = &log.file {
+            list = list.push(
+                row![
+                    text(t!("git.file_history_of", file = file.as_str()).to_string())
+                        .size(12)
+                        .color(se_theme::accent_color(dark))
+                        .width(Length::Fill)
+                        .wrapping(iced::widget::text::Wrapping::None),
+                    button(text("×").size(13))
+                        .padding([0, 8])
+                        .on_press(Message::Git(GitMsg::ClearLogFile))
+                        .style(
+                            (se_theme::GhostButton {
+                                dark,
+                                active: false,
+                            })
+                            .style(),
+                        ),
+                ]
+                .padding([4, 8])
+                .align_y(Alignment::Center),
+            );
+        }
+        // Only the rows around the part in view are built.
+        let rows = vec![ROW_H; log.commits.len()];
+        let (first, last, before, after) =
+            super::diff_view::visible(&rows, log.view_top.get(), log.view_height.get().max(1400.0));
+        list = list.push(Space::new().height(before));
+        for (i, commit) in log
+            .commits
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(last - first)
+        {
             let selected = log.selected.contains(&i);
             let mut line = row![graph_cell(&log.rows[i], log.lanes, dark)]
                 .spacing(6)
@@ -499,6 +532,7 @@ impl Panel {
                 Message::Git(GitMsg::SelectForMenu(i))
             }));
         }
+        list = list.push(Space::new().height(after));
         if log.commits.is_empty() {
             list = list.push(
                 container(
@@ -527,6 +561,12 @@ impl Panel {
         }
         scrollable(container(list).padding([2, 4]))
             .id(super::log::scroll_id())
+            .on_scroll(|viewport| {
+                Message::Git(GitMsg::LogScrolled(
+                    viewport.absolute_offset().y as i32,
+                    viewport.bounds().height as i32,
+                ))
+            })
             .style(se_theme::Scrollbar { dark }.style())
             .width(Length::Fill)
             .height(Length::Fill)
@@ -565,7 +605,7 @@ impl Panel {
                 avail.reword,
             ),
         ];
-        iced_aw::ContextMenu::new(target, move || {
+        crate::pointer_area::context_menu(target, move || {
             let mut menu = column![].spacing(1).padding(6);
             for (label, action, enabled) in labels.iter().cloned() {
                 let message = match action {
@@ -590,7 +630,6 @@ impl Panel {
             }
             container(menu).style(se_theme::card(dark)).into()
         })
-        .into()
     }
 
     // ─── The details ────────────────────────────────────────────────────────

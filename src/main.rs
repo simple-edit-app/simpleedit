@@ -29,6 +29,7 @@ mod lsp;
 mod lsp_install;
 mod menu_bar;
 mod palette;
+mod pointer_area;
 mod preferences;
 mod preview;
 mod scratch;

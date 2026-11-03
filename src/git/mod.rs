@@ -22,6 +22,29 @@ pub async fn run(repo: &Path, args: &[&str]) -> Result<String, String> {
     run_with(repo, args, None, &[]).await
 }
 
+/// A git command for `repo`: no password or editor prompt nobody could see.
+fn command(repo: &Path, args: &[&str], env: &[(&str, &str)], stdin: bool) -> Command {
+    let mut command = Command::new("git");
+    command
+        .args(args)
+        .current_dir(repo)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_EDITOR", "true")
+        .envs(env.iter().copied())
+        .stdin(if stdin { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    command
+}
+
+/// How long a command may take before it is given up.
+const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The same for what talks to a remote (a push can be big and the line slow).
+const NETWORK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(900);
+
 /// Like [`run`], with text for git's standard input and extra environment.
 pub async fn run_with(
     repo: &Path,
@@ -29,35 +52,41 @@ pub async fn run_with(
     input: Option<&str>,
     env: &[(&str, &str)],
 ) -> Result<String, String> {
-    let mut command = Command::new("git");
-    command
-        .args(args)
-        .current_dir(repo)
-        // Never wait for a password or an editor nobody can see.
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_EDITOR", "true")
-        .envs(env.iter().copied())
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = command.spawn().map_err(|e| format!("git: {e}"))?;
-    if let (Some(text), Some(mut stdin)) = (input, child.stdin.take()) {
-        let _ = stdin.write_all(text.as_bytes()).await;
-        drop(stdin);
+    run_timed(repo, args, input, env, TIMEOUT).await
+}
+
+/// `git push …`: it may take far longer than local commands.
+pub async fn run_network(repo: &Path, args: &[&str]) -> Result<String, String> {
+    run_timed(repo, args, None, &[], NETWORK_TIMEOUT).await
+}
+
+async fn run_timed(
+    repo: &Path,
+    args: &[&str],
+    input: Option<&str>,
+    env: &[(&str, &str)],
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    let mut child = command(repo, args, env, input.is_some())
+        .spawn()
+        .map_err(|e| format!("git: {e}"))?;
+    // Written while the output is read, so a big input can't block git.
+    let writer = match (input, child.stdin.take()) {
+        (Some(text), Some(mut stdin)) => {
+            let text = text.to_string();
+            Some(tokio::spawn(async move {
+                let _ = stdin.write_all(text.as_bytes()).await;
+            }))
+        }
+        _ => None,
+    };
+    let output = tokio::time::timeout(timeout, child.wait_with_output())
+        .await
+        .map_err(|_| t!("git.err_timeout").to_string())?
+        .map_err(|e| format!("git: {e}"))?;
+    if let Some(writer) = writer {
+        let _ = writer.await;
     }
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(120),
-        child.wait_with_output(),
-    )
-    .await
-    .map_err(|_| "git: timeout".to_string())?
-    .map_err(|e| format!("git: {e}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     if output.status.success() {
         Ok(stdout)
@@ -149,7 +178,9 @@ pub struct Status {
     pub unstaged: Vec<Change>,
 }
 
-pub async fn status(repo: &Path) -> Result<Status, String> {
+/// The state of the working tree; `untracked`: also list the files git does
+/// not know (costly in a big folder that isn't ignored).
+pub async fn status(repo: &Path, untracked: bool) -> Result<Status, String> {
     let out = run(
         repo,
         &[
@@ -157,7 +188,11 @@ pub async fn status(repo: &Path) -> Result<Status, String> {
             "--porcelain=v2",
             "-z",
             "--branch",
-            "--untracked-files=all",
+            if untracked {
+                "--untracked-files=all"
+            } else {
+                "--untracked-files=no"
+            },
         ],
     )
     .await?;
@@ -237,15 +272,17 @@ pub async fn merge_text(repo: &Path, path: &str) -> Option<String> {
     let ours = run(repo, &["show", &format!(":2:{path}")]).await.ok()?;
     let theirs = run(repo, &["show", &format!(":3:{path}")]).await.ok()?;
     let dir = tempfile::tempdir().ok()?;
-    let write = |name: &str, text: &str| -> Option<String> {
+    let write = |name: &'static str, text: String| {
         let file = dir.path().join(name);
-        std::fs::write(&file, text).ok()?;
-        Some(file.to_string_lossy().into_owned())
+        async move {
+            tokio::fs::write(&file, text).await.ok()?;
+            Some(file.to_string_lossy().into_owned())
+        }
     };
     let (ours, base, theirs) = (
-        write("ours", &ours)?,
-        write("base", &base)?,
-        write("theirs", &theirs)?,
+        write("ours", ours).await?,
+        write("base", base).await?,
+        write("theirs", theirs).await?,
     );
     // The exit status counts the conflicts: only the text matters.
     let out = run_allow_failure(
@@ -271,7 +308,9 @@ pub async fn merge_text(repo: &Path, path: &str) -> Option<String> {
 
 /// Writes the settled text of a conflicted file and marks it settled.
 pub async fn resolve_with(repo: &Path, path: &str, text: &str) -> Result<(), String> {
-    std::fs::write(repo.join(path), text).map_err(|e| format!("{path}: {e}"))?;
+    tokio::fs::write(repo.join(path), text)
+        .await
+        .map_err(|e| format!("{path}: {e}"))?;
     run(repo, &["add", "--", path]).await.map(|_| ())
 }
 
@@ -286,10 +325,24 @@ pub async fn continue_operation(repo: &Path, operation: Operation) -> Result<(),
     match result {
         Ok(_) => Ok(()),
         // The next commit of a rebase may conflict in turn.
-        Err(e) if has_conflicts(repo).await => {
-            let _ = e;
-            Err(CONFLICT.to_string())
-        }
+        Err(_) if has_conflicts(repo).await => Err(CONFLICT.to_string()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Leaves out the commit an operation is stopped on (it became empty once its
+/// conflicts were settled, say). A merge has no such step.
+pub async fn skip_operation(repo: &Path, operation: Operation) -> Result<(), String> {
+    let args: &[&str] = match operation {
+        Operation::Rebase => &["rebase", "--skip"],
+        Operation::CherryPick => &["cherry-pick", "--skip"],
+        Operation::Revert => &["revert", "--skip"],
+        Operation::Merge => return abort_operation(repo, operation).await,
+    };
+    match run(repo, args).await {
+        Ok(_) => Ok(()),
+        // The next commit of a rebase may conflict in turn.
+        Err(_) if has_conflicts(repo).await => Err(CONFLICT.to_string()),
         Err(e) => Err(e),
     }
 }
@@ -425,9 +478,29 @@ pub async fn rollback(repo: &Path, change: &Change, staged: bool) -> Result<(), 
     match change.kind {
         Kind::Untracked => {
             let target = repo.join(path);
-            std::fs::remove_file(&target).map_err(|e| format!("{path}: {e}"))
+            tokio::fs::remove_file(&target)
+                .await
+                .map_err(|e| format!("{path}: {e}"))
         }
         Kind::Added if staged => run(repo, &["rm", "-f", "--", path]).await.map(|_| ()),
+        // The new name isn't in HEAD: it goes, and the old one comes back.
+        Kind::Renamed if staged => {
+            run(repo, &["rm", "-f", "--", path]).await?;
+            let from = change.from.as_deref().unwrap_or(path);
+            run(
+                repo,
+                &[
+                    "restore",
+                    "--source=HEAD",
+                    "--staged",
+                    "--worktree",
+                    "--",
+                    from,
+                ],
+            )
+            .await
+            .map(|_| ())
+        }
         _ if staged => run(
             repo,
             &[
@@ -455,9 +528,11 @@ pub async fn rollback_block(
     let blocks = diff.blocks();
     let block = blocks
         .get(index)
-        .ok_or_else(|| "no such change".to_string())?;
+        .ok_or_else(|| t!("git.err_no_such_change").to_string())?;
     let target = repo.join(path);
-    let text = std::fs::read_to_string(&target).map_err(|e| format!("{path}: {e}"))?;
+    let text = tokio::fs::read_to_string(&target)
+        .await
+        .map_err(|e| format!("{path}: {e}"))?;
     let eol = if text.contains("\r\n") { "\r\n" } else { "\n" };
     let mut lines: Vec<String> = text.split_inclusive('\n').map(str::to_string).collect();
     let end = block.at + block.added.len();
@@ -465,19 +540,22 @@ pub async fn rollback_block(
     let current: Vec<&str> = lines
         .get(block.at..end)
         .map(|l| l.iter().map(|s| s.trim_end_matches(['\n', '\r'])).collect())
-        .ok_or_else(|| "the file changed since this diff".to_string())?;
+        .ok_or_else(|| t!("git.err_file_changed").to_string())?;
     if current != block.added.iter().map(String::as_str).collect::<Vec<_>>() {
-        return Err("the file changed since this diff".to_string());
+        return Err(t!("git.err_file_changed").to_string());
     }
     let old: Vec<String> = block.removed.iter().map(|l| format!("{l}{eol}")).collect();
     lines.splice(block.at..end, old);
-    std::fs::write(&target, lines.concat()).map_err(|e| format!("{path}: {e}"))
+    tokio::fs::write(&target, lines.concat())
+        .await
+        .map_err(|e| format!("{path}: {e}"))
 }
 
 /// Deletes a file and tells git: `git rm`, or a plain delete when untracked.
 pub async fn delete(repo: &Path, change: &Change) -> Result<(), String> {
     match change.kind {
-        Kind::Untracked => std::fs::remove_file(repo.join(&change.path))
+        Kind::Untracked => tokio::fs::remove_file(repo.join(&change.path))
+            .await
             .map_err(|e| format!("{}: {e}", change.path)),
         _ => run(repo, &["rm", "-f", "--", change.path.as_str()])
             .await
@@ -488,6 +566,23 @@ pub async fn delete(repo: &Path, change: &Change) -> Result<(), String> {
 // ─── Commit, push… ──────────────────────────────────────────────────────────
 
 /// Commits what is staged; `amend` rewrites the last commit with it.
+/// Commits one file only, whatever else is in the index (a new file is
+/// added first).
+pub async fn commit_only(
+    repo: &Path,
+    message: &str,
+    amend: bool,
+    path: &str,
+) -> Result<(), String> {
+    run(repo, &["add", "--", path]).await?;
+    let mut args = vec!["commit", "-F", "-"];
+    if amend {
+        args.push("--amend");
+    }
+    args.extend(["--", path]);
+    run_with(repo, &args, Some(message), &[]).await.map(|_| ())
+}
+
 pub async fn commit(repo: &Path, message: &str, amend: bool) -> Result<(), String> {
     let mut args = vec!["commit", "-F", "-"];
     if amend {
@@ -498,13 +593,24 @@ pub async fn commit(repo: &Path, message: &str, amend: bool) -> Result<(), Strin
 
 /// Pushes the current branch (creating its upstream the first time).
 pub async fn push(repo: &Path, branch: &str, has_upstream: bool) -> Result<(), String> {
-    if has_upstream {
-        run(repo, &["push"]).await.map(|_| ())
-    } else {
-        run(repo, &["push", "--set-upstream", "origin", branch])
-            .await
-            .map(|_| ())
+    let mut args = vec!["push"];
+    if !has_upstream {
+        args.extend(["--set-upstream", "origin", branch]);
     }
+    run_network(repo, &args).await.map(|_| ())
+}
+
+/// Whether a revision typed by the user names something (and cannot be read
+/// by git as an option). The name it resolves to.
+pub async fn verify_rev(repo: &Path, rev: &str) -> Result<String, String> {
+    if rev.starts_with('-') {
+        return Err(t!("git.err_bad_revision", rev = rev).to_string());
+    }
+    let spec = format!("{rev}^{{object}}");
+    run(repo, &["rev-parse", "--verify", "--quiet", &spec])
+        .await
+        .map(|out| out.trim().to_string())
+        .map_err(|_| t!("git.err_bad_revision", rev = rev).to_string())
 }
 
 pub async fn last_message(repo: &Path) -> Result<String, String> {
@@ -598,6 +704,10 @@ pub async fn diff_of(repo: &Path, source: &Source, path: &str) -> Result<FileDif
             ]
         }
     };
+    // Paths as they are, not quoted (`+++ b/…` names the file).
+    let mut full = vec!["-c", "core.quotepath=false"];
+    full.extend(args);
+    let args = full;
     // `--no-index` exits with 1 when the files differ.
     let out = match run(repo, &args).await {
         Ok(out) => out,
@@ -620,15 +730,13 @@ pub async fn diff_of(repo: &Path, source: &Source, path: &str) -> Result<FileDif
 
 /// The output of a command even when it exits with a failure status.
 async fn run_allow_failure(repo: &Path, args: &[&str]) -> String {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(repo)
-        .stdin(Stdio::null())
-        .output()
-        .await;
-    output
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default()
+    let Ok(child) = command(repo, args, &[], false).spawn() else {
+        return String::new();
+    };
+    match tokio::time::timeout(TIMEOUT, child.wait_with_output()).await {
+        Ok(Ok(output)) => String::from_utf8_lossy(&output.stdout).into_owned(),
+        _ => String::new(),
+    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -716,7 +824,7 @@ mod tests {
         repo.write("new.txt", "new\n");
         repo.git(&["rm", "-q", "c.txt"]);
 
-        let status = block(status(repo.path())).unwrap();
+        let status = block(status(repo.path(), true)).unwrap();
         assert_eq!(status.branch, "main");
         let staged: Vec<_> = status
             .staged
@@ -751,7 +859,7 @@ mod tests {
         );
         repo.commit_all("first");
         repo.git(&["mv", "old.txt", "new.txt"]);
-        let status = block(status(repo.path())).unwrap();
+        let status = block(status(repo.path(), true)).unwrap();
         assert_eq!(status.staged.len(), 1);
         assert_eq!(status.staged[0].kind, Kind::Renamed);
         assert_eq!(status.staged[0].path, "new.txt");
@@ -767,10 +875,10 @@ mod tests {
         repo.write("n.txt", "new\n");
 
         block(stage(repo.path(), &["a.txt".into(), "n.txt".into()])).unwrap();
-        let s = block(status(repo.path())).unwrap();
+        let s = block(status(repo.path(), true)).unwrap();
         assert_eq!(s.staged.len(), 2);
         block(unstage(repo.path(), &["n.txt".into()])).unwrap();
-        let s = block(status(repo.path())).unwrap();
+        let s = block(status(repo.path(), true)).unwrap();
         assert_eq!(s.staged.len(), 1);
         assert_eq!(s.unstaged[0].kind, Kind::Untracked);
 
@@ -778,7 +886,7 @@ mod tests {
         assert_eq!(block(last_message(repo.path())).unwrap(), "second\n\nbody");
         block(commit(repo.path(), "amended", true)).unwrap();
         assert_eq!(block(last_message(repo.path())).unwrap(), "amended");
-        let s = block(status(repo.path())).unwrap();
+        let s = block(status(repo.path(), true)).unwrap();
         assert!(s.staged.is_empty());
 
         // Rolling back a modified file restores it; an untracked one is removed.
@@ -831,7 +939,10 @@ mod tests {
         );
         let diff = block(diff_of(repo.path(), &Source::Unstaged, "a.txt")).unwrap();
         block(rollback_block(repo.path(), "a.txt", &diff, 0)).unwrap();
-        assert!(block(status(repo.path())).unwrap().unstaged.is_empty());
+        assert!(block(status(repo.path(), true))
+            .unwrap()
+            .unstaged
+            .is_empty());
     }
 
     #[test]
@@ -874,7 +985,7 @@ mod tests {
             block(merge_branch(repo.path(), "side")).unwrap_err(),
             CONFLICT
         );
-        let now = block(status(repo.path())).unwrap();
+        let now = block(status(repo.path(), true)).unwrap();
         assert_eq!(now.operation, Some(Operation::Merge));
         assert_eq!(
             now.conflicts().map(|c| c.path.as_str()).collect::<Vec<_>>(),
@@ -901,7 +1012,7 @@ mod tests {
             block(rebase_onto(repo.path(), "main")).unwrap_err(),
             CONFLICT
         );
-        let now = block(status(repo.path())).unwrap();
+        let now = block(status(repo.path(), true)).unwrap();
         assert_eq!(now.operation, Some(Operation::Rebase));
         // "Yours" = my commit ("side"), although git calls it theirs here.
         block(accept(repo.path(), "a.txt", true, true)).unwrap();
@@ -962,7 +1073,13 @@ mod tests {
         }
         block(resolve_with(repo.path(), "a.txt", &merge.render())).unwrap();
         assert_eq!(read(&repo), "1\nmain\nside\n3\n");
-        assert_eq!(block(status(repo.path())).unwrap().conflicts().count(), 0);
+        assert_eq!(
+            block(status(repo.path(), true))
+                .unwrap()
+                .conflicts()
+                .count(),
+            0
+        );
         block(continue_operation(repo.path(), Operation::Merge)).unwrap();
     }
 
@@ -985,7 +1102,7 @@ mod tests {
         };
         block(delete(repo.path(), &change)).unwrap();
         assert!(!repo.path().join("a.txt").exists());
-        let s = block(status(repo.path())).unwrap();
+        let s = block(status(repo.path(), true)).unwrap();
         assert_eq!(s.staged[0].kind, Kind::Deleted);
     }
 
@@ -1019,5 +1136,168 @@ mod tests {
         );
         let outside = tempfile::tempdir().unwrap();
         assert!(block(repo_root(outside.path())).is_none());
+    }
+
+    #[test]
+    fn committing_one_file_leaves_the_rest_of_the_index_alone() {
+        let repo = Repo::new();
+        repo.write("a.txt", "one\n");
+        repo.write("b.txt", "one\n");
+        repo.commit_all("first");
+        repo.write("a.txt", "two\n");
+        repo.write("b.txt", "two\n");
+        repo.write("new.txt", "fresh\n");
+        repo.git(&["add", "b.txt"]);
+        block(commit_only(repo.path(), "only a", false, "a.txt")).unwrap();
+        let last = repo.git(&["show", "--name-only", "--format=%s", "HEAD"]);
+        assert!(last.contains("only a") && last.contains("a.txt"));
+        assert!(!last.contains("b.txt"));
+        // b.txt is still staged, untouched; new.txt untracked.
+        let status = block(status(repo.path(), true)).unwrap();
+        assert_eq!(status.staged.len(), 1);
+        assert_eq!(status.staged[0].path, "b.txt");
+        // A new file is added then committed alone.
+        block(commit_only(repo.path(), "only new", false, "new.txt")).unwrap();
+        let last = repo.git(&["show", "--name-only", "--format=%s", "HEAD"]);
+        assert!(last.contains("new.txt") && !last.contains("b.txt"));
+    }
+
+    #[test]
+    fn a_file_is_compared_with_a_branch_or_a_revision() {
+        let repo = Repo::new();
+        repo.write("a.txt", "one\n");
+        repo.commit_all("first");
+        repo.git(&["tag", "v1"]);
+        repo.write("a.txt", "one\ntwo\n");
+        repo.commit_all("second");
+        repo.write("a.txt", "one\ntwo\nthree\n");
+        let diff = block(diff_of(repo.path(), &Source::Tree("v1".into()), "a.txt")).unwrap();
+        let added: usize = diff
+            .hunks
+            .iter()
+            .flat_map(|h| h.lines.iter())
+            .filter(|l| l.tag == crate::git::diff::Tag::Added)
+            .count();
+        assert_eq!(added, 2);
+        let sha = repo.git(&["rev-parse", "HEAD~1"]);
+        let by_sha = block(diff_of(
+            repo.path(),
+            &Source::Tree(sha.trim().to_string()),
+            "a.txt",
+        ))
+        .unwrap();
+        assert_eq!(by_sha.hunks.len(), 1);
+    }
+
+    #[test]
+    fn a_rewritten_branch_is_refused_by_a_plain_push() {
+        let remote = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .current_dir(remote.path())
+            .status()
+            .unwrap();
+        let repo = Repo::new();
+        repo.git(&["remote", "add", "origin", remote.path().to_str().unwrap()]);
+        repo.write("a.txt", "one\n");
+        repo.commit_all("first");
+        // The first push sets the upstream.
+        block(push(repo.path(), "main", false)).unwrap();
+        repo.git(&["commit", "-q", "--amend", "-m", "first, reworded"]);
+        assert!(block(push(repo.path(), "main", true)).is_err());
+    }
+
+    #[test]
+    fn a_block_of_a_staged_diff_can_be_put_back_and_the_file_is_to_stage_again() {
+        let repo = Repo::new();
+        repo.write("a.txt", "one\ntwo\n");
+        repo.commit_all("first");
+        repo.write("a.txt", "one\nTWO\n");
+        repo.git(&["add", "a.txt"]);
+        let diff = block(diff_of(repo.path(), &Source::Staged, "a.txt")).unwrap();
+        block(rollback_block(repo.path(), "a.txt", &diff, 0)).unwrap();
+        let text = std::fs::read_to_string(repo.path().join("a.txt")).unwrap();
+        assert_eq!(text, "one\ntwo\n");
+        // The index still holds the change, the file is back: both columns.
+        let status = block(status(repo.path(), true)).unwrap();
+        assert_eq!(status.staged.len(), 1);
+        assert_eq!(status.unstaged.len(), 1);
+    }
+
+    #[test]
+    fn rolling_back_a_staged_rename_brings_the_old_name_back() {
+        let repo = Repo::new();
+        repo.write("old.txt", "hello\n");
+        repo.commit_all("first");
+        repo.git(&["mv", "old.txt", "new.txt"]);
+        let status = block(status(repo.path(), true)).unwrap();
+        let change = status.staged[0].clone();
+        assert_eq!(change.kind, Kind::Renamed);
+        block(rollback(repo.path(), &change, true)).unwrap();
+        assert!(repo.path().join("old.txt").exists());
+        assert!(!repo.path().join("new.txt").exists());
+        assert!(repo.git(&["status", "--porcelain"]).trim().is_empty());
+    }
+
+    #[test]
+    fn a_skipped_commit_of_a_rebase_goes_on_to_the_end() {
+        let repo = Repo::new();
+        repo.write("a.txt", "one\n");
+        repo.commit_all("first");
+        repo.git(&["checkout", "-q", "-b", "side"]);
+        repo.write("a.txt", "side\n");
+        repo.commit_all("side");
+        repo.git(&["checkout", "-q", "main"]);
+        repo.write("a.txt", "main\n");
+        repo.commit_all("main");
+        repo.git(&["checkout", "-q", "side"]);
+        assert_eq!(
+            block(rebase_onto(repo.path(), "main")).unwrap_err(),
+            CONFLICT
+        );
+        block(skip_operation(repo.path(), Operation::Rebase)).unwrap();
+        assert!(block(operation(repo.path())).is_none());
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+            "main\n"
+        );
+    }
+
+    #[test]
+    fn a_revision_is_checked_before_it_reaches_git_as_an_option() {
+        let repo = Repo::new();
+        repo.write("a.txt", "one\n");
+        repo.commit_all("first");
+        repo.git(&["tag", "v1"]);
+        assert!(block(verify_rev(repo.path(), "v1")).is_ok());
+        assert!(block(verify_rev(repo.path(), "HEAD")).is_ok());
+        assert!(block(verify_rev(repo.path(), "nope")).is_err());
+        assert!(block(verify_rev(repo.path(), "--output=/tmp/x")).is_err());
+    }
+
+    #[test]
+    fn a_file_named_with_a_b_folder_has_its_own_diff() {
+        let repo = Repo::new();
+        repo.write("dir b/x.txt", "one\n");
+        repo.commit_all("first");
+        repo.write("dir b/x.txt", "two\n");
+        let diff = block(diff_of(repo.path(), &Source::Unstaged, "dir b/x.txt")).unwrap();
+        assert_eq!(diff.path, "dir b/x.txt");
+        assert_eq!(diff.blocks().len(), 1);
+    }
+
+    #[test]
+    fn a_removed_line_of_dashes_is_a_block_to_roll_back() {
+        let repo = Repo::new();
+        repo.write("q.sql", "SELECT 1;\n-- a comment\nSELECT 2;\n");
+        repo.commit_all("first");
+        repo.write("q.sql", "SELECT 1;\nSELECT 2;\n");
+        let diff = block(diff_of(repo.path(), &Source::Unstaged, "q.sql")).unwrap();
+        assert_eq!(diff.blocks().len(), 1);
+        block(rollback_block(repo.path(), "q.sql", &diff, 0)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("q.sql")).unwrap(),
+            "SELECT 1;\n-- a comment\nSELECT 2;\n"
+        );
     }
 }

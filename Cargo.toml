@@ -29,7 +29,7 @@ rust-i18n = "3"
 once_cell = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tokio = { version = "1", features = ["rt", "process", "io-util", "time", "sync"] }
+tokio = { version = "1", features = ["rt", "process", "io-util", "time", "sync", "fs", "macros"] }
 sha2 = "0.10"
 ed25519-dalek = { version = "2", default-features = false }
 tempfile = "3"
@@ -37,6 +37,7 @@ portable-pty = "0.9.0"
 vt100 = "0.18.1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 similar = "3.2.1"
+unicode-width = "0.2"
 
 
 # Text shaping and syntax highlighting are very slow unoptimized: jumping

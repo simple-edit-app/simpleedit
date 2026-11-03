@@ -239,7 +239,11 @@ impl EditorState {
             editor = editor.page_guide(config.page_guide_column, p.border);
         }
         if let Some(changes) = changes {
-            editor = editor.changes(changes);
+            editor = editor.changes(changes).revertible(
+                Message::ChangeBar,
+                || Message::RevertChange,
+                || Message::CloseRevert,
+            );
         }
         if let Some(blame) = blame {
             editor = editor.annotations(blame, Message::BlameLineClicked);

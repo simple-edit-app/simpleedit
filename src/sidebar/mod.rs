@@ -104,6 +104,7 @@ impl SidebarState {
         let lbl_close_all = t!("menu.file_close_all").to_string();
         let lbl_save = t!("sidebar.save").to_string();
         let lbl_save_as = t!("sidebar.save_as").to_string();
+        let lbl_git = t!("sidebar.git").to_string();
         let lbl_bookmark_add = t!("sidebar.bookmark_add").to_string();
         let lbl_bookmark_remove = t!("sidebar.bookmark_remove").to_string();
         let p = theme::palette(dark);
@@ -191,8 +192,9 @@ impl SidebarState {
                     lbl_bookmark_add.clone()
                 };
                 let bookmark_path = path.clone();
+                let lbl_git = lbl_git.clone();
 
-                iced_aw::ContextMenu::new(row_button, move || {
+                crate::pointer_area::context_menu(row_button, move || {
                     let ctx_item =
                         |label: String, msg: Option<Message>| -> Element<'static, Message> {
                             let mut btn = button(text(label).size(13))
@@ -235,6 +237,11 @@ impl SidebarState {
                                     .then_some(Message::Sidebar(SidebarMessage::RequestSaveAs)),
                             ),
                             ctx_item(
+                                lbl_git.clone(),
+                                crate::app::git_menu_applies(&bookmark_path)
+                                    .then(|| Message::GitFileMenu(bookmark_path.clone())),
+                            ),
+                            ctx_item(
                                 lbl_bookmark.clone(),
                                 (!crate::app::is_untitled(&bookmark_path))
                                     .then(|| Message::ToggleFileBookmark(bookmark_path.clone())),
@@ -246,7 +253,6 @@ impl SidebarState {
                     .style(theme::card(dark))
                     .into()
                 })
-                .into()
             })
             .collect();
 

@@ -90,7 +90,18 @@ pub struct ChangePaint {
     pub added_color: Color,
     pub modified_color: Color,
     pub deleted_color: Color,
+    /// The line whose change shows the button that puts it back.
+    pub revert: Option<usize>,
+    pub popup_background: Color,
+    pub popup_border: Color,
+    pub popup_text: Color,
 }
+
+/// Size of the button that puts a change back.
+const REVERT_W: f32 = 30.0;
+const REVERT_H: f32 = 26.0;
+
+type RevertHandlers<'a, Message> = (Box<dyn Fn() -> Message + 'a>, Box<dyn Fn() -> Message + 'a>);
 
 /// Width of the blame column.
 pub const ANNOTATION_WIDTH: f32 = 210.0;
@@ -300,6 +311,11 @@ where
     on_annotation: Option<Box<dyn Fn(usize) -> Message + 'a>>,
     folding: Option<FoldPaint>,
     on_fold: Option<Box<dyn Fn(usize, Scope) -> Message + 'a>>,
+    /// A click on the bar of a changed line.
+    on_change_bar: Option<Box<dyn Fn(usize) -> Message + 'a>>,
+    /// What the button that puts a change back says, and what a click
+    /// elsewhere says (to close it).
+    on_revert: Option<RevertHandlers<'a, Message>>,
     on_definition: Option<Box<dyn Fn() -> Message + 'a>>,
     style: Style,
     on_edit: Option<Box<dyn Fn(Action) -> Message + 'a>>,
@@ -328,6 +344,8 @@ impl<'a, Message, Theme> CodeEditor<'a, highlighter::PlainText, Message, Theme> 
             on_annotation: None,
             folding: None,
             on_fold: None,
+            on_change_bar: None,
+            on_revert: None,
             on_definition: None,
             style: Style {
                 background: Background::Color(Color::TRANSPARENT),
@@ -440,6 +458,19 @@ where
         self
     }
 
+    /// Clicking the bar of a changed line, and the button that then puts the
+    /// change back (`close` is what a click anywhere else says).
+    pub fn revertible(
+        mut self,
+        on_bar: impl Fn(usize) -> Message + 'a,
+        revert: impl Fn() -> Message + 'a,
+        close: impl Fn() -> Message + 'a,
+    ) -> Self {
+        self.on_change_bar = Some(Box::new(on_bar));
+        self.on_revert = Some((Box::new(revert), Box::new(close)));
+        self
+    }
+
     /// Lets blocks fold (see [`FoldPaint`]); `on_fold` hears about a click on
     /// a chevron, with how far it reaches.
     pub fn folding(
@@ -476,6 +507,8 @@ where
             on_annotation: self.on_annotation,
             folding: self.folding,
             on_fold: self.on_fold,
+            on_change_bar: self.on_change_bar,
+            on_revert: self.on_revert,
             on_definition: self.on_definition,
             style: self.style,
             on_edit: self.on_edit,
@@ -715,6 +748,64 @@ where
     /// The foldable line whose chevron is under `at` (relative to the
     /// widget).
     /// The line drawn at height `y` (from the widget's top).
+    /// Where the bar of the changed lines is, from the editor's left edge.
+    fn change_bar_x(&self, size: f32, lines: usize) -> f32 {
+        let extra = if self.annotations.is_some() {
+            ANNOTATION_WIDTH
+        } else {
+            0.0
+        };
+        self.padding.left + gutter_width(size, lines) + extra + 1.0
+    }
+
+    /// The button that puts a change back, under its line (from the top
+    /// left of the editor).
+    fn revert_rect(&self, padding: Padding, renderer: &iced::Renderer) -> Option<Rectangle> {
+        let internal = self.content.0.borrow();
+        self.revert_rect_in(&internal.editor, padding, self.size_px(renderer))
+    }
+
+    /// The same, when the editor is already borrowed (drawing).
+    fn revert_rect_in(&self, editor: &Editor, padding: Padding, size: f32) -> Option<Rectangle> {
+        let line = self.changes.as_ref()?.revert?;
+        let row = self.line_height.to_absolute(Pixels(size)).0;
+        let top = editor
+            .buffer()
+            .layout_runs()
+            .find(|run| run.line_i == line && run.line_height > 0.0)?
+            .line_top;
+        Some(Rectangle {
+            x: padding.left,
+            y: padding.top + top + row + 2.0,
+            width: REVERT_W,
+            height: REVERT_H,
+        })
+    }
+
+    /// The line of the buffer shown at height `y`, on any of the rows a
+    /// wrapped line takes.
+    fn line_at_any_row(
+        &self,
+        y: f32,
+        padding: Padding,
+        renderer: &iced::Renderer,
+    ) -> Option<usize> {
+        let internal = self.content.0.borrow();
+        let row = self
+            .line_height
+            .to_absolute(Pixels(self.size_px(renderer)))
+            .0;
+        internal
+            .editor
+            .buffer()
+            .layout_runs()
+            .find(|run| {
+                let top = padding.top + run.line_top;
+                run.line_height > 0.0 && y >= top && y < top + row
+            })
+            .map(|run| run.line_i)
+    }
+
     fn line_at_y(&self, y: f32, padding: Padding, renderer: &iced::Renderer) -> Option<usize> {
         let internal = self.content.0.borrow();
         let size = self.size_px(renderer);
@@ -1133,6 +1224,11 @@ impl Content {
         };
     }
 
+    /// Which buffer this is (a new one when the text is replaced as a whole).
+    pub fn id(&self) -> u64 {
+        self.0.borrow().id
+    }
+
     /// Bumped by every edit.
     pub fn revision(&self) -> u64 {
         self.0.borrow().revision
@@ -1327,6 +1423,43 @@ where
             }
         }
 
+        if let (Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), Some(changes)) =
+            (event, &self.changes)
+        {
+            if let (Some(at), Some(on_bar), Some((revert, close))) = (
+                cursor.position_in(layout.bounds()),
+                &self.on_change_bar,
+                &self.on_revert,
+            ) {
+                let bar = self.change_bar_x(self.size_px(renderer), self.content.line_count());
+                // The bar's own 3 px and the pixel around it: the chevron ends just
+                // before it and the text starts after the gap.
+                let on_bar_column = at.x >= bar - 0.5 && at.x < bar + 4.5;
+                let line = self.line_at_any_row(at.y, padding, renderer).filter(|l| {
+                    changes.added.binary_search(l).is_ok()
+                        || changes.modified.binary_search(l).is_ok()
+                        || changes.deleted.binary_search(l).is_ok()
+                });
+                if let (true, Some(line)) = (on_bar_column, line) {
+                    shell.publish(on_bar(line));
+                    shell.capture_event();
+                    return;
+                }
+                if changes.revert.is_some() {
+                    if self
+                        .revert_rect(padding, renderer)
+                        .is_some_and(|r| r.contains(at))
+                    {
+                        shell.publish(revert());
+                        shell.capture_event();
+                        return;
+                    }
+                    // Anywhere else closes it, and the click goes on.
+                    shell.publish(close());
+                }
+            }
+        }
+
         if let (Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), Some(on_fold)) =
             (event, &self.on_fold)
         {
@@ -1393,20 +1526,6 @@ where
                 shell.capture_event();
                 return;
             }
-        }
-
-        // A right click puts the cursor on the line it hit, so the context
-        // menu (bookmark, ...) acts on that line; a selection is left alone
-        // so that Copy and Cut still have it.
-        if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) = event {
-            if self.content.selection().is_none() {
-                if let Some(position) = cursor.position_in(layout.bounds()) {
-                    shell.publish(on_edit(Action::Click(
-                        position - Vector::new(padding.left, padding.top),
-                    )));
-                }
-            }
-            return;
         }
 
         let Some(update) = Update::from_event(event, state, layout.bounds(), padding, cursor)
@@ -2033,6 +2152,47 @@ where
                     }
                 });
             }
+        }
+
+        if let (Some(changes), Some(rect)) = (
+            &self.changes,
+            self.revert_rect_in(&internal.editor, padding, size),
+        ) {
+            let rect = Rectangle {
+                x: bounds.x + rect.x,
+                y: bounds.y + rect.y,
+                ..rect
+            };
+            renderer.with_layer(bounds, |renderer| {
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds: rect,
+                        border: iced::Border {
+                            color: changes.popup_border,
+                            width: 1.0,
+                            radius: 6.0.into(),
+                        },
+                        ..renderer::Quad::default()
+                    },
+                    changes.popup_background,
+                );
+                renderer.fill_text(
+                    text::Text {
+                        content: "↶".to_string(),
+                        bounds: rect.size(),
+                        size: Pixels(size * 1.3),
+                        line_height: LineHeight::Absolute(Pixels(rect.height)),
+                        font: self.font.unwrap_or(Font::MONOSPACE),
+                        align_x: text::Alignment::Center,
+                        align_y: alignment::Vertical::Center,
+                        shaping: text::Shaping::Advanced,
+                        wrapping: text::Wrapping::None,
+                    },
+                    rect.center(),
+                    changes.popup_text,
+                    rect,
+                );
+            });
         }
 
         if let Some(minimap) = self.minimap {

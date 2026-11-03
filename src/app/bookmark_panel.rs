@@ -206,7 +206,7 @@ impl SimpleEditApp {
         // A row, with the menu that deletes it.
         let with_menu = move |row_button: Element<'static, Message>, target: Target| {
             let label = delete_label.clone();
-            iced_aw::ContextMenu::new(row_button, move || {
+            crate::pointer_area::context_menu(row_button, move || {
                 container(
                     button(text(label.clone()).size(13))
                         .padding([7, 10])

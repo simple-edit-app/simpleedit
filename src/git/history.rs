@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use super::graph::Commit;
-use super::{run, run_with, Change, Kind};
+use super::{run, run_network, run_with, Change, Kind};
 
 // ─── The log ────────────────────────────────────────────────────────────────
 
@@ -13,22 +13,37 @@ const FIELD: char = '\x1f';
 const RECORD: char = '\x1e';
 
 /// The commits reachable from `rev` (a branch, a tag, `HEAD`), newest first,
-/// children before parents.
-pub async fn log(repo: &Path, rev: &str, limit: usize) -> Result<Vec<Commit>, String> {
+/// children before parents; with a `path`, only those that touched that file
+/// (through renames).
+pub async fn log(
+    repo: &Path,
+    rev: &str,
+    limit: usize,
+    path: Option<&str>,
+) -> Result<Vec<Commit>, String> {
     let max = format!("--max-count={limit}");
-    let out = run(
-        repo,
-        &[
-            "log",
-            "--topo-order",
-            &max,
-            "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%s%x1f%D%x1e",
-            rev,
-            "--",
-        ],
-    )
-    .await?;
-    Ok(parse_log(&out))
+    let mut args = vec![
+        "log",
+        "--topo-order",
+        &max,
+        "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%s%x1f%D%x1e",
+    ];
+    if path.is_some() {
+        args.push("--follow");
+    }
+    args.extend([rev, "--"]);
+    args.extend(path);
+    let out = run(repo, &args).await?;
+    let mut commits = parse_log(&out);
+    if path.is_some() {
+        // `%P` names the real parents, which the filtered list mostly lacks:
+        // each commit is drawn on top of the next one listed.
+        let shas: Vec<String> = commits.iter().map(|c| c.sha.clone()).collect();
+        for (i, commit) in commits.iter_mut().enumerate() {
+            commit.parents = shas.get(i + 1).cloned().into_iter().collect();
+        }
+    }
+    Ok(commits)
 }
 
 pub fn parse_log(out: &str) -> Vec<Commit> {
@@ -263,6 +278,66 @@ pub async fn checkout(repo: &Path, branch: &Branch) -> Result<(), String> {
     }
 }
 
+/// Creates a branch (from `start`, or where HEAD is) and switches to it;
+/// what is not committed comes along.
+pub async fn create_branch(repo: &Path, name: &str, start: Option<&str>) -> Result<(), String> {
+    let mut args = vec!["checkout", "-b", name];
+    args.extend(start);
+    run(repo, &args).await.map(|_| ())
+}
+
+/// Deletes a local branch, merged or not.
+pub async fn delete_branch(repo: &Path, name: &str) -> Result<(), String> {
+    run(repo, &["branch", "-D", name]).await.map(|_| ())
+}
+
+/// Deletes a branch on its remote (`origin/topic`).
+pub async fn delete_remote_branch(repo: &Path, name: &str) -> Result<(), String> {
+    let (remote, branch) = name
+        .split_once('/')
+        .ok_or_else(|| t!("git.err_not_remote", name = name).to_string())?;
+    run_network(repo, &["push", remote, "--delete", branch])
+        .await
+        .map(|_| ())
+}
+
+pub async fn delete_tag(repo: &Path, name: &str) -> Result<(), String> {
+    run(repo, &["tag", "-d", name]).await.map(|_| ())
+}
+
+/// Pushes a local branch to its upstream (`origin/topic`: the branch `topic`
+/// of `origin`, whatever the local one is called); with none, to a branch of
+/// the same name on `origin`, which becomes its upstream. `force`:
+/// `--force-with-lease`.
+pub async fn push_branch(
+    repo: &Path,
+    name: &str,
+    upstream: Option<&str>,
+    force: bool,
+) -> Result<(), String> {
+    let mut args = vec!["push"];
+    if force {
+        args.push("--force-with-lease");
+    }
+    let target;
+    match upstream.and_then(|u| u.split_once('/')) {
+        Some((remote, branch)) => {
+            target = format!("{name}:refs/heads/{branch}");
+            args.extend([remote, target.as_str()]);
+        }
+        None => args.extend(["--set-upstream", "origin", name]),
+    }
+    run_network(repo, &args).await.map(|_| ())
+}
+
+/// Switches to a tag or a commit (the head is then detached).
+pub async fn checkout_ref(repo: &Path, name: &str) -> Result<(), String> {
+    let name = name.to_string();
+    run(repo, &["checkout", "--end-of-options", &name])
+        .await
+        .map(|_| ())
+}
+
 /// The files that differ between a ref and the working tree.
 pub async fn tree_diff_files(repo: &Path, reference: &str) -> Result<Vec<Change>, String> {
     let out = run(repo, &["diff", "--name-status", "-z", "-M", reference]).await?;
@@ -404,7 +479,8 @@ pub fn parse_blame(out: &str) -> Vec<BlameLine> {
             continue;
         }
         let first = raw.split(' ').next().unwrap_or("");
-        let is_header = first.len() == 40 && first.chars().all(|c| c.is_ascii_hexdigit());
+        let is_header =
+            matches!(first.len(), 40 | 64) && first.chars().all(|c| c.is_ascii_hexdigit());
         if is_header && current.is_none() {
             current = Some(first.to_string());
             known.entry(first.to_string()).or_insert_with(|| BlameLine {
@@ -438,25 +514,39 @@ pub async fn is_linear(repo: &Path, base: &str) -> Result<bool, String> {
 }
 
 /// Rebases the commits after `base` (`None`: from the root) following a todo
-/// list, one instruction per line, oldest first.
-async fn rebase_with(repo: &Path, base: Option<&str>, todo: &str) -> Result<(), String> {
+/// list, one instruction per line, oldest first. What is not committed is put
+/// aside and brought back. `message`: a file the todo's `exec` lines may read
+/// (`$SE_MESSAGE`).
+async fn rebase_with(
+    repo: &Path,
+    base: Option<&str>,
+    todo: &str,
+    message: Option<&Path>,
+) -> Result<(), String> {
     let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
     let todo_path = dir.path().join("todo");
-    std::fs::write(&todo_path, todo).map_err(|e| e.to_string())?;
-    let editor = format!("cp '{}'", todo_path.display());
-    let mut args = vec!["rebase", "-i", "--no-autosquash"];
+    tokio::fs::write(&todo_path, todo)
+        .await
+        .map_err(|e| e.to_string())?;
+    // The sequence editor copies the todo over the one git made; paths go
+    // through the environment, so nothing needs quoting.
+    let editor = "sh -c 'cp \"$SE_TODO\" \"$1\"' sh";
+    let todo_env = todo_path.to_string_lossy().into_owned();
+    let message_env = message.map(|m| m.to_string_lossy().into_owned());
+    let mut args = vec!["rebase", "-i", "--autostash", "--no-autosquash"];
     match base {
         Some(base) => args.push(base),
         None => args.push("--root"),
     }
-    let result = run_with(
-        repo,
-        &args,
-        None,
-        &[("GIT_SEQUENCE_EDITOR", &editor), ("GIT_EDITOR", "true")],
-    )
-    .await;
-    match result {
+    let mut env: Vec<(&str, &str)> = vec![
+        ("GIT_SEQUENCE_EDITOR", editor),
+        ("GIT_EDITOR", "true"),
+        ("SE_TODO", &todo_env),
+    ];
+    if let Some(m) = &message_env {
+        env.push(("SE_MESSAGE", m));
+    }
+    match run_with(repo, &args, None, &env).await {
         Ok(_) => Ok(()),
         // Conflicts stay to be settled; any other failure leaves things as
         // they were.
@@ -488,7 +578,13 @@ pub async fn drop_commits(repo: &Path, shas: &[String]) -> Result<(), String> {
         .filter(|c| !shas.contains(c))
         .map(|c| format!("pick {c}\n"))
         .collect();
-    rebase_with(repo, base.as_deref(), &todo).await
+    // Dropping every commit leaves nothing to pick, which git refuses.
+    let todo = if todo.is_empty() {
+        "noop\n".to_string()
+    } else {
+        todo
+    };
+    rebase_with(repo, base.as_deref(), &todo, None).await
 }
 
 /// Joins consecutive commits into one with `message`.
@@ -499,7 +595,9 @@ pub async fn squash_commits(repo: &Path, shas: &[String], message: &str) -> Resu
     let all = commits_after(repo, base.as_deref()).await?;
     let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
     let message_path = dir.path().join("message");
-    std::fs::write(&message_path, message).map_err(|e| e.to_string())?;
+    tokio::fs::write(&message_path, message)
+        .await
+        .map_err(|e| e.to_string())?;
     let mut todo = String::new();
     let mut first_selected = true;
     let mut last_selected = None;
@@ -517,13 +615,10 @@ pub async fn squash_commits(repo: &Path, shas: &[String], message: &str) -> Resu
         if last_selected == Some(i)
             && shas.iter().filter(|s| all[..=i].contains(s)).count() == shas.len()
         {
-            todo.push_str(&format!(
-                "exec git commit --amend -q -F '{}'\n",
-                message_path.display()
-            ));
+            todo.push_str("exec git commit --amend -q -F \"$SE_MESSAGE\"\n");
         }
     }
-    rebase_with(repo, base.as_deref(), &todo).await
+    rebase_with(repo, base.as_deref(), &todo, Some(&message_path)).await
 }
 
 /// Changes the message of a commit.
@@ -532,7 +627,7 @@ pub async fn reword(repo: &Path, sha: &str, message: &str) -> Result<(), String>
     if head.trim() == sha {
         return run_with(
             repo,
-            &["commit", "--amend", "-q", "-F", "-"],
+            &["commit", "--amend", "--only", "-q", "-F", "-"],
             Some(message),
             &[],
         )
@@ -544,18 +639,17 @@ pub async fn reword(repo: &Path, sha: &str, message: &str) -> Result<(), String>
     let all = commits_after(repo, base.as_deref()).await?;
     let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
     let message_path = dir.path().join("message");
-    std::fs::write(&message_path, message).map_err(|e| e.to_string())?;
+    tokio::fs::write(&message_path, message)
+        .await
+        .map_err(|e| e.to_string())?;
     let mut todo = String::new();
     for c in &all {
         todo.push_str(&format!("pick {c}\n"));
         if c == sha {
-            todo.push_str(&format!(
-                "exec git commit --amend -q -F '{}'\n",
-                message_path.display()
-            ));
+            todo.push_str("exec git commit --amend -q -F \"$SE_MESSAGE\"\n");
         }
     }
-    rebase_with(repo, base.as_deref(), &todo).await
+    rebase_with(repo, base.as_deref(), &todo, Some(&message_path)).await
 }
 
 async fn ensure_linear(repo: &Path, base: Option<&str>) -> Result<(), String> {
@@ -571,16 +665,33 @@ async fn ensure_linear(repo: &Path, base: Option<&str>) -> Result<(), String> {
     if linear {
         Ok(())
     } else {
-        Err("the history holds merge commits here".to_string())
+        Err(t!("git.err_merge_commits").to_string())
     }
 }
 
-/// The oldest of some commits of the current branch.
+/// Whether `ancestor` is `of` or one of its ancestors.
+async fn is_ancestor(repo: &Path, ancestor: &str, of: &str) -> bool {
+    run(repo, &["merge-base", "--is-ancestor", ancestor, of])
+        .await
+        .is_ok()
+}
+
+/// The oldest of some commits of the current branch (they lie on one line of
+/// history, so one of them is an ancestor of all the others).
 async fn oldest_of(repo: &Path, shas: &[String]) -> Result<String, String> {
-    let all = commits_after(repo, None).await?;
-    all.into_iter()
-        .find(|c| shas.contains(c))
-        .ok_or_else(|| "those commits are not in the current branch".to_string())
+    let mut oldest: Option<&String> = None;
+    for sha in shas {
+        if !is_ancestor(repo, sha, "HEAD").await {
+            return Err(t!("git.err_not_in_branch").to_string());
+        }
+        oldest = match oldest {
+            Some(best) if !is_ancestor(repo, sha, best).await => Some(best),
+            _ => Some(sha),
+        };
+    }
+    oldest
+        .cloned()
+        .ok_or_else(|| t!("git.err_not_in_branch").to_string())
 }
 
 /// Adds commits that undo `shas` (newest first).
@@ -635,7 +746,7 @@ mod tests {
     fn the_log_lists_commits_with_parents_and_refs() {
         let repo = four_commits();
         repo.git(&["tag", "v1"]);
-        let commits = block(log(repo.path(), "HEAD", 10)).unwrap();
+        let commits = block(log(repo.path(), "HEAD", 10, None)).unwrap();
         assert_eq!(commits.len(), 4);
         assert_eq!(commits[0].subject, "four");
         assert_eq!(commits[0].parents, vec![commits[1].sha.clone()]);
@@ -643,14 +754,24 @@ mod tests {
         assert!(commits[0].refs.iter().any(|r| r.contains("main")));
         assert!(commits[0].refs.iter().any(|r| r == "tag: v1"));
         assert_eq!(commits[0].author, "Test");
-        let limited = block(log(repo.path(), "HEAD", 2)).unwrap();
+        let limited = block(log(repo.path(), "HEAD", 2, None)).unwrap();
         assert_eq!(limited.len(), 2);
+    }
+
+    #[test]
+    fn the_log_of_a_file_lists_only_the_commits_that_touched_it() {
+        let repo = four_commits();
+        repo.write("one.txt", "changed\n");
+        repo.commit_all("five");
+        let commits = block(log(repo.path(), "HEAD", 10, Some("one.txt"))).unwrap();
+        let subjects: Vec<&str> = commits.iter().map(|c| c.subject.as_str()).collect();
+        assert_eq!(subjects, vec!["five", "one"]);
     }
 
     #[test]
     fn a_commit_lists_its_files() {
         let repo = four_commits();
-        let commits = block(log(repo.path(), "HEAD", 10)).unwrap();
+        let commits = block(log(repo.path(), "HEAD", 10, None)).unwrap();
         let files = block(commit_files(repo.path(), &commits[0])).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "four.txt");
@@ -825,7 +946,7 @@ mod tests {
         // Reverting "second" conflicts with "third".
         let error = block(revert(repo.path(), &[all[1].clone()])).unwrap_err();
         assert_eq!(error, CONFLICT);
-        let now = block(status(repo.path())).unwrap();
+        let now = block(status(repo.path(), true)).unwrap();
         assert_eq!(now.operation, Some(Operation::Revert));
         assert_eq!(now.conflicts().count(), 1);
         block(abort_operation(repo.path(), Operation::Revert)).unwrap();
@@ -878,5 +999,272 @@ mod tests {
         assert_eq!(changes[1].kind, Kind::Renamed);
         assert_eq!(changes[1].from.as_deref(), Some("old.txt"));
         assert_eq!(changes[2].kind, Kind::Deleted);
+    }
+
+    fn with_remote(repo: &Repo) -> tempfile::TempDir {
+        let remote = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .current_dir(remote.path())
+            .status()
+            .unwrap();
+        repo.git(&["remote", "add", "origin", remote.path().to_str().unwrap()]);
+        remote
+    }
+
+    #[test]
+    fn a_new_branch_starts_at_head_or_at_a_ref_and_takes_the_changes_along() {
+        let repo = Repo::new();
+        repo.write("a.txt", "one\n");
+        repo.commit_all("first");
+        repo.git(&["tag", "v1"]);
+        repo.write("a.txt", "one\ntwo\n");
+        repo.commit_all("second");
+        repo.write("a.txt", "one\ntwo\nthree\n");
+        block(create_branch(repo.path(), "feature", None)).unwrap();
+        assert_eq!(repo.git(&["branch", "--show-current"]).trim(), "feature");
+        assert_eq!(repo.git(&["status", "--porcelain"]).lines().count(), 1);
+        repo.git(&["stash", "-q"]);
+        block(create_branch(repo.path(), "old", Some("v1"))).unwrap();
+        assert_eq!(repo.git(&["log", "-1", "--format=%s"]).trim(), "first");
+        // A name git refuses, or one that exists, is an error.
+        assert!(block(create_branch(repo.path(), "bad name", None)).is_err());
+        assert!(block(create_branch(repo.path(), "feature", None)).is_err());
+    }
+
+    #[test]
+    fn merging_and_rebasing_a_branch_and_deleting_it() {
+        let repo = Repo::new();
+        repo.write("a.txt", "one\n");
+        repo.commit_all("first");
+        repo.git(&["checkout", "-q", "-b", "side"]);
+        repo.write("b.txt", "side\n");
+        repo.commit_all("on side");
+        repo.git(&["checkout", "-q", "main"]);
+        repo.write("c.txt", "main\n");
+        repo.commit_all("on main");
+        block(super::super::merge_branch(repo.path(), "side")).unwrap();
+        assert!(repo.path().join("b.txt").exists());
+        block(delete_branch(repo.path(), "side")).unwrap();
+        assert!(!repo.git(&["branch"]).contains("side"));
+        // Rebase: another branch replayed on main.
+        repo.git(&["checkout", "-q", "-b", "topic", "HEAD~1"]);
+        repo.write("d.txt", "topic\n");
+        repo.commit_all("on topic");
+        block(super::super::rebase_onto(repo.path(), "main")).unwrap();
+        assert!(repo.path().join("c.txt").exists());
+        assert!(repo.path().join("d.txt").exists());
+    }
+
+    #[test]
+    fn a_conflicting_merge_is_left_to_settle() {
+        let repo = Repo::new();
+        repo.write("a.txt", "one\n");
+        repo.commit_all("first");
+        repo.git(&["checkout", "-q", "-b", "side"]);
+        repo.write("a.txt", "side\n");
+        repo.commit_all("side");
+        repo.git(&["checkout", "-q", "main"]);
+        repo.write("a.txt", "main\n");
+        repo.commit_all("main");
+        assert_eq!(
+            block(super::super::merge_branch(repo.path(), "side")).unwrap_err(),
+            crate::git::CONFLICT
+        );
+        assert!(block(crate::git::has_conflicts(repo.path())));
+    }
+
+    #[test]
+    fn a_branch_is_pushed_forced_and_deleted_on_the_remote() {
+        let repo = Repo::new();
+        let remote = with_remote(&repo);
+        repo.write("a.txt", "one\n");
+        repo.commit_all("first");
+        // No upstream yet: it becomes one.
+        block(push_branch(repo.path(), "main", None, false)).unwrap();
+        repo.git(&["checkout", "-q", "-b", "topic"]);
+        block(push_branch(repo.path(), "topic", None, false)).unwrap();
+        repo.git(&["commit", "-q", "--amend", "-m", "reworded"]);
+        assert!(block(push_branch(
+            repo.path(),
+            "topic",
+            Some("origin/topic"),
+            false
+        ))
+        .is_err());
+        block(push_branch(
+            repo.path(),
+            "topic",
+            Some("origin/topic"),
+            true,
+        ))
+        .unwrap();
+        let there = std::process::Command::new("git")
+            .args(["log", "-1", "--format=%s", "topic"])
+            .current_dir(remote.path())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&there.stdout).trim(), "reworded");
+        block(delete_remote_branch(repo.path(), "origin/topic")).unwrap();
+        let left = std::process::Command::new("git")
+            .args(["branch"])
+            .current_dir(remote.path())
+            .output()
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&left.stdout).contains("topic"));
+    }
+
+    #[test]
+    fn a_tag_is_deleted() {
+        let repo = Repo::new();
+        repo.write("a.txt", "one\n");
+        repo.commit_all("first");
+        repo.git(&["tag", "v1"]);
+        block(delete_tag(repo.path(), "v1")).unwrap();
+        assert!(repo.git(&["tag"]).trim().is_empty());
+    }
+
+    #[test]
+    fn the_last_commit_can_be_dropped() {
+        let repo = Repo::new();
+        repo.write("a.txt", "one\n");
+        repo.commit_all("first");
+        repo.write("a.txt", "one\ntwo\n");
+        repo.commit_all("second");
+        let all = shas(&repo);
+        block(drop_commits(repo.path(), &[all[0].clone()])).unwrap();
+        assert_eq!(history(&repo), vec!["first"]);
+    }
+
+    #[test]
+    fn rewording_the_last_commit_leaves_the_index_out_of_it() {
+        let repo = Repo::new();
+        repo.write("a.txt", "one\n");
+        repo.commit_all("first");
+        repo.write("b.txt", "staged\n");
+        repo.git(&["add", "b.txt"]);
+        let head = shas(&repo)[0].clone();
+        block(reword(repo.path(), &head, "better")).unwrap();
+        assert_eq!(history(&repo), vec!["better"]);
+        // Still staged, not in the commit.
+        assert!(
+            repo.git(&["show", "--name-only", "--format=", "HEAD"])
+                .trim()
+                == "a.txt"
+        );
+        assert!(repo.git(&["status", "--porcelain"]).contains("A  b.txt"));
+    }
+
+    #[test]
+    fn history_rewrites_work_with_uncommitted_changes_around() {
+        let repo = Repo::new();
+        repo.write("a.txt", "one\n");
+        repo.commit_all("first");
+        repo.write("a.txt", "one\ntwo\n");
+        repo.commit_all("second");
+        repo.write("a.txt", "one\ntwo\nthree\n");
+        repo.commit_all("third");
+        repo.write("a.txt", "one\ntwo\nthree\nwork in progress\n");
+        let all = shas(&repo);
+        block(reword(repo.path(), &all[1], "second, reworded")).unwrap();
+        assert_eq!(history(&repo), vec!["third", "second, reworded", "first"]);
+        assert!(std::fs::read_to_string(repo.path().join("a.txt"))
+            .unwrap()
+            .contains("work in progress"));
+    }
+
+    #[test]
+    fn a_squash_message_with_a_quote_in_the_temp_path_machinery_is_still_exact() {
+        let repo = Repo::new();
+        repo.write("a.txt", "one\n");
+        repo.commit_all("first");
+        repo.write("a.txt", "one\ntwo\n");
+        repo.commit_all("second");
+        repo.write("a.txt", "one\ntwo\nthree\n");
+        repo.commit_all("third");
+        let all = shas(&repo);
+        block(squash_commits(
+            repo.path(),
+            &[all[0].clone(), all[1].clone()],
+            "it's \"two in one\"",
+        ))
+        .unwrap();
+        assert_eq!(history(&repo), vec!["it's \"two in one\"", "first"]);
+    }
+
+    #[test]
+    fn a_files_history_is_drawn_as_one_line() {
+        let repo = Repo::new();
+        for i in 1..=4 {
+            repo.write("a.txt", &format!("{i}\n"));
+            repo.write("other.txt", &format!("{i}\n"));
+            repo.commit_all(&format!("c{i}"));
+            // A commit that doesn't touch a.txt, between the others.
+            repo.write("other.txt", &format!("{i}{i}\n"));
+            repo.commit_all(&format!("o{i}"));
+        }
+        let commits = block(log(repo.path(), "HEAD", 100, Some("a.txt"))).unwrap();
+        assert_eq!(commits.len(), 4);
+        let rows = super::super::graph::layout(&commits);
+        assert_eq!(super::super::graph::width(&rows), 1);
+        assert_eq!(commits[0].parents, vec![commits[1].sha.clone()]);
+        assert!(commits[3].parents.is_empty());
+    }
+
+    #[test]
+    fn a_branch_is_pushed_to_the_branch_its_upstream_names() {
+        let repo = Repo::new();
+        let remote = with_remote(&repo);
+        repo.write("a.txt", "one\n");
+        repo.commit_all("first");
+        block(push_branch(repo.path(), "main", None, false)).unwrap();
+        repo.git(&["checkout", "-q", "-b", "feat"]);
+        repo.git(&["push", "-q", "origin", "feat:refs/heads/feature-x"]);
+        repo.git(&["fetch", "-q", "origin"]);
+        repo.git(&["branch", "--set-upstream-to=origin/feature-x"]);
+        repo.write("b.txt", "more\n");
+        repo.commit_all("more");
+        block(push_branch(
+            repo.path(),
+            "feat",
+            Some("origin/feature-x"),
+            false,
+        ))
+        .unwrap();
+        let branches = std::process::Command::new("git")
+            .args(["branch"])
+            .current_dir(remote.path())
+            .output()
+            .unwrap();
+        let branches = String::from_utf8_lossy(&branches.stdout).into_owned();
+        assert!(branches.contains("feature-x"));
+        // Not a second branch under the local name.
+        assert!(!branches.split_whitespace().any(|b| b == "feat"));
+    }
+
+    #[test]
+    fn a_tag_can_be_checked_out() {
+        let repo = Repo::new();
+        repo.write("a.txt", "one\n");
+        repo.commit_all("first");
+        repo.git(&["tag", "v1"]);
+        repo.write("a.txt", "two\n");
+        repo.commit_all("second");
+        block(checkout_ref(repo.path(), "v1")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+            "one\n"
+        );
+        assert!(repo.git(&["branch", "--show-current"]).trim().is_empty());
+    }
+
+    #[test]
+    fn blame_lines_of_a_sha256_repository_are_read() {
+        let sha = "a".repeat(64);
+        let out =
+            format!("{sha} 1 1 1\nauthor Me\nauthor-time 100\nsummary hi\nfilename f\n\tline\n");
+        let lines = parse_blame(&out);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].author, "Me");
     }
 }

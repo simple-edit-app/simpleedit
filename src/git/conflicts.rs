@@ -139,8 +139,9 @@ impl Chunk {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Segment {
-    /// Lines both sides agree on.
-    Text(Vec<String>),
+    /// Lines both sides agree on (shared, so every step of the undo history
+    /// can keep the whole file without copying it).
+    Text(std::sync::Arc<Vec<String>>),
     Conflict(Chunk),
 }
 
@@ -300,7 +301,9 @@ pub fn parse(text: &str, swap: bool) -> Option<Merge> {
         match at {
             In::Common if line.starts_with("<<<<<<< ") || line == "<<<<<<<" => {
                 if !common.is_empty() {
-                    segments.push(Segment::Text(std::mem::take(&mut common)));
+                    segments.push(Segment::Text(std::sync::Arc::new(std::mem::take(
+                        &mut common,
+                    ))));
                 }
                 at = In::Ours;
             }
@@ -334,7 +337,7 @@ pub fn parse(text: &str, swap: bool) -> Option<Merge> {
         return None;
     }
     if !common.is_empty() {
-        segments.push(Segment::Text(common));
+        segments.push(Segment::Text(std::sync::Arc::new(common)));
     }
     let merge = Merge {
         segments,
@@ -343,6 +346,33 @@ pub fn parse(text: &str, swap: bool) -> Option<Merge> {
     };
     let has_conflict = merge.conflicts().next().is_some();
     has_conflict.then_some(merge)
+}
+
+/// Why no conflict could be offered for a file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unavailable {
+    /// The file holds no conflict markers any more: it was settled by hand.
+    Settled,
+    /// Neither text could be read as a conflicted file.
+    NotMergeable,
+}
+
+/// The conflicts to settle for a file: rebuilt from the three versions git
+/// keeps (so each knows its base), unless the file on disk has fewer of
+/// them, which means some were already settled by hand and that work must
+/// not be thrown away.
+pub fn choose(rebuilt: Option<&str>, disk: Option<&str>, swap: bool) -> Result<Merge, Unavailable> {
+    let from_rebuilt = rebuilt.and_then(|t| parse(t, swap));
+    let from_disk = disk.and_then(|t| parse(t, swap));
+    match (from_rebuilt, from_disk) {
+        (Some(r), Some(d)) if d.conflicts().count() < r.conflicts().count() => Ok(d),
+        (Some(r), _) if disk.is_none_or(|t| t.lines().any(|l| l.starts_with("<<<<<<<"))) => Ok(r),
+        // Markers gone: the file was settled by hand.
+        (Some(_), None) => Err(Unavailable::Settled),
+        (Some(r), Some(_)) => Ok(r),
+        (None, Some(d)) => Ok(d),
+        (None, None) => Err(Unavailable::NotMergeable),
+    }
 }
 
 #[cfg(test)]
@@ -481,5 +511,45 @@ end
     fn broken_or_absent_markers_are_not_a_conflict() {
         assert!(parse("just text\n", false).is_none());
         assert!(parse("a\n<<<<<<< HEAD\nx\n=======\ny\n", false).is_none());
+    }
+
+    const TWO: &str =
+        "a\n<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> t\nm\n<<<<<<< HEAD\np\n=======\nq\n>>>>>>> t\nz\n";
+    const ONE_LEFT: &str = "a\nsettled by hand\nm\n<<<<<<< HEAD\np\n=======\nq\n>>>>>>> t\nz\n";
+
+    #[test]
+    fn what_was_settled_by_hand_is_not_given_back_as_a_conflict() {
+        // Nothing settled yet: the rebuilt text (it knows the base).
+        assert_eq!(
+            choose(Some(TWO), Some(TWO), false)
+                .unwrap()
+                .conflicts()
+                .count(),
+            2
+        );
+        // One conflict settled in the editor: the file on disk wins.
+        assert_eq!(
+            choose(Some(TWO), Some(ONE_LEFT), false)
+                .unwrap()
+                .conflicts()
+                .count(),
+            1
+        );
+        // All of them: no markers, nothing to open.
+        assert_eq!(
+            choose(Some(TWO), Some("a\nall done\n"), false).unwrap_err(),
+            Unavailable::Settled
+        );
+        // No rebuilt text (a file deleted on one side): the disk's.
+        assert_eq!(
+            choose(None, Some(TWO), false).unwrap().conflicts().count(),
+            2
+        );
+        assert_eq!(
+            choose(None, None, false).unwrap_err(),
+            Unavailable::NotMergeable
+        );
+        // The disk can't be read: the rebuilt text.
+        assert!(choose(Some(TWO), None, false).is_ok());
     }
 }

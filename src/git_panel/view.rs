@@ -29,6 +29,19 @@ pub(super) fn kind_color(kind: Kind, dark: bool) -> Color {
     }
 }
 
+/// How many files a list shows (the rest are still staged and committed).
+const LIST_LIMIT: usize = 1000;
+
+fn more_files<'a>(n: usize, dark: bool) -> Element<'a, Message> {
+    container(
+        text(t!("git.too_many_files", n = n).to_string())
+            .size(12)
+            .color(se_theme::muted_text(dark)),
+    )
+    .padding([4, 10])
+    .into()
+}
+
 fn plain_button<'a>(
     label: String,
     msg: Option<Message>,
@@ -63,10 +76,29 @@ impl Panel {
                 dark,
             )
         };
+        let notice: Element<Message> = match (&self.notice, self.tab) {
+            (Some((message, is_error)), Tab::Stash | Tab::Log) => button(
+                text(message.as_str())
+                    .size(12)
+                    .color(if *is_error {
+                        se_theme::error_color(dark)
+                    } else {
+                        p.muted
+                    })
+                    .wrapping(iced::widget::text::Wrapping::None),
+            )
+            .padding([0, 8])
+            .on_press(Message::Git(GitMsg::DismissNotice))
+            .style(|_: &iced::Theme, _| iced::widget::button::Style::default())
+            .into(),
+            _ => Space::new().into(),
+        };
         let mut header = row![
             tab(t!("git.tab_commit").to_string(), Tab::Commit),
             tab(t!("git.tab_stash").to_string(), Tab::Stash),
             tab(t!("git.tab_log").to_string(), Tab::Log),
+            tab(t!("git.tab_branches").to_string(), Tab::Branches),
+            notice,
             Space::new().width(Length::Fill),
         ]
         .spacing(4)
@@ -98,6 +130,7 @@ impl Panel {
                 Tab::Commit => self.commit_tab(dark),
                 Tab::Stash => self.stash_tab(dark),
                 Tab::Log => self.log_tab(dark),
+                Tab::Branches => self.branches_tab(dark),
             },
         };
 
@@ -152,8 +185,12 @@ impl Panel {
             false,
             dark,
         ));
-        for (i, change) in status.staged.iter().enumerate() {
+        // A folder of thousands of untracked files would make a widget each.
+        for (i, change) in status.staged.iter().enumerate().take(LIST_LIMIT) {
             list = list.push(self.file_row(i, change, true, dark));
+        }
+        if staged > LIST_LIMIT {
+            list = list.push(more_files(staged - LIST_LIMIT, dark));
         }
         list = list.push(self.section(
             t!("git.changes", n = unstaged).to_string(),
@@ -162,8 +199,11 @@ impl Panel {
             true,
             dark,
         ));
-        for (i, change) in status.unstaged.iter().enumerate() {
+        for (i, change) in status.unstaged.iter().enumerate().take(LIST_LIMIT) {
             list = list.push(self.file_row(staged + i, change, false, dark));
+        }
+        if unstaged > LIST_LIMIT {
+            list = list.push(more_files(unstaged - LIST_LIMIT, dark));
         }
         if staged + unstaged == 0 {
             list = list.push(
@@ -176,8 +216,9 @@ impl Panel {
             );
         }
 
-        let can_commit =
-            !self.busy && (staged > 0 || self.amend) && !self.message.text().trim().is_empty();
+        let can_commit = !self.busy
+            && (staged > 0 || self.amend || self.only.is_some())
+            && !self.message.text().trim().is_empty();
         let notice: Element<Message> = match &self.notice {
             Some((text_value, is_error)) => button(
                 text(text_value.as_str())
@@ -212,6 +253,7 @@ impl Panel {
                 .height(Length::Fill),
             container(
                 column![
+                    self.only_banner(dark),
                     checkbox(self.amend)
                         .label(t!("git.amend").to_string())
                         .size(14)
@@ -251,6 +293,28 @@ impl Panel {
                 t!("git.select_file").to_string(),
             ),
         ]
+        .into()
+    }
+
+    /// "Commit of this file only", with the way back.
+    fn only_banner(&self, dark: bool) -> Element<'_, Message> {
+        let Some(path) = &self.only else {
+            return Space::new().into();
+        };
+        row![
+            text(t!("git.commit_only", file = path.as_str()).to_string())
+                .size(12)
+                .color(se_theme::accent_color(dark))
+                .width(Length::Fill)
+                .wrapping(iced::widget::text::Wrapping::None),
+            plain_button(
+                "×".to_string(),
+                Some(Message::Git(GitMsg::CancelOnly)),
+                false,
+                dark,
+            ),
+        ]
+        .align_y(Alignment::Center)
         .into()
     }
 
@@ -347,7 +411,7 @@ impl Panel {
         let jump_label = t!("git.jump_source").to_string();
         let diff_label = t!("git.diff_editor").to_string();
         let delete_label = t!("git.delete").to_string();
-        iced_aw::ContextMenu::new(target, move || {
+        crate::pointer_area::context_menu(target, move || {
             let item = |label: String, msg: Option<Message>| -> Element<'static, Message> {
                 let mut b = button(text(label).size(13))
                     .padding([7, 10])
@@ -395,7 +459,6 @@ impl Panel {
             .style(se_theme::card(dark))
             .into()
         })
-        .into()
     }
 }
 

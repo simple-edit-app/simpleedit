@@ -49,6 +49,8 @@ pub struct State {
     pub branch: Option<String>,
     /// What the commit list shows: a branch, a tag, `HEAD`.
     pub shown: Option<String>,
+    /// Only the commits that touched this file (the file's history).
+    pub file: Option<String>,
     pub commits: Vec<Commit>,
     pub rows: Vec<GraphRow>,
     pub lanes: usize,
@@ -67,6 +69,10 @@ pub struct State {
     pub dialog: Option<Dialog>,
     /// A commit to find and select once the log is there (from a blame).
     pub reveal: Option<Reveal>,
+    /// How far down the commit list is scrolled and how tall it shows: only
+    /// the rows around that are built.
+    pub view_top: std::cell::Cell<f32>,
+    pub view_height: std::cell::Cell<f32>,
 }
 
 /// A commit to bring up, and the file whose diff to open.
@@ -105,6 +111,15 @@ impl State {
         let chosen = self.selected_commits();
         if chosen.is_empty() {
             return Avail::default();
+        }
+        // A file's history skips commits: only what acts on single commits
+        // is offered there.
+        if self.file.is_some() {
+            return Avail {
+                revert: true,
+                cherry_pick: chosen.iter().all(|c| !self.head_set.contains(&c.sha)),
+                ..Avail::default()
+            };
         }
         let in_head = chosen.iter().all(|c| self.head_set.contains(&c.sha));
         let no_merge = chosen.iter().all(|c| c.parents.len() <= 1);
@@ -159,11 +174,14 @@ impl Panel {
         let rev = rev.to_string();
         let asked = rev.clone();
         let limit = self.log.limit;
+        let file = self.log.file.clone();
         Task::perform(
             async move {
-                let commits = history::log(&repo, &rev, limit).await?;
-                let head = history::head_commits(&repo, 5000).await.unwrap_or_default();
-                Ok::<_, String>((commits, head))
+                let (commits, head) = tokio::join!(
+                    history::log(&repo, &rev, limit, file.as_deref()),
+                    history::head_commits(&repo, 5000)
+                );
+                Ok::<_, String>((commits?, head.unwrap_or_default()))
             },
             move |result| Message::Git(GitMsg::LogLoaded(asked.clone(), result)),
         )
@@ -195,6 +213,8 @@ impl Panel {
                         Some(index) => {
                             self.log.selected = vec![index];
                             self.log.anchor = Some(index);
+                            // The rows there are built right away.
+                            self.log.view_top.set((index as f32 - 3.0).max(0.0) * 24.0);
                             return Task::batch([
                                 self.load_selection(),
                                 iced::widget::operation::scroll_to(

@@ -258,15 +258,36 @@ pub fn parse_diff(text: &str) -> Vec<FileDiff> {
             // before the first file is not part of a diff.
             continue;
         };
-        if let Some(path) = line.strip_prefix("--- ") {
+        // The headers come before the first hunk; after it, a line that
+        // reads `--- …` is a removed line whose text starts with `-- `.
+        let in_header = file.hunks.is_empty();
+        // (git adds a tab after a name that holds a space.)
+        if let (true, Some(path)) = (
+            in_header,
+            line.strip_prefix("--- ").map(|p| p.trim_end_matches('\t')),
+        ) {
             if let Some(old) = path.strip_prefix("a/") {
                 if old != file.path {
                     file.old_path = Some(old.to_string());
                 }
             }
-        } else if let Some(path) = line.strip_prefix("rename from ") {
+        } else if let (true, Some(path)) = (
+            in_header,
+            line.strip_prefix("+++ ").map(|p| p.trim_end_matches('\t')),
+        ) {
+            // The file's own name (the `diff --git` line is cut in the middle
+            // when a path holds " b/").
+            if let Some(new) = path.strip_prefix("b/") {
+                file.path = new.to_string();
+                if file.old_path.as_deref() == Some(new) {
+                    file.old_path = None;
+                }
+            }
+        } else if let (true, Some(path)) = (in_header, line.strip_prefix("rename from ")) {
             file.old_path = Some(path.to_string());
-        } else if line.starts_with("Binary files ") || line.starts_with("GIT binary patch") {
+        } else if in_header
+            && (line.starts_with("Binary files ") || line.starts_with("GIT binary patch"))
+        {
             file.binary = true;
         } else if let Some(rest) = line.strip_prefix("@@ ") {
             // @@ -old[,n] +new[,n] @@ section
@@ -433,5 +454,23 @@ Binary files a/b.bin and b/b.bin differ
         assert_eq!(lines[0].new_no, Some(1));
         assert_eq!(lines[1].new_no, Some(2));
         assert_eq!(lines[0].old_no, None);
+    }
+
+    #[test]
+    fn a_removed_line_that_starts_with_dashes_stays_a_line_of_the_diff() {
+        let text = "diff --git a/q.sql b/q.sql\nindex 1..2 100644\n--- a/q.sql\n+++ b/q.sql\n@@ -1,3 +1,2 @@\n SELECT 1;\n--- a comment\n SELECT 2;\n";
+        let file = parse_diff(text).remove(0);
+        assert_eq!(file.removed(), 1);
+        assert_eq!(file.hunks[0].lines[1].text, "-- a comment");
+        assert_eq!(file.blocks().len(), 1);
+        assert_eq!(file.path, "q.sql");
+    }
+
+    #[test]
+    fn the_path_comes_from_the_plus_line_even_when_it_holds_a_b_folder() {
+        let text = "diff --git a/dir b/x.txt b/dir b/x.txt\n--- a/dir b/x.txt\n+++ b/dir b/x.txt\n@@ -1 +1 @@\n-a\n+b\n";
+        let file = parse_diff(text).remove(0);
+        assert_eq!(file.path, "dir b/x.txt");
+        assert_eq!(file.old_path, None);
     }
 }

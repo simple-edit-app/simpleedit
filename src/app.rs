@@ -70,8 +70,18 @@ pub enum DiffNav {
     PrevFile,
     NextFile,
     ToggleSide,
+    /// The mouse on the rows of the diff.
+    Pick(crate::git_panel::DiffPointer),
+    /// The diff was scrolled: (offset, height shown).
+    Scrolled(i32, i32),
+    CopyPicked,
+    PickAll,
     /// Put the old version of a block of changes in the file.
     Apply(usize),
+    /// A commit's diff against the current file, and back.
+    ToggleCompare,
+    /// Opens the file of the diff in the editor.
+    OpenFile,
 }
 
 /// A conflicted file open in an editor tab (`merge://N/path`).
@@ -100,8 +110,10 @@ pub struct MarksState {
     /// What HEAD has of it (`None`: git doesn't know the file yet).
     pub base: Option<String>,
     pub marks: crate::git::marks::ChangeMarks,
-    /// The text revision the marks were computed for.
-    pub rev: u64,
+    /// The marks as the editor takes them, shared between frames.
+    pub paint: [std::sync::Arc<Vec<usize>>; 3],
+    /// The buffer (see [`SimpleEditApp::buffer_stamp`]) the marks were computed for.
+    pub rev: (u64, u64),
 }
 
 /// Which modal overlay (if any) is currently shown.
@@ -138,6 +150,10 @@ pub enum ActiveOverlay {
     ConfirmOverwrite(PathBuf),
     /// A scratch file is about to be deleted for good.
     ConfirmScratchDelete(PathBuf),
+    /// The Git actions of a file.
+    GitFile(PathBuf),
+    /// A branch, tag or revision to compare a file with.
+    GitPick(Box<git_file::Pick>),
 }
 
 #[derive(Debug, Clone)]
@@ -198,6 +214,13 @@ pub enum Message {
     ),
     CloseBlame,
     BlameLineClicked(usize),
+    /// The bar of a changed line was clicked: the button that puts the change
+    /// back opens under it (or closes).
+    ChangeBar(usize),
+    RevertChange,
+    CloseRevert,
+    /// Closes the pop-up that announces conflicts.
+    CloseConflictToast,
     /// What HEAD has of a file, for its changed-line marks.
     MarksBase(PathBuf, Option<Option<String>>),
     // Terminal
@@ -205,6 +228,17 @@ pub enum Message {
     NewTerminal,
     // Scratch files
     ToggleScratch,
+    // The Git menu of a file
+    GitFileMenu(PathBuf),
+    GitFileDo(PathBuf, git_file::FileAction),
+    GitFileRoot(PathBuf, git_file::FileAction, Option<PathBuf>),
+    GitFileDone(Result<String, String>),
+    GitFileDiff(Result<crate::git_panel::DiffTab, String>),
+    GitFilePick(Result<git_file::Pick, String>),
+    GitPickFilter(String),
+    GitPickChoose(String),
+    /// The revision typed in the picker exists: (repository, file, revision).
+    GitPickVerified(Result<(PathBuf, String, String), String>),
     // Bookmarks panel
     ToggleBookmarkPanel,
     BookmarkClick(bookmark_panel::Target),
@@ -398,6 +432,10 @@ pub struct SimpleEditApp {
     git: crate::git_panel::Panel,
     diff_tabs: HashMap<PathBuf, DiffTabState>,
     diff_counter: u32,
+    /// What files held before a rollback or an arrow of a diff changed them
+    /// (Ctrl+Z in a diff brings it back), and what Ctrl+Y puts again.
+    work_undo: Vec<(PathBuf, String)>,
+    work_redo: Vec<(PathBuf, String)>,
     merge_tabs: MergeTabs,
     merge_counter: u32,
     blame: Option<BlameState>,
@@ -410,6 +448,12 @@ pub struct SimpleEditApp {
     ticks: u32,
     /// The last right click on the editor was in the gutter.
     gutter_click: bool,
+    /// The change whose revert button is open: file, line, and the buffer it was
+    /// opened on (typing closes it).
+    revert: Option<(PathBuf, usize, (u64, u64))>,
+    /// The pop-up that announces conflicts was closed by the user (until
+    /// the conflicts are gone and come back).
+    conflict_toast_closed: bool,
     /// A language server to offer in the status bar, in place of the message.
     server_offer: Option<&'static crate::lsp_install::ServerInfo>,
     status_is_error: bool,
@@ -565,6 +609,8 @@ impl SimpleEditApp {
             git: Default::default(),
             diff_tabs: HashMap::new(),
             diff_counter: 0,
+            work_undo: Vec::new(),
+            work_redo: Vec::new(),
             merge_tabs: HashMap::new(),
             merge_counter: 0,
             blame: None,
@@ -574,6 +620,8 @@ impl SimpleEditApp {
             autosaving: false,
             ticks: 0,
             gutter_click: false,
+            revert: None,
+            conflict_toast_closed: false,
             server_offer: None,
             status_is_error: false,
             format_error: None,
@@ -686,6 +734,8 @@ impl SimpleEditApp {
                     | Message::PreviewTick
                     | Message::TerminalTick
                     | Message::WindowResized(..)
+                    | Message::Git(crate::git_panel::GitMsg::Pick(_))
+                    | Message::DiffTab(DiffNav::Pick(_) | DiffNav::Scrolled(..))
             );
         let edits_text = !passive && !matches!(&message, Message::EditorAction(a) if !a.is_edit());
         if edits_text {
@@ -1062,6 +1112,12 @@ impl SimpleEditApp {
             with_dropdown
         };
 
+        // A pop-up at the top announces conflicts, until they are gone.
+        let with_prefs: Element<Message> = match self.conflict_toast(dark) {
+            Some(toast) => iced::widget::stack![with_prefs, toast].into(),
+            None => with_prefs,
+        };
+
         // Modal overlays
         match &self.overlay {
             ActiveOverlay::None => with_prefs,
@@ -1106,6 +1162,8 @@ impl SimpleEditApp {
                         self.view_overwrite_overlay(dark, path)
                     }
                     ActiveOverlay::ConfirmClose(path) => self.view_confirm_overlay(dark, path),
+                    ActiveOverlay::GitFile(path) => self.git_file_overlay(dark, path),
+                    ActiveOverlay::GitPick(pick) => self.git_pick_overlay(dark, pick),
                     ActiveOverlay::ConfirmScratchDelete(path) => confirm_card(
                         dark,
                         t!("scratch.delete_title").to_string(),
@@ -1214,6 +1272,9 @@ impl SimpleEditApp {
         match message {
             Message::EditorAction(action) => {
                 self.git.typing = false;
+                // Back in the editor: Ctrl+A / Ctrl+C / Ctrl+Z are its own again.
+                self.git.viewer.selection = None;
+                self.git.stash.viewer.selection = None;
                 if action.is_edit() {
                     self.blame = None;
                 }
@@ -1547,10 +1608,13 @@ impl SimpleEditApp {
                     // One tool panel at the bottom: the terminal steps aside.
                     self.terminal.open = false;
                     self.terminal.focused = false;
+                    self.scratch.open = false;
+                    self.bookmark_panel.open = false;
                 }
                 task
             }
             Message::Git(msg) => {
+                self.remember_before_git(&msg);
                 let ctx = crate::git_panel::Ctx {
                     current_file: self.current_file.as_deref(),
                     ctrl: self.mod_ctrl,
@@ -1565,6 +1629,7 @@ impl SimpleEditApp {
                     let tasks: Vec<_> = self
                         .diff_tabs
                         .values_mut()
+                        .filter(|tab| tab.viewer.owns(*token))
                         .map(|tab| tab.viewer.loaded(*token, result.clone()))
                         .collect();
                     Task::batch(tasks)
@@ -1604,17 +1669,36 @@ impl SimpleEditApp {
                     self.terminal.open = false;
                     self.terminal.focused = false;
                     self.bookmark_panel.open = false;
+                    self.git.open = false;
                     self.scratch.refresh();
                     self.scratch.error = None;
                 }
                 Task::none()
             }
+            Message::GitFileMenu(path) => {
+                self.overlay = ActiveOverlay::GitFile(path);
+                Task::none()
+            }
+            Message::GitFileDo(path, action) => self.git_file_do(path, action),
+            Message::GitFileRoot(path, action, root) => self.git_file_root(path, action, root),
+            Message::GitFileDone(result) => self.git_file_done(result),
+            Message::GitFileDiff(result) => self.git_file_diff(result),
+            Message::GitFilePick(result) => self.git_file_pick(result),
+            Message::GitPickFilter(filter) => {
+                if let ActiveOverlay::GitPick(pick) = &mut self.overlay {
+                    pick.filter = filter;
+                }
+                Task::none()
+            }
+            Message::GitPickChoose(rev) => self.git_pick_choose(rev),
+            Message::GitPickVerified(result) => self.git_pick_verified(result),
             Message::ToggleBookmarkPanel => {
                 self.bookmark_panel.open = !self.bookmark_panel.open;
                 if self.bookmark_panel.open {
                     self.terminal.open = false;
                     self.terminal.focused = false;
                     self.scratch.open = false;
+                    self.git.open = false;
                     self.refresh_bookmark_texts(true);
                 }
                 Task::none()
@@ -2052,6 +2136,12 @@ impl SimpleEditApp {
                 self.show_error_panel = false;
                 Task::none()
             }
+            Message::Undo if self.on_diff_tab() || self.panel_diff_focused() => {
+                self.undo_work(true)
+            }
+            Message::Redo if self.on_diff_tab() || self.panel_diff_focused() => {
+                self.undo_work(false)
+            }
             Message::Undo if self.on_merge_tab() => {
                 self.merge_msg(crate::git_panel::merge::MergeMsg::Undo)
             }
@@ -2314,6 +2404,13 @@ impl SimpleEditApp {
                 if !matches!(self.overlay, ActiveOverlay::None) || self.show_preferences {
                     return Task::none();
                 }
+                // On a diff, Ctrl+A picks every row and Ctrl+C / Ctrl+X copy the
+                // picked ones (a diff can't be cut from).
+                if ctrl && !alt && !shift {
+                    if let Some(task) = self.diff_clipboard(&key) {
+                        return task;
+                    }
+                }
                 // Enter in the search card goes to the next match, Shift+Enter
                 // to the previous one — when the find field has the focus
                 // (it captures the key itself, which is why this listens to
@@ -2481,6 +2578,39 @@ impl SimpleEditApp {
                     self.undo_new_group = true;
                 }
                 Task::none()
+            }
+            Message::ChangeBar(line) => {
+                let Some(path) = self.current_file.clone() else {
+                    return Task::none();
+                };
+                let same = self
+                    .revert
+                    .as_ref()
+                    .is_some_and(|(p, l, r)| *p == path && *l == line && *r == self.buffer_stamp());
+                self.revert = (!same).then(|| (path, line, self.buffer_stamp()));
+                Task::none()
+            }
+            Message::CloseConflictToast => {
+                self.conflict_toast_closed = true;
+                Task::none()
+            }
+            Message::CloseRevert => {
+                self.revert = None;
+                Task::none()
+            }
+            Message::RevertChange => {
+                let Some((path, line, _)) = self.revert.take() else {
+                    return Task::none();
+                };
+                if self.editing_blocked() || self.current_file.as_ref() != Some(&path) {
+                    return Task::none();
+                }
+                let base = self.marks.as_ref().and_then(|m| m.base.clone());
+                let old = crate::editor::buffer_text(&self.editor.content);
+                match crate::git::marks::revert(base.as_deref(), &old, line) {
+                    Some(new_text) => self.apply_line_edit(&old, new_text, 0, None),
+                    None => Task::none(),
+                }
             }
             Message::GotoDefinition => self.goto_definition(),
             Message::OpenReference(index) => {
@@ -3573,6 +3703,11 @@ impl SimpleEditApp {
         status_before: Option<Option<crate::git::Status>>,
         git_done: bool,
     ) -> Task<Message> {
+        // The conflicts are settled or the operation was given up: the next
+        // ones are announced again.
+        if self.git.conflict_summary().is_none() {
+            self.conflict_toast_closed = false;
+        }
         // The dialog of conflicts closes once nothing is left to settle.
         if matches!(self.overlay, ActiveOverlay::Conflicts)
             && self
@@ -3629,7 +3764,8 @@ impl SimpleEditApp {
                     path,
                     base,
                     marks: Default::default(),
-                    rev: u64::MAX,
+                    paint: Default::default(),
+                    rev: (u64::MAX, u64::MAX),
                 });
                 self.refresh_marks_now();
             }
@@ -3638,7 +3774,7 @@ impl SimpleEditApp {
 
     /// Compares the buffer with the base again, if the text changed.
     fn refresh_marks_now(&mut self) {
-        let rev = self.text_rev;
+        let rev = self.buffer_stamp();
         let Some(state) = self.marks.as_mut().filter(|m| m.rev != rev) else {
             return;
         };
@@ -3647,11 +3783,30 @@ impl SimpleEditApp {
         }
         let text = crate::editor::buffer_text(&self.editor.content);
         state.marks = crate::git::marks::compute(state.base.as_deref(), &text);
+        state.paint = [
+            std::sync::Arc::new(state.marks.added.clone()),
+            std::sync::Arc::new(state.marks.modified.clone()),
+            std::sync::Arc::new(state.marks.deleted.clone()),
+        ];
         state.rev = rev;
+    }
+
+    /// Which text the buffer holds: changes with every edit and when the text
+    /// is replaced as a whole.
+    fn buffer_stamp(&self) -> (u64, u64) {
+        (self.editor.content.id(), self.editor.content.revision())
     }
 
     /// The changed-line marks of the current file, for the editor.
     fn change_paint(&self) -> Option<crate::code_editor::ChangePaint> {
+        let p = crate::theme::palette(self.config.dark_mode);
+        let revert = self
+            .revert
+            .as_ref()
+            .filter(|(path, _, rev)| {
+                self.current_file.as_ref() == Some(path) && *rev == self.buffer_stamp()
+            })
+            .map(|(_, line, _)| *line);
         let state = self
             .marks
             .as_ref()
@@ -3662,12 +3817,16 @@ impl SimpleEditApp {
         }
         let rgb = |r, g, b| iced::Color::from_rgb8(r, g, b);
         Some(crate::code_editor::ChangePaint {
-            added: std::sync::Arc::new(m.added.clone()),
-            modified: std::sync::Arc::new(m.modified.clone()),
-            deleted: std::sync::Arc::new(m.deleted.clone()),
+            added: state.paint[0].clone(),
+            modified: state.paint[1].clone(),
+            deleted: state.paint[2].clone(),
             added_color: rgb(0x4c, 0xaf, 0x50),
             modified_color: rgb(0x4a, 0x9f, 0xe0),
             deleted_color: rgb(0x9a, 0x9f, 0xab),
+            revert,
+            popup_background: p.elevated,
+            popup_border: p.border_strong,
+            popup_text: p.text,
         })
     }
 
@@ -3853,6 +4012,133 @@ impl SimpleEditApp {
         self.activate(path)
     }
 
+    /// The diff the clipboard keys act on: the tab in front, or the panel's
+    /// once rows were picked there (and the editor has nothing selected).
+    fn diff_viewer(&mut self) -> Option<&mut crate::git_panel::Viewer> {
+        if self.on_diff_tab() {
+            let path = self.current_file.clone()?;
+            return self.diff_tabs.get_mut(&path).map(|tab| &mut tab.viewer);
+        }
+        if self.git.open
+            && !self.git.typing
+            && self.editor.content.selection().is_none()
+            && self.git.active_viewer().selection.is_some()
+        {
+            return Some(self.git.active_viewer());
+        }
+        None
+    }
+
+    /// The Git panel's diff was clicked last (and the editor has nothing
+    /// selected): the keyboard shortcuts of a diff are for it.
+    fn panel_diff_focused(&self) -> bool {
+        self.git.open
+            && !self.git.typing
+            && self.editor.content.selection().is_none()
+            && self.git.viewer.selection.is_some()
+    }
+
+    fn diff_clipboard(&mut self, key: &str) -> Option<Task<Message>> {
+        let viewer = self.diff_viewer()?;
+        match key.to_ascii_lowercase().as_str() {
+            "a" => {
+                viewer.select_all();
+                Some(Task::none())
+            }
+            "c" | "x" => viewer.selected_text().map(iced::clipboard::write),
+            _ => None,
+        }
+    }
+
+    fn on_diff_tab(&self) -> bool {
+        self.current_file.as_deref().is_some_and(is_diff)
+    }
+
+    /// Keeps what a file holds now, before something rewrites it.
+    fn remember_file(&mut self, path: PathBuf) {
+        if let Ok(text) = file_io::read_text(&path) {
+            self.work_undo.push((path, text));
+            if self.work_undo.len() > 50 {
+                self.work_undo.remove(0);
+            }
+            self.work_redo.clear();
+        }
+    }
+
+    /// A rollback or a delete from the Git panel: the file as it was is kept.
+    fn remember_before_git(&mut self, msg: &crate::git_panel::GitMsg) {
+        use crate::git_panel::GitMsg;
+        let viewer = &self.git.viewer;
+        let entry = match msg {
+            GitMsg::RollbackBlock(_) => viewer.current(),
+            GitMsg::Rollback(i) | GitMsg::Delete(i) => viewer.entries.get(*i),
+            _ => None,
+        };
+        let (Some(repo), Some(entry)) = (self.git.repo.as_ref(), entry) else {
+            return;
+        };
+        let path = repo.join(&entry.change.path);
+        self.remember_file(path);
+    }
+
+    /// Ctrl+Z (or Ctrl+Y) in a diff: puts back the file as it was before the
+    /// last rollback or arrow (or again after it).
+    fn undo_work(&mut self, undo: bool) -> Task<Message> {
+        // Only what happened to the files this diff is about: a tab's own
+        // files, or anything in the repository of the panel.
+        let (repo, files): (Option<PathBuf>, Option<Vec<PathBuf>>) = match self
+            .current_file
+            .as_ref()
+            .and_then(|p| self.diff_tabs.get(p))
+        {
+            Some(tab) => (
+                Some(tab.repo.clone()),
+                Some(
+                    tab.viewer
+                        .entries
+                        .iter()
+                        .map(|e| tab.repo.join(&e.change.path))
+                        .collect(),
+                ),
+            ),
+            None => (self.git.repo.clone(), None),
+        };
+        let in_scope = |path: &PathBuf| {
+            repo.as_ref().is_some_and(|r| path.starts_with(r))
+                && files.as_ref().is_none_or(|f| f.contains(path))
+        };
+        let stack = if undo {
+            &mut self.work_undo
+        } else {
+            &mut self.work_redo
+        };
+        let popped = stack
+            .iter()
+            .rposition(|(path, _)| in_scope(path))
+            .map(|i| stack.remove(i));
+        let Some((path, text)) = popped else {
+            self.set_status(t!("status.nothing_to_undo"), false);
+            return Task::none();
+        };
+        // What the file holds now is what the opposite key gives back.
+        let now = file_io::read_text(&path).unwrap_or_default();
+        let (other, label) = if undo {
+            (&mut self.work_redo, t!("status.diff_undone"))
+        } else {
+            (&mut self.work_undo, t!("status.diff_redone"))
+        };
+        other.push((path.clone(), now));
+        if let Err(e) = crate::fsutil::write_atomic(&path, text.as_bytes(), false) {
+            self.set_status(format!("{}: {e}", t!("status.error")), true);
+            return Task::none();
+        }
+        self.set_status(label, false);
+        Task::batch([
+            self.refresh_diff_tabs(),
+            Task::done(Message::Git(crate::git_panel::GitMsg::Refresh)),
+        ])
+    }
+
     fn on_merge_tab(&self) -> bool {
         self.current_file
             .as_ref()
@@ -3884,6 +4170,54 @@ impl SimpleEditApp {
         tab.update(msg)
     }
 
+    /// The pop-up that announces conflicts, with the button that settles
+    /// them: shown while there are some, unless closed or something else
+    /// is already asking for attention.
+    fn conflict_toast(&self, dark: bool) -> Option<Element<'_, Message>> {
+        if self.conflict_toast_closed
+            || self.show_preferences
+            || !matches!(self.overlay, ActiveOverlay::None)
+        {
+            return None;
+        }
+        let label = self.git.conflict_summary()?;
+        let p = se_theme::palette(dark);
+        let card = container(
+            row![
+                text("⚠").size(15).color(p.accent),
+                text(label).size(13),
+                button(text(t!("git.resolve_short").to_string()).size(12.5))
+                    .padding([4, 12])
+                    .on_press(Message::OpenConflicts)
+                    .style((se_theme::Primary { dark }).style()),
+                button(text("×").size(15))
+                    .padding([0, 7])
+                    .on_press(Message::CloseConflictToast)
+                    .style(
+                        (se_theme::GhostButton {
+                            dark,
+                            active: false,
+                        })
+                        .style()
+                    ),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        )
+        .padding([8, 12])
+        .style(se_theme::card(dark));
+        Some(
+            container(iced::widget::opaque(card))
+                .width(Length::Fill)
+                .align_x(iced::alignment::Horizontal::Center)
+                .padding(iced::Padding {
+                    top: 46.0,
+                    ..iced::Padding::ZERO
+                })
+                .into(),
+        )
+    }
+
     /// What the status bar offers: settle conflicts first, else a language server.
     fn status_offer(&self) -> Option<(String, String, Message)> {
         let conflicts = self
@@ -3907,26 +4241,28 @@ impl SimpleEditApp {
         })
     }
 
-    /// The diffs of the working tree open in editor tabs follow the files.
+    /// The diff of the working tree in front follows the files (the others
+    /// look again when they come to the front).
     fn refresh_diff_tabs(&mut self) -> Task<Message> {
         use crate::git::Source;
-        let tasks: Vec<_> = self
-            .diff_tabs
-            .values_mut()
-            .filter(|tab| {
-                tab.viewer.current().is_some_and(|e| {
-                    matches!(
-                        e.source,
-                        Source::Staged | Source::Unstaged | Source::Untracked
-                    )
-                })
-            })
-            .map(|tab| {
-                let repo = tab.repo.clone();
-                tab.viewer.refresh(&repo)
-            })
-            .collect();
-        Task::batch(tasks)
+        let Some(tab) = self
+            .current_file
+            .as_ref()
+            .and_then(|path| self.diff_tabs.get_mut(path))
+        else {
+            return Task::none();
+        };
+        let working_tree = tab.viewer.current().is_some_and(|e| {
+            matches!(
+                e.source,
+                Source::Staged | Source::Unstaged | Source::Untracked
+            )
+        });
+        if !working_tree {
+            return Task::none();
+        }
+        let repo = tab.repo.clone();
+        tab.viewer.refresh(&repo)
     }
 
     /// Opens a diff in an editor tab (one with the same title is reused).
@@ -3969,9 +4305,51 @@ impl SimpleEditApp {
             DiffNav::PrevChange => tab.viewer.prev_change(&repo),
             DiffNav::NextFile => tab.viewer.next_file(&repo, crate::git_panel::Land::First),
             DiffNav::PrevFile => tab.viewer.prev_file(&repo, crate::git_panel::Land::First),
+            DiffNav::Pick(pick) => {
+                tab.viewer.pick(pick);
+                Task::none()
+            }
+            DiffNav::Scrolled(top, height) => {
+                tab.viewer.view_top.set(top as f32);
+                tab.viewer.view_height.set(height as f32);
+                Task::none()
+            }
+            DiffNav::CopyPicked => match tab.viewer.selected_text() {
+                Some(text) => iced::clipboard::write(text),
+                None => Task::none(),
+            },
+            DiffNav::PickAll => {
+                tab.viewer.select_all();
+                Task::none()
+            }
             DiffNav::ToggleSide => {
                 tab.viewer.side_by_side = !tab.viewer.side_by_side;
+                tab.viewer.selection = None;
                 tab.viewer.scroll_to_change()
+            }
+            DiffNav::ToggleCompare => {
+                let Some(index) = tab.viewer.index else {
+                    return Task::none();
+                };
+                if let Some(entry) = tab.viewer.entries.get_mut(index) {
+                    entry.source = match entry.source.clone() {
+                        crate::git::Source::Commit(rev) => crate::git::Source::Tree(rev),
+                        crate::git::Source::Tree(rev) => crate::git::Source::Commit(rev),
+                        other => other,
+                    };
+                }
+                tab.viewer.open(&repo, index, crate::git_panel::Land::First)
+            }
+            DiffNav::OpenFile => {
+                let Some(entry) = tab.viewer.current() else {
+                    return Task::none();
+                };
+                let file = repo.join(&entry.change.path);
+                if !file.is_file() {
+                    self.set_status(t!("git.file_gone"), true);
+                    return Task::none();
+                }
+                self.activate(file)
             }
             DiffNav::Apply(block) => {
                 let (Some(entry), Some(diff)) = (
@@ -3980,6 +4358,7 @@ impl SimpleEditApp {
                 ) else {
                     return Task::none();
                 };
+                self.remember_file(repo.join(&entry.change.path));
                 Task::perform(
                     async move {
                         crate::git::rollback_block(&repo, &entry.change.path, &diff, block).await
@@ -4372,7 +4751,8 @@ impl SimpleEditApp {
             self.pending_open = None;
             self.stash_current();
             self.load_buffer(path, CachedBuffer::blank());
-            Task::none()
+            // A diff that was behind may be out of date.
+            self.refresh_diff_tabs()
         } else {
             // TabRead parks the current buffer once the read succeeds.
             Task::perform(read_file(path, false), Message::TabRead)
@@ -4712,6 +5092,8 @@ impl SimpleEditApp {
         };
         let (sh_cut, sh_copy, sh_paste) = (clip("X"), clip("C"), clip("V"));
         let bookmark_state = self.bookmark_state();
+        let git_path = self.current_file.clone().filter(|p| git_menu_applies(p));
+        let lbl_git = t!("sidebar.git").to_string();
         let sh_bookmark = self.config.shortcuts.toggle_bookmark.display();
 
         let minimap_width = if self.config.show_minimap {
@@ -4723,7 +5105,7 @@ impl SimpleEditApp {
         let blame_on = self.blame_shown();
         let lbl_blame = t!("git.blame").to_string();
         let lbl_blame_close = t!("git.blame_close").to_string();
-        let menu = iced_aw::ContextMenu::new(editor_widget, move || {
+        let menu = crate::pointer_area::context_menu(editor_widget, move || {
             use crate::menu_bar::{disabled_item, item, separator};
             if gutter_menu {
                 let entry = if blame_on {
@@ -4792,6 +5174,16 @@ impl SimpleEditApp {
                 dark,
                 Some(sh_bookmark.clone()),
             ));
+            ctx_items.push(separator(dark));
+            ctx_items.push(match &git_path {
+                Some(path) => item(
+                    lbl_git.clone(),
+                    None,
+                    dark,
+                    Message::GitFileMenu(path.clone()),
+                ),
+                None => disabled_item(lbl_git.clone(), dark),
+            });
             container(
                 column(ctx_items)
                     .spacing(1)
@@ -4885,6 +5277,8 @@ mod file_io;
 use file_io::*;
 #[path = "app/bookmark_panel.rs"]
 mod bookmark_panel;
+#[path = "app/git_file.rs"]
+mod git_file;
 #[path = "app/views.rs"]
 mod views;
 
@@ -5064,6 +5458,11 @@ pub fn untitled_path(n: u32) -> PathBuf {
 }
 
 /// A tab that is not a file: an untitled buffer, or a diff.
+/// Whether a Git menu makes sense for this tab: a real file.
+pub fn git_menu_applies(path: &Path) -> bool {
+    !is_virtual(path) && path.is_absolute()
+}
+
 pub fn is_untitled(path: &Path) -> bool {
     path.to_str()
         .map(|s| {

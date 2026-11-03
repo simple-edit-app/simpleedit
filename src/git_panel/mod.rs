@@ -4,6 +4,7 @@
 //! work itself is done by [`crate::git`], always off the interface thread:
 //! each action is a task that answers with a message.
 
+pub mod branches;
 pub mod conflicts_view;
 pub mod diff_view;
 pub mod icon;
@@ -28,6 +29,7 @@ pub enum Tab {
     Commit,
     Stash,
     Log,
+    Branches,
 }
 
 /// A file of the list the viewer walks through.
@@ -63,6 +65,110 @@ pub struct Viewer {
     token: u64,
     /// Where its diff scrolls.
     pub scroll: iced::widget::Id,
+    /// How many characters a side of the side-by-side view holds on a line,
+    /// as the view last saw it (0: not known yet); long lines wrap there.
+    pub columns: std::cell::Cell<usize>,
+    /// How far down the diff is scrolled and how tall it shows: only the rows
+    /// around that are built.
+    pub view_top: std::cell::Cell<f32>,
+    pub view_height: std::cell::Cell<f32>,
+    /// The rows picked with the mouse (to copy them).
+    pub selection: Option<Selection>,
+    /// The mouse button is held down over the diff.
+    dragging: bool,
+    /// The last press, to tell a double click.
+    last_press: Option<(std::time::Instant, Pos)>,
+}
+
+/// A place in the diff: a row and a character of its text (tabs counted as
+/// four spaces, as shown).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Pos {
+    pub row: usize,
+    pub col: usize,
+}
+
+/// Text of the diff picked with the mouse, from `anchor` to `cursor`; in the
+/// side-by-side view, within one side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    pub anchor: Pos,
+    pub cursor: Pos,
+    pub right: bool,
+}
+
+impl Selection {
+    fn ends(&self) -> (Pos, Pos) {
+        (self.anchor.min(self.cursor), self.anchor.max(self.cursor))
+    }
+
+    /// The characters of a row of `len` that are picked.
+    pub fn span(&self, row: usize, len: usize) -> Option<(usize, usize)> {
+        let (lo, hi) = self.ends();
+        if row < lo.row || row > hi.row {
+            return None;
+        }
+        let start = if row == lo.row { lo.col.min(len) } else { 0 };
+        let end = if row == hi.row { hi.col.min(len) } else { len };
+        (start < end).then_some((start, end))
+    }
+}
+
+/// What the mouse does on the text of a diff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffPointer {
+    /// Pressed on a character of a row (side by side: of the right half or not).
+    Press(usize, bool, usize),
+    /// Dragged to a character of a row.
+    Drag(usize, usize),
+    Release,
+}
+
+/// The word around a character of a text (or the run of blanks, or the one
+/// symbol), as the characters it spans.
+fn word_at(text: &str, col: usize) -> (usize, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return (0, 0);
+    }
+    let at = col.min(chars.len() - 1);
+    let class = |c: char| {
+        if c.is_alphanumeric() || c == '_' {
+            0
+        } else if c.is_whitespace() {
+            1
+        } else {
+            2
+        }
+    };
+    let kind = class(chars[at]);
+    if kind == 2 {
+        return (at, at + 1);
+    }
+    let mut start = at;
+    while start > 0 && class(chars[start - 1]) == kind {
+        start -= 1;
+    }
+    let mut end = at + 1;
+    while end < chars.len() && class(chars[end]) == kind {
+        end += 1;
+    }
+    (start, end)
+}
+
+/// The part of a text between two columns of its shown form, where a tab
+/// counts as four.
+fn original_slice(text: &str, start: usize, end: usize) -> String {
+    let mut shown = 0;
+    let mut out = String::new();
+    for c in text.chars() {
+        let width = if c == '\t' { 4 } else { 1 };
+        if shown >= start && shown < end {
+            out.push(c);
+        }
+        shown += width;
+    }
+    out
 }
 
 /// Tokens are unique across the viewers.
@@ -75,16 +181,148 @@ impl Default for Viewer {
             index: None,
             diff: None,
             change: 0,
-            side_by_side: false,
+            side_by_side: true,
             land: None,
             silent: false,
             token: 0,
             scroll: iced::widget::Id::unique(),
+            columns: std::cell::Cell::new(0),
+            view_top: std::cell::Cell::new(0.0),
+            // Until the scrollable says, a tall screen's worth.
+            view_height: std::cell::Cell::new(1400.0),
+            selection: None,
+            dragging: false,
+            last_press: None,
         }
     }
 }
 
 impl Viewer {
+    pub fn is_dragging(&self) -> bool {
+        self.dragging
+    }
+
+    pub fn pick(&mut self, pick: DiffPointer) {
+        match pick {
+            DiffPointer::Press(row, right, col) => {
+                let here = Pos { row, col };
+                let double = self.last_press.is_some_and(|(at, p)| {
+                    at.elapsed() < std::time::Duration::from_millis(400)
+                        && p.row == row
+                        && p.col.abs_diff(col) <= 1
+                });
+                self.last_press = Some((std::time::Instant::now(), here));
+                self.dragging = true;
+                let (anchor, cursor) = match (double, self.line_text(row, right)) {
+                    (true, Some(text)) => {
+                        let (a, b) = word_at(&text, col);
+                        (Pos { row, col: a }, Pos { row, col: b })
+                    }
+                    _ => (here, here),
+                };
+                self.selection = Some(Selection {
+                    anchor,
+                    cursor,
+                    right,
+                });
+            }
+            DiffPointer::Drag(row, col) => {
+                if let (true, Some(sel)) = (self.dragging, self.selection.as_mut()) {
+                    sel.cursor = Pos { row, col };
+                }
+            }
+            DiffPointer::Release => self.dragging = false,
+        }
+    }
+
+    /// The line each row of the layout in use holds (of one side, side by
+    /// side), `None` for a header or an empty half. Built once per use.
+    fn row_lines(&self, right: bool) -> Vec<Option<&crate::git::diff::Line>> {
+        let Some(diff) = self.file_diff() else {
+            return Vec::new();
+        };
+        if self.side_by_side {
+            diff.side_rows()
+                .into_iter()
+                .map(|row| match row {
+                    crate::git::diff::SideRow::Pair(left, r) => {
+                        if right {
+                            r
+                        } else {
+                            left
+                        }
+                    }
+                    crate::git::diff::SideRow::Hunk(_) => None,
+                })
+                .collect()
+        } else {
+            diff.rows()
+                .into_iter()
+                .map(|row| match row {
+                    crate::git::diff::Row::Line(l) => Some(l),
+                    crate::git::diff::Row::Hunk(_) => None,
+                })
+                .collect()
+        }
+    }
+
+    /// The text of a row as shown (tabs expanded), if it has one.
+    fn line_text(&self, row: usize, right: bool) -> Option<String> {
+        let lines = self.row_lines(right);
+        let line = lines.get(row).copied().flatten()?;
+        Some(line.text.replace('\t', "    "))
+    }
+
+    /// Every row (of the right side, or of the side last picked).
+    pub fn select_all(&mut self) {
+        let right = self.selection.is_none_or(|s| s.right);
+        let lines = self.row_lines(right);
+        let Some(last) = lines.len().checked_sub(1) else {
+            return;
+        };
+        let col = lines[last].map_or(0, |l| l.text.replace('\t', "    ").chars().count());
+        self.selection = Some(Selection {
+            anchor: Pos { row: 0, col: 0 },
+            cursor: Pos { row: last, col },
+            right,
+        });
+    }
+
+    /// Whether something is picked (a click alone picks nothing).
+    pub fn has_selection(&self) -> bool {
+        self.selection.is_some_and(|s| s.anchor != s.cursor)
+    }
+
+    /// The picked text, as it is in the file (tabs back).
+    pub fn selected_text(&self) -> Option<String> {
+        let sel = self.selection?;
+        let (lo, hi) = sel.ends();
+        if lo == hi {
+            return None;
+        }
+        let lines = self.row_lines(sel.right);
+        let mut out: Vec<String> = Vec::new();
+        for row in lo.row..=hi.row {
+            let Some(line) = lines.get(row).copied().flatten() else {
+                continue;
+            };
+            let shown = line.text.replace('\t', "    ");
+            let Some((start, end)) = sel.span(row, shown.chars().count()) else {
+                // A picked line with nothing in it, between the ends.
+                if row > lo.row && row < hi.row {
+                    out.push(String::new());
+                }
+                continue;
+            };
+            out.push(original_slice(&line.text, start, end));
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out.join("\n"))
+        }
+    }
+
     pub fn current(&self) -> Option<&Entry> {
         self.index.and_then(|i| self.entries.get(i))
     }
@@ -100,6 +338,15 @@ impl Viewer {
         self.file_diff().map_or(0, FileDiff::changes)
     }
 
+    /// How far down a row starts: long lines of the side-by-side view wrap,
+    /// so rows are not all as tall.
+    fn row_top(&self, row: usize) -> f32 {
+        match (self.side_by_side, self.file_diff()) {
+            (true, Some(diff)) => diff_view::side_top(diff, row, self.columns.get()),
+            _ => row as f32 * diff_view::ROW_HEIGHT,
+        }
+    }
+
     /// The row to bring into view for the current change.
     pub fn change_row(&self) -> Option<usize> {
         let diff = self.file_diff()?;
@@ -111,6 +358,11 @@ impl Viewer {
         rows.get(self.change).copied()
     }
 
+    /// Whether an answer is for this viewer's last request.
+    pub fn owns(&self, token: u64) -> bool {
+        self.token == token
+    }
+
     /// Opens an entry: its diff is asked for, the answer comes as
     /// [`GitMsg::DiffLoaded`].
     pub fn open(&mut self, repo: &Path, index: usize, land: Land) -> Task<Message> {
@@ -119,6 +371,7 @@ impl Viewer {
         };
         self.index = Some(index);
         self.diff = None;
+        self.selection = None;
         self.change = 0;
         self.land = Some(land);
         self.silent = false;
@@ -145,8 +398,9 @@ impl Viewer {
             Some(entry) => match self.entries.iter().position(|e| e == &entry) {
                 Some(i) => {
                     self.index = Some(i);
-                    // The content may have changed with the list.
-                    self.reload(repo)
+                    // The content may have changed with the list: looked at
+                    // quietly, so the diff on screen doesn't blink.
+                    self.refresh(repo)
                 }
                 None => self.select_after_loss(repo),
             },
@@ -158,22 +412,11 @@ impl Viewer {
     fn select_after_loss(&mut self, repo: &Path) -> Task<Message> {
         self.index = None;
         self.diff = None;
+        self.selection = None;
         if self.entries.is_empty() {
             Task::none()
         } else {
             self.open(repo, 0, Land::First)
-        }
-    }
-
-    pub fn reload(&mut self, repo: &Path) -> Task<Message> {
-        match self.index {
-            Some(i) => {
-                let keep = self.change;
-                let task = self.open(repo, i, Land::First);
-                self.change = keep;
-                task
-            }
-            None => Task::none(),
         }
     }
 
@@ -202,6 +445,8 @@ impl Viewer {
                 return Task::none();
             }
             self.diff = Some(result);
+            // What was picked may be other lines now.
+            self.selection = None;
             self.change = self.change.min(self.changes().saturating_sub(1));
             return Task::none();
         }
@@ -215,19 +460,16 @@ impl Viewer {
     }
 
     pub fn scroll_to_change(&self) -> Task<Message> {
-        match self.change_row() {
-            Some(row) => iced::widget::operation::scroll_to(
-                self.scroll.clone(),
-                iced::widget::scrollable::AbsoluteOffset {
-                    x: 0.0,
-                    y: ((row as f32 - 3.0) * diff_view::ROW_HEIGHT).max(0.0),
-                },
-            ),
-            None => iced::widget::operation::scroll_to(
-                self.scroll.clone(),
-                iced::widget::scrollable::AbsoluteOffset { x: 0.0, y: 0.0 },
-            ),
-        }
+        let y = match self.change_row() {
+            Some(row) => self.row_top(row.saturating_sub(3)).max(0.0),
+            None => 0.0,
+        };
+        // The rows there are built right away, not when the scrollable says.
+        self.view_top.set(y);
+        iced::widget::operation::scroll_to(
+            self.scroll.clone(),
+            iced::widget::scrollable::AbsoluteOffset { x: 0.0, y },
+        )
     }
 
     /// Down: the next change, or the first of the next file.
@@ -280,7 +522,15 @@ pub struct Panel {
     /// The message box has the keyboard: the app's shortcuts stay out.
     pub typing: bool,
     pub amend: bool,
+    /// The commit is of this file only (from its Git menu).
+    pub only: Option<String>,
     pub busy: bool,
+    pub branches: branches::State,
+    /// What was asked once and waits for a second click to be done.
+    pub pending: Option<Pending>,
+    /// A repository chosen by hand (from a file's Git menu), kept until
+    /// another file comes to the front: the panel then follows that file.
+    pinned: Option<Pinned>,
     /// What the last action said, and whether it failed.
     pub notice: Option<(String, bool)>,
 }
@@ -300,10 +550,30 @@ impl Default for Panel {
             message: text_editor::Content::new(),
             typing: false,
             amend: false,
+            only: None,
             busy: false,
+            branches: branches::State::default(),
+            pending: None,
+            pinned: None,
             notice: None,
         }
     }
+}
+
+/// Something that can't be undone, waiting for a second click.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pending {
+    /// Throw away a staged file that also has changes that are not staged.
+    Rollback(String),
+    StashDrop(usize),
+    Abort,
+}
+
+/// The folder a repository was chosen from, and the file in front then.
+#[derive(Debug, Clone)]
+struct Pinned {
+    dir: PathBuf,
+    file: Option<PathBuf>,
 }
 
 /// What the panel needs to know of the app.
@@ -348,6 +618,15 @@ pub enum GitMsg {
     NextFile,
     PrevFile,
     ToggleSideBySide,
+    /// The diff was scrolled: (offset, height shown).
+    DiffScrolled(i32, i32),
+    /// The commit list was scrolled: (offset, height shown).
+    LogScrolled(i32, i32),
+    /// The mouse on the rows of the diff.
+    Pick(DiffPointer),
+    /// Copy the picked text / pick everything (context menu of the diff).
+    CopyPicked,
+    PickAll,
     // The commit list
     ToggleStaged(usize),
     StageAll(bool),
@@ -357,12 +636,16 @@ pub enum GitMsg {
     DiffInEditor(usize),
     /// Puts one block of changes of the open file back as it was.
     RollbackBlock(usize),
+    /// Opens the file of the diff in the editor.
+    OpenFile,
     // Conflicts
     /// Keep your side (`true`) or theirs of a conflicted file.
     AcceptSide(String, bool),
     /// Settle a conflicted file by hand, in three columns.
     OpenMerge(String),
     ContinueOperation,
+    /// Leaves out the commit a rebase or a cherry-pick stopped on.
+    SkipOperation,
     AbortOperation,
     MergeBranch(String),
     RebaseOnto(String),
@@ -370,6 +653,14 @@ pub enum GitMsg {
     MessageAction(text_editor::Action),
     MessageFocused,
     ToggleAmend(bool),
+    /// Back to committing everything that is staged.
+    CancelOnly,
+    // The Branches tab
+    SelectRef(branches::Ref),
+    RefName(String),
+    RefAction(branches::RefAction),
+    /// Back to the history of the whole branch.
+    ClearLogFile,
     Commit(bool),
     Init,
     /// An action ended: what it said, or why it failed.
@@ -420,6 +711,8 @@ impl GitMsg {
                 | GitMsg::Detected(..)
                 | GitMsg::StatusLoaded(_)
                 | GitMsg::DiffLoaded(..)
+                | GitMsg::DiffScrolled(..)
+                | GitMsg::LogScrolled(..)
                 | GitMsg::StashesLoaded(_)
                 | GitMsg::StashFilesLoaded(..)
                 | GitMsg::RefsLoaded(_)
@@ -436,9 +729,10 @@ impl Panel {
     /// The status, and the diff the tab shows, looked at again.
     fn look_again(&mut self, ctx: &Ctx) -> Task<Message> {
         let repo = self.repo.clone();
-        let more = match (self.tab, repo) {
-            (Tab::Stash, _) => self.load_stashes(),
-            (Tab::Commit, Some(repo)) => self.viewer.refresh(&repo),
+        let more = match (self.open, self.tab, repo) {
+            (false, ..) => Task::none(),
+            (_, Tab::Stash, _) => self.load_stashes(),
+            (_, Tab::Commit, Some(repo)) => self.viewer.refresh(&repo),
             _ => Task::none(),
         };
         Task::batch([self.refresh(ctx), more])
@@ -464,11 +758,23 @@ impl Panel {
 
     /// Looks at the repository again: where it is, then its status.
     pub fn refresh(&mut self, ctx: &Ctx) -> Task<Message> {
-        let dir = ctx
-            .current_file
-            .filter(|p| !crate::app::is_untitled(p))
-            .and_then(Path::parent)
-            .map(Path::to_path_buf)
+        if self
+            .pinned
+            .as_ref()
+            .is_some_and(|p| p.file.as_deref() != ctx.current_file)
+        {
+            self.pinned = None;
+        }
+        let dir = self
+            .pinned
+            .as_ref()
+            .map(|p| p.dir.clone())
+            .or_else(|| {
+                ctx.current_file
+                    .filter(|p| !crate::app::is_untitled(p))
+                    .and_then(Path::parent)
+                    .map(Path::to_path_buf)
+            })
             .or_else(|| self.probed.clone())
             .or_else(dirs::home_dir);
         let Some(dir) = dir else {
@@ -491,13 +797,17 @@ impl Panel {
         let Some(repo) = self.repo.clone() else {
             return Task::none();
         };
-        Task::perform(async move { git::status(&repo).await }, |status| {
-            Message::Git(GitMsg::StatusLoaded(status))
-        })
+        // Closed, the panel only watches for conflicts: listing every
+        // untracked file of a big folder would be wasted.
+        let untracked = self.open;
+        Task::perform(
+            async move { git::status(&repo, untracked).await },
+            |status| Message::Git(GitMsg::StatusLoaded(status)),
+        )
     }
 
     /// The file list of the Commit tab: staged first, then the rest.
-    fn commit_entries(status: &Status) -> Vec<Entry> {
+    pub fn commit_entries(status: &Status) -> Vec<Entry> {
         let mut entries: Vec<Entry> = status
             .staged
             .iter()
@@ -519,12 +829,55 @@ impl Panel {
         entries
     }
 
+    /// Another repository: what the tabs showed of the previous one is gone.
+    fn reset_for_another_repo(&mut self) {
+        self.status = None;
+        self.viewer = Viewer::default();
+        self.stash = stash::State::default();
+        self.log = log::State::default();
+        self.branches = branches::State::default();
+        self.only = None;
+        self.pending = None;
+    }
+
+    /// Opens the panel on a repository chosen from a file's Git menu, and
+    /// keeps it while that file stays in front.
+    pub fn show_repo(&mut self, root: PathBuf, current_file: Option<PathBuf>) {
+        if self.repo.as_ref() != Some(&root) {
+            self.reset_for_another_repo();
+        }
+        self.repo = Some(root.clone());
+        self.probed = Some(root.clone());
+        self.searched = true;
+        self.pinned = Some(Pinned {
+            dir: root,
+            file: current_file,
+        });
+        self.open = true;
+    }
+
+    /// The second click of something that can't be undone: `true` when it is
+    /// the second, else it is remembered and `message` says what to do.
+    fn confirmed(&mut self, what: Pending, message: String) -> bool {
+        if self.pending.as_ref() == Some(&what) {
+            self.pending = None;
+            return true;
+        }
+        self.pending = Some(what);
+        self.notice = Some((message, false));
+        false
+    }
+
     /// Runs `work` on the repository, then looks again.
     fn act<F, Fut>(&mut self, work: F) -> Task<Message>
     where
         F: FnOnce(PathBuf) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = Result<String, String>> + Send + 'static,
     {
+        // Two git commands at once would meet at `index.lock`.
+        if self.busy {
+            return Task::none();
+        }
         let Some(repo) = self.repo.clone() else {
             return Task::none();
         };
@@ -546,6 +899,8 @@ impl Panel {
                 | GitMsg::JumpToSource(_)
                 | GitMsg::DiffInEditor(_)
                 | GitMsg::SelectStash(_)
+                | GitMsg::SelectRef(_)
+                | GitMsg::RefAction(_)
                 | GitMsg::BranchClicked(_)
                 | GitMsg::SelectCommit(_)
                 | GitMsg::NextChange
@@ -554,6 +909,14 @@ impl Panel {
                 | GitMsg::PrevFile
         ) {
             self.typing = false;
+        }
+        if !msg.is_background()
+            && !matches!(
+                msg,
+                GitMsg::Rollback(_) | GitMsg::StashDrop(_) | GitMsg::AbortOperation
+            )
+        {
+            self.pending = None;
         }
         match msg {
             GitMsg::Tick => {
@@ -567,8 +930,7 @@ impl Panel {
                 self.probed = dir;
                 self.searched = true;
                 if root != self.repo {
-                    self.status = None;
-                    self.viewer = Viewer::default();
+                    self.reset_for_another_repo();
                 }
                 self.repo = root;
                 self.load_status()
@@ -607,17 +969,23 @@ impl Panel {
                 match tab {
                     Tab::Commit => Task::none(),
                     Tab::Stash => self.load_stashes(),
-                    Tab::Log => self.load_refs(),
+                    Tab::Log | Tab::Branches => self.load_refs(),
                 }
             }
             GitMsg::SelectFile(index) => match self.repo.clone() {
                 Some(repo) => self.active_viewer().open(&repo, index, Land::First),
                 None => Task::none(),
             },
-            GitMsg::DiffLoaded(token, result) => Task::batch([
-                self.viewer.loaded(token, result.clone()),
-                self.stash.viewer.loaded(token, result),
-            ]),
+            GitMsg::DiffLoaded(token, result) => {
+                // The answer is for one viewer: no copy for the others.
+                if self.viewer.owns(token) {
+                    self.viewer.loaded(token, result)
+                } else if self.stash.viewer.owns(token) {
+                    self.stash.viewer.loaded(token, result)
+                } else {
+                    Task::none()
+                }
+            }
             GitMsg::NextChange => match self.repo.clone() {
                 Some(repo) => self.active_viewer().next_change(&repo),
                 None => Task::none(),
@@ -637,7 +1005,31 @@ impl Panel {
             GitMsg::ToggleSideBySide => {
                 let viewer = self.active_viewer();
                 viewer.side_by_side = !viewer.side_by_side;
+                viewer.selection = None;
                 viewer.scroll_to_change()
+            }
+            GitMsg::Pick(pick) => {
+                self.active_viewer().pick(pick);
+                Task::none()
+            }
+            GitMsg::LogScrolled(top, height) => {
+                self.log.view_top.set(top as f32);
+                self.log.view_height.set(height as f32);
+                Task::none()
+            }
+            GitMsg::DiffScrolled(top, height) => {
+                let viewer = self.active_viewer();
+                viewer.view_top.set(top as f32);
+                viewer.view_height.set(height as f32);
+                Task::none()
+            }
+            GitMsg::CopyPicked => match self.active_viewer().selected_text() {
+                Some(text) => iced::clipboard::write(text),
+                None => Task::none(),
+            },
+            GitMsg::PickAll => {
+                self.active_viewer().select_all();
+                Task::none()
             }
             GitMsg::ToggleStaged(index) => {
                 let Some(entry) = self.viewer.entries.get(index).cloned() else {
@@ -680,6 +1072,21 @@ impl Panel {
                 let Some(entry) = self.viewer.entries.get(index).cloned() else {
                     return Task::none();
                 };
+                // Rolling back what is staged also takes the file back to
+                // HEAD on disk: changes not staged would go with it.
+                let also_unstaged = entry.staged
+                    && self
+                        .status
+                        .as_ref()
+                        .is_some_and(|s| s.unstaged.iter().any(|c| c.path == entry.change.path));
+                if also_unstaged
+                    && !self.confirmed(
+                        Pending::Rollback(entry.change.path.clone()),
+                        t!("git.confirm_rollback_both").to_string(),
+                    )
+                {
+                    return Task::none();
+                }
                 self.act(move |repo| async move {
                     git::rollback(&repo, &entry.change, entry.staged).await?;
                     Ok(String::new())
@@ -701,13 +1108,22 @@ impl Panel {
                 let Some(diff) = self.viewer.file_diff().cloned() else {
                     return Task::none();
                 };
-                if entry.source != Source::Unstaged {
+                if !matches!(entry.source, Source::Unstaged | Source::Staged) {
                     return Task::none();
                 }
                 self.act(move |repo| async move {
                     git::rollback_block(&repo, &entry.change.path, &diff, block).await?;
                     Ok(String::new())
                 })
+            }
+            GitMsg::OpenFile => {
+                let Some(repo) = self.repo.clone() else {
+                    return Task::none();
+                };
+                let Some(entry) = self.active_viewer().current() else {
+                    return Task::none();
+                };
+                Task::done(Message::OpenRecentFile(repo.join(&entry.change.path)))
             }
             GitMsg::AcceptSide(path, yours) => {
                 let rebasing = self
@@ -730,16 +1146,20 @@ impl Panel {
                 Task::perform(
                     async move {
                         // Rebuilt from the three versions (so each conflict knows
-                        // its base); the file's own markers if there are none.
+                        // its base) unless the file already has fewer conflicts
+                        // than that: some were settled by hand.
                         let rebuilt = git::merge_text(&repo, &path).await;
-                        let merge = rebuilt
-                            .and_then(|text| git::conflicts::parse(&text, rebasing))
-                            .or_else(|| {
-                                std::fs::read_to_string(repo.join(&path))
-                                    .ok()
-                                    .and_then(|text| git::conflicts::parse(&text, rebasing))
-                            })
-                            .ok_or_else(|| t!("git.not_mergeable").to_string())?;
+                        let disk = tokio::fs::read_to_string(repo.join(&path)).await.ok();
+                        let merge =
+                            git::conflicts::choose(rebuilt.as_deref(), disk.as_deref(), rebasing)
+                                .map_err(|why| match why {
+                                git::conflicts::Unavailable::Settled => {
+                                    t!("git.already_resolved").to_string()
+                                }
+                                git::conflicts::Unavailable::NotMergeable => {
+                                    t!("git.not_mergeable").to_string()
+                                }
+                            })?;
                         Ok::<_, String>(MergeSpec { repo, path, merge })
                     },
                     |result| match result {
@@ -757,10 +1177,24 @@ impl Panel {
                     Ok(String::new())
                 })
             }
+            GitMsg::SkipOperation => {
+                let Some(op) = self.status.as_ref().and_then(|s| s.operation) else {
+                    return Task::none();
+                };
+                self.act(move |repo| async move {
+                    git::skip_operation(&repo, op).await?;
+                    Ok(String::new())
+                })
+            }
             GitMsg::AbortOperation => {
                 let Some(op) = self.status.as_ref().and_then(|s| s.operation) else {
                     return Task::none();
                 };
+                let op_name = conflicts_view::operation_label(op);
+                let asked = t!("git.confirm_abort", op = op_name.as_str()).to_string();
+                if !self.confirmed(Pending::Abort, asked) {
+                    return Task::none();
+                }
                 self.act(move |repo| async move {
                     git::abort_operation(&repo, op).await?;
                     Ok(String::new())
@@ -830,6 +1264,7 @@ impl Panel {
                 let text = self.message.text();
                 let message = text.trim_end().to_string();
                 let amend = self.amend;
+                let only = self.only.clone();
                 if message.trim().is_empty() {
                     self.notice = Some((t!("git.empty_message").to_string(), true));
                     return Task::none();
@@ -839,15 +1274,55 @@ impl Panel {
                     .as_ref()
                     .map(|s| (s.branch.clone(), s.upstream.is_some()))
                     .unwrap_or_default();
+                // No branch to push (HEAD is detached): nothing is committed
+                // either, so the user can choose.
+                if and_push && branch.starts_with('(') {
+                    self.notice = Some((t!("git.err_detached_push").to_string(), true));
+                    return Task::none();
+                }
                 self.act(move |repo| async move {
-                    git::commit(&repo, &message, amend).await?;
+                    match &only {
+                        Some(path) => git::commit_only(&repo, &message, amend, path).await?,
+                        None => git::commit(&repo, &message, amend).await?,
+                    }
                     if and_push {
-                        git::push(&repo, &branch, has_upstream).await?;
-                        Ok("\u{2}pushed".to_string())
+                        // The commit is made: a push that fails says so, and
+                        // the message box is emptied all the same.
+                        match git::push(&repo, &branch, has_upstream).await {
+                            Ok(()) => Ok("\u{2}pushed".to_string()),
+                            Err(e) => Ok(format!("\u{5}{e}")),
+                        }
                     } else {
                         Ok("\u{2}committed".to_string())
                     }
                 })
+            }
+            GitMsg::SelectRef(r) => {
+                // A second click on the one picked gives it up (to start a
+                // branch from HEAD again).
+                self.branches.selected = if self.branches.selected.as_ref() == Some(&r) {
+                    None
+                } else {
+                    Some(r)
+                };
+                self.branches.confirm = None;
+                Task::none()
+            }
+            GitMsg::RefName(name) => {
+                self.typing = true;
+                self.branches.name = name;
+                self.branches.confirm = None;
+                Task::none()
+            }
+            GitMsg::RefAction(action) => self.ref_action(action),
+            GitMsg::CancelOnly => {
+                self.only = None;
+                Task::none()
+            }
+            GitMsg::ClearLogFile => {
+                self.log.file = None;
+                let rev = self.log.shown.clone().unwrap_or_else(|| "HEAD".into());
+                self.show_log(&rev)
             }
             GitMsg::Init => {
                 let dir = self.probed.clone().or_else(|| {
@@ -866,6 +1341,8 @@ impl Panel {
             }
             GitMsg::Done(result) => {
                 self.busy = false;
+                self.branches.confirm = None;
+                self.pending = None;
                 let mut opened: Option<Message> = None;
                 match result {
                     Ok(text) => {
@@ -876,6 +1353,7 @@ impl Panel {
                         }
                         match text.as_str() {
                             "\u{2}committed" | "\u{2}pushed" => {
+                                self.only = None;
                                 self.message = text_editor::Content::new();
                                 self.amend = false;
                                 self.notice = Some((
@@ -886,6 +1364,24 @@ impl Panel {
                                     },
                                     false,
                                 ));
+                            }
+                            failed if failed.starts_with('\u{5}') => {
+                                self.only = None;
+                                self.message = text_editor::Content::new();
+                                self.amend = false;
+                                self.notice = Some((
+                                    t!("git.commit_push_failed", error = &failed[1..]).to_string(),
+                                    true,
+                                ));
+                            }
+                            created if created.starts_with('\u{4}') => {
+                                self.notice = Some((
+                                    t!("git.branch_created", name = &created[1..]).to_string(),
+                                    false,
+                                ));
+                            }
+                            "\u{3}pushed" => {
+                                self.notice = Some((t!("git.pushed").to_string(), false));
                             }
                             _ => self.notice = None,
                         }
@@ -900,8 +1396,9 @@ impl Panel {
                 // Look again at once, whatever the tab shows.
                 let more = match self.tab {
                     Tab::Commit => match self.repo.clone() {
-                        // The open file changed under its diff.
-                        Some(repo) => self.viewer.reload(&repo),
+                        // The open file changed under its diff: looked at
+                        // quietly, so it doesn't blink.
+                        Some(repo) => self.viewer.refresh(&repo),
                         None => Task::none(),
                     },
                     Tab::Stash => self.load_stashes(),
@@ -909,6 +1406,7 @@ impl Panel {
                         let rev = self.log.shown.clone().unwrap_or_else(|| "HEAD".into());
                         Task::batch([self.load_refs(), self.show_log(&rev)])
                     }
+                    Tab::Branches => self.load_refs(),
                 };
                 let dialog = opened.map_or_else(Task::none, Task::done);
                 Task::batch([self.load_status(), more, dialog])
@@ -918,8 +1416,17 @@ impl Panel {
             GitMsg::StashFilesLoaded(index, result) => self.stash_files_loaded(index, result),
             GitMsg::StashApply(index) => self.stash_action(index, stash::StashAction::Apply),
             GitMsg::StashPop(index) => self.stash_action(index, stash::StashAction::Pop),
-            GitMsg::StashDrop(index) => self.stash_action(index, stash::StashAction::Drop),
+            GitMsg::StashDrop(index) => {
+                if !self.confirmed(
+                    Pending::StashDrop(index),
+                    t!("git.confirm_stash_drop").to_string(),
+                ) {
+                    return Task::none();
+                }
+                self.stash_action(index, stash::StashAction::Drop)
+            }
             GitMsg::StashMessage(text) => {
+                self.typing = true;
                 self.stash.message = text;
                 Task::none()
             }
@@ -933,6 +1440,7 @@ impl Panel {
                 Task::none()
             }
             GitMsg::BranchFilter(text) => {
+                self.typing = true;
                 self.log.filter = text;
                 Task::none()
             }
@@ -1047,5 +1555,243 @@ mod tests {
         let token = viewer.token;
         let _ = viewer.loaded(token, Ok(diff(&["one", "two"])));
         assert_eq!(viewer.change, 0);
+    }
+
+    fn panel_with_branches() -> Panel {
+        use crate::git::history::{Branch, Refs};
+        let branch = |name: &str, current: bool, remote: bool| Branch {
+            name: name.into(),
+            sha: String::new(),
+            upstream: None,
+            current,
+            remote,
+            ahead: 0,
+            behind: 0,
+        };
+        let mut panel = Panel {
+            repo: Some(PathBuf::from("/tmp")),
+            ..Default::default()
+        };
+        panel.log.refs = Some(Refs {
+            branches: vec![
+                branch("main", true, false),
+                branch("topic", false, false),
+                branch("origin/topic", false, true),
+            ],
+            tags: vec!["v1".into()],
+        });
+        panel.status = Some(Status {
+            operation: None,
+            branch: "main".into(),
+            upstream: None,
+            ahead: 0,
+            behind: 0,
+            staged: vec![],
+            unstaged: vec![],
+        });
+        panel
+    }
+
+    #[test]
+    fn what_can_be_done_depends_on_what_is_picked() {
+        use branches::{Ref, RefAction::*};
+        let mut panel = panel_with_branches();
+        for action in [Checkout, Merge, Rebase, Push, ForcePush, Delete, Create] {
+            assert!(!panel.can(action), "{action:?}: nothing picked");
+        }
+        panel.branches.selected = Some(Ref::Branch("main".into()));
+        // The current branch can be pushed, not switched to, merged or deleted.
+        assert!(panel.can(Push) && panel.can(ForcePush));
+        assert!(!panel.can(Checkout) && !panel.can(Merge) && !panel.can(Delete));
+        panel.branches.selected = Some(Ref::Branch("topic".into()));
+        assert!(panel.can(Checkout) && panel.can(Merge) && panel.can(Rebase) && panel.can(Delete));
+        // A remote branch can't be pushed from here, but can be deleted.
+        panel.branches.selected = Some(Ref::Branch("origin/topic".into()));
+        assert!(!panel.can(Push) && panel.can(Delete) && panel.can(Merge));
+        // A tag can be checked out (detached), deleted or started from, not merged.
+        panel.branches.selected = Some(Ref::Tag("v1".into()));
+        assert!(panel.can(Delete) && panel.can(Checkout) && !panel.can(Merge));
+        // A name is needed to create.
+        panel.branches.name = "  ".into();
+        assert!(!panel.can(Create));
+        panel.branches.name = "my topic".into();
+        assert!(panel.can(Create));
+        // Nothing while something is running, nor during a merge.
+        panel.busy = true;
+        assert!(!panel.can(Create));
+        panel.busy = false;
+        panel.status.as_mut().unwrap().operation = Some(git::Operation::Merge);
+        panel.branches.selected = Some(Ref::Branch("topic".into()));
+        assert!(!panel.can(Merge) && !panel.can(Rebase) && panel.can(Checkout));
+    }
+
+    #[test]
+    fn deleting_and_forcing_ask_twice() {
+        use branches::{Ref, RefAction::*};
+        let mut panel = panel_with_branches();
+        panel.branches.selected = Some(Ref::Branch("topic".into()));
+        let _ = panel.ref_action(Delete);
+        assert_eq!(panel.branches.confirm, Some(Delete));
+        assert!(!panel.busy, "the first click only asks");
+        // Picking something else gives up.
+        let ctx = Ctx {
+            current_file: None,
+            ctrl: false,
+            shift: false,
+        };
+        let _ = panel.update(GitMsg::SelectRef(Ref::Tag("v1".into())), &ctx);
+        assert_eq!(panel.branches.confirm, None);
+        let _ = panel.ref_action(ForcePush);
+        assert_eq!(panel.branches.confirm, None, "a tag isn't pushed");
+    }
+
+    fn ctx() -> Ctx<'static> {
+        Ctx {
+            current_file: None,
+            ctrl: false,
+            shift: false,
+        }
+    }
+
+    #[test]
+    fn a_second_click_on_the_one_picked_gives_it_up() {
+        use branches::Ref;
+        let mut panel = panel_with_branches();
+        let topic = Ref::Branch("topic".into());
+        let _ = panel.update(GitMsg::SelectRef(topic.clone()), &ctx());
+        assert_eq!(panel.branches.selected, Some(topic.clone()));
+        let _ = panel.update(GitMsg::SelectRef(topic), &ctx());
+        assert_eq!(panel.branches.selected, None);
+    }
+
+    #[test]
+    fn typing_a_name_keeps_the_shortcuts_of_the_editor_out() {
+        let mut panel = panel_with_branches();
+        let _ = panel.update(GitMsg::RefName("fea".into()), &ctx());
+        assert!(panel.typing);
+        let _ = panel.update(GitMsg::SelectTab(Tab::Commit), &ctx());
+        assert!(!panel.typing);
+        let _ = panel.update(GitMsg::StashMessage("wip".into()), &ctx());
+        assert!(panel.typing);
+        let _ = panel.update(GitMsg::BranchFilter("m".into()), &ctx());
+        assert!(panel.typing);
+    }
+
+    #[test]
+    fn giving_up_an_operation_and_dropping_a_stash_ask_twice() {
+        let mut panel = panel_with_branches();
+        panel.status.as_mut().unwrap().operation = Some(git::Operation::Rebase);
+        let _ = panel.update(GitMsg::AbortOperation, &ctx());
+        assert_eq!(panel.pending, Some(Pending::Abort));
+        assert!(!panel.busy, "the first click only asks");
+        // Something else in between: asking starts over.
+        let _ = panel.update(GitMsg::StashDrop(0), &ctx());
+        assert_eq!(panel.pending, Some(Pending::StashDrop(0)));
+        let _ = panel.update(GitMsg::DismissNotice, &ctx());
+        assert_eq!(panel.pending, None);
+        // The second click of the same thing does it.
+        let _ = panel.update(GitMsg::AbortOperation, &ctx());
+        let _ = panel.update(GitMsg::AbortOperation, &ctx());
+        assert!(panel.busy);
+    }
+
+    #[test]
+    fn a_staged_file_that_is_also_modified_asks_before_it_is_thrown_away() {
+        let mut panel = panel_with_branches();
+        let change = |kind| Change {
+            path: "a.txt".into(),
+            from: None,
+            kind,
+        };
+        let status = panel.status.as_mut().unwrap();
+        status.staged = vec![change(Kind::Modified)];
+        status.unstaged = vec![change(Kind::Modified)];
+        let status = status.clone();
+        panel.viewer.entries = Panel::commit_entries(&status);
+        let _ = panel.update(GitMsg::Rollback(0), &ctx());
+        assert_eq!(panel.pending, Some(Pending::Rollback("a.txt".into())));
+        assert!(!panel.busy);
+        let _ = panel.update(GitMsg::Rollback(0), &ctx());
+        assert!(panel.busy);
+        // A file that is only staged goes at once.
+        let mut panel = panel_with_branches();
+        let mut status = panel.status.clone().unwrap();
+        status.staged = vec![change(Kind::Modified)];
+        panel.viewer.entries = Panel::commit_entries(&status);
+        panel.status = Some(status);
+        let _ = panel.update(GitMsg::Rollback(0), &ctx());
+        assert!(panel.busy);
+    }
+
+    #[test]
+    fn only_one_git_command_runs_at_a_time() {
+        let mut panel = panel_with_branches();
+        panel.status.as_mut().unwrap().operation = Some(git::Operation::Rebase);
+        let _ = panel.update(GitMsg::ContinueOperation, &ctx());
+        assert!(panel.busy);
+        // Another one while it runs does nothing (it would find index.lock).
+        let before = panel.notice.clone();
+        let _ = panel.update(GitMsg::SkipOperation, &ctx());
+        assert!(panel.busy);
+        assert_eq!(panel.notice, before);
+    }
+
+    #[test]
+    fn another_repository_starts_from_a_clean_panel() {
+        let mut panel = panel_with_branches();
+        panel.branches.selected = Some(branches::Ref::Tag("v1".into()));
+        panel.only = Some("a.txt".into());
+        let _ = panel.update(
+            GitMsg::Detected(Some(PathBuf::from("/other")), Some(PathBuf::from("/other"))),
+            &ctx(),
+        );
+        assert!(panel.log.refs.is_none());
+        assert!(panel.branches.selected.is_none());
+        assert!(panel.only.is_none());
+        // Opened from a file's menu, it stays pinned until another file is in front.
+        panel.show_repo(PathBuf::from("/b"), Some(PathBuf::from("/a/x.rs")));
+        assert_eq!(panel.repo, Some(PathBuf::from("/b")));
+        let a = PathBuf::from("/a/x.rs");
+        let task_ctx = Ctx {
+            current_file: Some(&a),
+            ctrl: false,
+            shift: false,
+        };
+        let _ = panel.refresh(&task_ctx);
+        assert!(panel.pinned.is_some(), "same file in front: still pinned");
+        let b = PathBuf::from("/a/y.rs");
+        let other_ctx = Ctx {
+            current_file: Some(&b),
+            ctrl: false,
+            shift: false,
+        };
+        let _ = panel.refresh(&other_ctx);
+        assert!(panel.pinned.is_none(), "another file: the panel follows it");
+    }
+
+    #[test]
+    fn a_status_that_keeps_the_open_file_leaves_its_diff_on_screen() {
+        let mut viewer = viewer_on(diff(&["one", "two"]));
+        let repo = PathBuf::from("/tmp");
+        viewer.pick(DiffPointer::Press(1, true, 0));
+        let mut other = entry();
+        other.change.path = "b.txt".into();
+        let _ = viewer.set_entries(&repo, vec![entry(), other]);
+        // Still there while it is looked at again in the background.
+        assert!(viewer.file_diff().is_some());
+        assert_eq!(viewer.index, Some(0));
+        // A different answer replaces it, and what was picked is dropped.
+        let token = viewer.token;
+        let _ = viewer.loaded(token, Ok(diff(&["one", "two", "three"])));
+        assert!(viewer.selection.is_none());
+        assert_eq!(viewer.file_diff().unwrap().added(), 3);
+    }
+
+    #[test]
+    fn an_answer_for_another_viewer_is_not_taken() {
+        let viewer = viewer_on(diff(&["one"]));
+        let before = viewer.token;
+        assert!(viewer.owns(before));
+        assert!(!viewer.owns(before + 1));
     }
 }

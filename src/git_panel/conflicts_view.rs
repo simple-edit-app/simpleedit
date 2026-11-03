@@ -19,6 +19,19 @@ pub fn operation_label(operation: Operation) -> String {
 }
 
 impl Panel {
+    /// What the pop-up that announces conflicts says (none: no conflicts).
+    pub fn conflict_summary(&self) -> Option<String> {
+        let status = self.status.as_ref()?;
+        let n = status.conflicts().count();
+        if n == 0 {
+            return None;
+        }
+        Some(match status.operation {
+            Some(op) => t!("git.op_conflicts", op = operation_label(op), n = n).to_string(),
+            None => t!("git.conflicts_n", n = n).to_string(),
+        })
+    }
+
     /// The files in conflict, if there are any, or the operation to go on
     /// with: shown above the file list of the Commit tab.
     pub(super) fn conflict_banner(&self, dark: bool) -> Option<Element<'_, Message>> {
@@ -55,7 +68,23 @@ impl Panel {
             if conflicts == 0 && !self.busy {
                 next = next.on_press(Message::Git(GitMsg::ContinueOperation));
             }
-            line = line.push(next).push(
+            line = line.push(next);
+            // A commit that became empty once settled can be left out.
+            if conflicts == 0 && status.operation != Some(Operation::Merge) && !self.busy {
+                line = line.push(
+                    button(text(t!("git.skip").to_string()).size(12))
+                        .padding([3, 10])
+                        .on_press(Message::Git(GitMsg::SkipOperation))
+                        .style(
+                            (se_theme::GhostButton {
+                                dark,
+                                active: false,
+                            })
+                            .style(),
+                        ),
+                );
+            }
+            line = line.push(
                 button(text(t!("git.abort").to_string()).size(12))
                     .padding([3, 10])
                     .on_press(Message::Git(GitMsg::AbortOperation))
