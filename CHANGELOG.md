@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.7.0] - 2026-11-04
+
+### Added
+- Split editor: the editor can be split as many times as you like, side by side or one above the other, and split again inside any pane. It is in the View menu, the command palette, the right click menu of the editor, and, to show a file in a new pane, the right click menu of the file list (Open to the right, Open below). Each pane has a header with its file and a cross to close it. A click in a pane gives it the focus; the wheel scrolls it without. Panes on the same file keep their own cursor and scroll while the text follows.
+
 ## [1.6.0] - 2026-11-04
 
 ### Added

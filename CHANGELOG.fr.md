@@ -1,5 +1,10 @@
 # Journal des modifications
 
+## [1.7.0] - 2026-11-04
+
+### Ajouté
+- Éditeur divisé : l'éditeur peut être divisé autant de fois que l'on veut, côte à côte ou l'un au-dessus de l'autre, et de nouveau dans n'importe quel panneau. On le trouve dans le menu Affichage, la palette de commandes, le clic droit de l'éditeur et, pour montrer un fichier dans un nouveau panneau, le clic droit de la liste des fichiers (Ouvrir à droite, Ouvrir en bas). Chaque panneau a un en-tête avec son fichier et une croix pour le fermer. Un clic dans un panneau lui donne le focus ; la molette le fait défiler sans. Les panneaux sur un même fichier gardent leur curseur et leur défilement, et le texte suit.
+
 ## [1.6.0] - 2026-11-04
 
 ### Ajouté
