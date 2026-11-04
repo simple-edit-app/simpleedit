@@ -126,6 +126,117 @@ mod behavior_tests {
         assert!(!app.panel_resizing && app.panel_drag.is_none());
     }
 
+    fn open_text(app: &mut SimpleEditApp, path: &Path, text: &str) {
+        let _ = app.update(Message::TabRead(Ok(Loaded {
+            path: path.to_path_buf(),
+            text: text.into(),
+            format: TextFormat::default(),
+            stamp: None,
+        })));
+    }
+
+    fn pane_files(app: &SimpleEditApp) -> Vec<PathBuf> {
+        let split = app.split.as_ref().expect("split");
+        split
+            .layout_ids()
+            .iter()
+            .map(|id| split.panes[id].file.clone())
+            .collect()
+    }
+
+    fn paste(text: &str) -> text_editor::Action {
+        text_editor::Action::Edit(text_editor::Edit::Paste(std::sync::Arc::new(text.into())))
+    }
+
+    #[test]
+    fn the_editor_splits_in_many_panes_that_swap_on_focus() {
+        let mut app = app();
+        let (a, b) = (PathBuf::from("/s/a.txt"), PathBuf::from("/s/b.txt"));
+        open_text(&mut app, &a, "alpha\n");
+        // The same file in both panes: the new one is a copy that follows.
+        let _ = app.update(Message::Split(true));
+        assert_eq!(pane_files(&app), vec![a.clone(), a.clone()]);
+        let _ = app.update(Message::EditorAction(paste("x")));
+        assert_eq!(text(&app), "xalpha\n");
+        let other = app.split.as_ref().unwrap().layout_ids()[1];
+        assert_eq!(
+            app.pane_content_mut(other).map(|c| c.text()),
+            Some("xalpha\n".to_string())
+        );
+        // Another split, below: three panes in a tree.
+        let _ = app.update(Message::Split(false));
+        assert_eq!(app.split.as_ref().unwrap().panes.len(), 3);
+        // Another file in the active pane: the others keep `a`, parked.
+        open_text(&mut app, &b, "beta\n");
+        assert_eq!(app.current_file.as_ref(), Some(&b));
+        assert_eq!(pane_files(&app), vec![b.clone(), a.clone(), a.clone()]);
+        // Clicking in another pane brings its file to the editor.
+        let id = app.split.as_ref().unwrap().layout_ids()[2];
+        let _ = app.update(Message::SplitFocus(id));
+        assert_eq!(app.current_file.as_ref(), Some(&a));
+        assert_eq!(app.split.as_ref().unwrap().active, id);
+        assert_eq!(text(&app), "xalpha\n");
+        // Closing the file of a pane takes the pane away, the split too once
+        // one pane is left.
+        let _ = app.update(Message::CloseOtherTabs);
+        assert_eq!(pane_files(&app), vec![a.clone(), a.clone()]);
+        // Closing the active pane gives the focus to another one.
+        let _ = app.update(Message::CloseSplit);
+        assert!(app.split.is_none());
+        assert_eq!(app.current_file.as_ref(), Some(&a));
+    }
+
+    #[test]
+    fn a_pane_that_is_not_the_first_can_be_split_too() {
+        let mut app = app();
+        open_text(&mut app, Path::new("/s/a.txt"), "alpha\n");
+        let _ = app.update(Message::Split(true));
+        let second = app.split.as_ref().unwrap().layout_ids()[1];
+        let _ = app.update(Message::SplitFocus(second));
+        let _ = app.update(Message::Split(true));
+        assert_eq!(app.split.as_ref().unwrap().panes.len(), 3);
+        let _ = app.update(Message::Split(false));
+        assert_eq!(app.split.as_ref().unwrap().panes.len(), 4);
+    }
+
+    #[test]
+    fn a_file_of_the_list_opens_in_a_new_pane() {
+        let mut app = app();
+        let (a, b) = (PathBuf::from("/s/a.txt"), PathBuf::from("/s/b.txt"));
+        open_text(&mut app, &a, "alpha\n");
+        open_text(&mut app, &b, "beta\n");
+        let _ = app.update(Message::Sidebar(crate::sidebar::SidebarMessage::OpenFile(
+            a.clone(),
+        )));
+        let _ = app.update(Message::SplitWith(b.clone(), false));
+        assert_eq!(app.current_file.as_ref(), Some(&b));
+        let split = app.split.as_ref().expect("split");
+        assert_eq!(pane_files(&app), vec![a, b]);
+        assert_ne!(split.layout_ids()[0], split.active);
+    }
+
+    #[test]
+    fn a_scroll_stays_in_its_pane_and_a_click_takes_the_focus() {
+        let mut app = app();
+        let a = PathBuf::from("/s/a.txt");
+        open_text(&mut app, &a, &"line\n".repeat(200));
+        let _ = app.update(Message::Split(true));
+        let (first, second) = {
+            let ids = app.split.as_ref().unwrap().layout_ids();
+            (ids[0], ids[1])
+        };
+        let _ = app.update(Message::SplitAction(
+            second,
+            text_editor::Action::Scroll { lines: 5 },
+        ));
+        assert_eq!(app.split.as_ref().unwrap().active, first, "no focus change");
+        let _ = app.update(Message::SplitAction(
+            second,
+            text_editor::Action::Move(text_editor::Motion::Down),
+        ));
+        assert_eq!(app.split.as_ref().unwrap().active, second);
+    }
+
     #[test]
     fn a_path_is_shown_with_the_home_folder_as_a_tilde() {
         let home = dirs::home_dir().expect("a home folder");

@@ -205,6 +205,17 @@ pub enum Message {
     ConfirmDiscardMany(Vec<PathBuf>),
     ToggleSearch,
     ToggleSidebar,
+    /// Splits the editor in two (side by side, or one above the other).
+    Split(bool),
+    /// Shows a file in a pane of the split (the editor is split first).
+    SplitWith(PathBuf, bool),
+    /// Closes the active pane.
+    CloseSplit,
+    ClosePane(split::PaneId),
+    /// A pane takes the focus.
+    SplitFocus(split::PaneId),
+    /// Something done in a pane that has not the focus.
+    SplitAction(split::PaneId, text_editor::Action),
     /// The edge of the file list is grabbed, dragged (x of the pointer) and let go.
     /// The way a pull / a merge is made, chosen in the Git panel or the Preferences.
     SetPullMode(crate::git::PullMode),
@@ -468,6 +479,8 @@ pub struct SimpleEditApp {
     /// Marked lines of every file, saved between runs.
     bookmarks: crate::bookmarks::Bookmarks,
     editor: EditorState,
+    /// The editor split in two panes, if it is.
+    split: Option<split::Split>,
     sidebar: SidebarState,
     search: SearchState,
     preferences: PreferencesState,
@@ -659,6 +672,7 @@ impl SimpleEditApp {
         Self {
             bookmarks: crate::bookmarks::Bookmarks::default(),
             editor: EditorState::new(),
+            split: None,
             sidebar: SidebarState::new(),
             search: SearchState::new(),
             preferences: PreferencesState::from_config(&config),
@@ -836,6 +850,7 @@ impl SimpleEditApp {
         .then(|| self.git.status.clone());
         let git_done = matches!(&message, Message::Git(crate::git_panel::GitMsg::Done(_)));
         let command = self.handle(message);
+        self.sync_split();
         let marks_task = self.after_message(edits_text, status_before, git_done);
         let command = Task::batch([command, marks_task]);
         if !typing {
@@ -998,6 +1013,7 @@ impl SimpleEditApp {
             ViewMode::Raw
         };
         let editor_with_context = self.editor_pane(preview_kind, view_mode, dark);
+        let editor_with_context = self.with_split(editor_with_context, dark);
 
         // The search card floats over the top-right corner of the editor.
         let body: Element<'_, Message> = if self.show_search {
@@ -2066,6 +2082,15 @@ impl SimpleEditApp {
                     Task::none()
                 }
             }
+            Message::Split(side_by_side) => self.split_editor(side_by_side, None),
+            Message::SplitWith(path, side_by_side) => self.split_editor(side_by_side, Some(path)),
+            Message::CloseSplit => match self.split.as_ref().map(|s| s.active) {
+                Some(active) => self.close_pane(active),
+                None => Task::none(),
+            },
+            Message::ClosePane(id) => self.close_pane(id),
+            Message::SplitFocus(id) => self.focus_pane(id),
+            Message::SplitAction(id, action) => self.split_action(id, action),
             Message::ToggleSidebar => {
                 self.show_sidebar = !self.show_sidebar;
                 self.config.show_sidebar = self.show_sidebar;
@@ -5499,6 +5524,10 @@ impl SimpleEditApp {
         let lbl_copy = t!("ctx.copy").to_string();
         let lbl_paste = t!("ctx.paste").to_string();
         let lbl_delete = t!("ctx.delete").to_string();
+        let lbl_split_right = t!("menu.view_split_right").to_string();
+        let lbl_split_down = t!("menu.view_split_down").to_string();
+        let lbl_split_close = t!("menu.view_split_close").to_string();
+        let is_split = self.split.is_some();
         let lbl_format_sel = t!("ctx.format_selection").to_string();
         let lbl_format_all = t!("ctx.format_all").to_string();
         let has_fmt_ctx = self
@@ -5624,6 +5653,27 @@ impl SimpleEditApp {
                 ),
                 None => disabled_item(lbl_git.clone(), dark),
             });
+            ctx_items.push(separator(dark));
+            ctx_items.push(item(
+                lbl_split_right.clone(),
+                None,
+                dark,
+                Message::Split(true),
+            ));
+            ctx_items.push(item(
+                lbl_split_down.clone(),
+                None,
+                dark,
+                Message::Split(false),
+            ));
+            if is_split {
+                ctx_items.push(item(
+                    lbl_split_close.clone(),
+                    None,
+                    dark,
+                    Message::CloseSplit,
+                ));
+            }
             container(
                 column(ctx_items)
                     .spacing(1)
@@ -5719,6 +5769,8 @@ use file_io::*;
 mod bookmark_panel;
 #[path = "app/git_file.rs"]
 mod git_file;
+#[path = "app/split.rs"]
+mod split;
 #[path = "app/views.rs"]
 mod views;
 pub(crate) use views::resize_edge;
@@ -5915,6 +5967,11 @@ fn goto_line_id() -> iced::widget::Id {
 
 pub fn untitled_path(n: u32) -> PathBuf {
     PathBuf::from(format!("untitled://{}", n))
+}
+
+/// Whether a tab can be shown in a pane of the split: not a diff or a merge.
+pub fn splittable(path: &Path) -> bool {
+    !is_virtual(path)
 }
 
 /// A tab that is not a file: an untitled buffer, or a diff.

@@ -506,6 +506,24 @@ fn menu_items(
                     Message::ToggleSidebar,
                 ),
                 item(
+                    t!("menu.view_split_right").to_string(),
+                    None,
+                    dark,
+                    Message::Split(true),
+                ),
+                item(
+                    t!("menu.view_split_down").to_string(),
+                    None,
+                    dark,
+                    Message::Split(false),
+                ),
+                item(
+                    t!("menu.view_split_close").to_string(),
+                    None,
+                    dark,
+                    Message::CloseSplit,
+                ),
+                item(
                     t!("git.title").to_string(),
                     sc(&sh.toggle_git),
                     dark,

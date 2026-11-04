@@ -107,6 +107,8 @@ impl SidebarState {
         let lbl_save_as = t!("sidebar.save_as").to_string();
         let lbl_git = t!("sidebar.git").to_string();
         let lbl_delete = t!("sidebar.delete").to_string();
+        let lbl_split_right = t!("sidebar.split_right").to_string();
+        let lbl_split_down = t!("sidebar.split_down").to_string();
         let lbl_bookmark_add = t!("sidebar.bookmark_add").to_string();
         let lbl_bookmark_remove = t!("sidebar.bookmark_remove").to_string();
         let p = theme::palette(dark);
@@ -196,6 +198,8 @@ impl SidebarState {
                 let bookmark_path = path.clone();
                 let lbl_git = lbl_git.clone();
                 let lbl_delete = lbl_delete.clone();
+                let lbl_split_right = lbl_split_right.clone();
+                let lbl_split_down = lbl_split_down.clone();
                 let full_path = path.clone();
 
                 let row_with_menu = crate::pointer_area::context_menu(row_button, move || {
@@ -239,6 +243,16 @@ impl SidebarState {
                                 lbl_save_as.clone(),
                                 is_active
                                     .then_some(Message::Sidebar(SidebarMessage::RequestSaveAs)),
+                            ),
+                            ctx_item(
+                                lbl_split_right.clone(),
+                                crate::app::splittable(&bookmark_path)
+                                    .then(|| Message::SplitWith(bookmark_path.clone(), true)),
+                            ),
+                            ctx_item(
+                                lbl_split_down.clone(),
+                                crate::app::splittable(&bookmark_path)
+                                    .then(|| Message::SplitWith(bookmark_path.clone(), false)),
                             ),
                             ctx_item(
                                 lbl_git.clone(),

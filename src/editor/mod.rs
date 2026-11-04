@@ -186,6 +186,49 @@ impl EditorState {
         self.language = cached.or_else(|| detect_language(path, first_line).map(str::to_string));
     }
 
+    /// The other pane of a split editor: the text, colored, with line
+    /// numbers and a minimap, whose actions go to `on_action`.
+    pub fn pane_view<'a>(
+        content: &'a crate::code_editor::Content,
+        language: Option<&str>,
+        config: &Config,
+        on_action: impl Fn(iced::widget::text_editor::Action) -> Message + 'a,
+    ) -> Element<'a, Message> {
+        let dark = config.dark_mode;
+        content.set_wrapping(config.word_wrap);
+        let p = crate::theme::palette(dark);
+        let mut editor = crate::code_editor::CodeEditor::new(content)
+            .size(config.font_size.clamp(8.0, 32.0))
+            .font(crate::theme::MONO)
+            .line_height(iced::advanced::text::LineHeight::Relative(LINE_HEIGHT))
+            .on_action(on_action)
+            .highlight::<highlighter::Highlighter>(
+                highlighter::Settings {
+                    dark,
+                    extension: language.unwrap_or_default().to_string(),
+                },
+                highlighter::to_format,
+            )
+            .style(crate::theme::editor_style(dark))
+            .height(Length::Fill);
+        if config.show_minimap {
+            let with_alpha = |color: iced::Color, a: f32| iced::Color { a, ..color };
+            editor = editor.minimap(crate::code_editor::Minimap {
+                bar: with_alpha(p.muted, 0.45),
+                viewport: with_alpha(p.accent, 0.16),
+                viewport_border: with_alpha(p.accent, 0.75),
+                marker: p.accent,
+            });
+        }
+        if config.show_line_numbers {
+            editor = editor.gutter(crate::code_editor::Gutter {
+                text: p.gutter,
+                current: p.text,
+            });
+        }
+        editor.padding(padding(config)).into()
+    }
+
     pub fn view<'a>(
         &'a self,
         config: &Config,
