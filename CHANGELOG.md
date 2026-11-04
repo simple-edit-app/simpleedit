@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.8.1] - 2026-11-04
+
+### Fixed
+- The gap between the file list and the editor was twice as wide as the others; it now is one gap, and the whole gap grabs to resize the list.
+
 ## [1.8.0] - 2026-11-04
 
 ### Added

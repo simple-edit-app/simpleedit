@@ -1,5 +1,10 @@
 # Journal des modifications
 
+## [1.8.1] - 2026-11-04
+
+### Corrigé
+- L'espace entre la liste des fichiers et l'éditeur était deux fois plus large que les autres ; il est maintenant d'un seul espace, et tout cet espace permet de redimensionner la liste.
+
 ## [1.8.0] - 2026-11-04
 
 ### Ajouté
