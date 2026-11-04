@@ -321,6 +321,13 @@ fn menu_items(
                 dark,
                 Message::CloseTabs(None),
             ));
+            items.push(separator(dark));
+            items.push(item(
+                t!("menu.file_preferences").to_string(),
+                None,
+                dark,
+                Message::TogglePreferences,
+            ));
             items.push(item(
                 t!("menu.file_quit").to_string(),
                 sc(&sh.quit),
@@ -417,6 +424,31 @@ fn menu_items(
                     Message::OpenGotoLine,
                 ),
                 separator(dark),
+                item(
+                    t!("menu.lint_check").to_string(),
+                    None,
+                    dark,
+                    Message::LintNow,
+                ),
+                item(
+                    t!("menu.lint_fix").to_string(),
+                    None,
+                    dark,
+                    Message::LintFixAll,
+                ),
+                item(
+                    t!("menu.lint_next").to_string(),
+                    None,
+                    dark,
+                    Message::LintNext(true),
+                ),
+                item(
+                    t!("menu.lint_prev").to_string(),
+                    None,
+                    dark,
+                    Message::LintNext(false),
+                ),
+                separator(dark),
             ];
             items.extend(bookmark_items(bookmarks, dark, sc(&sh.toggle_bookmark)));
             for (label, shortcut, message) in [
@@ -469,16 +501,7 @@ fn menu_items(
                 dark,
                 Message::UnfoldAll,
             ));
-            items.extend([
-                separator(dark),
-                format_item,
-                item(
-                    t!("menu.edit_preferences").to_string(),
-                    None,
-                    dark,
-                    Message::TogglePreferences,
-                ),
-            ]);
+            items.extend([separator(dark), format_item]);
             items
         }
         TopMenu::View => {

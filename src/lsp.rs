@@ -468,6 +468,266 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
     Some(PathBuf::from(String::from_utf8(bytes).ok()?))
 }
 
+// ---- Problems and fixes ---------------------------------------------------
+
+/// Whether a server for the language of `ext` is installed.
+pub fn installed(ext: &str) -> bool {
+    spec_for(&ext.to_ascii_lowercase())
+        .is_some_and(|(_, candidates)| candidates.iter().any(|(name, _)| usable(name)))
+}
+
+/// The running server for a file, with the language id and its name.
+async fn connect(ext: &str, path: &Path) -> Result<(Arc<Server>, &'static str, String), String> {
+    let ext = ext.to_ascii_lowercase();
+    let (language_id, candidates) =
+        spec_for(&ext).ok_or_else(|| format!("no language server for .{ext}"))?;
+    let (exe, args) = candidates
+        .iter()
+        .find_map(|(name, args)| {
+            usable(name)
+                .then(|| find_executable(name))
+                .flatten()
+                .map(|exe| (exe, *args))
+        })
+        .ok_or_else(|| {
+            let names: Vec<_> = candidates.iter().map(|c| c.0).collect();
+            format!("no language server installed ({})", names.join(" / "))
+        })?;
+    let root = crate::definition::project_root(path)
+        .or_else(|| path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let name = exe
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let server = server_for(&exe, args, &root)
+        .await
+        .map_err(|e| format!("{name}: {e}"))?;
+    Ok((server, language_id, name))
+}
+
+/// How long to wait for a server to publish its problems.
+const DIAGNOSTICS_WAIT: Duration = if cfg!(test) {
+    Duration::from_secs(3)
+} else {
+    Duration::from_secs(20)
+};
+
+/// The problems the language server of `ext` finds in `text`, the content of
+/// `path`.
+pub async fn diagnostics(
+    ext: &str,
+    path: &Path,
+    text: &str,
+) -> Result<Vec<crate::lint::Diagnostic>, String> {
+    let (server, language_id, name) = connect(ext, path).await?;
+    let uri = path_to_uri(path);
+    let seen = server.published_count(&uri);
+    let changed = server.sync(&uri, language_id, text).await?;
+    let started = Instant::now();
+    loop {
+        let (count, _) = server.published_of(&uri);
+        let fresh = if changed { count > seen } else { count > 0 };
+        if fresh {
+            // The server may publish again right after (syntax, then types):
+            // the answer is what it said last, once it has been quiet.
+            let mut last = count;
+            let quiet_since = Instant::now();
+            let mut quiet = quiet_since;
+            while quiet.elapsed() < Duration::from_millis(700)
+                && quiet_since.elapsed() < Duration::from_secs(8)
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let now = server.published_count(&uri);
+                if now != last {
+                    last = now;
+                    quiet = Instant::now();
+                }
+            }
+            let (_, list) = server.published_of(&uri);
+            return Ok(list
+                .iter()
+                .filter_map(|d| lint_of(d, text, &name))
+                .collect());
+        }
+        if started.elapsed() > DIAGNOSTICS_WAIT {
+            return Ok(Vec::new());
+        }
+        if !server.alive.load(Ordering::SeqCst) {
+            return Err("language server stopped".to_string());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+impl Server {
+    fn published_of(&self, uri: &str) -> (u64, Vec<Value>) {
+        self.published
+            .lock()
+            .ok()
+            .and_then(|p| p.get(uri).cloned())
+            .unwrap_or_default()
+    }
+
+    fn published_count(&self, uri: &str) -> u64 {
+        self.published_of(uri).0
+    }
+}
+
+/// A problem as a server said it, in our terms (byte columns).
+fn lint_of(raw: &Value, text: &str, server: &str) -> Option<crate::lint::Diagnostic> {
+    use crate::lint::{Diagnostic, Severity};
+    let range = raw.get("range")?;
+    let pos = |side: &str| {
+        let p = range.get(side)?;
+        let line = p.get("line")?.as_u64()? as usize;
+        let character = p.get("character")?.as_u64()? as usize;
+        let line_text = text.split('\n').nth(line).unwrap_or("");
+        Some((line, byte_col(line_text, character)))
+    };
+    let (start, end) = (pos("start")?, pos("end")?);
+    let severity = match raw.get("severity").and_then(Value::as_u64) {
+        Some(1) | None => Severity::Error,
+        Some(2) => Severity::Warning,
+        Some(3) => Severity::Info,
+        _ => Severity::Hint,
+    };
+    let code = raw.get("code").map(|c| match c {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    });
+    let source = raw
+        .get("source")
+        .and_then(Value::as_str)
+        .map_or_else(|| server.to_string(), str::to_string);
+    // TypeScript's problems are known by their number.
+    let code = match (source.as_str(), code) {
+        ("ts" | "typescript", Some(c)) => Some(format!("TS{c}")),
+        (_, c) => c,
+    };
+    Some(Diagnostic {
+        line: start.0,
+        col: start.1,
+        end_line: end.0,
+        end_col: end.1.max(if end.0 == start.0 && end.1 == start.1 {
+            end.1
+        } else {
+            0
+        }),
+        severity,
+        message: raw.get("message")?.as_str()?.trim().to_string(),
+        code,
+        source: if matches!(source.as_str(), "ts" | "typescript") {
+            "TypeScript".to_string()
+        } else {
+            source
+        },
+        fixes: Vec::new(),
+        raw: Some(raw.clone()),
+    })
+}
+
+/// The edits of a workspace edit that are for `uri`, in byte columns.
+fn edits_for(edit: &Value, uri: &str, text: &str) -> Vec<crate::lint::Edit> {
+    let mut lists: Vec<&Value> = Vec::new();
+    if let Some(list) = edit.get("changes").and_then(|c| c.get(uri)) {
+        lists.push(list);
+    }
+    for change in edit
+        .get("documentChanges")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if change["textDocument"]["uri"].as_str() == Some(uri) {
+            if let Some(list) = change.get("edits") {
+                lists.push(list);
+            }
+        }
+    }
+    lists
+        .into_iter()
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(|e| {
+            let range = e.get("range")?;
+            let at = |side: &str| {
+                let p = range.get(side)?;
+                let line = p.get("line")?.as_u64()? as usize;
+                let character = p.get("character")?.as_u64()? as usize;
+                let line_text = text.split('\n').nth(line).unwrap_or("");
+                Some((line, byte_col(line_text, character)))
+            };
+            let (from, to) = (at("start")?, at("end")?);
+            Some(crate::lint::Edit {
+                line: from.0,
+                col: from.1,
+                end_line: to.0,
+                end_col: to.1,
+                text: e.get("newText")?.as_str()?.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// The code actions of a request, as fixes: those that edit this file.
+async fn fixes_of(
+    server: &Server,
+    uri: &str,
+    text: &str,
+    params: Value,
+) -> Result<Vec<crate::lint::Fix>, String> {
+    let actions = server
+        .request("textDocument/codeAction", params)
+        .await
+        .map_err(|e| e.message)?;
+    let mut fixes = Vec::new();
+    for action in actions.as_array().into_iter().flatten() {
+        let mut action = action.clone();
+        // Some servers send the edit only when asked for it.
+        if action.get("edit").is_none() && action.get("data").is_some() {
+            if let Ok(resolved) = server.request("codeAction/resolve", action.clone()).await {
+                action = resolved;
+            }
+        }
+        let Some(edit) = action.get("edit") else {
+            continue;
+        };
+        let edits = edits_for(edit, uri, text);
+        if edits.is_empty() {
+            continue;
+        }
+        fixes.push(crate::lint::Fix {
+            title: action["title"].as_str().unwrap_or("Fix").to_string(),
+            edits,
+            safe: true,
+        });
+    }
+    Ok(fixes)
+}
+
+/// The fixes the language server offers for one problem.
+pub async fn code_actions(
+    ext: &str,
+    path: &Path,
+    text: &str,
+    problem: &crate::lint::Diagnostic,
+) -> Result<Vec<crate::lint::Fix>, String> {
+    let (server, language_id, _) = connect(ext, path).await?;
+    let uri = path_to_uri(path);
+    server.sync(&uri, language_id, text).await?;
+    let range =
+        |line: usize, col: usize| json!({ "line": line, "character": utf16_col(text, line, col) });
+    let params = json!({
+        "textDocument": { "uri": uri },
+        "range": { "start": range(problem.line, problem.col), "end": range(problem.end_line, problem.end_col) },
+        "context": {
+            "diagnostics": problem.raw.iter().collect::<Vec<_>>(),
+            "only": ["quickfix"],
+        },
+    });
+    fixes_of(&server, &uri, text, params).await
+}
+
 // ---- The connection to one server -----------------------------------------
 
 #[derive(Debug)]
@@ -488,6 +748,9 @@ struct Server {
     progress: StdMutex<HashSet<String>>,
     /// Documents the server was told about: uri → (version, text).
     docs: Mutex<HashMap<String, (i64, String)>>,
+    /// What the server last published as problems, per document: how many
+    /// times it did, and the problems as it said them.
+    published: StdMutex<HashMap<String, (u64, Vec<Value>)>>,
     /// Kept so the process dies with the program.
     _child: StdMutex<Child>,
 }
@@ -528,6 +791,7 @@ impl Server {
             started: Instant::now(),
             progress: Default::default(),
             docs: Default::default(),
+            published: Default::default(),
             _child: StdMutex::new(child),
         });
         tokio::spawn(read_loop(server.clone(), stdout));
@@ -550,6 +814,13 @@ impl Server {
                 "textDocument": {
                     "synchronization": { "didSave": false },
                     "definition": { "linkSupport": true },
+                    "publishDiagnostics": { "versionSupport": true },
+                    "codeAction": {
+                        "codeActionLiteralSupport": { "codeActionKind": { "valueSet": [
+                            "quickfix", "source", "source.fixAll"
+                        ] } },
+                        "resolveSupport": { "properties": ["edit"] },
+                    },
                 },
             },
         });
@@ -597,7 +868,7 @@ impl Server {
     }
 
     /// Tells the server the current text of a document.
-    async fn sync(&self, uri: &str, language_id: &str, text: &str) -> Result<(), String> {
+    async fn sync(&self, uri: &str, language_id: &str, text: &str) -> Result<bool, String> {
         let mut docs = self.docs.lock().await;
         let message = match docs.get_mut(uri) {
             None => {
@@ -609,7 +880,7 @@ impl Server {
                     } },
                 })
             }
-            Some((_, known)) if known == text => return Ok(()),
+            Some((_, known)) if known == text => return Ok(false),
             Some((version, known)) => {
                 *version += 1;
                 *known = text.to_string();
@@ -622,7 +893,8 @@ impl Server {
                 })
             }
         };
-        self.send(&message).await
+        self.send(&message).await?;
+        Ok(true)
     }
 
     /// Reacts to a message of the server.
@@ -659,6 +931,21 @@ impl Server {
                 let _ = self
                     .send(&json!({ "jsonrpc": "2.0", "id": id, "result": result }))
                     .await;
+            }
+            (Some("textDocument/publishDiagnostics"), None) => {
+                let params = &message["params"];
+                let Some(uri) = params["uri"].as_str() else {
+                    return;
+                };
+                let list = params["diagnostics"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                if let Ok(mut published) = self.published.lock() {
+                    let entry = published.entry(uri.to_string()).or_default();
+                    entry.0 += 1;
+                    entry.1 = list;
+                }
             }
             (Some("$/progress"), None) => {
                 let token = message["params"]["token"].to_string();

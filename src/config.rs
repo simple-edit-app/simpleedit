@@ -444,6 +444,33 @@ pub struct Config {
     pub git_merge_mode: crate::git::MergeMode,
     /// Minutes between two fetches in the background (0: never).
     pub git_auto_fetch_minutes: u32,
+    /// Whether problems are looked for in the files (linters and language servers).
+    pub lint_enabled: bool,
+    /// Whether they are underlined in the editor.
+    pub lint_highlight: bool,
+    /// The languages (groups of `lint::tools`) the user turned the lint on
+    /// for: none to begin with.
+    pub lint_languages: std::collections::BTreeSet<String>,
+    /// Which problems "fix them all" fixes: errors only to begin with.
+    pub lint_fix_level: crate::lint::Level,
+    /// How each severity is marked in the text (`error`, `warning`, `info`,
+    /// `hint`).
+    pub lint_markings: std::collections::BTreeMap<String, crate::lint::Marking>,
+    /// The color of each severity (`error`, `warning`, `info`, `hint`) as
+    /// `#rrggbb`; the theme's own when missing.
+    pub lint_colors: std::collections::BTreeMap<String, String>,
+    /// A first look when a file is opened (and when the editor starts).
+    pub lint_on_open: bool,
+    pub lint_trigger: crate::lint::Trigger,
+    pub lint_level: crate::lint::Level,
+    /// Fixes are applied when a file is saved.
+    pub lint_fix_on_save: bool,
+    /// The tools chosen by hand for a language (a group of `lint::tools`):
+    /// none listed means whatever is ready by itself.
+    pub lint_tools: std::collections::BTreeMap<String, Vec<String>>,
+    /// The path of a tool chosen by the user (by tool id): it wins over the
+    /// search in the project and the system.
+    pub lint_programs: std::collections::BTreeMap<String, String>,
     /// Size of the window when it was last closed or resized.
     pub window_width: f32,
     pub window_height: f32,
@@ -481,6 +508,18 @@ impl Default for Config {
             git_pull_mode: crate::git::PullMode::default(),
             git_merge_mode: crate::git::MergeMode::default(),
             git_auto_fetch_minutes: 5,
+            lint_enabled: true,
+            lint_highlight: true,
+            lint_languages: std::collections::BTreeSet::new(),
+            lint_fix_level: crate::lint::Level::Errors,
+            lint_markings: std::collections::BTreeMap::new(),
+            lint_colors: std::collections::BTreeMap::new(),
+            lint_on_open: true,
+            lint_trigger: crate::lint::Trigger::default(),
+            lint_level: crate::lint::Level::default(),
+            lint_fix_on_save: false,
+            lint_tools: std::collections::BTreeMap::new(),
+            lint_programs: std::collections::BTreeMap::new(),
             window_width: 1200.0,
             window_height: 800.0,
             last_version: String::new(),

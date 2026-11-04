@@ -236,6 +236,7 @@ impl EditorState {
         bookmarks: &[usize],
         blame: Option<crate::code_editor::Annotations>,
         changes: Option<crate::code_editor::ChangePaint>,
+        problems: Option<crate::code_editor::DiagPaint>,
     ) -> Element<'a, Message> {
         let dark = config.dark_mode;
         self.content.set_wrapping(config.word_wrap);
@@ -290,6 +291,9 @@ impl EditorState {
         }
         if let Some(blame) = blame {
             editor = editor.annotations(blame, Message::BlameLineClicked);
+        }
+        if let Some(problems) = problems {
+            editor = editor.diagnostics(problems, Message::LintHover);
         }
 
         editor = editor.folding(
@@ -489,6 +493,14 @@ pub mod statusbar {
         /// The Git branch (name, commits ahead, behind): a click opens the
         /// switcher.
         pub branch: Option<(String, u32, u32)>,
+        /// How many problems the file has, once it was looked at: a click goes
+        /// to the next one.
+        pub problems: Option<crate::lint::Counts>,
+        /// The colors of errors and of warnings.
+        pub problem_colors: (iced::Color, iced::Color),
+        /// What the lint says when nothing could look at the file (no tool
+        /// found): a click opens its settings.
+        pub lint_hint: Option<String>,
         /// A language server that could be installed: its language, and
         /// what the button sends.
         pub offer: Option<(String, String, Message)>,
@@ -539,6 +551,49 @@ pub mod statusbar {
         };
 
         let mut right = row![].spacing(18).align_y(Alignment::Center);
+        if let Some(hint) = info.lint_hint {
+            right = right.push(
+                button(text(hint).size(11.5).color(muted))
+                    .padding([1, 8])
+                    .on_press(Message::OpenLintSettings)
+                    .style(
+                        (theme::GhostButton {
+                            dark,
+                            active: false,
+                        })
+                        .style(),
+                    ),
+            );
+        }
+        if let Some(counts) = info.problems {
+            let (red, amber) = info.problem_colors;
+            let mut label = row![].spacing(8).align_y(Alignment::Center);
+            if counts.errors > 0 {
+                label = label.push(text(format!("✖ {}", counts.errors)).size(11.5).color(red));
+            }
+            if counts.warnings > 0 {
+                label = label.push(
+                    text(format!("⚠ {}", counts.warnings))
+                        .size(11.5)
+                        .color(amber),
+                );
+            }
+            if counts.errors + counts.warnings == 0 {
+                label = label.push(text("✓").size(11.5).color(muted));
+            }
+            right = right.push(
+                button(label)
+                    .padding([1, 8])
+                    .on_press(Message::LintNext(true))
+                    .style(
+                        (theme::GhostButton {
+                            dark,
+                            active: false,
+                        })
+                        .style(),
+                    ),
+            );
+        }
         if let Some((name, ahead, behind)) = info.branch {
             let mut label = format!("⎇ {name}");
             if ahead > 0 {

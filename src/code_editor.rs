@@ -298,6 +298,36 @@ fn line_matches(
     }
 }
 
+/// A problem to underline: its range (bytes) and the color of its severity.
+#[derive(Debug, Clone)]
+pub struct DiagMark {
+    /// What the app calls it (sent back when the pointer rests on it).
+    pub id: usize,
+    pub line: usize,
+    pub col: usize,
+    pub end_line: usize,
+    pub end_col: usize,
+    pub color: Color,
+    /// A wavy line under it.
+    pub wavy: bool,
+    /// A plain line under it.
+    pub straight: bool,
+    /// A wash over its text, and how strong (0 to 1).
+    pub wash: Option<f32>,
+}
+
+/// The problems of the file, drawn as underlines or washes (as each one
+/// says) and as marks in the minimap.
+#[derive(Debug, Clone, Default)]
+pub struct DiagPaint {
+    pub marks: Vec<DiagMark>,
+}
+
+/// How long the pointer rests on a problem before its card opens.
+const DIAG_DELAY: std::time::Duration = std::time::Duration::from_millis(350);
+
+type DiagHover<'a, Message> = Box<dyn Fn(Option<(usize, Point)>) -> Message + 'a>;
+
 /// A multi-line text input.
 #[allow(missing_debug_implementations)]
 pub struct CodeEditor<'a, Highlighter, Message, Theme = iced::Theme>
@@ -329,6 +359,8 @@ where
     /// elsewhere says (to close it).
     on_revert: Option<RevertHandlers<'a, Message>>,
     on_definition: Option<Box<dyn Fn() -> Message + 'a>>,
+    diagnostics: Option<DiagPaint>,
+    on_diagnostic: Option<DiagHover<'a, Message>>,
     style: Style,
     on_edit: Option<Box<dyn Fn(Action) -> Message + 'a>>,
     highlighter_settings: Highlighter::Settings,
@@ -359,6 +391,8 @@ impl<'a, Message, Theme> CodeEditor<'a, highlighter::PlainText, Message, Theme> 
             on_change_bar: None,
             on_revert: None,
             on_definition: None,
+            diagnostics: None,
+            on_diagnostic: None,
             style: Style {
                 background: Background::Color(Color::TRANSPARENT),
                 border: Border::default(),
@@ -463,6 +497,18 @@ where
         self
     }
 
+    /// Underlines problems; `on_hover` hears of the one the pointer rests on
+    /// (and where its card goes, in the window), and when it leaves.
+    pub fn diagnostics(
+        mut self,
+        paint: DiagPaint,
+        on_hover: impl Fn(Option<(usize, Point)>) -> Message + 'a,
+    ) -> Self {
+        self.diagnostics = Some(paint);
+        self.on_diagnostic = Some(Box::new(on_hover));
+        self
+    }
+
     /// Ctrl/Cmd+click on a name: the cursor is put there, then `on_definition`
     /// hears about it.
     pub fn on_definition(mut self, on_definition: impl Fn() -> Message + 'a) -> Self {
@@ -522,6 +568,8 @@ where
             on_change_bar: self.on_change_bar,
             on_revert: self.on_revert,
             on_definition: self.on_definition,
+            diagnostics: self.diagnostics,
+            on_diagnostic: self.on_diagnostic,
             style: self.style,
             on_edit: self.on_edit,
             highlighter_settings: settings,
@@ -721,6 +769,35 @@ where
             }
         }
 
+        // Problems: a band across, and a tick near the right edge.
+        if let Some(paint) = &self.diagnostics {
+            for mark in &paint.marks {
+                if mark.line >= lines {
+                    continue;
+                }
+                let y = top + mark.line as f32 * scale;
+                quad(
+                    renderer,
+                    rect.x,
+                    y,
+                    rect.width,
+                    scale.max(2.0),
+                    Color {
+                        a: mark.color.a * 0.3,
+                        ..mark.color
+                    },
+                );
+                quad(
+                    renderer,
+                    rect.x + rect.width - 9.0,
+                    y,
+                    4.0,
+                    scale.max(2.0),
+                    mark.color,
+                );
+            }
+        }
+
         // Changed lines: a thin tick on the right edge.
         if let Some(changes) = &self.changes {
             for (lines_of, color) in [
@@ -831,6 +908,66 @@ where
             return None;
         }
         self.line_at_any_row(at.y, padding, renderer)
+    }
+
+    /// The problem under the pointer (at a point of the widget).
+    fn diag_at(&self, at: Point, padding: Padding) -> Option<usize> {
+        let paint = self.diagnostics.as_ref()?;
+        let internal = self.content.0.borrow();
+        let cursor = internal
+            .editor
+            .buffer()
+            .hit(at.x - padding.left, at.y - padding.top)?;
+        paint
+            .marks
+            .iter()
+            .filter(|m| {
+                let at = (cursor.line, cursor.index);
+                let end = if (m.end_line, m.end_col) == (m.line, m.col) {
+                    // An empty range stands for the character after it.
+                    (m.end_line, m.end_col + 1)
+                } else {
+                    (m.end_line, m.end_col)
+                };
+                at >= (m.line, m.col) && at < end
+            })
+            // The most serious one when several overlap: the first listed.
+            .map(|m| m.id)
+            .next()
+    }
+
+    /// Where the card of a problem goes: under where it starts.
+    fn diag_card_point(
+        &self,
+        id: usize,
+        bounds: Rectangle,
+        padding: Padding,
+        renderer: &iced::Renderer,
+    ) -> Option<Point> {
+        let mark = self
+            .diagnostics
+            .as_ref()?
+            .marks
+            .iter()
+            .find(|m| m.id == id)?;
+        let internal = self.content.0.borrow();
+        let row = self
+            .line_height
+            .to_absolute(Pixels(self.size_px(renderer)))
+            .0;
+        let run = internal
+            .editor
+            .buffer()
+            .layout_runs()
+            .find(|run| run.line_i == mark.line && run.line_height > 0.0)?;
+        let (x, _) = run.highlight(
+            Cursor_::new(mark.line, mark.col.min(run.text.len())),
+            Cursor_::new(mark.line, (mark.col + 1).min(run.text.len())),
+        )?;
+        Some(Point::new(
+            bounds.x + padding.left + x,
+            bounds.y + padding.top + run.line_top + row + 2.0,
+        ))
     }
 
     /// The cursor for something under the pointer in the gutter: a hand over
@@ -1383,6 +1520,11 @@ struct State<Highlighter: text::Highlighter> {
     hovered_note: Option<usize>,
     /// Since when the pointer rests on it (the card shows after a moment).
     note_since: std::cell::Cell<Option<std::time::Instant>>,
+    /// The problem the pointer rests on, since when, and whether its card
+    /// was asked for.
+    hovered_diag: Option<usize>,
+    diag_since: Option<std::time::Instant>,
+    diag_shown: bool,
     highlighter: RefCell<Highlighter>,
     highlighter_settings: Highlighter::Settings,
     highlighter_format_address: usize,
@@ -1424,6 +1566,9 @@ where
             hovered_fold: None,
             hovered_note: None,
             note_since: std::cell::Cell::new(None),
+            hovered_diag: None,
+            diag_since: None,
+            diag_shown: false,
             highlighter: RefCell::new(Highlighter::new(&self.highlighter_settings)),
             highlighter_settings: self.highlighter_settings.clone(),
             highlighter_format_address: self.highlighter_format as usize,
@@ -1544,6 +1689,38 @@ where
                             + NOTE_DELAY
                             + std::time::Duration::from_millis(20),
                     );
+                }
+            }
+        }
+
+        if let Some(on_diagnostic) = &self.on_diagnostic {
+            let bounds = layout.bounds();
+            let over = cursor
+                .position_in(bounds)
+                .filter(|at| at.x >= padding.left && at.x < bounds.width - padding.right);
+            let hovered = over.and_then(|at| self.diag_at(at, padding));
+            if hovered != state.hovered_diag {
+                if state.diag_shown {
+                    shell.publish(on_diagnostic(None));
+                    state.diag_shown = false;
+                }
+                state.hovered_diag = hovered;
+                state.diag_since = hovered.map(|_| std::time::Instant::now());
+                if hovered.is_some() {
+                    shell.request_redraw_at(
+                        std::time::Instant::now()
+                            + DIAG_DELAY
+                            + std::time::Duration::from_millis(20),
+                    );
+                }
+            } else if let (Some(id), Some(since), false) =
+                (hovered, state.diag_since, state.diag_shown)
+            {
+                if since.elapsed() >= DIAG_DELAY {
+                    if let Some(point) = self.diag_card_point(id, bounds, padding, renderer) {
+                        shell.publish(on_diagnostic(Some((id, point))));
+                        state.diag_shown = true;
+                    }
                 }
             }
         }
@@ -1869,6 +2046,107 @@ where
                             paint.color
                         },
                     );
+                }
+            }
+        }
+
+        if let Some(paint) = &self.diagnostics {
+            for run in internal.editor.buffer().layout_runs() {
+                if run.line_height <= 0.0 {
+                    continue;
+                }
+                let top = bounds.y + padding.top + run.line_top;
+                for mark in paint
+                    .marks
+                    .iter()
+                    .filter(|m| (m.line..=m.end_line).contains(&run.line_i))
+                {
+                    let from = if run.line_i == mark.line { mark.col } else { 0 };
+                    let to = if run.line_i == mark.end_line {
+                        mark.end_col
+                    } else {
+                        run.text.len()
+                    };
+                    // An empty range is drawn under the next character.
+                    let to = if to <= from {
+                        run.text
+                            .get(from..)
+                            .and_then(|r| r.chars().next())
+                            .map_or(from, |c| from + c.len_utf8())
+                    } else {
+                        to
+                    };
+                    let (from, to) = (from.min(run.text.len()), to.min(run.text.len()));
+                    let Some((x, width)) =
+                        run.highlight(Cursor_::new(run.line_i, from), Cursor_::new(run.line_i, to))
+                    else {
+                        continue;
+                    };
+                    if let Some(strength) = mark.wash {
+                        if let Some(rect) = bounds.intersection(&Rectangle {
+                            x: origin.x + x,
+                            y: top,
+                            width,
+                            height: row_height,
+                        }) {
+                            renderer.fill_quad(
+                                renderer::Quad {
+                                    bounds: rect,
+                                    border: iced::Border {
+                                        radius: 2.0.into(),
+                                        ..iced::Border::default()
+                                    },
+                                    ..renderer::Quad::default()
+                                },
+                                Color {
+                                    a: strength,
+                                    ..mark.color
+                                },
+                            );
+                        }
+                    }
+                    // The wavy line under the text.
+                    let base = top + row_height - 3.0;
+                    let mut step = 0.0;
+                    while mark.wavy && step < width {
+                        let piece = Rectangle {
+                            x: origin.x + x + step,
+                            y: base
+                                + if ((step / 2.0) as usize).is_multiple_of(2) {
+                                    0.0
+                                } else {
+                                    1.5
+                                },
+                            width: 2.0_f32.min(width - step),
+                            height: 1.2,
+                        };
+                        if let Some(piece) = bounds.intersection(&piece) {
+                            renderer.fill_quad(
+                                renderer::Quad {
+                                    bounds: piece,
+                                    ..renderer::Quad::default()
+                                },
+                                mark.color,
+                            );
+                        }
+                        step += 2.0;
+                    }
+                    if mark.straight {
+                        if let Some(line) = bounds.intersection(&Rectangle {
+                            x: origin.x + x,
+                            y: base + 0.5,
+                            width,
+                            height: 1.5,
+                        }) {
+                            renderer.fill_quad(
+                                renderer::Quad {
+                                    bounds: line,
+                                    ..renderer::Quad::default()
+                                },
+                                mark.color,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -2739,6 +3017,9 @@ mod tests {
             hovered_fold: None,
             hovered_note: None,
             note_since: std::cell::Cell::new(None),
+            hovered_diag: None,
+            diag_since: None,
+            diag_shown: false,
             highlighter: RefCell::new(highlighter::PlainText::new(&())),
             highlighter_settings: (),
             highlighter_format_address: 0,

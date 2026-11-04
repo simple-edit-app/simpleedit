@@ -205,6 +205,29 @@ pub enum Message {
     ConfirmDiscardMany(Vec<PathBuf>),
     ToggleSearch,
     ToggleSidebar,
+    /// A setting of the lint, changed in the Preferences.
+    Lint(crate::lint::Setting),
+    /// A run of the linters is done (its generation, the text it read).
+    LintDone(u64, lint::Key, lint::Outcome),
+    /// The pointer rests on a problem (and where its card goes), or left it.
+    LintHover(Option<(usize, iced::Point)>),
+    LintCardHover(bool),
+    LintCloseCheck(u64),
+    /// The fixes a language server has for a problem.
+    LintFixesLoaded(lint::Key, usize, Result<Vec<crate::lint::Fix>, String>),
+    /// Applies a fix (of a problem, by number) to the text.
+    LintApply(usize, usize),
+    LintFixAll,
+    /// Fixes the problems of one source (a linter, a server) only.
+    LintFixSource(String),
+    LintFixedAll(lint::Key, String),
+    LintFixFile(PathBuf),
+    /// Looks at the file now.
+    LintNow,
+    /// Opens the Preferences on the Lint page.
+    OpenLintSettings,
+    /// The cursor goes to the next problem (false: the previous one).
+    LintNext(bool),
     /// Splits the editor in two (side by side, or one above the other).
     Split(bool),
     /// Shows a file in a pane of the split (the editor is split first).
@@ -479,6 +502,7 @@ pub struct SimpleEditApp {
     /// Marked lines of every file, saved between runs.
     bookmarks: crate::bookmarks::Bookmarks,
     editor: EditorState,
+    lint: lint::LintState,
     /// The editor split in two panes, if it is.
     split: Option<split::Split>,
     sidebar: SidebarState,
@@ -672,6 +696,7 @@ impl SimpleEditApp {
         Self {
             bookmarks: crate::bookmarks::Bookmarks::default(),
             editor: EditorState::new(),
+            lint: lint::LintState::default(),
             split: None,
             sidebar: SidebarState::new(),
             search: SearchState::new(),
@@ -852,7 +877,8 @@ impl SimpleEditApp {
         let command = self.handle(message);
         self.sync_split();
         let marks_task = self.after_message(edits_text, status_before, git_done);
-        let command = Task::batch([command, marks_task]);
+        let lint_task = self.lint_tick();
+        let command = Task::batch([command, marks_task, lint_task]);
         if !typing {
             self.refresh_preview();
         }
@@ -1060,6 +1086,12 @@ impl SimpleEditApp {
                 .as_ref()
                 .filter(|s| !s.branch.is_empty())
                 .map(|s| (s.branch.clone(), s.ahead, s.behind)),
+            problems: self.problem_counts(),
+            problem_colors: (
+                crate::lint::color(&self.config, crate::lint::Severity::Error),
+                crate::lint::color(&self.config, crate::lint::Severity::Warning),
+            ),
+            lint_hint: self.lint_hint(),
         });
 
         let error_panel: Option<Element<Message>> = if self.show_error_panel {
@@ -1251,12 +1283,24 @@ impl SimpleEditApp {
             None => with_dropdown,
         };
 
+        // The card of a problem floats under it. The layer is always there,
+        // empty when no card is open: the tree of widgets must keep its shape,
+        // or the editor loses its focus (and its caret) each time a card
+        // appears or goes away.
+        let (card_at, card): (iced::Point, Element<Message>) = match self.lint_card(dark) {
+            Some(open) => open,
+            None => (iced::Point::ORIGIN, Space::new().into()),
+        };
+        let with_dropdown: Element<Message> =
+            crate::floating::at_point(with_dropdown, card, card_at.x, card_at.y);
+
         // The Preferences window floats over everything but the dialogs.
         let with_prefs: Element<Message> = if self.show_preferences {
             let window = container(self.preferences.view(
                 &self.config,
                 self.capturing,
                 &self.servers,
+                self.current_file.as_deref(),
             ))
             .width(Length::Fill)
             .height(Length::Fill)
@@ -1585,6 +1629,7 @@ impl SimpleEditApp {
                 Task::none()
             }
             Message::SaveFile => {
+                self.fix_before_save();
                 if let Some(path) = self.current_file.clone() {
                     if self.changed_on_disk(&path) {
                         self.overlay = ActiveOverlay::ConfirmOverwrite(path);
@@ -1697,6 +1742,8 @@ impl SimpleEditApp {
                             self.set_status(t!("status.file_saved"), false);
                         }
                         self.autosaving = false;
+                        // The tools that read the disk look again.
+                        self.lint.force = self.config.lint_trigger != crate::lint::Trigger::Manual;
                         // The Git panel and the open diffs follow the save.
                         let panel = if self.git.open {
                             Task::done(Message::Git(crate::git_panel::GitMsg::Refresh))
@@ -2081,6 +2128,48 @@ impl SimpleEditApp {
                 } else {
                     Task::none()
                 }
+            }
+            Message::Lint(setting) => {
+                // Turning a language on looks at the file at once.
+                if matches!(setting, crate::lint::Setting::Language(_, true)) {
+                    self.lint.force = true;
+                }
+                crate::lint::apply_setting(&mut self.config, setting);
+                self.config_dirty = true;
+                Task::none()
+            }
+            Message::LintDone(generation, key, outcome) => {
+                self.lint_done(generation, key, outcome);
+                Task::none()
+            }
+            Message::LintHover(over) => self.lint_hover(over),
+            Message::LintCardHover(over) => self.lint_card_hovered(over),
+            Message::LintCloseCheck(token) => {
+                self.lint_close_check(token);
+                Task::none()
+            }
+            Message::LintFixesLoaded(key, id, result) => {
+                self.lint_fixes_loaded(key, id, result);
+                Task::none()
+            }
+            Message::LintApply(id, fix) => self.lint_apply(id, fix),
+            Message::LintFixAll => {
+                self.lint.hover = None;
+                self.start_fix_all()
+            }
+            Message::LintFixSource(source) => self.start_fix_source(source),
+            Message::LintFixedAll(key, text) => self.lint_fixed_all(key, text),
+            Message::LintFixFile(path) => self.lint_fix_file(path),
+            Message::LintNow => self.lint_now(),
+            Message::OpenLintSettings => {
+                self.show_preferences = true;
+                self.handle(Message::Preferences(PreferencesMessage::PageSelected(
+                    crate::preferences::PrefsPage::Lint,
+                )))
+            }
+            Message::LintNext(forward) => {
+                self.lint_next(forward);
+                Task::none()
             }
             Message::Split(side_by_side) => self.split_editor(side_by_side, None),
             Message::SplitWith(path, side_by_side) => self.split_editor(side_by_side, Some(path)),
@@ -3597,8 +3686,9 @@ impl SimpleEditApp {
             return;
         }
         let top = top_before.min(self.editor.content.cursor_position().0);
-        self.bookmarks
-            .shift(path, top, count as isize - count_before as isize);
+        let delta = count as isize - count_before as isize;
+        self.bookmarks.shift(path, top, delta);
+        self.shift_problems(top, delta);
     }
 
     /// Runs an edit of the buffer and moves the bookmarks along with it.
@@ -5432,6 +5522,7 @@ impl SimpleEditApp {
                     marks,
                     self.blame_annotations(),
                     self.change_paint(),
+                    self.problem_paint(),
                 ),
                 dark,
             )
@@ -5528,6 +5619,10 @@ impl SimpleEditApp {
         let lbl_split_down = t!("menu.view_split_down").to_string();
         let lbl_split_close = t!("menu.view_split_close").to_string();
         let is_split = self.split.is_some();
+        let lbl_lint_fix = t!("menu.lint_fix").to_string();
+        let lbl_lint_now = t!("menu.lint_check").to_string();
+        let has_problems = !self.lint.diagnostics.is_empty();
+        let lint_off = self.lint_group_off();
         let lbl_format_sel = t!("ctx.format_selection").to_string();
         let lbl_format_all = t!("ctx.format_all").to_string();
         let has_fmt_ctx = self
@@ -5654,6 +5749,22 @@ impl SimpleEditApp {
                 None => disabled_item(lbl_git.clone(), dark),
             });
             ctx_items.push(separator(dark));
+            if let Some(group) = lint_off {
+                ctx_items.push(item(
+                    t!("lint.turn_on", name = group.name).to_string(),
+                    None,
+                    dark,
+                    Message::Lint(crate::lint::Setting::Language(group.id, true)),
+                ));
+            } else {
+                ctx_items.push(item(lbl_lint_now.clone(), None, dark, Message::LintNow));
+            }
+            ctx_items.push(if has_problems {
+                item(lbl_lint_fix.clone(), None, dark, Message::LintFixAll)
+            } else {
+                disabled_item(lbl_lint_fix.clone(), dark)
+            });
+            ctx_items.push(separator(dark));
             ctx_items.push(item(
                 lbl_split_right.clone(),
                 None,
@@ -5769,6 +5880,8 @@ use file_io::*;
 mod bookmark_panel;
 #[path = "app/git_file.rs"]
 mod git_file;
+#[path = "app/lint.rs"]
+mod lint;
 #[path = "app/split.rs"]
 mod split;
 #[path = "app/views.rs"]
