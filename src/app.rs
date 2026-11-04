@@ -1179,8 +1179,9 @@ impl SimpleEditApp {
             .style(se_theme::editor_panel(dark));
 
         // The floating panels, separated by a gap, on the window background.
+        // The panels touch: the gap between the list and the editor is the
+        // handle that resizes the list.
         let mut main_row = row![]
-            .spacing(se_theme::PANEL_GAP)
             .padding(iced::Padding {
                 top: 0.0,
                 right: se_theme::PANEL_GAP,
@@ -1203,11 +1204,11 @@ impl SimpleEditApp {
                 .spacing(se_theme::PANEL_GAP)
                 .width(Length::Fixed(self.sidebar_width)),
             );
-            // The edge between the list and the editor: drag it to resize.
+            // The gap between the list and the editor: drag it to resize.
             main_row = main_row.push(
                 iced::widget::mouse_area(
                     container(Space::new())
-                        .width(Length::Fixed(4.0))
+                        .width(Length::Fixed(se_theme::PANEL_GAP))
                         .height(Length::Fill),
                 )
                 .on_press(Message::SidebarResizeStart)
