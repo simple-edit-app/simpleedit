@@ -318,9 +318,7 @@ impl SimpleEditApp {
         }
 
         column![
-            container(Space::new().height(1))
-                .width(Length::Fill)
-                .style(se_theme::rule(dark)),
+            super::resize_edge(dark),
             container(
                 column![
                     header,
@@ -333,7 +331,7 @@ impl SimpleEditApp {
             .padding([8, 12])
             .height(Length::Fill),
         ]
-        .height(Length::Fixed(300.0))
+        .height(Length::Fixed(self.panel_height))
         .into()
     }
 }

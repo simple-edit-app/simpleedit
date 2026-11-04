@@ -10,7 +10,8 @@ use iced::Task;
 use super::{DiffTab, Entry, GitMsg, Panel};
 use crate::app::Message;
 use crate::git::graph::{self, Commit, GraphRow};
-use crate::git::history::{self, Refs};
+use crate::git::history::{self, PlanAction, PlanItem, Refs, SearchMode};
+use crate::git::{self};
 use crate::git::{Change, Source};
 
 /// How many commits a branch shows at first, and per "load more".
@@ -37,6 +38,42 @@ pub enum Dialog {
     },
     /// A confirmation (drop).
     Confirm { shas: Vec<String>, pushed: bool },
+    /// A name to type for a branch or a tag made at a commit.
+    Name {
+        kind: NameKind,
+        sha: String,
+        input: String,
+    },
+    /// A reset to a commit, to confirm.
+    Reset { sha: String, mode: git::ResetMode },
+    /// An interactive rebase, to arrange: the commits after `base`, oldest
+    /// first, each with what to do with it.
+    Rebase {
+        base: Option<String>,
+        items: Vec<PlanItem>,
+    },
+}
+
+/// What a name typed in the log is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameKind {
+    Branch,
+    Tag,
+}
+
+/// What the menu of a commit does besides rewriting history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogAction {
+    BranchHere,
+    TagHere,
+    CheckoutHere,
+    Reset(git::ResetMode),
+    /// The files that differ between that commit and HEAD / the other
+    /// commit selected.
+    CompareHead,
+    CompareSelected,
+    /// An interactive rebase of the commits from this one on.
+    RebaseFrom,
 }
 
 #[derive(Default)]
@@ -73,6 +110,9 @@ pub struct State {
     /// the rows around that are built.
     pub view_top: std::cell::Cell<f32>,
     pub view_height: std::cell::Cell<f32>,
+    /// What the commits are searched for, and in what.
+    pub search: String,
+    pub search_mode: SearchMode,
 }
 
 /// A commit to bring up, and the file whose diff to open.
@@ -95,6 +135,11 @@ pub struct Avail {
     pub reword: bool,
     pub revert: bool,
     pub cherry_pick: bool,
+    /// One commit is selected / exactly two, and the arrangements that need
+    /// a linear run of commits of the current branch.
+    pub one: bool,
+    pub two: bool,
+    pub rebase: bool,
 }
 
 impl State {
@@ -118,6 +163,8 @@ impl State {
             return Avail {
                 revert: true,
                 cherry_pick: chosen.iter().all(|c| !self.head_set.contains(&c.sha)),
+                one: chosen.len() == 1,
+                two: chosen.len() == 2,
                 ..Avail::default()
             };
         }
@@ -132,12 +179,15 @@ impl State {
             reword: chosen.len() == 1 && in_head && no_merge,
             revert: true,
             cherry_pick: chosen.iter().all(|c| !self.head_set.contains(&c.sha)),
+            one: chosen.len() == 1,
+            two: chosen.len() == 2,
+            rebase: chosen.len() == 1 && in_head && no_merge,
         }
     }
 }
 
 impl Panel {
-    pub(super) fn load_refs(&self) -> Task<Message> {
+    pub fn load_refs(&self) -> Task<Message> {
         let Some(repo) = self.repo.clone() else {
             return Task::none();
         };
@@ -175,10 +225,17 @@ impl Panel {
         let asked = rev.clone();
         let limit = self.log.limit;
         let file = self.log.file.clone();
+        let search = (self.log.search.trim().to_string(), self.log.search_mode);
         Task::perform(
             async move {
                 let (commits, head) = tokio::join!(
-                    history::log(&repo, &rev, limit, file.as_deref()),
+                    history::log_matching(
+                        &repo,
+                        &rev,
+                        limit,
+                        file.as_deref(),
+                        Some((search.1, search.0.as_str()))
+                    ),
                     history::head_commits(&repo, 5000)
                 );
                 Ok::<_, String>((commits?, head.unwrap_or_default()))
@@ -579,11 +636,203 @@ impl Panel {
         });
     }
 
+    /// The oldest commit and the newest of the selection, and the one.
+    fn selected_shas(&self) -> Vec<String> {
+        self.log
+            .selected_commits()
+            .iter()
+            .map(|c| c.sha.clone())
+            .collect()
+    }
+
+    pub(super) fn log_action(&mut self, action: LogAction) -> Task<Message> {
+        let avail = self.log.availability();
+        let shas = self.selected_shas();
+        let Some(repo) = self.repo.clone() else {
+            return Task::none();
+        };
+        match action {
+            LogAction::BranchHere | LogAction::TagHere | LogAction::CheckoutHere if !avail.one => {
+                Task::none()
+            }
+            LogAction::BranchHere => {
+                self.log.dialog = Some(Dialog::Name {
+                    kind: NameKind::Branch,
+                    sha: shas[0].clone(),
+                    input: String::new(),
+                });
+                self.typing = true;
+                Task::none()
+            }
+            LogAction::TagHere => {
+                self.log.dialog = Some(Dialog::Name {
+                    kind: NameKind::Tag,
+                    sha: shas[0].clone(),
+                    input: String::new(),
+                });
+                self.typing = true;
+                Task::none()
+            }
+            LogAction::CheckoutHere => {
+                let sha = shas[0].clone();
+                self.act(move |repo| async move {
+                    history::checkout_ref(&repo, &sha).await?;
+                    Ok(String::new())
+                })
+            }
+            LogAction::Reset(mode) => {
+                if !avail.one {
+                    return Task::none();
+                }
+                self.log.dialog = Some(Dialog::Reset {
+                    sha: shas[0].clone(),
+                    mode,
+                });
+                Task::none()
+            }
+            LogAction::CompareHead | LogAction::CompareSelected => {
+                // Newest first, as listed: the older one is the last.
+                let (from, to) = match (action, shas.as_slice()) {
+                    (LogAction::CompareHead, [one]) => (one.clone(), "HEAD".to_string()),
+                    (LogAction::CompareSelected, [newer, older]) => (older.clone(), newer.clone()),
+                    _ => return Task::none(),
+                };
+                let title = format!("{}..{}", short(&from), short(&to));
+                Task::perform(
+                    async move {
+                        let files = history::range_files(&repo, &from, &to).await?;
+                        Ok::<_, String>((repo, from, to, files))
+                    },
+                    move |result| match result {
+                        Ok((repo, from, to, files)) if !files.is_empty() => {
+                            Message::OpenDiffTab(DiffTab {
+                                repo,
+                                title: title.clone(),
+                                entries: files
+                                    .into_iter()
+                                    .map(|change| Entry {
+                                        source: Source::Range(from.clone(), to.clone()),
+                                        change,
+                                        staged: false,
+                                    })
+                                    .collect(),
+                                start: 0,
+                            })
+                        }
+                        Ok(_) => Message::Git(GitMsg::Done(Err(t!("git.no_diff").to_string()))),
+                        Err(e) => Message::Git(GitMsg::Done(Err(e))),
+                    },
+                )
+            }
+            LogAction::RebaseFrom => {
+                if !avail.rebase {
+                    return Task::none();
+                }
+                let commit = self.log.selected_commits()[0].clone();
+                // From this commit on: its parent is the base (none: the root).
+                let base = commit.parents.first().cloned();
+                Task::perform(
+                    async move {
+                        let plan = history::plan_from(&repo, base.as_deref()).await;
+                        (base, plan)
+                    },
+                    |(base, plan)| Message::Git(GitMsg::RebasePlanReady(base, plan)),
+                )
+            }
+        }
+    }
+
+    /// The plan of an interactive rebase is read: the dialog to arrange it.
+    pub(super) fn rebase_plan_ready(
+        &mut self,
+        base: Option<String>,
+        plan: Result<Vec<PlanItem>, String>,
+    ) {
+        match plan {
+            Ok(items) => self.log.dialog = Some(Dialog::Rebase { base, items }),
+            Err(error) => self.notice = Some((error, true)),
+        }
+    }
+
+    pub(super) fn rebase_move(&mut self, index: usize, up: bool) {
+        if let Some(Dialog::Rebase { items, .. }) = &mut self.log.dialog {
+            let other = if up {
+                index.checked_sub(1)
+            } else {
+                Some(index + 1).filter(|n| *n < items.len())
+            };
+            if let (Some(other), true) = (other, index < items.len()) {
+                items.swap(index, other);
+            }
+        }
+    }
+
+    pub(super) fn rebase_set(&mut self, index: usize, action: PlanAction) {
+        if let Some(Dialog::Rebase { items, .. }) = &mut self.log.dialog {
+            if let Some(item) = items.get_mut(index) {
+                item.action = action;
+            }
+        }
+    }
+
+    /// The first line of a reworded commit: the rest of its message stays.
+    pub(super) fn rebase_subject(&mut self, index: usize, subject: String) {
+        if let Some(Dialog::Rebase { items, .. }) = &mut self.log.dialog {
+            if let Some(item) = items.get_mut(index) {
+                let body = item
+                    .message
+                    .split_once('\n')
+                    .map(|(_, rest)| rest.to_string())
+                    .unwrap_or_default();
+                item.message = if body.is_empty() {
+                    subject.clone()
+                } else {
+                    format!("{subject}\n{body}")
+                };
+                item.subject = subject;
+            }
+        }
+    }
+
     pub(super) fn dialog_ok(&mut self) -> Task<Message> {
         let Some(dialog) = self.log.dialog.take() else {
             return Task::none();
         };
         match dialog {
+            Dialog::Name { kind, sha, input } => {
+                let name = input.split_whitespace().collect::<Vec<_>>().join("-");
+                if name.is_empty() {
+                    self.log.dialog = Some(Dialog::Name { kind, sha, input });
+                    return Task::none();
+                }
+                self.act(move |repo| async move {
+                    match kind {
+                        NameKind::Branch => {
+                            history::create_branch(&repo, &name, Some(&sha)).await?;
+                            Ok(format!("\u{4}{name}"))
+                        }
+                        NameKind::Tag => {
+                            history::create_tag(&repo, &name, Some(&sha), None).await?;
+                            Ok(format!("\u{9}{name}"))
+                        }
+                    }
+                })
+            }
+            Dialog::Reset { sha, mode } => self.act(move |repo| async move {
+                git::reset(&repo, &sha, mode).await?;
+                Ok(String::new())
+            }),
+            Dialog::Rebase { base, items } => {
+                if let Err(error) = history::check_plan(&items) {
+                    self.notice = Some((error, true));
+                    self.log.dialog = Some(Dialog::Rebase { base, items });
+                    return Task::none();
+                }
+                self.act(move |repo| async move {
+                    history::interactive_rebase(&repo, base.as_deref(), &items).await?;
+                    Ok(String::new())
+                })
+            }
             Dialog::Confirm { shas, .. } => self.act(move |repo| async move {
                 history::drop_commits(&repo, &shas).await?;
                 Ok(String::new())

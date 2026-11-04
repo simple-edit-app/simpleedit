@@ -6,16 +6,16 @@ use std::collections::BTreeMap;
 use iced::mouse;
 use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path, Stroke};
 use iced::widget::{
-    button, column, container, row, scrollable, text, text_editor, text_input, Space,
+    button, column, container, pick_list, row, scrollable, text, text_editor, text_input, Space,
 };
 use iced::{Alignment, Color, Element, Length, Point, Rectangle, Theme};
 
-use super::log::{short, Action, Avail, Dialog};
+use super::log::{short, Action, Avail, Dialog, NameKind};
 use super::stash::format_time;
 use super::{GitMsg, Panel};
 use crate::app::Message;
 use crate::git::graph::{GraphRow, COLORS};
-use crate::git::history::Branch;
+use crate::git::history::{self, Branch, PlanAction, PlanItem, SearchMode};
 use crate::theme as se_theme;
 
 const ROW_H: f32 = 24.0;
@@ -436,6 +436,29 @@ impl Panel {
         let log = &self.log;
         let avail = log.availability();
         let mut list = column![].spacing(0);
+        list = list.push(
+            container(
+                row![
+                    text_input(&t!("git.search_placeholder"), &log.search)
+                        .on_input(|t| Message::Git(GitMsg::LogSearch(t)))
+                        .on_submit(Message::Git(GitMsg::LogSearchRun))
+                        .size(12.5)
+                        .padding([3, 8])
+                        .style(se_theme::Field::new(dark).style()),
+                    pick_list(SearchMode::ALL, Some(log.search_mode), |mode| {
+                        Message::Git(GitMsg::LogSearchMode(mode))
+                    })
+                    .text_size(12)
+                    .padding([3, 8])
+                    .width(Length::Fixed(130.0))
+                    .style(se_theme::Select { dark }.style())
+                    .menu_style(se_theme::Select { dark }.menu_style()),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .padding([4, 8]),
+        );
         if let Some(file) = &log.file {
             list = list.push(
                 row![
@@ -581,37 +604,85 @@ impl Panel {
         avail: Avail,
         dark: bool,
     ) -> Element<'a, Message> {
-        let labels = [
-            (t!("git.copy_hash").to_string(), None, true),
-            (
+        use super::log::LogAction;
+        use crate::git::ResetMode;
+        let item = |key: String, msg: GitMsg, enabled: bool| (key, msg, enabled);
+        let labels = vec![
+            item(t!("git.copy_hash").to_string(), GitMsg::CopyHash, true),
+            item(
                 t!("git.cherry_pick").to_string(),
-                Some(Action::CherryPick),
+                GitMsg::Rewrite(Action::CherryPick),
                 avail.cherry_pick,
             ),
-            (
+            item(
                 t!("git.revert").to_string(),
-                Some(Action::Revert),
+                GitMsg::Rewrite(Action::Revert),
                 avail.revert,
             ),
-            (t!("git.drop").to_string(), Some(Action::Drop), avail.drop),
-            (
+            item(
+                t!("git.drop").to_string(),
+                GitMsg::Rewrite(Action::Drop),
+                avail.drop,
+            ),
+            item(
                 t!("git.squash").to_string(),
-                Some(Action::Squash),
+                GitMsg::Rewrite(Action::Squash),
                 avail.squash,
             ),
-            (
+            item(
                 t!("git.reword").to_string(),
-                Some(Action::Reword),
+                GitMsg::Rewrite(Action::Reword),
                 avail.reword,
+            ),
+            item(
+                t!("git.log_rebase_from").to_string(),
+                GitMsg::LogAction(LogAction::RebaseFrom),
+                avail.rebase,
+            ),
+            item(
+                t!("git.log_branch_here").to_string(),
+                GitMsg::LogAction(LogAction::BranchHere),
+                avail.one,
+            ),
+            item(
+                t!("git.log_tag_here").to_string(),
+                GitMsg::LogAction(LogAction::TagHere),
+                avail.one,
+            ),
+            item(
+                t!("git.log_checkout_here").to_string(),
+                GitMsg::LogAction(LogAction::CheckoutHere),
+                avail.one,
+            ),
+            item(
+                t!("git.log_reset_soft").to_string(),
+                GitMsg::LogAction(LogAction::Reset(ResetMode::Soft)),
+                avail.one,
+            ),
+            item(
+                t!("git.log_reset_mixed").to_string(),
+                GitMsg::LogAction(LogAction::Reset(ResetMode::Mixed)),
+                avail.one,
+            ),
+            item(
+                t!("git.log_reset_hard").to_string(),
+                GitMsg::LogAction(LogAction::Reset(ResetMode::Hard)),
+                avail.one,
+            ),
+            item(
+                t!("git.log_compare_head").to_string(),
+                GitMsg::LogAction(LogAction::CompareHead),
+                avail.one,
+            ),
+            item(
+                t!("git.log_compare_two").to_string(),
+                GitMsg::LogAction(LogAction::CompareSelected),
+                avail.two,
             ),
         ];
         crate::pointer_area::context_menu(target, move || {
             let mut menu = column![].spacing(1).padding(6);
-            for (label, action, enabled) in labels.iter().cloned() {
-                let message = match action {
-                    Some(a) => GitMsg::Rewrite(a),
-                    None => GitMsg::CopyHash,
-                };
+            for (label, message, enabled) in labels.iter().cloned() {
                 let mut b = button(text(label).size(13))
                     .padding([7, 10])
                     .width(Length::Fixed(230.0))
@@ -745,8 +816,113 @@ impl Panel {
 
     // ─── A question before a rewrite ────────────────────────────────────────
 
+    /// The commits of an interactive rebase, oldest first: what to do with
+    /// each, and in what order.
+    fn rebase_dialog<'a>(&'a self, items: &'a [PlanItem], dark: bool) -> Element<'a, Message> {
+        let p = se_theme::palette(dark);
+        let mut list = column![].spacing(2);
+        for (i, item) in items.iter().enumerate() {
+            let step = |label: &'static str, up: bool, enabled: bool| {
+                let mut b = button(text(label).size(12)).padding([2, 7]).style(
+                    (se_theme::GhostButton {
+                        dark,
+                        active: false,
+                    })
+                    .style(),
+                );
+                if enabled {
+                    b = b.on_press(Message::Git(GitMsg::RebaseMove(i, up)));
+                }
+                b
+            };
+            let dropped = item.action == PlanAction::Drop;
+            let what: Element<'a, Message> = if item.action == PlanAction::Reword {
+                text_input("", &item.subject)
+                    .on_input(move |t| Message::Git(GitMsg::RebaseSubject(i, t)))
+                    .size(12.5)
+                    .padding([3, 8])
+                    .style(se_theme::Field::new(dark).style())
+                    .into()
+            } else {
+                text(item.subject.as_str())
+                    .size(12.5)
+                    .color(if dropped { p.muted } else { p.text })
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .into()
+            };
+            list = list.push(
+                row![
+                    step("↑", true, i > 0),
+                    step("↓", false, i + 1 < items.len()),
+                    pick_list(PlanAction::ALL, Some(item.action), move |a| {
+                        Message::Git(GitMsg::RebaseSet(i, a))
+                    })
+                    .text_size(12)
+                    .padding([3, 8])
+                    .width(Length::Fixed(118.0))
+                    .style(se_theme::Select { dark }.style())
+                    .menu_style(se_theme::Select { dark }.menu_style()),
+                    text(super::log::short(&item.sha))
+                        .size(11.5)
+                        .font(se_theme::MONO)
+                        .color(p.muted)
+                        .width(58),
+                    container(what).width(Length::Fill).clip(true),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            );
+        }
+        let problem = history::check_plan(items).err();
+        let mut start = button(text(t!("git.rebase_start").to_string()).size(12.5))
+            .padding([5, 14])
+            .style((se_theme::Primary { dark }).style());
+        if problem.is_none() {
+            start = start.on_press(Message::Git(GitMsg::DialogOk));
+        }
+        container(
+            column![
+                text(t!("git.rebase_title").to_string())
+                    .size(13)
+                    .font(se_theme::UI_SEMIBOLD),
+                text(t!("git.rebase_help").to_string())
+                    .size(11.5)
+                    .color(p.muted),
+                scrollable(list)
+                    .style(se_theme::Scrollbar { dark }.style())
+                    .height(Length::Fill),
+                match problem {
+                    Some(error) => text(error).size(12).color(se_theme::error_color(dark)),
+                    None => text(""),
+                },
+                row![
+                    start,
+                    button(text(t!("git.cancel").to_string()).size(12.5))
+                        .padding([5, 14])
+                        .on_press(Message::Git(GitMsg::DialogCancel))
+                        .style(
+                            (se_theme::GhostButton {
+                                dark,
+                                active: false
+                            })
+                            .style()
+                        ),
+                ]
+                .spacing(8),
+            ]
+            .spacing(8),
+        )
+        .padding(14)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+    }
+
     fn dialog_view<'a>(&'a self, dialog: &'a Dialog, dark: bool) -> Element<'a, Message> {
         let p = se_theme::palette(dark);
+        if let Dialog::Rebase { items, .. } = dialog {
+            return self.rebase_dialog(items, dark);
+        }
         let (title, body, pushed): (String, Element<'a, Message>, bool) = match dialog {
             Dialog::Message {
                 action,
@@ -773,6 +949,41 @@ impl Panel {
                     .into(),
                 *pushed,
             ),
+            Dialog::Name { kind, sha, input } => (
+                match kind {
+                    NameKind::Branch => {
+                        t!("git.name_branch_title", sha = super::log::short(sha)).to_string()
+                    }
+                    NameKind::Tag => {
+                        t!("git.name_tag_title", sha = super::log::short(sha)).to_string()
+                    }
+                },
+                text_input(&t!("git.new_branch_name"), input)
+                    .on_input(|t| Message::Git(GitMsg::DialogName(t)))
+                    .on_submit(Message::Git(GitMsg::DialogOk))
+                    .size(13)
+                    .padding([6, 10])
+                    .style(se_theme::Field::new(dark).style())
+                    .into(),
+                false,
+            ),
+            Dialog::Reset { sha, mode } => (
+                t!("git.reset_title", sha = super::log::short(sha)).to_string(),
+                text(match mode {
+                    crate::git::ResetMode::Soft => t!("git.reset_text_soft").to_string(),
+                    crate::git::ResetMode::Mixed => t!("git.reset_text_mixed").to_string(),
+                    crate::git::ResetMode::Hard => t!("git.reset_text_hard").to_string(),
+                })
+                .size(12.5)
+                .color(if *mode == crate::git::ResetMode::Hard {
+                    se_theme::error_color(dark)
+                } else {
+                    p.muted
+                })
+                .into(),
+                false,
+            ),
+            Dialog::Rebase { .. } => unreachable!("shown by `rebase_dialog`"),
         };
         let mut form = column![text(title).size(13).font(se_theme::UI_SEMIBOLD), body].spacing(10);
         if pushed {
@@ -786,7 +997,10 @@ impl Panel {
             row![
                 button(text(t!("git.ok").to_string()).size(12.5))
                     .padding([5, 14])
-                    .on_press(Message::Git(GitMsg::DialogOk))
+                    .on_press_maybe(
+                        (!matches!(dialog, Dialog::Name { input, .. } if input.trim().is_empty()))
+                            .then_some(Message::Git(GitMsg::DialogOk))
+                    )
                     .style((se_theme::Primary { dark }).style()),
                 button(text(t!("git.cancel").to_string()).size(12.5))
                     .padding([5, 14])

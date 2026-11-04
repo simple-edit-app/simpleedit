@@ -98,6 +98,7 @@ impl SidebarState {
         current_file: &Option<PathBuf>,
         dirty: &HashSet<PathBuf>,
         marked: &HashSet<PathBuf>,
+        width: f32,
     ) -> Element<'_, Message> {
         let lbl_close = t!("sidebar.close").to_string();
         let lbl_close_others = t!("menu.file_close_others").to_string();
@@ -105,6 +106,7 @@ impl SidebarState {
         let lbl_save = t!("sidebar.save").to_string();
         let lbl_save_as = t!("sidebar.save_as").to_string();
         let lbl_git = t!("sidebar.git").to_string();
+        let lbl_delete = t!("sidebar.delete").to_string();
         let lbl_bookmark_add = t!("sidebar.bookmark_add").to_string();
         let lbl_bookmark_remove = t!("sidebar.bookmark_remove").to_string();
         let p = theme::palette(dark);
@@ -193,8 +195,10 @@ impl SidebarState {
                 };
                 let bookmark_path = path.clone();
                 let lbl_git = lbl_git.clone();
+                let lbl_delete = lbl_delete.clone();
+                let full_path = path.clone();
 
-                crate::pointer_area::context_menu(row_button, move || {
+                let row_with_menu = crate::pointer_area::context_menu(row_button, move || {
                     let ctx_item =
                         |label: String, msg: Option<Message>| -> Element<'static, Message> {
                             let mut btn = button(text(label).size(13))
@@ -246,13 +250,37 @@ impl SidebarState {
                                 (!crate::app::is_untitled(&bookmark_path))
                                     .then(|| Message::ToggleFileBookmark(bookmark_path.clone())),
                             ),
+                            ctx_item(
+                                lbl_delete.clone(),
+                                (!crate::app::is_untitled(&bookmark_path))
+                                    .then(|| Message::AskDeleteFile(bookmark_path.clone())),
+                            ),
                         ]
                         .spacing(1)
                         .padding(6),
                     )
                     .style(theme::card(dark))
                     .into()
-                })
+                });
+                // The whole path, as the IDEs show it under the pointer.
+                if crate::app::is_untitled(&full_path) {
+                    row_with_menu
+                } else {
+                    iced::widget::tooltip(
+                        row_with_menu,
+                        container(
+                            text(crate::app::display_path(&full_path))
+                                .size(12)
+                                .shaping(iced::widget::text::Shaping::Advanced),
+                        )
+                        .padding([4, 8])
+                        .style(theme::tooltip(dark)),
+                        iced::widget::tooltip::Position::Bottom,
+                    )
+                    .gap(4)
+                    .delay(std::time::Duration::from_millis(500))
+                    .into()
+                }
             })
             .collect();
 
@@ -289,7 +317,7 @@ impl SidebarState {
             .spacing(10),
         )
         .padding([14, 10])
-        .width(208)
+        .width(width)
         .height(Length::Fill)
         .style(theme::panel(dark))
         .into()

@@ -73,6 +73,12 @@ pub struct Settings {
 /// A highlighted span: just its text color (`None` = the default text color).
 pub struct Highlight(Option<Color>);
 
+impl Highlight {
+    pub fn color(&self) -> Option<Color> {
+        self.0
+    }
+}
+
 /// The `to_format` callback `text_editor::highlight` expects.
 pub fn to_format(highlight: &Highlight, _theme: &iced::Theme) -> Format<Font> {
     Format {

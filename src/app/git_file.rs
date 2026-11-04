@@ -17,6 +17,8 @@ pub enum FileAction {
     CompareRef,
     CompareRevision,
     History,
+    /// Adds the file to the `.gitignore` of its repository.
+    Ignore,
 }
 
 /// What a comparison can be made against.
@@ -37,6 +39,10 @@ pub struct Pick {
     pub revisions: bool,
     pub items: Vec<PickItem>,
     pub filter: String,
+}
+
+pub(super) fn branch_input_id() -> iced::widget::Id {
+    iced::widget::Id::new("git-branch-input")
 }
 
 fn pick_input_id() -> iced::widget::Id {
@@ -64,6 +70,113 @@ fn ref_items(refs: &history::Refs) -> Vec<PickItem> {
 }
 
 impl SimpleEditApp {
+    /// The list that switches branch from the status bar: type to filter,
+    /// Enter takes the first, and a name no branch has can be made.
+    pub(super) fn branch_switch_overlay(&self, dark: bool, filter: &str) -> Element<'_, Message> {
+        let p = se_theme::palette(dark);
+        let typed = filter.trim().to_lowercase();
+        let current = self.git.status.as_ref().map(|s| s.branch.as_str());
+        let mut matching: Vec<(&str, bool, bool)> = self
+            .git
+            .log
+            .refs
+            .as_ref()
+            .map(|refs| {
+                refs.branches
+                    .iter()
+                    .filter(|b| b.name.to_lowercase().contains(&typed))
+                    .map(|b| (b.name.as_str(), b.remote, Some(b.name.as_str()) == current))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // The local ones first.
+        matching.sort_by_key(|(_, remote, _)| *remote);
+        let exists = matching
+            .iter()
+            .any(|(name, ..)| name.to_lowercase() == typed);
+        let mut list = column![].spacing(1);
+        for (name, remote, is_current) in matching.iter().take(200) {
+            list = list.push(
+                button(
+                    row![
+                        text(if *is_current { "●" } else { " " })
+                            .size(10)
+                            .color(p.accent)
+                            .width(14),
+                        text(*name).size(13).width(Length::Fill),
+                        text(if *remote {
+                            t!("git.pick_remote").to_string()
+                        } else {
+                            String::new()
+                        })
+                        .size(11)
+                        .color(p.muted),
+                    ]
+                    .align_y(iced::Alignment::Center),
+                )
+                .padding([6, 10])
+                .width(Length::Fill)
+                .on_press(Message::BranchSwitchChoose(name.to_string(), false))
+                .style(
+                    (se_theme::MenuItem {
+                        dark,
+                        radius: se_theme::R_SM,
+                        highlighted: false,
+                    })
+                    .style(),
+                ),
+            );
+        }
+        // Nothing of that name: it can be made.
+        let new_name = filter.split_whitespace().collect::<Vec<_>>().join("-");
+        if !typed.is_empty() && !exists {
+            list = list.push(
+                button(
+                    text(t!("git.switch_create", name = new_name.as_str()).to_string()).size(13),
+                )
+                .padding([6, 10])
+                .width(Length::Fill)
+                .on_press(Message::BranchSwitchChoose(new_name.clone(), true))
+                .style(
+                    (se_theme::MenuItem {
+                        dark,
+                        radius: se_theme::R_SM,
+                        highlighted: false,
+                    })
+                    .style(),
+                ),
+            );
+        }
+        // Enter: the first of the list, or the new branch.
+        let first = match matching.first() {
+            Some((name, ..)) => Message::BranchSwitchChoose(name.to_string(), false),
+            None => Message::BranchSwitchChoose(new_name, true),
+        };
+        container(
+            column![
+                text(t!("git.switch_title").to_string())
+                    .size(14)
+                    .font(se_theme::UI_SEMIBOLD)
+                    .color(p.text),
+                text_input(&t!("git.switch_placeholder"), filter)
+                    .id(branch_input_id())
+                    .on_input(Message::BranchSwitchFilter)
+                    .on_submit(first)
+                    .padding([7, 10])
+                    .size(13)
+                    .style(se_theme::Field::new(dark).style()),
+                scrollable(container(list).padding([0, 2]))
+                    .style(se_theme::Scrollbar { dark }.style())
+                    .height(Length::Fixed(280.0)),
+            ]
+            .spacing(10)
+            .padding(16),
+        )
+        .width(420)
+        .style(se_theme::card(dark))
+        .into()
+    }
+
     pub(super) fn git_file_overlay(&self, dark: bool, path: &Path) -> Element<'_, Message> {
         let p = se_theme::palette(dark);
         let staged = self.git.repo.as_ref().is_some_and(|repo| {
@@ -113,6 +226,7 @@ impl SimpleEditApp {
                         FileAction::CompareRevision
                     ),
                     item(t!("git.file_history").to_string(), FileAction::History),
+                    item(t!("git.ignore_file").to_string(), FileAction::Ignore),
                 ]
                 .spacing(1),
             ]
@@ -265,6 +379,17 @@ impl SimpleEditApp {
                 self.git.typing = false;
                 Task::done(Message::Git(GitMsg::Refresh))
             }
+            FileAction::Ignore => Task::perform(
+                async move {
+                    let untracked = crate::git::ignore_file(&root, &rel).await?;
+                    Ok(if untracked {
+                        t!("git.file_ignored_untracked").to_string()
+                    } else {
+                        t!("git.file_ignored").to_string()
+                    })
+                },
+                Message::GitFileDone,
+            ),
             FileAction::History => {
                 self.show_git_panel(root);
                 self.git.tab = Tab::Log;

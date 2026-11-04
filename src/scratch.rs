@@ -59,6 +59,15 @@ pub fn file_name(name: &str, ext: &str) -> Result<String, String> {
     })
 }
 
+/// The name given to a file made without one: `scratch1`, `scratch2`...,
+/// the first that is free in `dir` with that extension.
+pub fn next_name(dir: &Path, ext: &str) -> String {
+    (1..)
+        .map(|n| format!("scratch{n}"))
+        .find(|name| file_name(name, ext).is_ok_and(|file| !dir.join(file).exists()))
+        .expect("an unbounded range")
+}
+
 /// Creates an empty scratch file; an existing one is never overwritten.
 pub fn create(dir: &Path, name: &str, ext: &str) -> Result<PathBuf, String> {
     let file = file_name(name, ext)?;

@@ -68,6 +68,8 @@ pub struct Gutter {
 pub struct Annotation {
     pub text: String,
     pub tint: Color,
+    /// Which entry of [`Annotations::details`] a pointer on it shows.
+    pub details: Option<usize>,
 }
 
 /// A column of text left of the line numbers (git blame).
@@ -76,6 +78,13 @@ pub struct Annotations {
     /// One per line of the buffer.
     pub lines: std::sync::Arc<Vec<Annotation>>,
     pub text: Color,
+    /// What a pointer on a line shows, one entry per commit: the first line
+    /// is the hash, drawn as a link.
+    pub details: std::sync::Arc<Vec<Vec<String>>>,
+    pub link: Color,
+    pub card_text: Color,
+    pub card_background: Color,
+    pub card_border: Color,
 }
 
 /// Lines that differ from the last commit: a bar between the gutter and the
@@ -102,6 +111,9 @@ const REVERT_W: f32 = 30.0;
 const REVERT_H: f32 = 26.0;
 
 type RevertHandlers<'a, Message> = (Box<dyn Fn() -> Message + 'a>, Box<dyn Fn() -> Message + 'a>);
+
+/// How long the pointer rests on a blame line before its card shows.
+const NOTE_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Width of the blame column.
 pub const ANNOTATION_WIDTH: f32 = 210.0;
@@ -659,6 +671,30 @@ where
             );
         }
 
+        // Changed lines: a band across the minimap (under the bookmarks'
+        // lines), and a tick on the right edge below.
+        if let Some(changes) = &self.changes {
+            for (lines_of, color) in [
+                (&changes.added, changes.added_color),
+                (&changes.modified, changes.modified_color),
+                (&changes.deleted, changes.deleted_color),
+            ] {
+                for &line in lines_of.iter().filter(|l| **l <= lines) {
+                    quad(
+                        renderer,
+                        rect.x,
+                        top + line as f32 * scale,
+                        rect.width,
+                        scale.max(2.0),
+                        Color {
+                            a: color.a * 0.32,
+                            ..color
+                        },
+                    );
+                }
+            }
+        }
+
         // Bookmarks: a line across the minimap, and a tick on the left edge.
         if let Some(marks) = &self.bookmarks {
             for &line in marks.lines.iter().filter(|l| **l < lines) {
@@ -780,6 +816,64 @@ where
             width: REVERT_W,
             height: REVERT_H,
         })
+    }
+
+    /// The line whose blame column the pointer is in.
+    fn note_line_at(
+        &self,
+        at: Point,
+        padding: Padding,
+        renderer: &iced::Renderer,
+    ) -> Option<usize> {
+        self.annotations.as_ref()?;
+        let from = self.padding.left;
+        if at.x < from || at.x >= from + ANNOTATION_WIDTH - 6.0 {
+            return None;
+        }
+        self.line_at_any_row(at.y, padding, renderer)
+    }
+
+    /// The cursor for something under the pointer in the gutter: a hand over
+    /// what a click does (a chevron, a bar of changes, a bookmark, a blame
+    /// line, the button that puts a change back), the plain arrow elsewhere.
+    fn gutter_interaction(
+        &self,
+        at: Point,
+        padding: Padding,
+        renderer: &iced::Renderer,
+    ) -> mouse::Interaction {
+        let size = self.size_px(renderer);
+        let extra = if self.annotations.is_some() {
+            ANNOTATION_WIDTH
+        } else {
+            0.0
+        };
+        let line = self.line_at_any_row(at.y, padding, renderer);
+        let over = |from: f32, to: f32| at.x >= from && at.x < to;
+        let hand = self.chevron_line_at(at, padding, renderer).is_some()
+            || self.note_line_at(at, padding, renderer).is_some()
+            || self
+                .revert_rect(padding, renderer)
+                .is_some_and(|r| r.contains(at))
+            || line.is_some_and(|l| {
+                let bar = self.change_bar_x(size, self.content.line_count());
+                let changed = self.changes.as_ref().is_some_and(|c| {
+                    c.added.binary_search(&l).is_ok()
+                        || c.modified.binary_search(&l).is_ok()
+                        || c.deleted.binary_search(&l).is_ok()
+                });
+                let marked = self
+                    .bookmarks
+                    .as_ref()
+                    .is_some_and(|b| b.lines.binary_search(&l).is_ok());
+                (changed && over(bar - 0.5, bar + 4.5))
+                    || (marked && over(self.padding.left + extra, self.padding.left + extra + 16.0))
+            });
+        if hand {
+            mouse::Interaction::Pointer
+        } else {
+            mouse::Interaction::Idle
+        }
     }
 
     /// The line of the buffer shown at height `y`, on any of the rows a
@@ -1224,6 +1318,20 @@ impl Content {
         };
     }
 
+    /// The line of the buffer shown at height `y` of the text area (the top
+    /// of the first visible row is 0).
+    pub fn line_at_y(&self, y: f32) -> Option<usize> {
+        let internal = self.0.borrow();
+        internal
+            .editor
+            .buffer()
+            .layout_runs()
+            .find(|run| {
+                run.line_height > 0.0 && y >= run.line_top && y < run.line_top + run.line_height
+            })
+            .map(|run| run.line_i)
+    }
+
     /// Which buffer this is (a new one when the text is replaced as a whole).
     pub fn id(&self) -> u64 {
         self.0.borrow().id
@@ -1271,6 +1379,10 @@ struct State<Highlighter: text::Highlighter> {
     modifiers: keyboard::Modifiers,
     /// The line whose chevron the pointer is on.
     hovered_fold: Option<usize>,
+    /// The line whose blame the pointer is on.
+    hovered_note: Option<usize>,
+    /// Since when the pointer rests on it (the card shows after a moment).
+    note_since: std::cell::Cell<Option<std::time::Instant>>,
     highlighter: RefCell<Highlighter>,
     highlighter_settings: Highlighter::Settings,
     highlighter_format_address: usize,
@@ -1310,6 +1422,8 @@ where
             minimap_drag: false,
             modifiers: keyboard::Modifiers::default(),
             hovered_fold: None,
+            hovered_note: None,
+            note_since: std::cell::Cell::new(None),
             highlighter: RefCell::new(Highlighter::new(&self.highlighter_settings)),
             highlighter_settings: self.highlighter_settings.clone(),
             highlighter_format_address: self.highlighter_format as usize,
@@ -1411,6 +1525,27 @@ where
 
         if let Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) = event {
             state.modifiers = *modifiers;
+        }
+
+        if self.annotations.is_some() {
+            let hovered = cursor
+                .position_in(layout.bounds())
+                .and_then(|at| self.note_line_at(at, padding, renderer));
+            if hovered != state.hovered_note {
+                state.hovered_note = hovered;
+                state
+                    .note_since
+                    .set(hovered.map(|_| std::time::Instant::now()));
+                shell.request_redraw();
+                // And again once the card is due.
+                if hovered.is_some() {
+                    shell.request_redraw_at(
+                        std::time::Instant::now()
+                            + NOTE_DELAY
+                            + std::time::Duration::from_millis(20),
+                    );
+                }
+            }
         }
 
         if self.folding.is_some() {
@@ -2154,6 +2289,76 @@ where
             }
         }
 
+        // What the pointer on a blame line says of its commit.
+        let note_due = state
+            .note_since
+            .get()
+            .is_some_and(|since| since.elapsed() >= NOTE_DELAY);
+        if let (Some(line), Some(notes), true) = (state.hovered_note, &self.annotations, note_due) {
+            let lines = notes
+                .lines
+                .get(line)
+                .and_then(|n| n.details)
+                .and_then(|i| notes.details.get(i));
+            let top = internal
+                .editor
+                .buffer()
+                .layout_runs()
+                .find(|run| run.line_i == line && run.line_height > 0.0)
+                .map(|run| bounds.y + padding.top + run.line_top);
+            if let (Some(top), Some(lines)) = (top, lines) {
+                let text_size = 12.5;
+                let row = 18.0;
+                let pad = 10.0;
+                let chars = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+                let width = (chars as f32 * text_size * 0.6 + 2.0 * pad).min(bounds.width - 20.0);
+                let height = lines.len() as f32 * row + 2.0 * pad;
+                let x = bounds.x + self.padding.left + 12.0;
+                let y = (top + row_height + 2.0)
+                    .min(bounds.y + bounds.height - height - 4.0)
+                    .max(bounds.y);
+                let card = Rectangle {
+                    x,
+                    y,
+                    width,
+                    height,
+                };
+                renderer.with_layer(bounds, |renderer| {
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: card,
+                            border: iced::Border {
+                                color: notes.card_border,
+                                width: 1.0,
+                                radius: 6.0.into(),
+                            },
+                            ..renderer::Quad::default()
+                        },
+                        notes.card_background,
+                    );
+                    for (i, text_line) in lines.iter().enumerate() {
+                        renderer.fill_text(
+                            text::Text {
+                                content: text_line.clone(),
+                                bounds: Size::new(width - 2.0 * pad, row),
+                                size: Pixels(text_size),
+                                line_height: LineHeight::Absolute(Pixels(row)),
+                                font: self.font.unwrap_or(Font::MONOSPACE),
+                                align_x: text::Alignment::Left,
+                                align_y: alignment::Vertical::Top,
+                                shaping: text::Shaping::Advanced,
+                                wrapping: text::Wrapping::None,
+                            },
+                            Point::new(x + pad, y + pad + i as f32 * row),
+                            // The hash is drawn like a link.
+                            if i == 0 { notes.link } else { notes.card_text },
+                            card,
+                        );
+                    }
+                });
+            }
+        }
+
         if let (Some(changes), Some(rect)) = (
             &self.changes,
             self.revert_rect_in(&internal.editor, padding, size),
@@ -2214,13 +2419,30 @@ where
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         _viewport: &Rectangle,
-        _renderer: &iced::Renderer,
+        renderer: &iced::Renderer,
     ) -> mouse::Interaction {
         let is_disabled = self.on_edit.is_none();
         let state = tree.state.downcast_ref::<State<Highlighter>>();
 
-        if self.minimap.is_some() && cursor.is_over(minimap_rect(layout.bounds())) {
+        let on_revert_button = cursor.position_in(layout.bounds()).is_some_and(|at| {
+            let padding = self.text_padding(renderer, self.content.line_count());
+            self.revert_rect(padding, renderer)
+                .is_some_and(|r| r.contains(at))
+        });
+        if (self.minimap.is_some() && cursor.is_over(minimap_rect(layout.bounds())))
+            || on_revert_button
+        {
             mouse::Interaction::Pointer
+        } else if let Some(at) = cursor
+            .position_in(layout.bounds())
+            .filter(|_| self.gutter.is_some())
+            .filter(|at| {
+                // Left of the text: the gutter (and the blame column).
+                at.x < self.text_padding(renderer, self.content.line_count()).left
+            })
+        {
+            let padding = self.text_padding(renderer, self.content.line_count());
+            self.gutter_interaction(at, padding, renderer)
         } else if cursor.is_over(layout.bounds()) {
             if is_disabled {
                 mouse::Interaction::NotAllowed
@@ -2515,6 +2737,8 @@ mod tests {
             minimap_drag: false,
             modifiers: keyboard::Modifiers::default(),
             hovered_fold: None,
+            hovered_note: None,
+            note_since: std::cell::Cell::new(None),
             highlighter: RefCell::new(highlighter::PlainText::new(&())),
             highlighter_settings: (),
             highlighter_format_address: 0,

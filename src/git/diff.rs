@@ -16,6 +16,8 @@ pub struct Line {
     /// Line numbers in the old and the new file.
     pub old_no: Option<u32>,
     pub new_no: Option<u32>,
+    /// Where it is in the diff: (hunk, line of the hunk).
+    pub pos: (usize, usize),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -236,6 +238,103 @@ impl FileDiff {
     }
 }
 
+impl FileDiff {
+    /// Which block of changes each line of each hunk belongs to (`None` for
+    /// context), numbered as [`blocks`](Self::blocks) does.
+    fn block_ids(&self) -> Vec<Vec<Option<usize>>> {
+        let mut next = 0usize;
+        self.hunks
+            .iter()
+            .map(|hunk| {
+                let mut open = false;
+                hunk.lines
+                    .iter()
+                    .map(|line| {
+                        if line.tag == Tag::Context {
+                            open = false;
+                            None
+                        } else {
+                            if !open {
+                                open = true;
+                                next += 1;
+                            }
+                            Some(next - 1)
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// A patch that holds only the changes `keep` says yes to, for
+    /// `git apply --cached`: what is left out stays as it is. Reversed
+    /// (`git apply --cached -R`, to take changes out of the index) it is
+    /// what is *kept* that is taken out, and what is left out stays in.
+    fn patch_of(&self, reverse: bool, keep: impl Fn(usize, usize) -> bool) -> Option<String> {
+        let mut out = String::new();
+        for (h, hunk) in self.hunks.iter().enumerate() {
+            let kept = |l: usize| keep(h, l);
+            if !(0..hunk.lines.len()).any(|l| hunk.lines[l].tag != Tag::Context && kept(l)) {
+                continue;
+            }
+            let start = |sign: char| -> usize {
+                hunk.header
+                    .split(' ')
+                    .find_map(|p| p.strip_prefix(sign))
+                    .and_then(|n| n.split(',').next())
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(1)
+            };
+            let (mut old_len, mut new_len) = (0usize, 0usize);
+            let mut body = String::new();
+            for (l, line) in hunk.lines.iter().enumerate() {
+                let (sign, in_old, in_new) = match (line.tag, kept(l), reverse) {
+                    (Tag::Context, _, _) => (' ', true, true),
+                    (Tag::Added, true, _) => ('+', false, true),
+                    (Tag::Removed, true, _) => ('-', true, false),
+                    // Left out: the line is as it already is where the patch
+                    // is applied: not there (apply) or there (reverse).
+                    (Tag::Added, false, false) | (Tag::Removed, false, true) => continue,
+                    (Tag::Removed, false, false) | (Tag::Added, false, true) => (' ', true, true),
+                };
+                old_len += usize::from(in_old);
+                new_len += usize::from(in_new);
+                body.push(sign);
+                body.push_str(&line.text);
+                body.push('\n');
+            }
+            if out.is_empty() {
+                let old = self.old_path.as_deref().unwrap_or(&self.path);
+                out.push_str(&format!(
+                    "diff --git a/{old} b/{new}\n--- a/{old}\n+++ b/{new}\n",
+                    new = self.path
+                ));
+            }
+            // (`git apply --recount` takes the counts from the body.)
+            let (old_start, new_start) = (start('-'), start('+'));
+            out.push_str(&format!(
+                "@@ -{old_start},{old_len} +{new_start},{new_len} @@\n{body}"
+            ));
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    /// The patch of one block of changes (an index of [`blocks`](Self::blocks)).
+    pub fn block_patch(&self, block: usize, reverse: bool) -> Option<String> {
+        let ids = self.block_ids();
+        self.patch_of(reverse, |h, l| ids[h][l] == Some(block))
+    }
+
+    /// The patch of the changed lines picked (hunk, line).
+    pub fn lines_patch(
+        &self,
+        picked: &std::collections::HashSet<(usize, usize)>,
+        reverse: bool,
+    ) -> Option<String> {
+        self.patch_of(reverse, |h, l| picked.contains(&(h, l)))
+    }
+}
+
 /// Parses the output of `git diff` / `git show` (one or several files).
 pub fn parse_diff(text: &str) -> Vec<FileDiff> {
     let mut files: Vec<FileDiff> = Vec::new();
@@ -306,7 +405,9 @@ pub fn parse_diff(text: &str) -> Vec<FileDiff> {
                 header,
                 lines: Vec::new(),
             });
-        } else if let Some(hunk) = file.hunks.last_mut() {
+        } else if let Some(hunk) = file.hunks.len().checked_sub(1).map(|h| (h, h)) {
+            let (hunk_index, _) = hunk;
+            let hunk = &mut file.hunks[hunk_index];
             let (tag, text) = match line.as_bytes().first() {
                 Some(b'+') => (Tag::Added, &line[1..]),
                 Some(b'-') => (Tag::Removed, &line[1..]),
@@ -333,6 +434,7 @@ pub fn parse_diff(text: &str) -> Vec<FileDiff> {
                 text: text.to_string(),
                 old_no: old,
                 new_no: new,
+                pos: (hunk_index, hunk.lines.len()),
             });
         }
     }
@@ -472,5 +574,48 @@ Binary files a/b.bin and b/b.bin differ
         let file = parse_diff(text).remove(0);
         assert_eq!(file.path, "dir b/x.txt");
         assert_eq!(file.old_path, None);
+    }
+
+    const TWO_BLOCKS: &str = "\
+diff --git a/f.txt b/f.txt
+--- a/f.txt
++++ b/f.txt
+@@ -1,7 +1,7 @@
+ a
+-b
++B
+ c
+ d
+ e
+-f
++F
+ g
+";
+
+    #[test]
+    fn a_block_has_a_patch_of_its_own_with_the_other_blocks_left_as_they_are() {
+        let file = parse_diff(TWO_BLOCKS).remove(0);
+        let patch = file.block_patch(1, false).unwrap();
+        // The second block only: the first one's lines are context.
+        assert!(patch.contains("\n-f\n+F\n"));
+        assert!(patch.contains("\n b\n"), "{patch}");
+        assert!(!patch.contains("+B") && !patch.contains("-b"));
+        assert!(patch.contains("@@ -1,7 +1,7 @@"));
+        // Reversed, to take it out of the index: the first block's new line
+        // stays in, and the first block's old line is not there.
+        let reversed = file.block_patch(1, true).unwrap();
+        assert!(reversed.contains("\n B\n") && !reversed.contains("\n b\n"));
+        assert!(file.block_patch(5, false).is_none());
+    }
+
+    #[test]
+    fn some_lines_have_a_patch_too() {
+        let file = parse_diff(TWO_BLOCKS).remove(0);
+        let mut picked = std::collections::HashSet::new();
+        picked.insert((0usize, 1usize)); // -b only
+        let patch = file.lines_patch(&picked, false).unwrap();
+        assert!(patch.contains("\n-b\n") && !patch.contains("+B"));
+        assert!(patch.contains("@@ -1,7 +1,6 @@"), "{patch}");
+        assert!(file.lines_patch(&Default::default(), false).is_none());
     }
 }

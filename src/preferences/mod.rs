@@ -42,16 +42,18 @@ pub enum PrefsPage {
     Appearance,
     Shortcuts,
     Language,
+    Git,
     Servers,
     Updates,
 }
 
 impl PrefsPage {
-    const ALL: [PrefsPage; 6] = [
+    const ALL: [PrefsPage; 7] = [
         PrefsPage::Editor,
         PrefsPage::Appearance,
         PrefsPage::Shortcuts,
         PrefsPage::Language,
+        PrefsPage::Git,
         PrefsPage::Servers,
         PrefsPage::Updates,
     ];
@@ -62,6 +64,7 @@ impl PrefsPage {
             PrefsPage::Appearance => t!("prefs.nav_appearance"),
             PrefsPage::Shortcuts => t!("prefs.nav_shortcuts"),
             PrefsPage::Language => t!("prefs.language"),
+            PrefsPage::Git => t!("prefs.nav_git"),
             PrefsPage::Servers => t!("prefs.nav_servers"),
             PrefsPage::Updates => t!("prefs.nav_updates"),
         }
@@ -72,6 +75,29 @@ impl PrefsPage {
         match self {
             PrefsPage::Editor => t!("prefs.editor").to_string(),
             other => other.label(),
+        }
+    }
+}
+
+/// How often the Git panel fetches by itself, in minutes (0: never).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AutoFetch(u32);
+
+impl AutoFetch {
+    const ALL: [AutoFetch; 5] = [
+        AutoFetch(0),
+        AutoFetch(1),
+        AutoFetch(5),
+        AutoFetch(10),
+        AutoFetch(30),
+    ];
+}
+
+impl std::fmt::Display for AutoFetch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            0 => f.write_str(&t!("prefs.git_fetch_never")),
+            n => f.write_str(&t!("prefs.git_fetch_every", n = n)),
         }
     }
 }
@@ -269,6 +295,7 @@ impl PreferencesState {
             PrefsPage::Appearance => self.appearance_card(dark),
             PrefsPage::Shortcuts => shortcuts_list(dark, config, capturing),
             PrefsPage::Language => self.language_card(config, dark),
+            PrefsPage::Git => self.git_card(config, dark),
             PrefsPage::Servers => self.servers_page(dark, servers),
             PrefsPage::Updates => self.updates_card(dark),
         };
@@ -511,6 +538,48 @@ impl PreferencesState {
         )
     }
 
+    /// How a pull and a merge are made when the Git panel asks for one.
+    fn git_card(&self, config: &Config, dark: bool) -> Element<'_, Message> {
+        let pull = pick_list(
+            crate::git::PullMode::ALL,
+            Some(config.git_pull_mode),
+            Message::SetPullMode,
+        )
+        .padding([6, 12])
+        .width(220)
+        .text_size(13)
+        .style(theme::Select { dark }.style())
+        .menu_style(theme::Select { dark }.menu_style());
+        let merge = pick_list(
+            crate::git::MergeMode::ALL,
+            Some(config.git_merge_mode),
+            Message::SetMergeMode,
+        )
+        .padding([6, 12])
+        .width(220)
+        .text_size(13)
+        .style(theme::Select { dark }.style())
+        .menu_style(theme::Select { dark }.menu_style());
+        let fetch = pick_list(
+            AutoFetch::ALL,
+            Some(AutoFetch(config.git_auto_fetch_minutes)),
+            |choice| Message::SetAutoFetch(choice.0),
+        )
+        .padding([6, 12])
+        .width(220)
+        .text_size(13)
+        .style(theme::Select { dark }.style())
+        .menu_style(theme::Select { dark }.menu_style());
+        card_of_rows(
+            dark,
+            vec![
+                setting_row(t!("prefs.git_pull").to_string(), pull.into()),
+                setting_row(t!("prefs.git_merge").to_string(), merge.into()),
+                setting_row(t!("prefs.git_auto_fetch").to_string(), fetch.into()),
+            ],
+        )
+    }
+
     fn language_card(&self, config: &Config, dark: bool) -> Element<'_, Message> {
         let selected = LOCALES.iter().copied().find(|l| l.code == config.locale);
         let select = pick_list(LOCALES, selected, |choice| {
@@ -720,6 +789,31 @@ pub fn shortcuts_list(
             ShortcutTarget::ToggleGit,
             t!("shortcuts.toggle_git").to_string(),
             sc.toggle_git.display(),
+        ),
+        (
+            ShortcutTarget::GitCommit,
+            t!("shortcuts.git_commit").to_string(),
+            sc.git_commit.display(),
+        ),
+        (
+            ShortcutTarget::GitPush,
+            t!("shortcuts.git_push").to_string(),
+            sc.git_push.display(),
+        ),
+        (
+            ShortcutTarget::GitPull,
+            t!("shortcuts.git_pull").to_string(),
+            sc.git_pull.display(),
+        ),
+        (
+            ShortcutTarget::GitBranches,
+            t!("shortcuts.git_branches").to_string(),
+            sc.git_branches.display(),
+        ),
+        (
+            ShortcutTarget::BookmarkPanel,
+            t!("shortcuts.bookmark_panel").to_string(),
+            sc.bookmark_panel.display(),
         ),
         (
             ShortcutTarget::ToggleFold,

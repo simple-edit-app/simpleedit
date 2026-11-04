@@ -10,9 +10,6 @@ use crate::app::Message;
 use crate::git::{Change, Kind};
 use crate::theme as se_theme;
 
-/// The height of the panel.
-pub const HEIGHT: f32 = 380.0;
-
 /// The color of a kind of change.
 pub(super) fn kind_color(kind: Kind, dark: bool) -> Color {
     let p = se_theme::palette(dark);
@@ -104,6 +101,14 @@ impl Panel {
         .spacing(4)
         .align_y(Alignment::Center);
         if let Some(status) = &self.status {
+            header = header.push(plain_button(
+                t!("git.fetch").to_string(),
+                (!self.busy).then_some(Message::Git(GitMsg::RefAction(
+                    super::branches::RefAction::Fetch,
+                ))),
+                false,
+                dark,
+            ));
             header = header.push(
                 text(branch_label(&status.branch, status.ahead, status.behind))
                     .size(12)
@@ -135,16 +140,14 @@ impl Panel {
         };
 
         column![
-            container(Space::new().height(1))
-                .width(Length::Fill)
-                .style(se_theme::rule(dark)),
+            crate::app::resize_edge(dark),
             container(header).padding([4, 10]),
             container(Space::new().height(1))
                 .width(Length::Fill)
                 .style(se_theme::rule(dark)),
             content,
         ]
-        .height(Length::Fixed(HEIGHT))
+        .height(Length::Fill)
         .into()
     }
 
@@ -254,11 +257,21 @@ impl Panel {
             container(
                 column![
                     self.only_banner(dark),
-                    checkbox(self.amend)
-                        .label(t!("git.amend").to_string())
-                        .size(14)
-                        .text_size(12.5)
-                        .on_toggle(|on| Message::Git(GitMsg::ToggleAmend(on))),
+                    row![
+                        checkbox(self.amend)
+                            .label(t!("git.amend").to_string())
+                            .size(14)
+                            .text_size(12.5)
+                            .on_toggle(|on| Message::Git(GitMsg::ToggleAmend(on))),
+                        Space::new().width(Length::Fill),
+                        plain_button(
+                            t!("git.undo_commit").to_string(),
+                            (!self.busy).then_some(Message::Git(GitMsg::UndoCommit)),
+                            false,
+                            dark,
+                        ),
+                    ]
+                    .align_y(Alignment::Center),
                     editor,
                     row![
                         filled_button(
@@ -411,6 +424,8 @@ impl Panel {
         let jump_label = t!("git.jump_source").to_string();
         let diff_label = t!("git.diff_editor").to_string();
         let delete_label = t!("git.delete").to_string();
+        let stash_label = t!("git.stash_file").to_string();
+        let ignore_label = t!("git.ignore_file").to_string();
         crate::pointer_area::context_menu(target, move || {
             let item = |label: String, msg: Option<Message>| -> Element<'static, Message> {
                 let mut b = button(text(label).size(13))
@@ -447,6 +462,14 @@ impl Panel {
                     item(
                         jump_label.clone(),
                         exists.then_some(Message::Git(GitMsg::JumpToSource(index))),
+                    ),
+                    item(
+                        stash_label.clone(),
+                        Some(Message::Git(GitMsg::StashFile(index))),
+                    ),
+                    item(
+                        ignore_label.clone(),
+                        Some(Message::Git(GitMsg::IgnoreFile(index))),
                     ),
                     item(
                         delete_label.clone(),

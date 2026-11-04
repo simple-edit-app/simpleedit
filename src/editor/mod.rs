@@ -443,6 +443,9 @@ pub mod statusbar {
         pub file_size: Option<u64>,
         pub use_spaces: bool,
         pub tab_width: usize,
+        /// The Git branch (name, commits ahead, behind): a click opens the
+        /// switcher.
+        pub branch: Option<(String, u32, u32)>,
         /// A language server that could be installed: its language, and
         /// what the button sends.
         pub offer: Option<(String, String, Message)>,
@@ -493,6 +496,27 @@ pub mod statusbar {
         };
 
         let mut right = row![].spacing(18).align_y(Alignment::Center);
+        if let Some((name, ahead, behind)) = info.branch {
+            let mut label = format!("⎇ {name}");
+            if ahead > 0 {
+                label.push_str(&format!(" ↑{ahead}"));
+            }
+            if behind > 0 {
+                label.push_str(&format!(" ↓{behind}"));
+            }
+            right = right.push(
+                button(text(label).size(11.5).color(p.text))
+                    .padding([1, 8])
+                    .on_press(Message::OpenBranchSwitcher)
+                    .style(
+                        (theme::GhostButton {
+                            dark,
+                            active: false,
+                        })
+                        .style(),
+                    ),
+            );
+        }
         if let Some(sel) = info.selection {
             right = right.push(text(sel).size(11.5).color(muted));
         }

@@ -62,6 +62,15 @@ pub type Servers = (
     std::collections::HashSet<&'static str>,
 );
 
+/// What the Git shortcuts ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitShortcut {
+    /// The Commit tab, to write the message.
+    Commit,
+    Push,
+    Pull,
+}
+
 /// What the arrows of a diff tab do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffNav {
@@ -78,6 +87,12 @@ pub enum DiffNav {
     PickAll,
     /// Put the old version of a block of changes in the file.
     Apply(usize),
+    /// Stage (or unstage) a block, or the lines picked; blanks left out of
+    /// the diff; more or less context.
+    StageBlock(usize),
+    StageSelection,
+    ToggleBlanks,
+    CycleContext,
     /// A commit's diff against the current file, and back.
     ToggleCompare,
     /// Opens the file of the diff in the editor.
@@ -150,6 +165,11 @@ pub enum ActiveOverlay {
     ConfirmOverwrite(PathBuf),
     /// A scratch file is about to be deleted for good.
     ConfirmScratchDelete(PathBuf),
+    /// A file to delete for good; `Some(on)`: git tracks it, and the box
+    /// "remove it from Git too" is (un)checked.
+    ConfirmFileDelete(PathBuf, Option<bool>),
+    /// The list that switches branch from the status bar, with what is typed.
+    BranchSwitch(String),
     /// The Git actions of a file.
     GitFile(PathBuf),
     /// A branch, tag or revision to compare a file with.
@@ -185,6 +205,33 @@ pub enum Message {
     ConfirmDiscardMany(Vec<PathBuf>),
     ToggleSearch,
     ToggleSidebar,
+    /// The edge of the file list is grabbed, dragged (x of the pointer) and let go.
+    /// The way a pull / a merge is made, chosen in the Git panel or the Preferences.
+    SetPullMode(crate::git::PullMode),
+    /// Minutes between two fetches in the background (0: never).
+    SetAutoFetch(u32),
+    /// The branch switcher of the status bar: open, typed in, chosen (the
+    /// name, and whether it is made first).
+    OpenBranchSwitcher,
+    BranchSwitchFilter(String),
+    BranchSwitchChoose(String, bool),
+    SetMergeMode(crate::git::MergeMode),
+    /// A Git shortcut: opens the panel and does it.
+    GitShortcut(GitShortcut),
+    SidebarResizeStart,
+    SidebarResize(f32),
+    SidebarResizeEnd,
+    PanelResizeStart,
+    PanelResize(f32),
+    PanelResizeEnd,
+    /// Delete a file for good: ask first, then do it (from Git as well when tracked).
+    AskDeleteFile(PathBuf),
+    /// Whether git tracks the file asked about (it decides on the checkbox).
+    DeleteAsked(PathBuf, bool),
+    ToggleDeleteFromGit(bool),
+    /// Delete the file; `true`: from git as well.
+    DeleteFile(PathBuf, bool),
+    FileDeleted(Result<bool, String>),
     TogglePreferences,
     ThemeChanged(bool),
     /// Switches between the dark and the light theme.
@@ -214,6 +261,21 @@ pub enum Message {
     ),
     CloseBlame,
     BlameLineClicked(usize),
+    /// Shows the file as it was before the commit of the line that was
+    /// right-clicked in the blame column, with its own blame.
+    BlamePrevious,
+    BlamePreviousLoaded(
+        Result<
+            (
+                PathBuf,
+                String,
+                String,
+                String,
+                Vec<crate::git::history::BlameLine>,
+            ),
+            String,
+        >,
+    ),
     /// The bar of a changed line was clicked: the button that puts the change
     /// back opens under it (or closes).
     ChangeBar(usize),
@@ -411,6 +473,14 @@ pub struct SimpleEditApp {
     preferences: PreferencesState,
     show_search: bool,
     show_sidebar: bool,
+    /// Width of the file list, and whether its edge is being dragged.
+    sidebar_width: f32,
+    sidebar_resizing: bool,
+    /// The height of the bottom panels (Git, terminal, scratch files, bookmarks), and the drag that resizes it: where the
+    /// pointer and the height were at its first move.
+    panel_height: f32,
+    panel_resizing: bool,
+    panel_drag: Option<(f32, f32)>,
     show_preferences: bool,
     /// The shortcut being rebound, while waiting for its new key.
     capturing: Option<ShortcutTarget>,
@@ -448,6 +518,8 @@ pub struct SimpleEditApp {
     ticks: u32,
     /// The last right click on the editor was in the gutter.
     gutter_click: bool,
+    /// The line of the gutter that was right-clicked (for the blame menu).
+    gutter_line: Option<usize>,
     /// The change whose revert button is open: file, line, and the buffer it was
     /// opened on (typing closes it).
     revert: Option<(PathBuf, usize, (u64, u64))>,
@@ -592,6 +664,11 @@ impl SimpleEditApp {
             preferences: PreferencesState::from_config(&config),
             show_search: false,
             show_sidebar: config.show_sidebar,
+            sidebar_width: config.sidebar_width.clamp(SIDEBAR_MIN, SIDEBAR_MAX),
+            sidebar_resizing: false,
+            panel_height: PANEL_HEIGHT,
+            panel_resizing: false,
+            panel_drag: None,
             show_preferences: false,
             capturing: None,
             palette_query: String::new(),
@@ -620,6 +697,7 @@ impl SimpleEditApp {
             autosaving: false,
             ticks: 0,
             gutter_click: false,
+            gutter_line: None,
             revert: None,
             conflict_toast_closed: false,
             server_offer: None,
@@ -683,6 +761,8 @@ impl SimpleEditApp {
             }
         };
         let mut app = Self::blank(flags.config);
+        app.git.pull_mode = app.config.git_pull_mode;
+        app.git.merge_mode = app.config.git_merge_mode;
         app.session_lock = lock;
         app.session_owner = owner;
         if owner {
@@ -859,6 +939,32 @@ impl SimpleEditApp {
             iced::time::every(std::time::Duration::from_secs(1)).map(|_| Message::AutoSave);
 
         let mut subscriptions = vec![keys, modifiers, autosave];
+        if self.sidebar_resizing {
+            subscriptions.push(iced::event::listen_with(
+                |event, _status, _window| match event {
+                    iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+                        Some(Message::SidebarResize(position.x))
+                    }
+                    iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                        iced::mouse::Button::Left,
+                    )) => Some(Message::SidebarResizeEnd),
+                    _ => None,
+                },
+            ));
+        }
+        if self.panel_resizing {
+            subscriptions.push(iced::event::listen_with(
+                |event, _status, _window| match event {
+                    iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+                        Some(Message::PanelResize(position.y))
+                    }
+                    iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                        iced::mouse::Button::Left,
+                    )) => Some(Message::PanelResizeEnd),
+                    _ => None,
+                },
+            ));
+        }
         if self.view_mode != ViewMode::Raw && self.preview_kind().is_some() {
             subscriptions.push(
                 iced::time::every(std::time::Duration::from_millis(150))
@@ -932,6 +1038,12 @@ impl SimpleEditApp {
             file_size: self.file_size,
             use_spaces: self.config.use_spaces,
             tab_width: self.config.tab_width,
+            branch: self
+                .git
+                .status
+                .as_ref()
+                .filter(|s| !s.branch.is_empty())
+                .map(|s| (s.branch.clone(), s.ahead, s.behind)),
         });
 
         let error_panel: Option<Element<Message>> = if self.show_error_panel {
@@ -1004,7 +1116,8 @@ impl SimpleEditApp {
         if self.terminal.open {
             panel = panel.push(self.terminal_panel(dark));
         } else if self.git.open {
-            panel = panel.push(self.git.view(dark));
+            panel =
+                panel.push(container(self.git.view(dark)).height(Length::Fixed(self.panel_height)));
         }
         if self.scratch.open {
             panel = panel.push(self.scratch_panel(dark));
@@ -1035,10 +1148,22 @@ impl SimpleEditApp {
                         &self.current_file,
                         &self.dirty_files(),
                         &self.bookmarks.marked_paths(),
+                        self.sidebar_width,
                     ),
                     self.terminal_button(dark),
                 ]
-                .spacing(se_theme::PANEL_GAP),
+                .spacing(se_theme::PANEL_GAP)
+                .width(Length::Fixed(self.sidebar_width)),
+            );
+            // The edge between the list and the editor: drag it to resize.
+            main_row = main_row.push(
+                iced::widget::mouse_area(
+                    container(Space::new())
+                        .width(Length::Fixed(4.0))
+                        .height(Length::Fill),
+                )
+                .on_press(Message::SidebarResizeStart)
+                .interaction(iced::mouse::Interaction::ResizingHorizontally),
             );
         }
         main_row = main_row.push(editor_panel);
@@ -1088,6 +1213,26 @@ impl SimpleEditApp {
             )
         } else {
             base
+        };
+
+        // The modes behind the chevron of a Git button float where it was
+        // pressed, over everything below; a click anywhere else closes them.
+        let with_dropdown: Element<Message> = match self.git.split_overlay(dark) {
+            Some((at, options)) => {
+                let outside =
+                    iced::widget::mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
+                        .on_press(Message::Git(crate::git_panel::GitMsg::CloseSplit))
+                        .on_right_press(Message::Git(crate::git_panel::GitMsg::CloseSplit));
+                // Right edge under the chevron, a little below the button.
+                let x = (at.x - crate::git_panel::branches::SPLIT_OPTIONS_WIDTH + 14.0).max(4.0);
+                crate::floating::at_point(
+                    iced::widget::stack![with_dropdown, outside],
+                    options,
+                    x,
+                    at.y + 14.0,
+                )
+            }
+            None => with_dropdown,
         };
 
         // The Preferences window floats over everything but the dialogs.
@@ -1164,6 +1309,26 @@ impl SimpleEditApp {
                     ActiveOverlay::ConfirmClose(path) => self.view_confirm_overlay(dark, path),
                     ActiveOverlay::GitFile(path) => self.git_file_overlay(dark, path),
                     ActiveOverlay::GitPick(pick) => self.git_pick_overlay(dark, pick),
+                    ActiveOverlay::BranchSwitch(filter) => self.branch_switch_overlay(dark, filter),
+                    ActiveOverlay::ConfirmFileDelete(path, from_git) => {
+                        // Tracked by git: a box to remove it from git too.
+                        let extra: Option<Element<'static, Message>> = from_git.map(|on| {
+                            iced::widget::checkbox(on)
+                                .label(t!("delete_file.from_git").to_string())
+                                .size(15)
+                                .text_size(13)
+                                .on_toggle(Message::ToggleDeleteFromGit)
+                                .into()
+                        });
+                        confirm_card_with(
+                            dark,
+                            t!("delete_file.title").to_string(),
+                            t!("delete_file.message", name = file_label(path).as_str()).to_string(),
+                            extra,
+                            t!("delete_file.confirm").to_string(),
+                            Message::DeleteFile(path.clone(), from_git.unwrap_or(false)),
+                        )
+                    }
                     ActiveOverlay::ConfirmScratchDelete(path) => confirm_card(
                         dark,
                         t!("scratch.delete_title").to_string(),
@@ -1560,6 +1725,61 @@ impl SimpleEditApp {
                 Task::none()
             }
             Message::BlameLineClicked(line) => self.blame_line_clicked(line),
+            Message::BlamePrevious => {
+                let (Some(line), Some(blame)) = (self.gutter_line, &self.blame) else {
+                    return Task::none();
+                };
+                let Some(sha) = blame
+                    .shas
+                    .get(line)
+                    .filter(|s| !s.chars().all(|c| c == '0'))
+                else {
+                    return Task::none();
+                };
+                let (repo, relative) = (blame.repo.clone(), blame.relative.clone());
+                let sha = sha.clone();
+                Task::perform(
+                    async move {
+                        let rev = format!("{sha}^");
+                        let lines =
+                            crate::git::history::blame_at(&repo, Some(&rev), &relative).await?;
+                        let text = crate::git::history::file_at(&repo, &rev, &relative).await?;
+                        let label = sha.chars().take(8).collect::<String>();
+                        Ok((repo, relative, label, text, lines))
+                    },
+                    Message::BlamePreviousLoaded,
+                )
+            }
+            Message::BlamePreviousLoaded(result) => {
+                match result {
+                    Ok((repo, relative, label, text, lines)) => {
+                        // A tab of its own for that version, with its blame.
+                        self.untitled_counter += 1;
+                        let name = relative.rsplit('/').next().unwrap_or(&relative).to_string();
+                        let path = PathBuf::from(format!(
+                            "rev://{}/{name} @ {label}",
+                            self.untitled_counter
+                        ));
+                        let language = Path::new(&relative)
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .and_then(|e| crate::editor::extension_to_token(&e.to_lowercase()))
+                            .map(str::to_string);
+                        self.stash_current();
+                        self.sidebar.add_file(path.clone());
+                        let loaded = Loaded {
+                            path: path.clone(),
+                            text,
+                            format: TextFormat::default(),
+                            stamp: None,
+                        };
+                        self.load_buffer(path.clone(), CachedBuffer::from_loaded(loaded, language));
+                        self.blame_loaded(path, Ok((repo, relative, lines)));
+                    }
+                    Err(e) => self.set_status(format!("{}: {e}", t!("status.error")), true),
+                }
+                Task::none()
+            }
             Message::OpenConflicts => {
                 if self
                     .git
@@ -1614,6 +1834,12 @@ impl SimpleEditApp {
                 task
             }
             Message::Git(msg) => {
+                // The panel closed: what went wrong is told in the status bar.
+                if let crate::git_panel::GitMsg::Done(Err(error)) = &msg {
+                    if !self.git.open && error != crate::git::CONFLICT {
+                        self.set_status(error.clone(), true);
+                    }
+                }
                 self.remember_before_git(&msg);
                 let ctx = crate::git_panel::Ctx {
                     current_file: self.current_file.as_deref(),
@@ -1729,11 +1955,13 @@ impl SimpleEditApp {
                 Task::none()
             }
             Message::ScratchCreate => {
-                match crate::scratch::create(
-                    &self.scratch.dir,
-                    &self.scratch.name,
-                    self.scratch.ext.as_str(),
-                ) {
+                let ext = self.scratch.ext.as_str();
+                let name = if self.scratch.name.trim().is_empty() {
+                    crate::scratch::next_name(&self.scratch.dir, ext)
+                } else {
+                    self.scratch.name.clone()
+                };
+                match crate::scratch::create(&self.scratch.dir, &name, ext) {
                     Ok(path) => {
                         self.scratch.name.clear();
                         self.scratch.error = None;
@@ -1843,6 +2071,137 @@ impl SimpleEditApp {
                 self.config.show_sidebar = self.show_sidebar;
                 self.config_dirty = true;
                 Task::none()
+            }
+            Message::GitShortcut(what) => {
+                // The panel opens first: what happens shows there.
+                let open = if self.git.open {
+                    Task::none()
+                } else {
+                    self.handle(Message::ToggleGit)
+                };
+                self.git.tab = crate::git_panel::Tab::Commit;
+                let action = match what {
+                    GitShortcut::Commit => Task::none(),
+                    GitShortcut::Push => {
+                        Task::done(Message::Git(crate::git_panel::GitMsg::PushCurrent))
+                    }
+                    GitShortcut::Pull => {
+                        Task::done(Message::Git(crate::git_panel::GitMsg::RefAction(
+                            crate::git_panel::branches::RefAction::Pull,
+                        )))
+                    }
+                };
+                Task::batch([open, action])
+            }
+            Message::OpenBranchSwitcher => {
+                if self.git.status.is_none() {
+                    return Task::none();
+                }
+                self.overlay = ActiveOverlay::BranchSwitch(String::new());
+                Task::batch([
+                    self.git.load_refs(),
+                    iced::widget::operation::focus(git_file::branch_input_id()),
+                ])
+            }
+            Message::BranchSwitchFilter(text) => {
+                if let ActiveOverlay::BranchSwitch(filter) = &mut self.overlay {
+                    *filter = text;
+                }
+                Task::none()
+            }
+            Message::BranchSwitchChoose(name, create) => {
+                self.overlay = ActiveOverlay::None;
+                if name.is_empty() {
+                    return Task::none();
+                }
+                self.git.switch_branch(name, create)
+            }
+            Message::SetAutoFetch(minutes) => {
+                self.config.git_auto_fetch_minutes = minutes;
+                self.config_dirty = true;
+                Task::none()
+            }
+            Message::SetPullMode(mode) => {
+                // Chosen behind the chevron of the Git panel: the modes close.
+                self.git.branches.menu = None;
+                self.git.pull_mode = mode;
+                self.config.git_pull_mode = mode;
+                self.config_dirty = true;
+                Task::none()
+            }
+            Message::SetMergeMode(mode) => {
+                self.git.branches.menu = None;
+                self.git.merge_mode = mode;
+                self.config.git_merge_mode = mode;
+                self.config_dirty = true;
+                Task::none()
+            }
+            Message::SidebarResizeStart => {
+                self.sidebar_resizing = true;
+                Task::none()
+            }
+            Message::SidebarResize(x) => {
+                // The list starts one gap in from the window's edge.
+                let most = (self.config.window_width * 0.6).clamp(SIDEBAR_MIN, SIDEBAR_MAX);
+                self.sidebar_width = (x - se_theme::PANEL_GAP).clamp(SIDEBAR_MIN, most);
+                Task::none()
+            }
+            Message::PanelResizeStart => {
+                self.panel_resizing = true;
+                self.panel_drag = None;
+                Task::none()
+            }
+            Message::PanelResize(y) => {
+                // Dragging up makes it taller: the height follows how far the
+                // pointer went from where it was at the first move.
+                let (y0, h0) = *self.panel_drag.get_or_insert((y, self.panel_height));
+                let most = (self.config.window_height * 0.85).max(PANEL_MIN_HEIGHT);
+                self.panel_height = (h0 + y0 - y).clamp(PANEL_MIN_HEIGHT, most);
+                Task::none()
+            }
+            Message::PanelResizeEnd => {
+                self.panel_resizing = false;
+                self.panel_drag = None;
+                Task::none()
+            }
+            Message::SidebarResizeEnd => {
+                self.sidebar_resizing = false;
+                self.config.sidebar_width = self.sidebar_width;
+                self.config_dirty = true;
+                Task::none()
+            }
+            Message::AskDeleteFile(path) => Task::perform(
+                async move {
+                    let tracked = is_tracked(&path).await;
+                    (path, tracked)
+                },
+                |(path, tracked)| Message::DeleteAsked(path, tracked),
+            ),
+            Message::DeleteAsked(path, tracked) => {
+                // Checked by default: a file git tracks is usually meant to go from it too.
+                self.overlay = ActiveOverlay::ConfirmFileDelete(path, tracked.then_some(true));
+                Task::none()
+            }
+            Message::ToggleDeleteFromGit(on) => {
+                if let ActiveOverlay::ConfirmFileDelete(_, from_git @ Some(_)) = &mut self.overlay {
+                    *from_git = Some(on);
+                }
+                Task::none()
+            }
+            Message::DeleteFile(path, from_git) => {
+                self.overlay = ActiveOverlay::None;
+                self.bookmarks.clear(&path);
+                let close = self.close_path(path.clone());
+                let delete = Task::perform(delete_file(path, from_git), Message::FileDeleted);
+                Task::batch([close, delete])
+            }
+            Message::FileDeleted(result) => {
+                match result {
+                    Ok(true) => self.set_status(t!("status.file_deleted_git"), false),
+                    Ok(false) => self.set_status(t!("status.file_deleted"), false),
+                    Err(e) => self.set_status(format!("{}: {e}", t!("status.error")), true),
+                }
+                Task::done(Message::Git(crate::git_panel::GitMsg::Refresh))
             }
             Message::WindowResized(width, height) => {
                 // Remembered, and written with the next autosave tick.
@@ -2197,7 +2556,17 @@ impl SimpleEditApp {
                 } else {
                     Task::none()
                 };
-                let external = Task::batch([external, self.auto_save_files(), marks, probe]);
+                // What the remotes have is looked at now and then, in the background.
+                let minutes = u64::from(self.config.git_auto_fetch_minutes);
+                let fetch = if minutes > 0
+                    && (self.ticks as u64).is_multiple_of(minutes * 60)
+                    && self.git.repo.is_some()
+                {
+                    Task::done(Message::Git(crate::git_panel::GitMsg::AutoFetch))
+                } else {
+                    Task::none()
+                };
+                let external = Task::batch([external, self.auto_save_files(), marks, probe, fetch]);
                 if self.rev == self.session_rev {
                     return external;
                 }
@@ -2451,8 +2820,13 @@ impl SimpleEditApp {
                 };
                 let sh = &self.config.shortcuts;
                 // Order matters: Ctrl+Shift+S must be tried before Ctrl+S.
-                let bindings: [(&ShortcutConfig, Message); 26] = [
+                let bindings: [(&ShortcutConfig, Message); 31] = [
                     (&sh.toggle_git, Message::ToggleGit),
+                    (&sh.git_commit, Message::GitShortcut(GitShortcut::Commit)),
+                    (&sh.git_push, Message::GitShortcut(GitShortcut::Push)),
+                    (&sh.git_pull, Message::GitShortcut(GitShortcut::Pull)),
+                    (&sh.git_branches, Message::OpenBranchSwitcher),
+                    (&sh.bookmark_panel, Message::ToggleBookmarkPanel),
                     (&sh.toggle_terminal, Message::ToggleTerminal),
                     (&sh.nav_back, Message::NavBack),
                     (&sh.nav_forward, Message::NavForward),
@@ -2569,6 +2943,10 @@ impl SimpleEditApp {
                     annotated,
                 );
                 self.gutter_click = self.config.show_line_numbers && at.x < origin.x;
+                self.gutter_line = self
+                    .gutter_click
+                    .then(|| self.editor.content.line_at_y(at.y - origin.y))
+                    .flatten();
                 // The context menu acts on the clicked line: move the caret
                 // there, unless there is a selection to act on.
                 if self.editor.content.selection().is_none() && !self.gutter_click {
@@ -3718,6 +4096,15 @@ impl SimpleEditApp {
         {
             self.overlay = ActiveOverlay::None;
         }
+        // New commits on the remote (a fetch, here or in a terminal): said once.
+        if let (Some(Some(before)), Some(now)) = (&status_before, &self.git.status) {
+            if before.branch == now.branch && now.behind > before.behind {
+                let upstream = now.upstream.clone().unwrap_or_default();
+                let n = now.behind - before.behind;
+                let news = t!("git.behind_news", n = n, upstream = upstream.as_str());
+                self.set_status(news, false);
+            }
+        }
         let moved = self.current_file != self.marks_asked;
         let status_changed = status_before.is_some_and(|before| before != self.git.status);
         if moved || status_changed || git_done {
@@ -3926,6 +4313,16 @@ impl SimpleEditApp {
                     iced::Color::from_rgba8(0xe6, 0xc0, 0x6a, 0.16),
                     iced::Color::from_rgba8(0x5e, 0xcf, 0xd1, 0.16),
                 ];
+                // What a pointer on a line shows, once for each commit.
+                let mut details: Vec<Vec<String>> = Vec::new();
+                let mut index_of: std::collections::HashMap<&str, usize> =
+                    std::collections::HashMap::new();
+                for l in lines.iter().filter(|l| l.committed()) {
+                    index_of.entry(l.sha.as_str()).or_insert_with(|| {
+                        details.push(commit_card(l));
+                        details.len() - 1
+                    });
+                }
                 let notes: Vec<crate::code_editor::Annotation> = lines
                     .iter()
                     .map(|l| {
@@ -3948,7 +4345,12 @@ impl SimpleEditApp {
                         } else {
                             t!("git.not_committed").to_string()
                         };
-                        crate::code_editor::Annotation { text, tint }
+                        let details = index_of.get(l.sha.as_str()).copied();
+                        crate::code_editor::Annotation {
+                            text,
+                            tint,
+                            details,
+                        }
                     })
                     .collect();
                 self.blame = Some(BlameState {
@@ -3958,6 +4360,11 @@ impl SimpleEditApp {
                     annotations: crate::code_editor::Annotations {
                         lines: std::sync::Arc::new(notes),
                         text: p.muted,
+                        details: std::sync::Arc::new(details),
+                        link: p.accent,
+                        card_text: p.text,
+                        card_background: p.elevated,
+                        card_border: p.border_strong,
                     },
                     shas: lines.iter().map(|l| l.sha.clone()).collect(),
                 });
@@ -4350,6 +4757,27 @@ impl SimpleEditApp {
                     return Task::none();
                 }
                 self.activate(file)
+            }
+            DiffNav::StageBlock(_) | DiffNav::StageSelection => {
+                let block = match nav {
+                    DiffNav::StageBlock(b) => Some(b),
+                    _ => None,
+                };
+                let Some((patch, reverse)) = tab.viewer.index_patch(block) else {
+                    return Task::none();
+                };
+                Task::perform(
+                    async move { crate::git::apply_patch(&repo, &patch, reverse).await },
+                    Message::DiffApplied,
+                )
+            }
+            DiffNav::ToggleBlanks => {
+                tab.viewer.ignore_blanks = !tab.viewer.ignore_blanks;
+                tab.viewer.reopen(&repo)
+            }
+            DiffNav::CycleContext => {
+                tab.viewer.cycle_context();
+                tab.viewer.reopen(&repo)
             }
             DiffNav::Apply(block) => {
                 let (Some(entry), Some(diff)) = (
@@ -5103,6 +5531,14 @@ impl SimpleEditApp {
         };
         let gutter_menu = self.gutter_click;
         let blame_on = self.blame_shown();
+        // A line of the blame that a commit made: its previous version is there.
+        let previous_ok = self.gutter_line.is_some_and(|line| {
+            self.blame
+                .as_ref()
+                .and_then(|b| b.shas.get(line))
+                .is_some_and(|sha| !sha.chars().all(|c| c == '0'))
+        });
+        let lbl_previous = t!("git.blame_previous").to_string();
         let lbl_blame = t!("git.blame").to_string();
         let lbl_blame_close = t!("git.blame_close").to_string();
         let menu = crate::pointer_area::context_menu(editor_widget, move || {
@@ -5113,14 +5549,18 @@ impl SimpleEditApp {
                 } else {
                     item(lbl_blame.clone(), None, dark, Message::BlameFile)
                 };
-                return container(
-                    column![entry]
-                        .spacing(1)
-                        .padding(6)
-                        .width(Length::Fixed(264.0)),
-                )
-                .style(crate::theme::card(dark))
-                .into();
+                let mut entries = column![entry]
+                    .spacing(1)
+                    .padding(6)
+                    .width(Length::Fixed(264.0));
+                if blame_on {
+                    entries = entries.push(if previous_ok {
+                        item(lbl_previous.clone(), None, dark, Message::BlamePrevious)
+                    } else {
+                        disabled_item(lbl_previous.clone(), dark)
+                    });
+                }
+                return container(entries).style(crate::theme::card(dark)).into();
             }
             let fmt_sel_el: Element<'static, Message> = if has_fmt_ctx && has_sel_ctx {
                 item(lbl_format_sel.clone(), None, dark, Message::FormatSelection)
@@ -5281,6 +5721,7 @@ mod bookmark_panel;
 mod git_file;
 #[path = "app/views.rs"]
 mod views;
+pub(crate) use views::resize_edge;
 
 #[cfg(test)]
 #[path = "app/tests.rs"]
@@ -5298,6 +5739,11 @@ pub fn display_name(path: &Path) -> String {
         let rest = path.to_str().unwrap_or("").trim_start_matches("merge://");
         let file = rest.split_once('/').map_or(rest, |(_, f)| f);
         format!("⇄ {}", file.rsplit('/').next().unwrap_or(file))
+    } else if path.to_str().is_some_and(|s| s.starts_with("rev://")) {
+        // rev://4/file.rs @ 1a2b3c4d: a file as an older commit had it
+        let rest = path.to_str().unwrap_or("").trim_start_matches("rev://");
+        let title = rest.split_once('/').map_or(rest, |(_, t)| t);
+        format!("⟲ {title}")
     } else if is_untitled(path) {
         let n = path
             .to_str()
@@ -5344,6 +5790,19 @@ fn confirm_card(
     confirm_label: String,
     confirm: Message,
 ) -> Element<'static, Message> {
+    confirm_card_with(dark, title, message, None, confirm_label, confirm)
+}
+
+/// A confirmation card, with something (a checkbox) between the text and the
+/// buttons when `extra` is given.
+fn confirm_card_with(
+    dark: bool,
+    title: String,
+    message: String,
+    extra: Option<Element<'static, Message>>,
+    confirm_label: String,
+    confirm: Message,
+) -> Element<'static, Message> {
     let p = se_theme::palette(dark);
     container(
         column![
@@ -5352,6 +5811,7 @@ fn confirm_card(
                 .size(12)
                 .color(p.muted)
                 .shaping(iced::widget::text::Shaping::Advanced),
+            extra.unwrap_or_else(|| Space::new().height(0).into()),
             row![
                 button(text(t!("confirm.cancel").to_string()).size(13))
                     .padding([7, 16])
@@ -5463,10 +5923,90 @@ pub fn git_menu_applies(path: &Path) -> bool {
     !is_virtual(path) && path.is_absolute()
 }
 
+/// What a pointer on a blame line shows of its commit: the hash, who and
+/// when, then the message wrapped to a readable width.
+fn commit_card(line: &crate::git::history::BlameLine) -> Vec<String> {
+    let (name, email) = (line.author.as_str(), line.email.as_str());
+    let date = crate::git_panel::stash::format_time(line.time);
+    let mut card = vec![
+        t!("git.blame_commit", sha = line.sha.as_str()).to_string(),
+        t!("git.blame_author", name = name, email = email).to_string(),
+        t!("git.blame_date", date = date.as_str()).to_string(),
+        String::new(),
+    ];
+    let message: &str = if line.message.is_empty() {
+        &line.summary
+    } else {
+        &line.message
+    };
+    for paragraph in message.lines() {
+        let mut current = String::new();
+        for word in paragraph.split_whitespace() {
+            if !current.is_empty() && current.chars().count() + 1 + word.chars().count() > 72 {
+                card.push(std::mem::take(&mut current));
+            }
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        }
+        card.push(current);
+    }
+    card
+}
+
+/// Bounds of the file list's width.
+/// The height the bottom panels start with, and the least they can take.
+pub(crate) const PANEL_HEIGHT: f32 = 340.0;
+pub(crate) const PANEL_MIN_HEIGHT: f32 = 160.0;
+const SIDEBAR_MIN: f32 = 200.0;
+const SIDEBAR_MAX: f32 = 700.0;
+
+/// A path for a person: the home folder written `~`.
+pub fn display_path(path: &Path) -> String {
+    match dirs::home_dir().and_then(|home| path.strip_prefix(&home).ok().map(Path::to_path_buf)) {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
+/// Whether git tracks a file (it is in a repository and in its index).
+pub(crate) async fn is_tracked(path: &Path) -> bool {
+    let Some(root) = crate::git::repo_root(path).await else {
+        return false;
+    };
+    let Some(rel) = relative_to(&root, path) else {
+        return false;
+    };
+    crate::git::run(&root, &["ls-files", "--error-unmatch", "--", &rel])
+        .await
+        .is_ok()
+}
+
+/// Deletes a file from the disk and, if `from_git` and git tracks it, from
+/// the index too (`git rm`). `true`: it was removed from git as well.
+async fn delete_file(path: PathBuf, from_git: bool) -> Result<bool, String> {
+    if from_git && is_tracked(&path).await {
+        if let Some(root) = crate::git::repo_root(&path).await {
+            if let Some(rel) = relative_to(&root, &path) {
+                crate::git::run(&root, &["rm", "-f", "--", &rel]).await?;
+                return Ok(true);
+            }
+        }
+    }
+    tokio::fs::remove_file(&path)
+        .await
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(false)
+}
+
 pub fn is_untitled(path: &Path) -> bool {
     path.to_str()
         .map(|s| {
-            s.starts_with("untitled://") || s.starts_with("diff://") || s.starts_with("merge://")
+            s.starts_with("untitled://")
+                || s.starts_with("diff://")
+                || s.starts_with("merge://")
+                || s.starts_with("rev://")
         })
         .unwrap_or(false)
 }

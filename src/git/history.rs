@@ -21,6 +21,42 @@ pub async fn log(
     limit: usize,
     path: Option<&str>,
 ) -> Result<Vec<Commit>, String> {
+    log_matching(repo, rev, limit, path, None).await
+}
+
+/// What the commit search looks at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchMode {
+    /// The words of the message.
+    #[default]
+    Message,
+    Author,
+    /// Text that a commit added or removed (`git log -S`).
+    Content,
+    /// Commits that touched a path.
+    File,
+    /// Commits since a date (`2026-01-31`, `2 weeks ago`).
+    Since,
+}
+
+impl SearchMode {
+    pub const ALL: [SearchMode; 5] = [
+        SearchMode::Message,
+        SearchMode::Author,
+        SearchMode::Content,
+        SearchMode::File,
+        SearchMode::Since,
+    ];
+}
+
+/// [`log`] restricted by a search `(what to look at, the text)`.
+pub async fn log_matching(
+    repo: &Path,
+    rev: &str,
+    limit: usize,
+    path: Option<&str>,
+    search: Option<(SearchMode, &str)>,
+) -> Result<Vec<Commit>, String> {
     let max = format!("--max-count={limit}");
     let mut args = vec![
         "log",
@@ -31,7 +67,35 @@ pub async fn log(
     if path.is_some() {
         args.push("--follow");
     }
-    args.extend([rev, "--"]);
+    let found;
+    let mut path = path;
+    if let Some((mode, text)) = search.filter(|(_, t)| !t.trim().is_empty()) {
+        let text = text.trim();
+        match mode {
+            SearchMode::Message => {
+                found = format!("--grep={text}");
+                args.extend([found.as_str(), "-i", "--fixed-strings"]);
+            }
+            SearchMode::Author => {
+                found = format!("--author={text}");
+                args.extend([found.as_str(), "-i", "--fixed-strings"]);
+            }
+            SearchMode::Content => {
+                found = format!("-S{text}");
+                args.push(&found);
+            }
+            SearchMode::Since => {
+                found = format!("--since={text}");
+                args.push(&found);
+            }
+            // A path to follow, as the file history does.
+            SearchMode::File => {
+                path = Some(text);
+                args.push("--follow");
+            }
+        }
+    }
+    args.extend(["--end-of-options", rev, "--"]);
     args.extend(path);
     let out = run(repo, &args).await?;
     let mut commits = parse_log(&out);
@@ -301,6 +365,40 @@ pub async fn delete_remote_branch(repo: &Path, name: &str) -> Result<(), String>
         .map(|_| ())
 }
 
+/// Makes a tag at a commit (or where HEAD is); with a message it is an
+/// annotated tag.
+pub async fn create_tag(
+    repo: &Path,
+    name: &str,
+    at: Option<&str>,
+    message: Option<&str>,
+) -> Result<(), String> {
+    let mut args = vec!["tag"];
+    if let Some(message) = message.filter(|m| !m.trim().is_empty()) {
+        args.extend(["-a", "-m", message]);
+    }
+    args.extend(["--end-of-options", name]);
+    args.extend(at);
+    run(repo, &args).await.map(|_| ())
+}
+
+/// Sends a tag to `origin`.
+pub async fn push_tag(repo: &Path, name: &str) -> Result<(), String> {
+    run_network(repo, &["push", "origin", &format!("refs/tags/{name}")])
+        .await
+        .map(|_| ())
+}
+
+/// Removes a tag from `origin`.
+pub async fn delete_remote_tag(repo: &Path, name: &str) -> Result<(), String> {
+    run_network(
+        repo,
+        &["push", "origin", "--delete", &format!("refs/tags/{name}")],
+    )
+    .await
+    .map(|_| ())
+}
+
 pub async fn delete_tag(repo: &Path, name: &str) -> Result<(), String> {
     run(repo, &["tag", "-d", name]).await.map(|_| ())
 }
@@ -336,6 +434,37 @@ pub async fn checkout_ref(repo: &Path, name: &str) -> Result<(), String> {
     run(repo, &["checkout", "--end-of-options", &name])
         .await
         .map(|_| ())
+}
+
+/// The files that differ between two commits.
+pub async fn range_files(repo: &Path, from: &str, to: &str) -> Result<Vec<Change>, String> {
+    let out = run(repo, &["diff", "--name-status", "-z", "-M", from, to]).await?;
+    Ok(parse_name_status(&out))
+}
+
+impl std::fmt::Display for PlanAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&match self {
+            PlanAction::Pick => t!("git.plan_pick"),
+            PlanAction::Reword => t!("git.plan_reword"),
+            PlanAction::Edit => t!("git.plan_edit"),
+            PlanAction::Squash => t!("git.plan_squash"),
+            PlanAction::Fixup => t!("git.plan_fixup"),
+            PlanAction::Drop => t!("git.plan_drop"),
+        })
+    }
+}
+
+impl std::fmt::Display for SearchMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&match self {
+            SearchMode::Message => t!("git.search_message"),
+            SearchMode::Author => t!("git.search_author"),
+            SearchMode::Content => t!("git.search_content"),
+            SearchMode::File => t!("git.search_file"),
+            SearchMode::Since => t!("git.search_since"),
+        })
+    }
 }
 
 /// The files that differ between a ref and the working tree.
@@ -448,8 +577,11 @@ pub async fn stash_files(repo: &Path, index: usize) -> Result<Vec<Change>, Strin
 pub struct BlameLine {
     pub sha: String,
     pub author: String,
+    pub email: String,
     pub time: i64,
     pub summary: String,
+    /// The whole message of the commit (empty until read).
+    pub message: std::sync::Arc<str>,
 }
 
 impl BlameLine {
@@ -459,8 +591,61 @@ impl BlameLine {
 }
 
 pub async fn blame(repo: &Path, path: &str) -> Result<Vec<BlameLine>, String> {
-    let out = run(repo, &["blame", "--porcelain", "--", path]).await?;
-    Ok(parse_blame(&out))
+    blame_at(repo, None, path).await
+}
+
+/// The text of a file as a commit had it.
+pub async fn file_at(repo: &Path, rev: &str, path: &str) -> Result<String, String> {
+    run(repo, &["show", &format!("{rev}:{path}")]).await
+}
+
+/// Blame of a file as a commit had it (`None`: the file as it is now).
+pub async fn blame_at(
+    repo: &Path,
+    rev: Option<&str>,
+    path: &str,
+) -> Result<Vec<BlameLine>, String> {
+    let mut args = vec!["blame", "--porcelain"];
+    args.extend(rev);
+    args.extend(["--", path]);
+    let out = run(repo, &args).await?;
+    let mut lines = parse_blame(&out);
+    // The messages of the commits met, for what a pointer on a line shows.
+    let mut shas: Vec<&str> = lines
+        .iter()
+        .filter(|l| l.committed())
+        .map(|l| l.sha.as_str())
+        .collect();
+    shas.sort_unstable();
+    shas.dedup();
+    let messages = commit_messages(repo, &shas).await.unwrap_or_default();
+    for line in &mut lines {
+        if let Some(message) = messages.get(&line.sha) {
+            line.message = message.clone();
+        }
+    }
+    Ok(lines)
+}
+
+/// The whole message of each commit (by hash).
+pub async fn commit_messages(
+    repo: &Path,
+    shas: &[&str],
+) -> Result<std::collections::HashMap<String, std::sync::Arc<str>>, String> {
+    if shas.is_empty() {
+        return Ok(Default::default());
+    }
+    let mut args = vec!["log", "--no-walk=unsorted", "--format=%H%x1f%B%x1e"];
+    args.extend(shas.iter().copied());
+    args.push("--");
+    let out = run(repo, &args).await?;
+    Ok(out
+        .split(RECORD)
+        .filter_map(|record| {
+            let (sha, message) = record.trim_matches(['\n', '\r']).split_once(FIELD)?;
+            Some((sha.to_string(), std::sync::Arc::from(message.trim_end())))
+        })
+        .collect())
 }
 
 /// One entry per line of the file, in order.
@@ -486,13 +671,17 @@ pub fn parse_blame(out: &str) -> Vec<BlameLine> {
             known.entry(first.to_string()).or_insert_with(|| BlameLine {
                 sha: first.to_string(),
                 author: String::new(),
+                email: String::new(),
                 time: 0,
                 summary: String::new(),
+                message: std::sync::Arc::from(""),
             });
         } else if let Some(sha) = current.as_ref() {
             if let Some(entry) = known.get_mut(sha) {
                 if let Some(a) = raw.strip_prefix("author ") {
                     entry.author = a.to_string();
+                } else if let Some(m) = raw.strip_prefix("author-mail ") {
+                    entry.email = m.trim_matches(['<', '>']).to_string();
                 } else if let Some(t) = raw.strip_prefix("author-time ") {
                     entry.time = t.parse().unwrap_or(0);
                 } else if let Some(s) = raw.strip_prefix("summary ") {
@@ -523,6 +712,20 @@ async fn rebase_with(
     todo: &str,
     message: Option<&Path>,
 ) -> Result<(), String> {
+    let files: Vec<(String, std::path::PathBuf)> = message
+        .map(|m| vec![("SE_MESSAGE".to_string(), m.to_path_buf())])
+        .unwrap_or_default();
+    rebase_todo(repo, base, todo, &files).await
+}
+
+/// [`rebase_with`] with any number of files for the `exec` lines to read, each
+/// named by the environment variable that holds its path.
+async fn rebase_todo(
+    repo: &Path,
+    base: Option<&str>,
+    todo: &str,
+    files: &[(String, std::path::PathBuf)],
+) -> Result<(), String> {
     let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
     let todo_path = dir.path().join("todo");
     tokio::fs::write(&todo_path, todo)
@@ -532,7 +735,10 @@ async fn rebase_with(
     // through the environment, so nothing needs quoting.
     let editor = "sh -c 'cp \"$SE_TODO\" \"$1\"' sh";
     let todo_env = todo_path.to_string_lossy().into_owned();
-    let message_env = message.map(|m| m.to_string_lossy().into_owned());
+    let owned: Vec<(String, String)> = files
+        .iter()
+        .map(|(name, path)| (name.clone(), path.to_string_lossy().into_owned()))
+        .collect();
     let mut args = vec!["rebase", "-i", "--autostash", "--no-autosquash"];
     match base {
         Some(base) => args.push(base),
@@ -543,15 +749,134 @@ async fn rebase_with(
         ("GIT_EDITOR", "true"),
         ("SE_TODO", &todo_env),
     ];
-    if let Some(m) = &message_env {
-        env.push(("SE_MESSAGE", m));
-    }
+    env.extend(owned.iter().map(|(n, p)| (n.as_str(), p.as_str())));
     match run_with(repo, &args, None, &env).await {
         Ok(_) => Ok(()),
         // Conflicts stay to be settled; any other failure leaves things as
         // they were.
         Err(e) => Err(super::stopped(repo, e, &["rebase", "--abort"]).await),
     }
+}
+
+/// What is done with a commit in an interactive rebase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanAction {
+    Pick,
+    /// Keeps it with another message.
+    Reword,
+    /// Stops there, to change it (then `Continue`).
+    Edit,
+    /// Folds it into the commit before, keeping both messages.
+    Squash,
+    /// Folds it into the commit before, dropping its message.
+    Fixup,
+    Drop,
+}
+
+impl PlanAction {
+    pub const ALL: [PlanAction; 6] = [
+        PlanAction::Pick,
+        PlanAction::Reword,
+        PlanAction::Edit,
+        PlanAction::Squash,
+        PlanAction::Fixup,
+        PlanAction::Drop,
+    ];
+
+    fn folds(self) -> bool {
+        matches!(self, PlanAction::Squash | PlanAction::Fixup)
+    }
+}
+
+/// One line of an interactive rebase: a commit, what is done with it, and
+/// (for a reword) its new message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanItem {
+    pub sha: String,
+    pub action: PlanAction,
+    pub subject: String,
+    /// The whole message: the commit's own, or what it is changed to.
+    pub message: String,
+}
+
+/// The commits an interactive rebase from `base` would replay, oldest first,
+/// all to be picked.
+pub async fn plan_from(repo: &Path, base: Option<&str>) -> Result<Vec<PlanItem>, String> {
+    ensure_linear(repo, base).await?;
+    let shas = commits_after(repo, base).await?;
+    let refs: Vec<&str> = shas.iter().map(String::as_str).collect();
+    let messages = commit_messages(repo, &refs).await?;
+    Ok(shas
+        .iter()
+        .map(|sha| {
+            let message = messages.get(sha).map(|m| m.to_string()).unwrap_or_default();
+            PlanItem {
+                sha: sha.clone(),
+                action: PlanAction::Pick,
+                subject: message.lines().next().unwrap_or("").to_string(),
+                message,
+            }
+        })
+        .collect())
+}
+
+/// Why a plan can't be run, if it can't.
+pub fn check_plan(plan: &[PlanItem]) -> Result<(), String> {
+    let first = plan.iter().find(|i| i.action != PlanAction::Drop);
+    match first {
+        Some(item) if item.action.folds() => Err(t!("git.err_plan_first").to_string()),
+        _ => Ok(()),
+    }
+}
+
+/// Runs an interactive rebase: the commits after `base`, in the order of the
+/// plan, each picked, reworded, stopped at, folded or dropped.
+pub async fn interactive_rebase(
+    repo: &Path,
+    base: Option<&str>,
+    plan: &[PlanItem],
+) -> Result<(), String> {
+    check_plan(plan)?;
+    ensure_linear(repo, base).await?;
+    let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+    let mut todo = String::new();
+    let mut files: Vec<(String, std::path::PathBuf)> = Vec::new();
+    // The new message of the commit a group of folded ones ends on.
+    let mut reword: Option<usize> = None;
+    let close_group = |todo: &mut String, reword: &mut Option<usize>| {
+        if let Some(n) = reword.take() {
+            todo.push_str(&format!(
+                "exec git commit --amend -q -F \"$SE_MESSAGE_{n}\"\n"
+            ));
+        }
+    };
+    for item in plan.iter().filter(|i| i.action != PlanAction::Drop) {
+        if !item.action.folds() {
+            close_group(&mut todo, &mut reword);
+        }
+        let word = match item.action {
+            PlanAction::Edit => "edit",
+            PlanAction::Squash => "squash",
+            PlanAction::Fixup => "fixup",
+            _ => "pick",
+        };
+        todo.push_str(&format!("{word} {}\n", item.sha));
+        if item.action == PlanAction::Reword {
+            let n = files.len();
+            let path = dir.path().join(format!("message{n}"));
+            tokio::fs::write(&path, &item.message)
+                .await
+                .map_err(|e| e.to_string())?;
+            files.push((format!("SE_MESSAGE_{n}"), path));
+            reword = Some(n);
+        }
+    }
+    close_group(&mut todo, &mut reword);
+    // Everything dropped leaves nothing to pick, which git refuses.
+    if todo.is_empty() {
+        todo.push_str("noop\n");
+    }
+    rebase_todo(repo, base, &todo, &files).await
 }
 
 /// The commits of `base..HEAD`, oldest first.
@@ -1043,7 +1368,12 @@ mod tests {
         repo.git(&["checkout", "-q", "main"]);
         repo.write("c.txt", "main\n");
         repo.commit_all("on main");
-        block(super::super::merge_branch(repo.path(), "side")).unwrap();
+        block(super::super::merge_branch(
+            repo.path(),
+            "side",
+            super::super::MergeMode::Default,
+        ))
+        .unwrap();
         assert!(repo.path().join("b.txt").exists());
         block(delete_branch(repo.path(), "side")).unwrap();
         assert!(!repo.git(&["branch"]).contains("side"));
@@ -1068,7 +1398,12 @@ mod tests {
         repo.write("a.txt", "main\n");
         repo.commit_all("main");
         assert_eq!(
-            block(super::super::merge_branch(repo.path(), "side")).unwrap_err(),
+            block(super::super::merge_branch(
+                repo.path(),
+                "side",
+                super::super::MergeMode::Default
+            ))
+            .unwrap_err(),
             crate::git::CONFLICT
         );
         assert!(block(crate::git::has_conflicts(repo.path())));
@@ -1266,5 +1601,290 @@ mod tests {
         let lines = parse_blame(&out);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].author, "Me");
+    }
+
+    fn make_commit(repo: &Repo, files: &[(&str, &str)], message: &str) {
+        for (name, text) in files {
+            repo.write(name, text);
+        }
+        repo.commit_all(message);
+    }
+
+    /// Three commits, each adding a file.
+    fn three(repo: &Repo) {
+        make_commit(repo, &[("a.txt", "a\n")], "first");
+        make_commit(repo, &[("b.txt", "b\n")], "second");
+        make_commit(repo, &[("c.txt", "c\n")], "third");
+        make_commit(repo, &[("d.txt", "d\n")], "fourth");
+    }
+
+    fn item(plan: &[PlanItem], n: usize, action: PlanAction) -> PlanItem {
+        PlanItem {
+            action,
+            ..plan[n].clone()
+        }
+    }
+
+    #[test]
+    fn a_plan_lists_the_commits_after_the_base_oldest_first_with_their_messages() {
+        let repo = Repo::new();
+        three(&repo);
+        let first = shas(&repo)[3].clone();
+        let plan = block(plan_from(repo.path(), Some(&first))).unwrap();
+        let subjects: Vec<&str> = plan.iter().map(|i| i.subject.as_str()).collect();
+        assert_eq!(subjects, vec!["second", "third", "fourth"]);
+        assert!(plan.iter().all(|i| i.action == PlanAction::Pick));
+        // From the root: all of them.
+        assert_eq!(block(plan_from(repo.path(), None)).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn an_interactive_rebase_reorders_drops_and_rewords() {
+        let repo = Repo::new();
+        three(&repo);
+        let first = shas(&repo)[3].clone();
+        let plan = block(plan_from(repo.path(), Some(&first))).unwrap();
+        // second, third, fourth  →  fourth, (third dropped), second reworded.
+        let mut reworded = item(&plan, 0, PlanAction::Reword);
+        reworded.message = "it's the \"second\", renamed\n\nWith a body.".into();
+        let new_plan = vec![
+            item(&plan, 2, PlanAction::Pick),
+            item(&plan, 1, PlanAction::Drop),
+            reworded,
+        ];
+        block(interactive_rebase(repo.path(), Some(&first), &new_plan)).unwrap();
+        assert_eq!(
+            history(&repo),
+            vec!["it's the \"second\", renamed", "fourth", "first"]
+        );
+        assert!(!repo.path().join("c.txt").exists());
+        assert!(repo
+            .git(&["log", "-1", "--format=%b"])
+            .contains("With a body."));
+    }
+
+    #[test]
+    fn folded_commits_join_the_one_before_with_or_without_their_message() {
+        let repo = Repo::new();
+        three(&repo);
+        let first = shas(&repo)[3].clone();
+        let plan = block(plan_from(repo.path(), Some(&first))).unwrap();
+        // fixup the third into the second, squash the fourth into them.
+        let new_plan = vec![
+            item(&plan, 0, PlanAction::Pick),
+            item(&plan, 1, PlanAction::Fixup),
+            item(&plan, 2, PlanAction::Squash),
+        ];
+        block(interactive_rebase(repo.path(), Some(&first), &new_plan)).unwrap();
+        let log = history(&repo);
+        assert_eq!(log.len(), 2, "{log:?}");
+        assert_eq!(log[0], "second");
+        // All three files are there, in one commit.
+        let files = repo.git(&["show", "--name-only", "--format=", "HEAD"]);
+        assert!(files.contains("b.txt") && files.contains("c.txt") && files.contains("d.txt"));
+        // The squash kept the message of the fourth in the body, the fixup dropped the third's.
+        let body = repo.git(&["log", "-1", "--format=%B"]);
+        assert!(body.contains("fourth") && !body.contains("third"));
+    }
+
+    #[test]
+    fn a_folded_group_takes_the_new_message_of_the_commit_it_ends_on() {
+        let repo = Repo::new();
+        three(&repo);
+        let first = shas(&repo)[3].clone();
+        let plan = block(plan_from(repo.path(), Some(&first))).unwrap();
+        let mut head = item(&plan, 0, PlanAction::Reword);
+        head.message = "both of them".into();
+        let new_plan = vec![
+            head,
+            item(&plan, 1, PlanAction::Fixup),
+            item(&plan, 2, PlanAction::Pick),
+        ];
+        block(interactive_rebase(repo.path(), Some(&first), &new_plan)).unwrap();
+        assert_eq!(history(&repo), vec!["fourth", "both of them", "first"]);
+    }
+
+    #[test]
+    fn a_rebase_can_stop_at_a_commit_to_change_it_and_then_go_on() {
+        let repo = Repo::new();
+        three(&repo);
+        let first = shas(&repo)[3].clone();
+        let plan = block(plan_from(repo.path(), Some(&first))).unwrap();
+        let new_plan = vec![
+            item(&plan, 0, PlanAction::Edit),
+            item(&plan, 1, PlanAction::Pick),
+            item(&plan, 2, PlanAction::Pick),
+        ];
+        block(interactive_rebase(repo.path(), Some(&first), &new_plan)).unwrap();
+        // Stopped after "second", the rest waiting.
+        assert_eq!(
+            block(crate::git::operation(repo.path())),
+            Some(crate::git::Operation::Rebase)
+        );
+        assert_eq!(history(&repo), vec!["second", "first"]);
+        repo.write("extra.txt", "x\n");
+        repo.git(&["add", "extra.txt"]);
+        repo.git(&["commit", "-q", "--amend", "--no-edit"]);
+        block(crate::git::continue_operation(
+            repo.path(),
+            crate::git::Operation::Rebase,
+        ))
+        .unwrap();
+        assert_eq!(history(&repo), vec!["fourth", "third", "second", "first"]);
+        assert!(repo.path().join("extra.txt").exists());
+    }
+
+    #[test]
+    fn a_plan_that_folds_the_first_commit_or_drops_everything_is_dealt_with() {
+        let repo = Repo::new();
+        three(&repo);
+        let first = shas(&repo)[3].clone();
+        let plan = block(plan_from(repo.path(), Some(&first))).unwrap();
+        let bad = vec![
+            item(&plan, 0, PlanAction::Squash),
+            item(&plan, 1, PlanAction::Pick),
+        ];
+        assert!(check_plan(&bad).is_err());
+        assert!(block(interactive_rebase(repo.path(), Some(&first), &bad)).is_err());
+        assert_eq!(history(&repo).len(), 4, "nothing was touched");
+        // A dropped one first is not "the first": folding after it is refused too.
+        let also_bad = vec![
+            item(&plan, 0, PlanAction::Drop),
+            item(&plan, 1, PlanAction::Fixup),
+        ];
+        assert!(check_plan(&also_bad).is_err());
+        // Everything dropped: the branch goes back to the base.
+        let all_dropped: Vec<PlanItem> = plan
+            .iter()
+            .map(|i| PlanItem {
+                action: PlanAction::Drop,
+                ..i.clone()
+            })
+            .collect();
+        block(interactive_rebase(repo.path(), Some(&first), &all_dropped)).unwrap();
+        assert_eq!(history(&repo), vec!["first"]);
+    }
+
+    #[test]
+    fn a_rebase_with_a_conflict_is_left_to_settle() {
+        let repo = Repo::new();
+        make_commit(&repo, &[("f.txt", "base\n")], "base");
+        make_commit(&repo, &[("f.txt", "one\n")], "one");
+        make_commit(&repo, &[("f.txt", "two\n")], "two");
+        let base = shas(&repo)[2].clone();
+        let plan = block(plan_from(repo.path(), Some(&base))).unwrap();
+        // Replayed in the other order, they touch the same line.
+        let swapped = vec![
+            item(&plan, 1, PlanAction::Pick),
+            item(&plan, 0, PlanAction::Pick),
+        ];
+        assert_eq!(
+            block(interactive_rebase(repo.path(), Some(&base), &swapped)).unwrap_err(),
+            crate::git::CONFLICT
+        );
+    }
+
+    #[test]
+    fn the_log_can_be_searched_by_message_author_content_file_and_date() {
+        let repo = Repo::new();
+        make_commit(&repo, &[("a.txt", "alpha\n")], "add the alpha file");
+        repo.git(&[
+            "commit",
+            "-q",
+            "--allow-empty",
+            "--author",
+            "Zed <z@example.com>",
+            "-m",
+            "an empty one by Zed",
+        ]);
+        make_commit(
+            &repo,
+            &[("b.txt", "beta needle beta\n")],
+            "add the beta file",
+        );
+        let find = |mode, text: &str| -> Vec<String> {
+            block(log_matching(
+                repo.path(),
+                "HEAD",
+                100,
+                None,
+                Some((mode, text)),
+            ))
+            .unwrap()
+            .into_iter()
+            .map(|c| c.subject)
+            .collect()
+        };
+        assert_eq!(
+            find(SearchMode::Message, "ALPHA"),
+            vec!["add the alpha file"]
+        );
+        assert_eq!(find(SearchMode::Author, "zed"), vec!["an empty one by Zed"]);
+        assert_eq!(
+            find(SearchMode::Content, "needle"),
+            vec!["add the beta file"]
+        );
+        assert_eq!(find(SearchMode::File, "a.txt"), vec!["add the alpha file"]);
+        assert_eq!(find(SearchMode::Since, "1 day ago").len(), 3);
+        assert_eq!(find(SearchMode::Since, "2099-01-01").len(), 0);
+        // Nothing typed: everything.
+        assert_eq!(find(SearchMode::Message, "  ").len(), 3);
+        // Text that git could read as an option stays text.
+        assert!(find(SearchMode::Message, "--all").is_empty());
+    }
+
+    #[test]
+    fn tags_are_made_pushed_and_removed_on_the_remote() {
+        let repo = Repo::new();
+        let remote = with_remote(&repo);
+        make_commit(&repo, &[("a.txt", "a\n")], "first");
+        make_commit(&repo, &[("a.txt", "a2\n")], "second");
+        let old = shas(&repo)[1].clone();
+        block(create_tag(repo.path(), "light", None, None)).unwrap();
+        block(create_tag(
+            repo.path(),
+            "v0",
+            Some(&old),
+            Some("the first one"),
+        ))
+        .unwrap();
+        assert_eq!(repo.git(&["cat-file", "-t", "light"]).trim(), "commit");
+        assert_eq!(
+            repo.git(&["cat-file", "-t", "v0"]).trim(),
+            "tag",
+            "annotated"
+        );
+        assert_eq!(repo.git(&["rev-list", "-n", "1", "v0"]).trim(), old);
+        // A name that is an option is refused, not obeyed.
+        assert!(block(create_tag(repo.path(), "--delete", None, None)).is_err());
+        block(push_tag(repo.path(), "v0")).unwrap();
+        let tags_there = |name: &str| {
+            let out = std::process::Command::new("git")
+                .args(["tag", "-l", name])
+                .current_dir(remote.path())
+                .output()
+                .unwrap();
+            !String::from_utf8_lossy(&out.stdout).trim().is_empty()
+        };
+        assert!(tags_there("v0") && !tags_there("light"));
+        block(delete_remote_tag(repo.path(), "v0")).unwrap();
+        assert!(!tags_there("v0"));
+    }
+
+    #[test]
+    fn the_blame_of_an_older_revision_is_read() {
+        let repo = Repo::new();
+        make_commit(&repo, &[("f.txt", "one\ntwo\n")], "first");
+        make_commit(&repo, &[("f.txt", "one\nTWO\nthree\n")], "second");
+        let head = block(blame(repo.path(), "f.txt")).unwrap();
+        assert_eq!(head.len(), 3);
+        assert_eq!(head[1].summary, "second");
+        let before = block(blame_at(repo.path(), Some("HEAD~1"), "f.txt")).unwrap();
+        assert_eq!(before.len(), 2);
+        assert!(before.iter().all(|l| l.summary == "first"));
+        assert_eq!(
+            block(file_at(repo.path(), "HEAD~1", "f.txt")).unwrap(),
+            "one\ntwo\n"
+        );
     }
 }

@@ -86,6 +86,109 @@ mod behavior_tests {
     }
 
     #[test]
+    fn the_file_list_is_resized_by_dragging_its_edge() {
+        let mut app = app();
+        assert!(!app.sidebar_resizing);
+        let _ = app.handle(Message::SidebarResizeStart);
+        assert!(app.sidebar_resizing);
+        let gap = se_theme::PANEL_GAP;
+        let _ = app.handle(Message::SidebarResize(300.0 + gap));
+        assert_eq!(app.sidebar_width, 300.0);
+        // Never thinner than the names need, nor wider than the window allows.
+        let _ = app.handle(Message::SidebarResize(5.0));
+        assert_eq!(app.sidebar_width, super::SIDEBAR_MIN);
+        let _ = app.handle(Message::SidebarResize(1.0e6));
+        assert!(app.sidebar_width <= super::SIDEBAR_MAX);
+        assert!(app.sidebar_width <= app.config.window_width * 0.6 + 0.01);
+        let _ = app.handle(Message::SidebarResize(300.0 + gap));
+        let _ = app.handle(Message::SidebarResizeEnd);
+        assert!(!app.sidebar_resizing);
+        assert_eq!(app.config.sidebar_width, 300.0, "remembered");
+    }
+
+    #[test]
+    fn the_bottom_panels_are_resized_by_dragging_its_top_edge() {
+        let mut app = app();
+        let start = app.panel_height;
+        let _ = app.handle(Message::PanelResizeStart);
+        assert!(app.panel_resizing);
+        // The first move only anchors the drag; moving up makes it taller.
+        let _ = app.handle(Message::PanelResize(500.0));
+        assert_eq!(app.panel_height, start);
+        let _ = app.handle(Message::PanelResize(450.0));
+        assert_eq!(app.panel_height, start + 50.0);
+        // Within the least and the most the window allows.
+        let _ = app.handle(Message::PanelResize(1.0e6));
+        assert_eq!(app.panel_height, super::PANEL_MIN_HEIGHT);
+        let _ = app.handle(Message::PanelResize(-1.0e6));
+        assert!(app.panel_height <= app.config.window_height * 0.85 + 0.01);
+        let _ = app.handle(Message::PanelResizeEnd);
+        assert!(!app.panel_resizing && app.panel_drag.is_none());
+    }
+
+    #[test]
+    fn a_path_is_shown_with_the_home_folder_as_a_tilde() {
+        let home = dirs::home_dir().expect("a home folder");
+        assert_eq!(super::display_path(&home.join("work/a.rs")), "~/work/a.rs");
+        assert_eq!(super::display_path(Path::new("/etc/hosts")), "/etc/hosts");
+    }
+
+    #[test]
+    fn deleting_a_file_asks_first_and_git_is_a_choice() {
+        use crate::git::testing::{block, Repo};
+        let mut app = app();
+        // Not in a repository: no checkbox.
+        let dir = tempfile::tempdir().unwrap();
+        let loose = dir.path().join("loose.txt");
+        std::fs::write(&loose, "x").unwrap();
+        let _ = app.handle(Message::DeleteAsked(
+            loose.clone(),
+            block(super::is_tracked(&loose)),
+        ));
+        assert_eq!(
+            app.overlay,
+            ActiveOverlay::ConfirmFileDelete(loose.clone(), None)
+        );
+        let _ = app.handle(Message::DeleteFile(loose.clone(), false));
+        assert!(matches!(app.overlay, ActiveOverlay::None));
+        assert_eq!(block(super::delete_file(loose.clone(), false)), Ok(false));
+        assert!(!loose.exists());
+        // Tracked by git: the box is there, checked.
+        let repo = Repo::new();
+        repo.write("a.txt", "one\n");
+        repo.write("b.txt", "two\n");
+        repo.commit_all("first");
+        let (a, b) = (repo.path().join("a.txt"), repo.path().join("b.txt"));
+        assert!(block(super::is_tracked(&a)));
+        let _ = app.handle(Message::DeleteAsked(a.clone(), true));
+        assert_eq!(
+            app.overlay,
+            ActiveOverlay::ConfirmFileDelete(a.clone(), Some(true))
+        );
+        // Unchecked: only the disk.
+        let _ = app.handle(Message::ToggleDeleteFromGit(false));
+        assert_eq!(
+            app.overlay,
+            ActiveOverlay::ConfirmFileDelete(a.clone(), Some(false))
+        );
+        assert_eq!(block(super::delete_file(a.clone(), false)), Ok(false));
+        assert!(!a.exists());
+        assert!(
+            repo.git(&["status", "--porcelain"]).starts_with(" D"),
+            "not staged"
+        );
+        // Checked: git removes it too.
+        assert_eq!(block(super::delete_file(b.clone(), true)), Ok(true));
+        assert!(repo.git(&["status", "--porcelain"]).contains("D  b.txt"));
+        // A file of a repository that git doesn't know: only the disk.
+        repo.write("new.txt", "n\n");
+        let new = repo.path().join("new.txt");
+        assert!(!block(super::is_tracked(&new)));
+        assert_eq!(block(super::delete_file(new.clone(), true)), Ok(false));
+        assert!(!new.exists());
+    }
+
+    #[test]
     fn closing_the_last_tab_leaves_a_tab_to_type_in() {
         let mut app = app();
         let first = app.current_file.clone().unwrap();
@@ -315,6 +418,29 @@ mod behavior_tests {
             stamp: DiskStamp::of(&path),
         })));
         (app, dir, path)
+    }
+
+    #[test]
+    fn a_scratch_file_made_without_a_name_is_numbered() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app();
+        app.scratch.dir = dir.path().join("scratches");
+        app.scratch.ext = crate::scratch::Ext(Some("md"));
+        for _ in 0..2 {
+            let _ = app.handle(Message::ScratchCreate);
+        }
+        assert!(app.scratch.dir.join("scratch1.md").is_file());
+        assert!(app.scratch.dir.join("scratch2.md").is_file());
+        assert_eq!(
+            crate::scratch::next_name(&app.scratch.dir, "md"),
+            "scratch3"
+        );
+        // Another extension has its own numbering.
+        assert_eq!(
+            crate::scratch::next_name(&app.scratch.dir, "py"),
+            "scratch1"
+        );
+        assert!(app.scratch.error.is_none());
     }
 
     #[test]
@@ -967,6 +1093,11 @@ mod behavior_tests {
             annotations: crate::code_editor::Annotations {
                 lines: std::sync::Arc::new(Vec::new()),
                 text: iced::Color::BLACK,
+                details: std::sync::Arc::new(Vec::new()),
+                link: iced::Color::BLACK,
+                card_text: iced::Color::BLACK,
+                card_background: iced::Color::BLACK,
+                card_border: iced::Color::BLACK,
             },
             shas: vec![],
         });
@@ -1309,5 +1440,217 @@ mod behavior_tests {
         app.session_owner = false;
         assert!(app.save_session_now().is_ok());
         assert!(app.session_write_job().is_none());
+    }
+
+    #[test]
+    fn a_blame_line_shows_its_commit_like_an_ide_does() {
+        let line = crate::git::history::BlameLine {
+            sha: "cc695242ccbf0dde1002b50be37f9bb58b0385ed".into(),
+            author: "Olivier Sandré".into(),
+            email: "olivier@example.fr".into(),
+            time: 1_784_000_000,
+            summary: "Oc 540".into(),
+            message: std::sync::Arc::from("Oc 540\n\nA second paragraph that is long enough to need wrapping because it goes well past the width of a readable line of text."),
+        };
+        let card = super::commit_card(&line);
+        assert!(card[0].starts_with("commit cc695242"));
+        assert!(card[1].contains("Olivier Sandré") && card[1].contains("<olivier@example.fr>"));
+        assert!(card[2].starts_with("Date"));
+        assert_eq!(card[3], "");
+        assert_eq!(card[4], "Oc 540");
+        // The long paragraph is wrapped, nothing is lost.
+        let wrapped: Vec<&String> = card[6..].iter().collect();
+        assert!(wrapped.len() >= 2);
+        assert!(wrapped.iter().all(|l| l.chars().count() <= 72));
+        assert!(wrapped
+            .iter()
+            .map(|l| l.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .ends_with("readable line of text."));
+        // Without the whole message, the summary stands in.
+        let short = crate::git::history::BlameLine {
+            message: std::sync::Arc::from(""),
+            ..line
+        };
+        assert_eq!(super::commit_card(&short)[4], "Oc 540");
+    }
+
+    #[test]
+    fn the_way_to_pull_and_merge_is_chosen_in_the_panel_or_the_preferences_and_kept() {
+        let mut app = app();
+        assert_eq!(app.git.pull_mode, crate::git::PullMode::Merge);
+        // Chosen behind the chevron: the modes close, nothing is run.
+        app.git.branches.menu =
+            Some((crate::git_panel::branches::Split::Pull, iced::Point::ORIGIN));
+        let _ = app.handle(Message::SetPullMode(crate::git::PullMode::Rebase));
+        assert!(app.git.branches.menu.is_none());
+        assert!(!app.git.busy);
+        let _ = app.handle(Message::SetMergeMode(crate::git::MergeMode::NoFastForward));
+        assert_eq!(app.git.pull_mode, crate::git::PullMode::Rebase);
+        assert_eq!(app.config.git_pull_mode, crate::git::PullMode::Rebase);
+        assert_eq!(app.git.merge_mode, crate::git::MergeMode::NoFastForward);
+        assert_eq!(
+            app.config.git_merge_mode,
+            crate::git::MergeMode::NoFastForward
+        );
+        assert!(app.config_dirty, "written with the next tick");
+        // A config file keeps them, in words.
+        let text = serde_json::to_string(&app.config).unwrap();
+        assert!(text.contains("rebase") && text.contains("no-fast-forward"));
+    }
+
+    fn press(app: &mut SimpleEditApp, key: &str, ctrl: bool, shift: bool, alt: bool) {
+        let _ = app.handle(Message::KeyPressed {
+            key: key.into(),
+            ctrl,
+            shift,
+            alt,
+        });
+    }
+
+    #[test]
+    fn the_ide_shortcuts_edit_lines() {
+        let mut app = app();
+        type_text(&mut app, "one\ntwo\nthree");
+        // Ctrl+D duplicates the line, Ctrl+Y deletes it.
+        press(&mut app, "d", true, false, false);
+        assert_eq!(text(&app).trim_end(), "one\ntwo\nthree\nthree");
+        press(&mut app, "y", true, false, false);
+        assert_eq!(text(&app).trim_end(), "one\ntwo\nthree");
+        // Alt+Shift+Up moves it above the one before.
+        press(&mut app, "ArrowUp", false, true, true);
+        assert_eq!(text(&app).trim_end(), "one\nthree\ntwo");
+        // Ctrl+Z goes back, Ctrl+Shift+Z forward.
+        press(&mut app, "z", true, false, false);
+        assert_eq!(text(&app).trim_end(), "one\ntwo\nthree");
+        press(&mut app, "z", true, true, false);
+        assert_eq!(text(&app).trim_end(), "one\nthree\ntwo");
+    }
+
+    #[test]
+    fn the_git_shortcuts_open_the_panel() {
+        let mut app = app();
+        press(&mut app, "k", true, false, false);
+        assert!(app.git.open);
+        assert_eq!(app.git.tab, crate::git_panel::Tab::Commit);
+        // Bookmarks panel: Shift+F11.
+        press(&mut app, "F11", false, true, false);
+        assert!(app.bookmark_panel.open);
+    }
+
+    #[test]
+    fn the_remote_is_fetched_by_itself_at_the_chosen_pace_and_new_commits_are_told() {
+        let mut app = app();
+        app.git.repo = Some(PathBuf::from("/tmp"));
+        app.config.git_auto_fetch_minutes = 1;
+        // One minute is sixty ticks of a second.
+        app.ticks = 59;
+        let _ = app.handle(Message::AutoSave);
+        assert_eq!(app.ticks, 60);
+        // Never: the pace is only a setting.
+        let _ = app.handle(Message::SetAutoFetch(0));
+        assert_eq!(app.config.git_auto_fetch_minutes, 0);
+        assert!(app.config_dirty);
+        // New commits on the remote show in the status bar.
+        let mut before = conflicted(None, 0);
+        before.upstream = Some("origin/main".into());
+        let mut after = before.clone();
+        after.behind = 3;
+        app.git.status = Some(after);
+        let _ = app.after_message(false, Some(Some(before)), false);
+        assert!(app.status_message.contains('3'));
+    }
+
+    #[test]
+    fn the_branch_in_the_status_bar_opens_a_list_to_switch_or_make_a_branch() {
+        let mut app = app();
+        // Not in a repository: nothing to switch.
+        let _ = app.handle(Message::OpenBranchSwitcher);
+        assert!(matches!(app.overlay, ActiveOverlay::None));
+        app.git.repo = Some(PathBuf::from("/tmp"));
+        app.git.status = Some(conflicted(None, 0));
+        app.git.log.refs = Some(crate::git::history::Refs {
+            branches: vec![crate::git::history::Branch {
+                name: "main".into(),
+                sha: String::new(),
+                upstream: None,
+                current: true,
+                remote: false,
+                ahead: 0,
+                behind: 0,
+            }],
+            tags: vec![],
+        });
+        press(&mut app, "b", true, true, false);
+        assert_eq!(app.overlay, ActiveOverlay::BranchSwitch(String::new()));
+        let _ = app.handle(Message::BranchSwitchFilter("fea".into()));
+        assert_eq!(app.overlay, ActiveOverlay::BranchSwitch("fea".into()));
+        // A name no branch has: made, then switched to.
+        let _ = app.handle(Message::BranchSwitchChoose("feature-x".into(), true));
+        assert!(matches!(app.overlay, ActiveOverlay::None));
+        assert!(app.git.busy);
+        // An empty name does nothing.
+        app.git.busy = false;
+        let _ = app.handle(Message::OpenBranchSwitcher);
+        let _ = app.handle(Message::BranchSwitchChoose(String::new(), false));
+        assert!(!app.git.busy);
+    }
+
+    #[test]
+    fn what_goes_wrong_with_the_panel_closed_is_told_in_the_status_bar() {
+        let mut app = app();
+        assert!(!app.git.open);
+        let _ = app.handle(Message::Git(crate::git_panel::GitMsg::Done(Err(
+            "push refused".into(),
+        ))));
+        assert!(app.status_message.contains("push refused"));
+        assert!(app.status_is_error);
+        // A conflict is not a failure: the pop-up says it.
+        app.set_status("calm", false);
+        let _ = app.handle(Message::Git(crate::git_panel::GitMsg::Done(Err(
+            crate::git::CONFLICT.into(),
+        ))));
+        assert_eq!(app.status_message, "calm");
+    }
+
+    #[test]
+    fn the_previous_version_of_a_line_opens_in_a_tab_of_its_own_with_its_blame() {
+        let mut app = app();
+        let line = |sha: &str, summary: &str| crate::git::history::BlameLine {
+            sha: sha.into(),
+            author: "A".into(),
+            email: "a@example.com".into(),
+            time: 0,
+            summary: summary.into(),
+            message: std::sync::Arc::from(""),
+        };
+        let lines = vec![
+            line(&"a".repeat(40), "first"),
+            line(&"b".repeat(40), "second"),
+        ];
+        let _ = app.handle(Message::BlamePreviousLoaded(Ok((
+            PathBuf::from("/repo"),
+            "src/f.rs".into(),
+            "12345678".into(),
+            "one\ntwo\n".into(),
+            lines,
+        ))));
+        let tab = app.current_file.clone().unwrap();
+        assert_eq!(display_name(&tab), "⟲ f.rs @ 12345678");
+        assert!(is_untitled(&tab), "never written to disk by mistake");
+        assert_eq!(text(&app), "one\ntwo\n");
+        // Its blame is there: one note per line, the hashes kept for the next step back.
+        assert!(app.blame_shown());
+        assert_eq!(app.blame.as_ref().unwrap().shas.len(), 2);
+        // A line a commit made can go back again; one not committed yet can't.
+        app.gutter_line = Some(1);
+        let task = app.handle(Message::BlamePrevious);
+        let _ = task;
+        // An error says why and opens nothing.
+        let before = app.current_file.clone();
+        let _ = app.handle(Message::BlamePreviousLoaded(Err("no such path".into())));
+        assert_eq!(app.current_file, before);
+        assert!(app.status_message.contains("no such path"));
     }
 }

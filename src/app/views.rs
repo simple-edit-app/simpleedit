@@ -181,6 +181,8 @@ impl SimpleEditApp {
             | ActiveOverlay::ConfirmCloseMany(..)
             | ActiveOverlay::ConfirmQuit(_)
             | ActiveOverlay::ConfirmScratchDelete(_)
+            | ActiveOverlay::ConfirmFileDelete(..)
+            | ActiveOverlay::BranchSwitch(_)
             | ActiveOverlay::GitFile(_)
             | ActiveOverlay::GitPick(_)
             | ActiveOverlay::ConfirmOverwrite(_) => Space::new().height(0).into(),
@@ -331,8 +333,9 @@ impl SimpleEditApp {
     /// and the scratch files.
     pub(super) fn terminal_button(&self, dark: bool) -> Element<'_, Message> {
         let tool = |label: Element<'static, Message>, open: bool, msg: Message| {
-            button(label)
+            button(container(label).center_x(Length::Fill))
                 .padding([5, 10])
+                .width(Length::Fill)
                 .on_press(msg)
                 // Open: the accent wash; closed: an outline, so it reads as a button.
                 .style(move |theme: &iced::Theme, status| {
@@ -384,7 +387,7 @@ impl SimpleEditApp {
             .spacing(6),
         )
         .padding([6, 10])
-        .width(208)
+        .width(Length::Fill)
         .style(se_theme::panel(dark))
         .into()
     }
@@ -394,20 +397,19 @@ impl SimpleEditApp {
         let p = se_theme::palette(dark);
         let scratch = &self.scratch;
         let ghost = move |active: bool| (se_theme::GhostButton { dark, active }).style();
-        let can_create = !scratch.name.trim().is_empty();
-        let mut create = button(text(t!("scratch.create").to_string()).size(12.5))
+        // Left empty, the name is the next free `scratchN`, shown as a hint.
+        let suggestion = crate::scratch::next_name(&scratch.dir, scratch.ext.as_str());
+        let create = button(text(t!("scratch.create").to_string()).size(12.5))
             .padding([5, 12])
+            .on_press(Message::ScratchCreate)
             .style((se_theme::Primary { dark }).style());
-        if can_create {
-            create = create.on_press(Message::ScratchCreate);
-        }
         let header = row![
             text(t!("scratch.title").to_string())
                 .size(12)
                 .font(se_theme::UI_SEMIBOLD)
                 .color(p.text),
             Space::new().width(8),
-            text_input(&t!("scratch.name_placeholder"), &scratch.name)
+            text_input(&suggestion, &scratch.name)
                 .on_input(Message::ScratchName)
                 .on_submit(Message::ScratchCreate)
                 .padding([5, 8])
@@ -500,12 +502,10 @@ impl SimpleEditApp {
                 .height(Length::Fill),
         );
         column![
-            container(Space::new().height(1))
-                .width(Length::Fill)
-                .style(se_theme::rule(dark)),
+            resize_edge(dark),
             container(body).padding([8, 12]).height(Length::Fill),
         ]
-        .height(Length::Fixed(300.0))
+        .height(Length::Fixed(self.panel_height))
         .into()
     }
 
@@ -574,13 +574,11 @@ impl SimpleEditApp {
             None => Space::new().into(),
         };
         column![
-            container(Space::new().height(1))
-                .width(Length::Fill)
-                .style(se_theme::rule(dark)),
+            resize_edge(dark),
             container(header).padding([4, 12]),
             container(body).width(Length::Fill).height(Length::Fill),
         ]
-        .height(Length::Fixed(300.0))
+        .height(Length::Fixed(self.panel_height))
         .into()
     }
 
@@ -1032,4 +1030,21 @@ impl SimpleEditApp {
             None => Task::none(),
         }
     }
+}
+
+/// The top edge of a bottom panel: a rule that can be dragged to resize it.
+pub(crate) fn resize_edge<'a>(dark: bool) -> Element<'a, Message> {
+    iced::widget::mouse_area(
+        container(Space::new().height(1))
+            .width(Length::Fill)
+            .padding(iced::Padding {
+                top: 2.0,
+                bottom: 2.0,
+                ..Default::default()
+            })
+            .style(se_theme::rule(dark)),
+    )
+    .on_press(Message::PanelResizeStart)
+    .interaction(iced::mouse::Interaction::ResizingVertically)
+    .into()
 }

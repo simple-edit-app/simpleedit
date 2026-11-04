@@ -358,11 +358,117 @@ pub async fn abort_operation(repo: &Path, operation: Operation) -> Result<(), St
     run(repo, args).await.map(|_| ())
 }
 
+/// How `pull` brings in what the remote has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PullMode {
+    /// `git pull`: a merge commit when the branches diverged.
+    #[default]
+    Merge,
+    /// `git pull --rebase`: your commits replayed on top.
+    Rebase,
+    /// `git pull --ff-only`: only when nothing diverged.
+    FastForwardOnly,
+}
+
+impl PullMode {
+    pub const ALL: [PullMode; 3] = [PullMode::Merge, PullMode::Rebase, PullMode::FastForwardOnly];
+
+    fn flag(self) -> &'static str {
+        match self {
+            PullMode::Merge => "--no-rebase",
+            PullMode::Rebase => "--rebase",
+            PullMode::FastForwardOnly => "--ff-only",
+        }
+    }
+}
+
+impl std::fmt::Display for PullMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&match self {
+            PullMode::Merge => t!("git.pull_merge"),
+            PullMode::Rebase => t!("git.pull_rebase"),
+            PullMode::FastForwardOnly => t!("git.pull_ff_only"),
+        })
+    }
+}
+
+/// How a merge is made when nothing says otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MergeMode {
+    /// Git's own choice: fast-forward when it can, else a merge commit.
+    #[default]
+    Default,
+    /// `--no-ff`: always a merge commit.
+    NoFastForward,
+    /// `--ff-only`: refuses when a merge commit would be needed.
+    FastForwardOnly,
+    /// `--squash`: the changes are staged as one, to commit yourself.
+    Squash,
+}
+
+impl MergeMode {
+    pub const ALL: [MergeMode; 4] = [
+        MergeMode::Default,
+        MergeMode::NoFastForward,
+        MergeMode::FastForwardOnly,
+        MergeMode::Squash,
+    ];
+
+    fn flag(self) -> Option<&'static str> {
+        match self {
+            MergeMode::Default => None,
+            MergeMode::NoFastForward => Some("--no-ff"),
+            MergeMode::FastForwardOnly => Some("--ff-only"),
+            MergeMode::Squash => Some("--squash"),
+        }
+    }
+}
+
+impl std::fmt::Display for MergeMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&match self {
+            MergeMode::Default => t!("git.merge_default"),
+            MergeMode::NoFastForward => t!("git.merge_no_ff"),
+            MergeMode::FastForwardOnly => t!("git.merge_ff_only"),
+            MergeMode::Squash => t!("git.merge_squash"),
+        })
+    }
+}
+
 /// Merges a branch into the current one.
-pub async fn merge_branch(repo: &Path, branch: &str) -> Result<(), String> {
-    match run(repo, &["merge", "--no-edit", branch]).await {
+pub async fn merge_branch(repo: &Path, branch: &str, mode: MergeMode) -> Result<(), String> {
+    let mut args = vec!["merge", "--no-edit"];
+    args.extend(mode.flag());
+    args.push(branch);
+    match run(repo, &args).await {
         Ok(_) => Ok(()),
         Err(e) => Err(stopped(repo, e, &["merge", "--abort"]).await),
+    }
+}
+
+/// Brings in what a remote has: the upstream of the current branch, or
+/// `from` (a remote and one of its branches). What is not committed is put
+/// aside meanwhile.
+pub async fn pull(repo: &Path, mode: PullMode, from: Option<(&str, &str)>) -> Result<(), String> {
+    let mut args = vec!["pull", "--autostash", mode.flag()];
+    if mode == PullMode::Merge {
+        args.push("--no-edit");
+    }
+    if let Some((remote, branch)) = from {
+        args.extend([remote, branch]);
+    }
+    match run_network(repo, &args).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let abort: &[&str] = if mode == PullMode::Rebase {
+                &["rebase", "--abort"]
+            } else {
+                &["merge", "--abort"]
+            };
+            Err(stopped(repo, e, abort).await)
+        }
     }
 }
 
@@ -619,6 +725,93 @@ pub async fn last_message(repo: &Path) -> Result<String, String> {
         .map(|m| m.trim_end().to_string())
 }
 
+/// Applies a patch to the index only (`--cached`), or takes it out of it
+/// (`reverse`): the way to stage or unstage a block or some lines.
+pub async fn apply_patch(repo: &Path, patch: &str, reverse: bool) -> Result<(), String> {
+    let mut args = vec!["apply", "--cached", "--recount", "--whitespace=nowarn"];
+    if reverse {
+        args.push("-R");
+    }
+    run_with(repo, &args, Some(patch), &[]).await.map(|_| ())
+}
+
+/// Gets what the remotes have (without changing the working tree), and drops
+/// the branches they no longer have.
+pub async fn fetch(repo: &Path) -> Result<(), String> {
+    run_network(repo, &["fetch", "--all", "--prune"])
+        .await
+        .map(|_| ())
+}
+
+/// How far `reset` goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetMode {
+    /// Only the branch moves: the changes stay staged.
+    Soft,
+    /// The branch and the index: the changes stay in the files.
+    Mixed,
+    /// Everything: the changes are lost.
+    Hard,
+}
+
+/// Moves the current branch to a commit.
+pub async fn reset(repo: &Path, to: &str, mode: ResetMode) -> Result<(), String> {
+    let flag = match mode {
+        ResetMode::Soft => "--soft",
+        ResetMode::Mixed => "--mixed",
+        ResetMode::Hard => "--hard",
+    };
+    run(repo, &["reset", flag, "--end-of-options", to])
+        .await
+        .map(|_| ())
+}
+
+/// Takes the last commit back, its changes staying staged; its message.
+pub async fn undo_last_commit(repo: &Path) -> Result<String, String> {
+    let message = last_message(repo).await?;
+    run(repo, &["reset", "--soft", "HEAD~1"]).await?;
+    Ok(message)
+}
+
+/// Puts one file's changes aside (a stash of that file alone).
+pub async fn stash_file(repo: &Path, path: &str, message: &str) -> Result<(), String> {
+    let mut args = vec!["stash", "push", "--include-untracked"];
+    if !message.trim().is_empty() {
+        args.extend(["-m", message]);
+    }
+    args.extend(["--", path]);
+    run(repo, &args).await.map(|_| ())
+}
+
+/// Adds a file to the `.gitignore` of the repository (made if it is not
+/// there). A file git already tracks is taken out of the index too (its
+/// copy on disk stays), else the line would change nothing.
+pub async fn ignore_file(repo: &Path, path: &str) -> Result<bool, String> {
+    let file = repo.join(".gitignore");
+    let mut text = tokio::fs::read_to_string(&file).await.unwrap_or_default();
+    let pattern = format!("/{path}");
+    if !text
+        .lines()
+        .any(|l| l.trim() == pattern || l.trim() == path)
+    {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str(&pattern);
+        text.push('\n');
+        tokio::fs::write(&file, text)
+            .await
+            .map_err(|e| format!(".gitignore: {e}"))?;
+    }
+    let tracked = run(repo, &["ls-files", "--error-unmatch", "--", path])
+        .await
+        .is_ok();
+    if tracked {
+        run(repo, &["rm", "--cached", "-q", "--", path]).await?;
+    }
+    Ok(tracked)
+}
+
 // ─── Diffs ──────────────────────────────────────────────────────────────────
 
 /// What a diff compares.
@@ -636,9 +829,38 @@ pub enum Source {
     Stash(usize),
     /// A ref against the working tree.
     Tree(String),
+    /// One commit against another (the second against the first).
+    Range(String, String),
 }
 
+/// How a diff is read: context lines around the changes (`u32::MAX`: the
+/// whole file) and whether changes of blanks count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiffOptions {
+    pub context: u32,
+    pub ignore_blanks: bool,
+}
+
+impl Default for DiffOptions {
+    fn default() -> Self {
+        DiffOptions {
+            context: 3,
+            ignore_blanks: false,
+        }
+    }
+}
+
+#[cfg(test)]
 pub async fn diff_of(repo: &Path, source: &Source, path: &str) -> Result<FileDiff, String> {
+    diff_with(repo, source, path, DiffOptions::default()).await
+}
+
+pub async fn diff_with(
+    repo: &Path,
+    source: &Source,
+    path: &str,
+    options: DiffOptions,
+) -> Result<FileDiff, String> {
     let owned;
     let base;
     let args: Vec<&str> = match source {
@@ -691,6 +913,20 @@ pub async fn diff_of(repo: &Path, source: &Source, path: &str) -> Result<FileDif
                 path,
             ]
         }
+        Source::Range(from, to) => {
+            owned = from.clone();
+            base = to.clone();
+            vec![
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "-U3",
+                &owned,
+                &base,
+                "--",
+                path,
+            ]
+        }
         Source::Tree(reference) => {
             owned = reference.clone();
             vec![
@@ -704,9 +940,20 @@ pub async fn diff_of(repo: &Path, source: &Source, path: &str) -> Result<FileDif
             ]
         }
     };
-    // Paths as they are, not quoted (`+++ b/…` names the file).
+    // Paths as they are, not quoted (`+++ b/…` names the file); the options
+    // of the reading in place of the default context.
+    let context = format!("-U{}", options.context.min(1_000_000));
     let mut full = vec!["-c", "core.quotepath=false"];
-    full.extend(args);
+    for arg in args {
+        if arg == "-U3" {
+            full.push(&context);
+            if options.ignore_blanks {
+                full.push("-w");
+            }
+        } else {
+            full.push(arg);
+        }
+    }
     let args = full;
     // `--no-index` exits with 1 when the files differ.
     let out = match run(repo, &args).await {
@@ -808,6 +1055,7 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::*;
     use super::*;
+    use crate::git::diff::Tag;
 
     #[test]
     fn status_separates_the_index_from_the_working_tree() {
@@ -982,7 +1230,7 @@ mod tests {
     fn a_merge_that_conflicts_is_settled_by_keeping_a_side_then_continued() {
         let repo = conflicting();
         assert_eq!(
-            block(merge_branch(repo.path(), "side")).unwrap_err(),
+            block(merge_branch(repo.path(), "side", MergeMode::Default)).unwrap_err(),
             CONFLICT
         );
         let now = block(status(repo.path(), true)).unwrap();
@@ -1052,7 +1300,7 @@ mod tests {
     #[test]
     fn the_three_versions_rebuild_a_conflict_that_shows_its_base() {
         let repo = conflicting();
-        let _ = block(merge_branch(repo.path(), "side"));
+        let _ = block(merge_branch(repo.path(), "side", MergeMode::Default));
         let text = block(merge_text(repo.path(), "a.txt")).expect("a merge");
         let merge = conflicts::parse(&text, false).unwrap();
         let chunk = merge.conflicts().next().unwrap();
@@ -1064,7 +1312,7 @@ mod tests {
     #[test]
     fn a_hand_made_resolution_is_written_and_staged() {
         let repo = conflicting();
-        let _ = block(merge_branch(repo.path(), "side"));
+        let _ = block(merge_branch(repo.path(), "side", MergeMode::Default));
         let text = std::fs::read_to_string(repo.path().join("a.txt")).unwrap();
         let mut merge = conflicts::parse(&text, false).unwrap();
         for chunk in merge.conflicts_mut() {
@@ -1086,7 +1334,12 @@ mod tests {
     #[test]
     fn a_merge_that_fails_without_conflicts_is_aborted_cleanly() {
         let repo = conflicting();
-        assert!(block(merge_branch(repo.path(), "no-such-branch")).is_err());
+        assert!(block(merge_branch(
+            repo.path(),
+            "no-such-branch",
+            MergeMode::Default
+        ))
+        .is_err());
         assert_eq!(block(operation(repo.path())), None);
     }
 
@@ -1299,5 +1552,380 @@ mod tests {
             std::fs::read_to_string(repo.path().join("q.sql")).unwrap(),
             "SELECT 1;\n-- a comment\nSELECT 2;\n"
         );
+    }
+
+    /// A repository cloned from a bare remote, and a second clone to push from.
+    fn two_clones() -> (Repo, Repo, tempfile::TempDir) {
+        let remote = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .current_dir(remote.path())
+            .status()
+            .unwrap();
+        let url = remote.path().to_str().unwrap().to_string();
+        let a = Repo::new();
+        a.git(&["remote", "add", "origin", &url]);
+        a.write("f.txt", "one\n");
+        a.commit_all("first");
+        a.git(&["push", "-q", "-u", "origin", "main"]);
+        let b = Repo::new();
+        b.git(&["remote", "add", "origin", &url]);
+        b.git(&["pull", "-q", "origin", "main"]);
+        b.git(&["branch", "--set-upstream-to=origin/main", "main"]);
+        (a, b, remote)
+    }
+
+    #[test]
+    fn a_pull_brings_in_what_the_remote_has_by_merge_rebase_or_fast_forward() {
+        for mode in PullMode::ALL {
+            let (a, b, _remote) = two_clones();
+            b.write("b.txt", "from b\n");
+            b.commit_all("on b");
+            b.git(&["push", "-q"]);
+            // A local commit too, so the branches diverged.
+            a.write("a.txt", "from a\n");
+            a.commit_all("on a");
+            let result = block(pull(a.path(), mode, None));
+            match mode {
+                PullMode::FastForwardOnly => {
+                    assert!(result.is_err(), "diverged: no fast-forward");
+                    assert!(!a.path().join("b.txt").exists());
+                }
+                PullMode::Merge => {
+                    result.unwrap();
+                    assert!(a.path().join("b.txt").exists());
+                    assert!(a.git(&["log", "--merges", "--format=%s"]).contains("Merge"));
+                }
+                PullMode::Rebase => {
+                    result.unwrap();
+                    assert!(a.path().join("b.txt").exists());
+                    assert!(a.git(&["log", "--merges", "--format=%s"]).trim().is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_pull_goes_on_with_changes_in_the_working_tree_and_stops_on_conflicts() {
+        let (a, b, _remote) = two_clones();
+        b.write("f.txt", "from b\n");
+        b.commit_all("b changes f");
+        b.git(&["push", "-q"]);
+        // Uncommitted work in another file: put aside and brought back.
+        a.write("other.txt", "wip\n");
+        a.git(&["add", "other.txt"]);
+        block(pull(a.path(), PullMode::Rebase, None)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(a.path().join("f.txt")).unwrap(),
+            "from b\n"
+        );
+        assert!(a.path().join("other.txt").exists());
+        // The same line changed on both sides: left to settle.
+        b.write("f.txt", "again from b\n");
+        b.commit_all("b again");
+        b.git(&["push", "-q"]);
+        a.git(&["commit", "-q", "-m", "wip"]);
+        a.write("f.txt", "from a\n");
+        a.commit_all("a changes f");
+        assert_eq!(
+            block(pull(a.path(), PullMode::Merge, None)).unwrap_err(),
+            CONFLICT
+        );
+        assert!(block(has_conflicts(a.path())));
+    }
+
+    #[test]
+    fn a_pull_can_name_the_remote_branch() {
+        let (a, b, _remote) = two_clones();
+        b.git(&["checkout", "-q", "-b", "topic"]);
+        b.write("t.txt", "topic\n");
+        b.commit_all("topic");
+        b.git(&["push", "-q", "origin", "topic"]);
+        block(pull(a.path(), PullMode::Merge, Some(("origin", "topic")))).unwrap();
+        assert!(a.path().join("t.txt").exists());
+    }
+
+    #[test]
+    fn a_merge_follows_the_chosen_mode() {
+        let make = || {
+            let repo = Repo::new();
+            repo.write("a.txt", "one\n");
+            repo.commit_all("first");
+            repo.git(&["checkout", "-q", "-b", "side"]);
+            repo.write("b.txt", "side\n");
+            repo.commit_all("on side");
+            repo.git(&["checkout", "-q", "main"]);
+            repo
+        };
+        // Default: nothing diverged, so a fast-forward.
+        let repo = make();
+        block(merge_branch(repo.path(), "side", MergeMode::Default)).unwrap();
+        assert!(repo
+            .git(&["log", "--merges", "--format=%s"])
+            .trim()
+            .is_empty());
+        // --no-ff: a merge commit all the same.
+        let repo = make();
+        block(merge_branch(repo.path(), "side", MergeMode::NoFastForward)).unwrap();
+        assert!(repo
+            .git(&["log", "--merges", "--format=%s"])
+            .contains("Merge"));
+        // --squash: staged, not committed.
+        let repo = make();
+        block(merge_branch(repo.path(), "side", MergeMode::Squash)).unwrap();
+        assert!(repo.git(&["status", "--porcelain"]).contains("A  b.txt"));
+        assert_eq!(repo.git(&["log", "--format=%s"]).trim(), "first");
+        // --ff-only refuses when the branches diverged.
+        let repo = make();
+        repo.write("c.txt", "main\n");
+        repo.commit_all("on main");
+        assert!(block(merge_branch(
+            repo.path(),
+            "side",
+            MergeMode::FastForwardOnly
+        ))
+        .is_err());
+    }
+
+    const SEVEN: &str = "a\nb\nc\nd\ne\nf\ng\n";
+    const SEVEN_CHANGED: &str = "a\nB\nc\nd\ne\nF\ng\n";
+
+    fn staged(repo: &Repo) -> String {
+        repo.git(&["diff", "--cached", "-U0"])
+    }
+
+    #[test]
+    fn one_block_is_staged_then_taken_out_of_the_index_again() {
+        let repo = Repo::new();
+        repo.write("f.txt", SEVEN);
+        repo.commit_all("first");
+        repo.write("f.txt", SEVEN_CHANGED);
+        let diff = block(diff_of(repo.path(), &Source::Unstaged, "f.txt")).unwrap();
+        assert_eq!(diff.blocks().len(), 2);
+        // The second block goes to the index, the first stays in the file.
+        block(apply_patch(
+            repo.path(),
+            &diff.block_patch(1, false).unwrap(),
+            false,
+        ))
+        .unwrap();
+        let cached = staged(&repo);
+        assert!(cached.contains("+F") && !cached.contains("+B"), "{cached}");
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("f.txt")).unwrap(),
+            SEVEN_CHANGED
+        );
+        // The staged diff has that block; out it goes (the file is not touched).
+        let cached_diff = block(diff_of(repo.path(), &Source::Staged, "f.txt")).unwrap();
+        block(apply_patch(
+            repo.path(),
+            &cached_diff.block_patch(0, true).unwrap(),
+            true,
+        ))
+        .unwrap();
+        assert!(staged(&repo).trim().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("f.txt")).unwrap(),
+            SEVEN_CHANGED
+        );
+    }
+
+    #[test]
+    fn some_lines_are_staged_and_unstaged() {
+        let repo = Repo::new();
+        repo.write("f.txt", "one\ntwo\nthree\n");
+        repo.commit_all("first");
+        repo.write("f.txt", "ONE\ntwo\nTHREE\nfour\n");
+        let diff = block(diff_of(repo.path(), &Source::Unstaged, "f.txt")).unwrap();
+        // Hunk 0: lines are -one +ONE two -three +THREE +four (indexes 0..5).
+        let lines: Vec<&str> = diff.hunks[0]
+            .lines
+            .iter()
+            .map(|l| l.text.as_str())
+            .collect();
+        let at = |text: &str, tag| {
+            diff.hunks[0]
+                .lines
+                .iter()
+                .position(|l| l.text == text && l.tag == tag)
+                .unwrap()
+        };
+        let picked: std::collections::HashSet<(usize, usize)> = [
+            (0, at("one", Tag::Removed)),
+            (0, at("ONE", Tag::Added)),
+            (0, at("four", Tag::Added)),
+        ]
+        .into_iter()
+        .collect();
+        assert!(lines.contains(&"four"));
+        block(apply_patch(
+            repo.path(),
+            &diff.lines_patch(&picked, false).unwrap(),
+            false,
+        ))
+        .unwrap();
+        let cached = repo.git(&["show", ":f.txt"]);
+        assert_eq!(cached, "ONE\ntwo\nthree\nfour\n");
+        // Take two of them out again, one line stays staged.
+        let cached_diff = block(diff_of(repo.path(), &Source::Staged, "f.txt")).unwrap();
+        let out: std::collections::HashSet<(usize, usize)> = [(
+            0,
+            cached_diff.hunks[0]
+                .lines
+                .iter()
+                .position(|l| l.text == "four" && l.tag == Tag::Added)
+                .unwrap(),
+        )]
+        .into_iter()
+        .collect();
+        block(apply_patch(
+            repo.path(),
+            &cached_diff.lines_patch(&out, true).unwrap(),
+            true,
+        ))
+        .unwrap();
+        assert_eq!(repo.git(&["show", ":f.txt"]), "ONE\ntwo\nthree\n");
+        // The file itself never changed.
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("f.txt")).unwrap(),
+            "ONE\ntwo\nTHREE\nfour\n"
+        );
+    }
+
+    #[test]
+    fn a_diff_can_ignore_blanks_and_show_more_context() {
+        let repo = Repo::new();
+        repo.write("f.txt", "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n");
+        repo.commit_all("first");
+        repo.write("f.txt", "a\nb\nc\nd\ne\n f\ng\nh\ni\nJ\n");
+        let read =
+            |options| block(diff_with(repo.path(), &Source::Unstaged, "f.txt", options)).unwrap();
+        // Default: the indented line counts.
+        assert_eq!(read(DiffOptions::default()).changes(), 2);
+        // Blanks ignored: only the real change.
+        let ignoring = read(DiffOptions {
+            ignore_blanks: true,
+            ..Default::default()
+        });
+        assert_eq!(ignoring.changes(), 1);
+        // More context: the whole file in one hunk.
+        let whole = read(DiffOptions {
+            context: u32::MAX,
+            ..Default::default()
+        });
+        assert_eq!(whole.hunks.len(), 1);
+        assert_eq!(whole.hunks[0].lines.len(), 12);
+    }
+
+    #[test]
+    fn two_commits_can_be_compared() {
+        let repo = Repo::new();
+        repo.write("f.txt", "one\n");
+        repo.commit_all("first");
+        repo.write("f.txt", "one\ntwo\n");
+        repo.commit_all("second");
+        repo.write("f.txt", "one\ntwo\nthree\n");
+        repo.commit_all("third");
+        let (a, c) = (
+            repo.git(&["rev-parse", "HEAD~2"]),
+            repo.git(&["rev-parse", "HEAD"]),
+        );
+        let diff = block(diff_of(
+            repo.path(),
+            &Source::Range(a.trim().into(), c.trim().into()),
+            "f.txt",
+        ))
+        .unwrap();
+        assert_eq!(diff.added(), 2);
+    }
+
+    #[test]
+    fn fetch_brings_the_remote_in_without_touching_the_files_and_prunes() {
+        let (a, b, _remote) = two_clones();
+        b.write("b.txt", "from b\n");
+        b.commit_all("on b");
+        b.git(&["push", "-q"]);
+        block(fetch(a.path())).unwrap();
+        let status = block(status(a.path(), false)).unwrap();
+        assert_eq!(status.behind, 1);
+        assert!(
+            !a.path().join("b.txt").exists(),
+            "the files are not touched"
+        );
+        // A branch deleted on the remote is dropped from the tracking ones.
+        b.git(&["push", "-q", "origin", "HEAD:refs/heads/gone"]);
+        block(fetch(a.path())).unwrap();
+        assert!(a.git(&["branch", "-r"]).contains("origin/gone"));
+        b.git(&["push", "-q", "origin", "--delete", "gone"]);
+        block(fetch(a.path())).unwrap();
+        assert!(!a.git(&["branch", "-r"]).contains("origin/gone"));
+    }
+
+    #[test]
+    fn reset_moves_the_branch_and_the_last_commit_can_be_taken_back() {
+        let repo = Repo::new();
+        repo.write("f.txt", "one\n");
+        repo.commit_all("first");
+        repo.write("f.txt", "two\n");
+        repo.commit_all("second");
+        repo.write("f.txt", "three\n");
+        repo.commit_all("third");
+        // Soft: the changes stay staged. Mixed: in the files. Hard: lost.
+        block(reset(repo.path(), "HEAD~1", ResetMode::Soft)).unwrap();
+        assert!(repo.git(&["status", "--porcelain"]).starts_with("M  "));
+        block(reset(repo.path(), "HEAD", ResetMode::Mixed)).unwrap();
+        assert!(repo.git(&["status", "--porcelain"]).starts_with(" M"));
+        block(reset(repo.path(), "HEAD~1", ResetMode::Hard)).unwrap();
+        assert!(repo.git(&["status", "--porcelain"]).trim().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("f.txt")).unwrap(),
+            "one\n"
+        );
+        // A name that is an option is refused.
+        assert!(block(reset(repo.path(), "--hard", ResetMode::Hard)).is_err());
+        // Undoing the last commit gives its message back.
+        repo.write("g.txt", "g\n");
+        repo.commit_all("to be taken back");
+        let message = block(undo_last_commit(repo.path())).unwrap();
+        assert_eq!(message, "to be taken back");
+        assert!(repo.git(&["status", "--porcelain"]).contains("A  g.txt"));
+        assert_eq!(repo.git(&["log", "-1", "--format=%s"]).trim(), "first");
+    }
+
+    #[test]
+    fn one_file_can_be_stashed_alone_and_a_file_can_be_ignored() {
+        let repo = Repo::new();
+        repo.write("a.txt", "a\n");
+        repo.write("b.txt", "b\n");
+        repo.commit_all("first");
+        repo.write("a.txt", "a changed\n");
+        repo.write("b.txt", "b changed\n");
+        block(stash_file(repo.path(), "a.txt", "just a")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+            "a\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("b.txt")).unwrap(),
+            "b changed\n"
+        );
+        assert!(repo.git(&["stash", "list"]).contains("just a"));
+        // Ignoring a file git doesn't track: a line in .gitignore.
+        repo.write("scratch.log", "noise\n");
+        assert_eq!(block(ignore_file(repo.path(), "scratch.log")), Ok(false));
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join(".gitignore")).unwrap(),
+            "/scratch.log\n"
+        );
+        assert!(!repo.git(&["status", "--porcelain"]).contains("scratch.log"));
+        // Again: not added twice. A tracked file leaves the index, stays on disk.
+        assert_eq!(block(ignore_file(repo.path(), "scratch.log")), Ok(false));
+        assert_eq!(block(ignore_file(repo.path(), "b.txt")), Ok(true));
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join(".gitignore")).unwrap(),
+            "/scratch.log\n/b.txt\n"
+        );
+        assert!(repo.path().join("b.txt").exists());
+        assert!(repo.git(&["status", "--porcelain"]).contains("D  b.txt"));
     }
 }

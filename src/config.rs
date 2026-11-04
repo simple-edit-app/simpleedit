@@ -31,6 +31,11 @@ pub enum ShortcutTarget {
     NavForward,
     ToggleTerminal,
     ToggleGit,
+    GitCommit,
+    GitPush,
+    GitPull,
+    GitBranches,
+    BookmarkPanel,
 }
 
 /// How a key is named to the user.
@@ -76,6 +81,22 @@ impl ShortcutConfig {
             ctrl: true,
             shift: true,
             alt: false,
+            key: key.to_string(),
+        }
+    }
+    fn ctrl_alt(key: &str) -> Self {
+        Self {
+            ctrl: true,
+            shift: false,
+            alt: true,
+            key: key.to_string(),
+        }
+    }
+    fn alt_shift(key: &str) -> Self {
+        Self {
+            ctrl: false,
+            shift: true,
+            alt: true,
             key: key.to_string(),
         }
     }
@@ -181,37 +202,47 @@ pub struct Shortcuts {
     pub nav_forward: ShortcutConfig,
     pub toggle_terminal: ShortcutConfig,
     pub toggle_git: ShortcutConfig,
+    pub git_commit: ShortcutConfig,
+    pub git_push: ShortcutConfig,
+    pub git_pull: ShortcutConfig,
+    pub git_branches: ShortcutConfig,
+    pub bookmark_panel: ShortcutConfig,
 }
 
-/// Alt+←/→, or Ctrl+- / Ctrl+Shift+- where Alt+arrows move by word (macOS).
+/// Back and forward, as the IDEs do: Ctrl+Alt+←/→ on Windows, ⌘[ / ⌘] on
+/// macOS. On Linux desktops Ctrl+Alt+arrows switch workspace, so Alt+←/→.
 fn default_nav_back() -> ShortcutConfig {
     if cfg!(target_os = "macos") {
-        ShortcutConfig::ctrl("-")
+        ShortcutConfig::ctrl("[")
+    } else if cfg!(windows) {
+        ShortcutConfig::ctrl_alt("ArrowLeft")
     } else {
         ShortcutConfig::alt("ArrowLeft")
     }
 }
 fn default_nav_forward() -> ShortcutConfig {
     if cfg!(target_os = "macos") {
-        ShortcutConfig::ctrl_shift("-")
+        ShortcutConfig::ctrl("]")
+    } else if cfg!(windows) {
+        ShortcutConfig::ctrl_alt("ArrowRight")
     } else {
         ShortcutConfig::alt("ArrowRight")
     }
 }
 fn default_duplicate_line() -> ShortcutConfig {
-    ShortcutConfig::ctrl_shift("d")
+    ShortcutConfig::ctrl("d")
 }
 fn default_move_line_up() -> ShortcutConfig {
-    ShortcutConfig::alt("ArrowUp")
+    ShortcutConfig::alt_shift("ArrowUp")
 }
 fn default_move_line_down() -> ShortcutConfig {
-    ShortcutConfig::alt("ArrowDown")
+    ShortcutConfig::alt_shift("ArrowDown")
 }
 fn default_toggle_comment() -> ShortcutConfig {
     ShortcutConfig::ctrl("/")
 }
 fn default_delete_line() -> ShortcutConfig {
-    ShortcutConfig::ctrl_shift("k")
+    ShortcutConfig::ctrl("y")
 }
 
 /// The one table tying each action to its field: it generates both accessors
@@ -262,6 +293,11 @@ shortcut_slots! {
     NavForward => nav_forward,
     ToggleTerminal => toggle_terminal,
     ToggleGit => toggle_git,
+    GitCommit => git_commit,
+    GitPush => git_push,
+    GitPull => git_pull,
+    GitBranches => git_branches,
+    BookmarkPanel => bookmark_panel,
 }
 
 impl Shortcuts {
@@ -294,31 +330,83 @@ impl Default for Shortcuts {
             open_file: ShortcutConfig::ctrl("o"),
             save_file: ShortcutConfig::ctrl("s"),
             save_as: ShortcutConfig::ctrl_shift("s"),
-            close_file: ShortcutConfig::ctrl("w"),
+            close_file: ShortcutConfig::ctrl("F4"),
             find: ShortcutConfig::ctrl("f"),
             select_all: ShortcutConfig::ctrl("a"),
-            format_code: ShortcutConfig::ctrl_shift("f"),
+            format_code: ShortcutConfig::ctrl_alt("l"),
             goto_line: ShortcutConfig::ctrl("g"),
-            command_palette: ShortcutConfig::ctrl_shift("p"),
+            command_palette: ShortcutConfig::ctrl_shift("a"),
             toggle_sidebar: ShortcutConfig::ctrl("b"),
             quit: ShortcutConfig::ctrl("q"),
             undo: ShortcutConfig::ctrl("z"),
-            redo: ShortcutConfig::ctrl("y"),
+            redo: ShortcutConfig::ctrl_shift("z"),
             duplicate_line: default_duplicate_line(),
             move_line_up: default_move_line_up(),
             move_line_down: default_move_line_down(),
             toggle_comment: default_toggle_comment(),
             delete_line: default_delete_line(),
-            toggle_bookmark: ShortcutConfig::ctrl("F2"),
+            toggle_bookmark: ShortcutConfig::plain("F11"),
             next_bookmark: ShortcutConfig::plain("F2"),
             prev_bookmark: ShortcutConfig::shift("F2"),
-            toggle_fold: ShortcutConfig::ctrl_shift("l"),
+            toggle_fold: ShortcutConfig::ctrl("."),
             nav_back: default_nav_back(),
             nav_forward: default_nav_forward(),
             toggle_terminal: ShortcutConfig::alt("F12"),
             toggle_git: ShortcutConfig::alt("g"),
+            git_commit: ShortcutConfig::ctrl("k"),
+            git_push: ShortcutConfig::ctrl_shift("k"),
+            git_pull: ShortcutConfig::ctrl("t"),
+            git_branches: ShortcutConfig::ctrl_shift("b"),
+            bookmark_panel: ShortcutConfig::shift("F11"),
         }
     }
+}
+
+impl Shortcuts {
+    /// What these were before they followed the IDEs' keymap (version 1).
+    fn before_the_ide_keymap() -> Shortcuts {
+        Shortcuts {
+            close_file: ShortcutConfig::ctrl("w"),
+            format_code: ShortcutConfig::ctrl_shift("f"),
+            command_palette: ShortcutConfig::ctrl_shift("p"),
+            redo: ShortcutConfig::ctrl("y"),
+            duplicate_line: ShortcutConfig::ctrl_shift("d"),
+            delete_line: ShortcutConfig::ctrl_shift("k"),
+            move_line_up: ShortcutConfig::alt("ArrowUp"),
+            move_line_down: ShortcutConfig::alt("ArrowDown"),
+            toggle_bookmark: ShortcutConfig::ctrl("F2"),
+            toggle_fold: ShortcutConfig::ctrl_shift("l"),
+            nav_back: if cfg!(target_os = "macos") {
+                ShortcutConfig::ctrl("-")
+            } else {
+                ShortcutConfig::alt("ArrowLeft")
+            },
+            nav_forward: if cfg!(target_os = "macos") {
+                ShortcutConfig::ctrl_shift("-")
+            } else {
+                ShortcutConfig::alt("ArrowRight")
+            },
+            ..Shortcuts::default()
+        }
+    }
+
+    /// A config saved before the new keymap: every shortcut still at its old
+    /// default moves to the new one; the ones the user chose are left alone.
+    pub fn adopt_the_ide_keymap(&mut self) {
+        let old = Shortcuts::before_the_ide_keymap();
+        let new = Shortcuts::default();
+        for target in ALL_TARGETS {
+            if self.slot(*target) == old.slot(*target) {
+                *self.slot_mut(*target) = new.slot(*target).clone();
+            }
+        }
+    }
+}
+
+/// The keymap the defaults are from, and what a config without the number is.
+const KEYMAP_VERSION: u32 = 2;
+fn first_keymap() -> u32 {
+    1
 }
 
 /// Every field has a default, so a config written by an older version (or
@@ -349,12 +437,22 @@ pub struct Config {
     pub locale: String,
     /// Whether the file list is shown.
     pub show_sidebar: bool,
+    /// Width of the file list, in pixels (dragged by its right edge).
+    pub sidebar_width: f32,
+    /// How `pull` and `merge` are made in the Git panel.
+    pub git_pull_mode: crate::git::PullMode,
+    pub git_merge_mode: crate::git::MergeMode,
+    /// Minutes between two fetches in the background (0: never).
+    pub git_auto_fetch_minutes: u32,
     /// Size of the window when it was last closed or resized.
     pub window_width: f32,
     pub window_height: f32,
     /// The version that last ran, to show what's new after an update.
     pub last_version: String,
     pub shortcuts: Shortcuts,
+    /// Which default keymap `shortcuts` was written under (1: before the IDEs').
+    #[serde(default = "first_keymap")]
+    pub shortcuts_version: u32,
     pub recent_files: Vec<String>,
     /// Where scratch files are kept; empty: the default folder.
     pub scratch_dir: String,
@@ -379,10 +477,15 @@ impl Default for Config {
             auto_save: true,
             locale: "en".to_string(),
             show_sidebar: true,
+            sidebar_width: 208.0,
+            git_pull_mode: crate::git::PullMode::default(),
+            git_merge_mode: crate::git::MergeMode::default(),
+            git_auto_fetch_minutes: 5,
             window_width: 1200.0,
             window_height: 800.0,
             last_version: String::new(),
             shortcuts: Shortcuts::default(),
+            shortcuts_version: KEYMAP_VERSION,
             recent_files: Vec::new(),
             scratch_dir: String::new(),
         }
@@ -491,6 +594,10 @@ impl Config {
                 match serde_json::from_str::<Config>(&s) {
                     Ok(mut cfg) => {
                         cfg.sanitize();
+                        if cfg.shortcuts_version < KEYMAP_VERSION {
+                            cfg.shortcuts.adopt_the_ide_keymap();
+                            cfg.shortcuts_version = KEYMAP_VERSION;
+                        }
                         return cfg;
                     }
                     // Keep the unreadable file around instead of silently
@@ -643,7 +750,7 @@ mod tests {
         cfg.shortcuts.redo = ShortcutConfig::ctrl("z");
         cfg.sanitize();
         assert_eq!(cfg.shortcuts.undo, ShortcutConfig::ctrl("z"));
-        assert_eq!(cfg.shortcuts.redo, ShortcutConfig::ctrl("y"));
+        assert_eq!(cfg.shortcuts.redo, ShortcutConfig::ctrl_shift("z"));
     }
 
     #[test]
@@ -671,10 +778,10 @@ mod tests {
             let own = sh.slot(target).clone();
             assert!(!sh.conflicts(target, &own), "{target:?} collides");
         }
-        assert_eq!(sh.toggle_bookmark, ShortcutConfig::ctrl("F2"));
+        assert_eq!(sh.toggle_bookmark, ShortcutConfig::plain("F11"));
         assert_eq!(sh.next_bookmark, ShortcutConfig::plain("F2"));
         assert_eq!(sh.prev_bookmark, ShortcutConfig::shift("F2"));
-        assert_eq!(sh.toggle_fold, ShortcutConfig::ctrl_shift("l"));
+        assert_eq!(sh.toggle_fold, ShortcutConfig::ctrl("."));
     }
 
     #[test]
@@ -717,5 +824,49 @@ mod tests {
         let mut config = Config::default();
         config.add_recent(&PathBuf::from("untitled://1"));
         assert!(config.recent_files.is_empty());
+    }
+
+    #[test]
+    fn the_default_shortcuts_follow_the_ides_and_never_share_a_key() {
+        let sh = Shortcuts::default();
+        assert_eq!(sh.duplicate_line, ShortcutConfig::ctrl("d"));
+        assert_eq!(sh.delete_line, ShortcutConfig::ctrl("y"));
+        assert_eq!(sh.redo, ShortcutConfig::ctrl_shift("z"));
+        assert_eq!(sh.format_code, ShortcutConfig::ctrl_alt("l"));
+        assert_eq!(sh.command_palette, ShortcutConfig::ctrl_shift("a"));
+        assert_eq!(sh.move_line_up, ShortcutConfig::alt_shift("ArrowUp"));
+        assert_eq!(sh.toggle_bookmark, ShortcutConfig::plain("F11"));
+        assert_eq!(sh.git_commit, ShortcutConfig::ctrl("k"));
+        assert_eq!(sh.git_push, ShortcutConfig::ctrl_shift("k"));
+        for (i, a) in ALL_TARGETS.iter().enumerate() {
+            for b in &ALL_TARGETS[i + 1..] {
+                assert!(
+                    sh.slot(*a) != sh.slot(*b),
+                    "{a:?} and {b:?} share {}",
+                    sh.slot(*a).display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_old_config_moves_to_the_new_keymap_but_keeps_what_the_user_chose() {
+        // Written by a version before the new keymap: no version number.
+        let mut old = Shortcuts::before_the_ide_keymap();
+        old.find = ShortcutConfig::ctrl("e");
+        old.delete_line = ShortcutConfig::ctrl_alt("x");
+        let json = serde_json::json!({ "shortcuts": old });
+        let config: Config = serde_json::from_value(json).unwrap();
+        assert_eq!(config.shortcuts_version, 1);
+        let mut shortcuts = config.shortcuts;
+        shortcuts.adopt_the_ide_keymap();
+        // Still the old default: follows the new keymap.
+        assert_eq!(shortcuts.duplicate_line, ShortcutConfig::ctrl("d"));
+        assert_eq!(shortcuts.redo, ShortcutConfig::ctrl_shift("z"));
+        // Chosen by the user: kept.
+        assert_eq!(shortcuts.find, ShortcutConfig::ctrl("e"));
+        assert_eq!(shortcuts.delete_line, ShortcutConfig::ctrl_alt("x"));
+        // A new install starts on the new keymap, and so is not moved again.
+        assert_eq!(Config::default().shortcuts_version, KEYMAP_VERSION);
     }
 }

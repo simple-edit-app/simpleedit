@@ -4,6 +4,7 @@
 use iced::widget::{button, column, container, row, scrollable, text, Space};
 use iced::{Alignment, Color, Element, Length, Point};
 
+use super::diff_syntax;
 use super::{DiffPointer, GitMsg, Selection, Viewer};
 use crate::app::Message;
 use crate::git::diff::{Row, SideRow, Tag};
@@ -16,8 +17,13 @@ const FONT: f32 = 12.0;
 /// JetBrains Mono's advance at 12 px.
 const CHAR_W: f32 = FONT * 0.6;
 const NUMBER_W: f32 = 44.0;
-/// The column of rollback arrows.
+/// One button of the column in front of the rows (stage, roll back).
 const ARROW_W: f32 = 24.0;
+
+/// How wide that column is for the buttons it holds.
+fn arrows_w(rollback: bool, stage: bool) -> f32 {
+    ARROW_W * (usize::from(rollback) + usize::from(stage)) as f32
+}
 /// A diff longer than this many rows is cut (only the rows in view are
 /// widgets, but the file has to be laid out).
 const MAX_ROWS: usize = 20_000;
@@ -42,6 +48,12 @@ pub struct Nav {
     pub select_all: Message,
     /// The scrollable of the diff moved: (offset, height shown).
     pub scrolled: fn(i32, i32) -> Message,
+    /// Stage (or unstage) a block, or the lines picked.
+    pub stage_block: fn(usize) -> Message,
+    pub stage_selection: Message,
+    /// Changes of blanks left out; more or less context.
+    pub toggle_blanks: Message,
+    pub cycle_context: Message,
 }
 
 impl Nav {
@@ -59,6 +71,10 @@ impl Nav {
             copy: Message::Git(GitMsg::CopyPicked),
             select_all: Message::Git(GitMsg::PickAll),
             scrolled: |top, height| Message::Git(GitMsg::DiffScrolled(top, height)),
+            stage_block: |block| Message::Git(GitMsg::StageBlock(block)),
+            stage_selection: Message::Git(GitMsg::StageSelection),
+            toggle_blanks: Message::Git(GitMsg::ToggleBlanks),
+            cycle_context: Message::Git(GitMsg::CycleContext),
         }
     }
 
@@ -77,6 +93,10 @@ impl Nav {
             copy: Message::DiffTab(DiffNav::CopyPicked),
             select_all: Message::DiffTab(DiffNav::PickAll),
             scrolled: |top, height| Message::DiffTab(DiffNav::Scrolled(top, height)),
+            stage_block: |block| Message::DiffTab(DiffNav::StageBlock(block)),
+            stage_selection: Message::DiffTab(DiffNav::StageSelection),
+            toggle_blanks: Message::DiffTab(DiffNav::ToggleBlanks),
+            cycle_context: Message::DiffTab(DiffNav::CycleContext),
         }
     }
 }
@@ -89,6 +109,9 @@ struct Colors {
     removed_now: Color,
     hunk: Color,
     number: Color,
+    /// The words that changed within a changed line.
+    added_word: Color,
+    removed_word: Color,
 }
 
 fn colors(dark: bool) -> Colors {
@@ -100,6 +123,8 @@ fn colors(dark: bool) -> Colors {
             removed_now: Color::from_rgba8(0xf8, 0x51, 0x49, 0.32),
             hunk: Color::from_rgba8(0x6e, 0xa8, 0xff, 0.12),
             number: Color::from_rgb8(0x5c, 0x61, 0x70),
+            added_word: Color::from_rgba8(0x3f, 0xb9, 0x50, 0.42),
+            removed_word: Color::from_rgba8(0xf8, 0x51, 0x49, 0.42),
         }
     } else {
         Colors {
@@ -109,6 +134,8 @@ fn colors(dark: bool) -> Colors {
             removed_now: Color::from_rgba8(0xcf, 0x22, 0x2e, 0.30),
             hunk: Color::from_rgba8(0x1b, 0x5f, 0xc6, 0.10),
             number: Color::from_rgb8(0x9a, 0x9f, 0xab),
+            added_word: Color::from_rgba8(0x2e, 0xa0, 0x43, 0.38),
+            removed_word: Color::from_rgba8(0xcf, 0x22, 0x2e, 0.34),
         }
     }
 }
@@ -120,8 +147,7 @@ fn expand(text: &str) -> String {
 
 /// How many characters fit on one line of a side of the side-by-side view
 /// in `width` pixels (a little under, so a wrapped line is never cut short).
-fn columns_for(width: f32, arrows: bool) -> usize {
-    let middle = if arrows { ARROW_W } else { 0.0 };
+fn columns_for(width: f32, middle: f32) -> usize {
     // The scrollbar, then both sides, each with its number column and padding.
     let side = (width - middle - 14.0) / 2.0;
     (((side - NUMBER_W - 12.0) / CHAR_W).floor() as usize)
@@ -321,14 +347,86 @@ fn broken(chars: &[char], range: std::ops::Range<usize>, columns: usize) -> Stri
     out
 }
 
-/// A line of the diff, with the picked part highlighted.
+/// Ranges of character indexes.
+type Marks = Vec<(usize, usize)>;
+
+/// The characters of `old` and `new` that differ, as ranges of character
+/// indexes (none when the two lines are so different that marking all of it
+/// would say nothing).
+fn word_marks(old: &str, new: &str) -> (Marks, Marks) {
+    use similar::{ChangeTag, TextDiff};
+    let diff = TextDiff::from_chars(old, new);
+    if diff.ratio() < 0.4 {
+        return Default::default();
+    }
+    let (mut old_marks, mut new_marks) = (Vec::new(), Vec::new());
+    let (mut i, mut j) = (0usize, 0usize);
+    let extend = |marks: &mut Vec<(usize, usize)>, at: usize| match marks.last_mut() {
+        Some(last) if last.1 == at => last.1 = at + 1,
+        _ => marks.push((at, at + 1)),
+    };
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Equal => {
+                i += 1;
+                j += 1;
+            }
+            ChangeTag::Delete => {
+                extend(&mut old_marks, i);
+                i += 1;
+            }
+            ChangeTag::Insert => {
+                extend(&mut new_marks, j);
+                j += 1;
+            }
+        }
+    }
+    (old_marks, new_marks)
+}
+
+/// For each row of the unified layout, the row of the line it replaces (or
+/// that replaces it): the k-th removed line of a block goes with the k-th
+/// added one.
+fn partners(rows: &[Row<'_>]) -> Vec<Option<usize>> {
+    let tag = |i: usize| match &rows[i] {
+        Row::Line(l) => Some(l.tag),
+        Row::Hunk(_) => None,
+    };
+    let mut partners = vec![None; rows.len()];
+    let mut i = 0;
+    while i < rows.len() {
+        if tag(i) != Some(Tag::Removed) {
+            i += 1;
+            continue;
+        }
+        let removed_end = (i..rows.len())
+            .find(|&k| tag(k) != Some(Tag::Removed))
+            .unwrap_or(rows.len());
+        let added_end = (removed_end..rows.len())
+            .find(|&k| tag(k) != Some(Tag::Added))
+            .unwrap_or(rows.len());
+        for k in 0..(removed_end - i).min(added_end - removed_end) {
+            partners[i + k] = Some(removed_end + k);
+            partners[removed_end + k] = Some(i + k);
+        }
+        i = added_end.max(i + 1);
+    }
+    partners
+}
+
+/// A line of the diff, with the picked part highlighted and the words that
+/// changed marked.
+#[allow(clippy::too_many_arguments)]
 fn shown_text<'a>(
     prefix: &str,
     text_value: &str,
+    base: &[Option<Color>],
     picked: Option<(usize, usize)>,
+    words: &[(usize, usize)],
     columns: usize,
     color: Color,
     highlight: Color,
+    word_color: Color,
 ) -> Element<'a, Message> {
     let chars: Vec<char> = text_value.chars().collect();
     let wrapping = if columns > 0 {
@@ -337,7 +435,7 @@ fn shown_text<'a>(
         iced::widget::text::Wrapping::None
     };
     let line_height = iced::widget::text::LineHeight::Absolute(iced::Pixels(ROW_HEIGHT));
-    let Some((start, end)) = picked else {
+    if picked.is_none() && words.is_empty() {
         return text(format!(
             "{prefix}{}",
             broken(&chars, 0..chars.len(), columns)
@@ -348,13 +446,43 @@ fn shown_text<'a>(
         .line_height(line_height)
         .wrapping(wrapping)
         .into();
+    }
+    // Each character is plain, in a changed word, or picked (which wins), and
+    // has the color of its syntax: runs of the same look are one span.
+    let tint = |i: usize| base.get(i).copied().flatten().unwrap_or(color);
+    let look = |i: usize| -> (u8, Color) {
+        let kind = if picked.is_some_and(|(a, b)| (a..b).contains(&i)) {
+            2
+        } else if words.iter().any(|&(a, b)| (a..b).contains(&i)) {
+            1
+        } else {
+            0
+        };
+        (kind, tint(i))
     };
-    let plain = |t: String| iced::widget::span(t).font(se_theme::MONO).color(color);
-    let spans = vec![
-        plain(format!("{prefix}{}", broken(&chars, 0..start, columns))),
-        plain(broken(&chars, start..end, columns)).background(highlight),
-        plain(broken(&chars, end..chars.len(), columns)),
-    ];
+    let plain = |t: String, c: Color| iced::widget::span(t).font(se_theme::MONO).color(c);
+    let mut spans = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        let (kind, tone) = look(start);
+        let end = (start..chars.len())
+            .find(|&i| look(i) != (kind, tone))
+            .unwrap_or(chars.len());
+        let head = if start == 0 { prefix } else { "" };
+        let piece = plain(
+            format!("{head}{}", broken(&chars, start..end, columns)),
+            tone,
+        );
+        spans.push(match kind {
+            2 => piece.background(highlight),
+            1 => piece.background(word_color),
+            _ => piece,
+        });
+        start = end;
+    }
+    if spans.is_empty() {
+        spans.push(plain(prefix.to_string(), color));
+    }
     let rich: iced::widget::text::Rich<'a, (), Message> = iced::widget::rich_text(spans);
     rich.size(FONT)
         .line_height(line_height)
@@ -362,14 +490,21 @@ fn shown_text<'a>(
         .into()
 }
 
+/// The button that stages a block (or, `true`, unstages it).
+type StageButton = (fn(usize) -> Message, bool);
+
 /// What [`body`] shows and how.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Body<'a> {
     diff: &'a FileDiff,
     current: usize,
     side_by_side: bool,
     scroll: &'a iced::widget::Id,
     rollback: Option<fn(usize) -> Message>,
+    /// Stage a block (or, `true`, unstage it).
+    stage: Option<StageButton>,
+    /// The syntax colors of the lines.
+    syntax: Option<std::sync::Arc<diff_syntax::Spans>>,
     /// Characters per line of a side (side by side).
     columns: usize,
     select: Sel,
@@ -417,6 +552,8 @@ fn body<'a>(args: Body<'a>) -> Element<'a, Message> {
         side_by_side,
         scroll,
         rollback,
+        stage,
+        syntax,
         columns,
         select,
         top,
@@ -428,29 +565,67 @@ fn body<'a>(args: Body<'a>) -> Element<'a, Message> {
     let p = se_theme::palette(dark);
     let mut rows: Vec<Element<'a, Message>> = Vec::new();
     let mut longest = 0usize;
-    // In front of each row: the arrow that rolls back the block it opens.
+    // In front of each row: the buttons of the block it opens (stage, roll back).
+    let column_w = arrows_w(rollback.is_some(), stage.is_some());
+    let small = |label: &'static str, tip: String, msg: Message| -> Element<'a, Message> {
+        iced::widget::tooltip(
+            button(text(label).size(13).color(se_theme::palette(dark).muted))
+                .padding([0, 4])
+                .height(Length::Fixed(ROW_HEIGHT))
+                .on_press(msg)
+                .style(
+                    (se_theme::GhostButton {
+                        dark,
+                        active: false,
+                    })
+                    .style(),
+                ),
+            container(text(tip).size(12))
+                .padding([3, 8])
+                .style(se_theme::tooltip(dark)),
+            iced::widget::tooltip::Position::Top,
+        )
+        .into()
+    };
+    let block_buttons = |b: usize| -> Vec<Element<'a, Message>> {
+        let mut buttons = Vec::new();
+        if let Some((make, undo)) = stage {
+            let tip = if undo {
+                t!("git.unstage_block")
+            } else {
+                t!("git.stage_block")
+            };
+            buttons.push(small(
+                if undo { "−" } else { "+" },
+                tip.to_string(),
+                make(b),
+            ));
+        }
+        if let Some(make) = rollback {
+            buttons.push(small("↶", t!("git.rollback_block").to_string(), make(b)));
+        }
+        buttons
+    };
     let with_arrow =
         |element: Element<'a, Message>, block: Option<usize>| -> Element<'a, Message> {
-            let Some(make) = rollback else {
+            if column_w == 0.0 {
                 return element;
+            }
+            let buttons: Element<'a, Message> = match block {
+                Some(b) => row(block_buttons(b)).into(),
+                None => Space::new().width(Length::Fixed(column_w)).into(),
             };
-            let arrow: Element<'a, Message> = match block {
-                Some(b) => button(text("↶").size(13).color(se_theme::palette(dark).muted))
-                    .padding([0, 4])
-                    .height(Length::Fixed(ROW_HEIGHT))
-                    .on_press(make(b))
-                    .style(
-                        (se_theme::GhostButton {
-                            dark,
-                            active: false,
-                        })
-                        .style(),
-                    )
-                    .into(),
-                None => Space::new().width(Length::Fixed(ARROW_W)).into(),
-            };
-            row![container(arrow).width(Length::Fixed(ARROW_W)), element].into()
+            row![container(buttons).width(Length::Fixed(column_w)), element].into()
         };
+    // What the grammar colors in a line, character by character.
+    let syntax_of = |line: &crate::git::diff::Line, shown: &str| -> Vec<Option<Color>> {
+        syntax
+            .as_deref()
+            .and_then(|spans| spans.get(line.pos.0)?.get(line.pos.1))
+            .map(|spans| diff_syntax::colors_of(&line.text, spans))
+            .filter(|colors| colors.len() == shown.chars().count())
+            .unwrap_or_default()
+    };
     let starts = |blocks: &[Option<usize>], i: usize| -> Option<usize> {
         match blocks.get(i).copied().flatten() {
             Some(b) if i == 0 || blocks.get(i - 1).copied().flatten() != Some(b) => Some(b),
@@ -485,30 +660,38 @@ fn body<'a>(args: Body<'a>) -> Element<'a, Message> {
                         .into(),
                 ),
                 SideRow::Pair(left, right) => {
-                    let side_cell = |line: Option<&'a crate::git::diff::Line>, old: bool| {
-                        let (background, text_value, n) = match line {
-                            Some(l) => {
-                                let bg = match (l.tag, now) {
-                                    (Tag::Added, false) => Some(c.added),
-                                    (Tag::Added, true) => Some(c.added_now),
-                                    (Tag::Removed, false) => Some(c.removed),
-                                    (Tag::Removed, true) => Some(c.removed_now),
-                                    _ => None,
-                                };
-                                (bg, expand(&l.text), if old { l.old_no } else { l.new_no })
-                            }
-                            None => (Some(c.number.scale_alpha(0.12)), String::new(), None),
-                        };
-                        let chars: Vec<char> = text_value.chars().collect();
-                        let picked = select.span(i, Some(!old), chars.len());
-                        let at = Layout {
-                            text_x: NUMBER_W + 6.0,
-                            prefix: 0,
-                            columns,
-                            chars: std::sync::Arc::new(chars),
-                        };
-                        let cell =
-                            container(row![
+                    let (left_words, right_words) = match (left, right) {
+                        (Some(l), Some(r)) if l.tag == Tag::Removed && r.tag == Tag::Added => {
+                            word_marks(&expand(&l.text), &expand(&r.text))
+                        }
+                        _ => Default::default(),
+                    };
+                    let side_cell =
+                        |line: Option<&'a crate::git::diff::Line>,
+                         old: bool,
+                         words: Vec<(usize, usize)>| {
+                            let (background, text_value, n) = match line {
+                                Some(l) => {
+                                    let bg = match (l.tag, now) {
+                                        (Tag::Added, false) => Some(c.added),
+                                        (Tag::Added, true) => Some(c.added_now),
+                                        (Tag::Removed, false) => Some(c.removed),
+                                        (Tag::Removed, true) => Some(c.removed_now),
+                                        _ => None,
+                                    };
+                                    (bg, expand(&l.text), if old { l.old_no } else { l.new_no })
+                                }
+                                None => (Some(c.number.scale_alpha(0.12)), String::new(), None),
+                            };
+                            let chars: Vec<char> = text_value.chars().collect();
+                            let picked = select.span(i, Some(!old), chars.len());
+                            let at = Layout {
+                                text_x: NUMBER_W + 6.0,
+                                prefix: 0,
+                                columns,
+                                chars: std::sync::Arc::new(chars),
+                            };
+                            let cell = container(row![
                                 container(
                                     text(n.map(|n| n.to_string()).unwrap_or_default())
                                         .size(FONT - 1.0)
@@ -523,10 +706,13 @@ fn body<'a>(args: Body<'a>) -> Element<'a, Message> {
                                 container(shown_text(
                                     "",
                                     &text_value,
+                                    &line.map(|l| syntax_of(l, &text_value)).unwrap_or_default(),
                                     picked,
+                                    &words,
                                     columns,
                                     p.text,
                                     p.accent.scale_alpha(0.45),
+                                    if old { c.removed_word } else { c.added_word },
                                 ))
                                 .width(Length::Fill)
                                 .padding([0, 6])
@@ -539,37 +725,40 @@ fn body<'a>(args: Body<'a>) -> Element<'a, Message> {
                                 background: background.map(iced::Background::Color),
                                 ..Default::default()
                             });
-                        select.catch(cell.into(), i, !old, at)
-                    };
-                    // The chevron that carries a change across sits between the sides.
-                    let middle: Element<'a, Message> = match (rollback, starts(&blocks, i)) {
-                        (Some(make), Some(b)) => iced::widget::tooltip(
-                            button(text("»").size(13).color(p.accent))
-                                .padding([0, 4])
-                                .height(Length::Fixed(ROW_HEIGHT))
-                                .on_press(make(b))
-                                .style(
-                                    (se_theme::GhostButton {
-                                        dark,
-                                        active: false,
-                                    })
-                                    .style(),
-                                ),
-                            container(text(t!("git.apply_here").to_string()).size(12))
-                                .padding([3, 8])
-                                .style(se_theme::tooltip(dark)),
-                            iced::widget::tooltip::Position::Top,
-                        )
-                        .into(),
+                            select.catch(cell.into(), i, !old, at)
+                        };
+                    // The buttons of a change sit between the sides: stage it, or
+                    // carry it across.
+                    let middle: Element<'a, Message> = match starts(&blocks, i) {
+                        Some(b) if column_w > 0.0 => {
+                            let mut buttons = Vec::new();
+                            if let Some((make, undo)) = stage {
+                                let tip = if undo {
+                                    t!("git.unstage_block")
+                                } else {
+                                    t!("git.stage_block")
+                                };
+                                buttons.push(small(
+                                    if undo { "−" } else { "+" },
+                                    tip.to_string(),
+                                    make(b),
+                                ));
+                            }
+                            if let Some(make) = rollback {
+                                buttons.push(small("»", t!("git.apply_here").to_string(), make(b)));
+                            }
+                            row(buttons).into()
+                        }
                         _ => Space::new().into(),
                     };
-                    let middle = container(middle).width(Length::Fixed(if rollback.is_some() {
-                        ARROW_W
-                    } else {
-                        0.0
-                    }));
+                    let middle = container(middle).width(Length::Fixed(column_w));
                     rows.push(
-                        row![side_cell(*left, true), middle, side_cell(*right, false)].into(),
+                        row![
+                            side_cell(*left, true, left_words),
+                            middle,
+                            side_cell(*right, false, right_words)
+                        ]
+                        .into(),
                     );
                 }
             }
@@ -585,6 +774,7 @@ fn body<'a>(args: Body<'a>) -> Element<'a, Message> {
             }
         }
         let width = NUMBER_W * 2.0 + 16.0 + longest.max(40) as f32 * CHAR_W + 24.0;
+        let partners = partners(&flat);
         let pixels = vec![ROW_HEIGHT; flat.len().min(MAX_ROWS)];
         let (first, last, before, after) = visible(&pixels, top, height);
         rows.push(Space::new().height(before).into());
@@ -612,13 +802,38 @@ fn body<'a>(args: Body<'a>) -> Element<'a, Message> {
                         columns: 0,
                         chars: std::sync::Arc::new(chars),
                     };
+                    // The words that changed against the line it replaces.
+                    let words = match partners[i].map(|j| flat[j].clone()) {
+                        Some(Row::Line(other)) => {
+                            let other = expand(&other.text);
+                            let (old, new) = if line.tag == Tag::Removed {
+                                (shown.as_str(), other.as_str())
+                            } else {
+                                (other.as_str(), shown.as_str())
+                            };
+                            let (old_words, new_words) = word_marks(old, new);
+                            if line.tag == Tag::Removed {
+                                old_words
+                            } else {
+                                new_words
+                            }
+                        }
+                        _ => Vec::new(),
+                    };
                     let code_cell = container(shown_text(
                         &format!("{marker} "),
                         &shown,
+                        &syntax_of(line, &shown),
                         select.span(i, None, len),
+                        &words,
                         0,
                         p.text,
                         p.accent.scale_alpha(0.45),
+                        if line.tag == Tag::Removed {
+                            c.removed_word
+                        } else {
+                            c.added_word
+                        },
                     ))
                     .height(Length::Fixed(ROW_HEIGHT))
                     .align_y(iced::alignment::Vertical::Center)
@@ -792,6 +1007,44 @@ pub fn view<'a>(viewer: &'a Viewer, nav: &Nav, dark: bool, empty: String) -> Ele
             .style(se_theme::tooltip(dark)),
             iced::widget::tooltip::Position::Bottom,
         ),
+        iced::widget::tooltip(
+            tool_button(
+                "␣",
+                Some(nav.toggle_blanks.clone()),
+                viewer.ignore_blanks,
+                dark
+            ),
+            container(
+                text(if viewer.ignore_blanks {
+                    t!("git.blanks_counted").to_string()
+                } else {
+                    t!("git.blanks_ignored").to_string()
+                })
+                .size(12)
+            )
+            .padding([3, 8])
+            .style(se_theme::tooltip(dark)),
+            iced::widget::tooltip::Position::Bottom,
+        ),
+        iced::widget::tooltip(
+            tool_button(
+                "⇕",
+                Some(nav.cycle_context.clone()),
+                viewer.context != 3,
+                dark
+            ),
+            container(
+                text(if viewer.context == u32::MAX {
+                    t!("git.context_all").to_string()
+                } else {
+                    t!("git.context_n", n = viewer.context).to_string()
+                })
+                .size(12)
+            )
+            .padding([3, 8])
+            .style(se_theme::tooltip(dark)),
+            iced::widget::tooltip::Position::Bottom,
+        ),
     ]
     .spacing(4)
     .align_y(Alignment::Center);
@@ -831,12 +1084,26 @@ pub fn view<'a>(viewer: &'a Viewer, nav: &Nav, dark: bool, empty: String) -> Ele
                 dragging: viewer.is_dragging(),
                 make: nav.pick,
             };
+            // Stage by block: the working tree's diff (to the index), or the
+            // index's (out of it), as read now (a patch needs the diff as is).
+            let stage = viewer
+                .current()
+                .and_then(|e| match e.source {
+                    crate::git::Source::Unstaged => Some(false),
+                    crate::git::Source::Staged => Some(true),
+                    _ => None,
+                })
+                .filter(|_| !viewer.ignore_blanks)
+                .map(|undo| (nav.stage_block, undo));
+            let syntax = viewer.syntax_spans(dark);
             let args = Body {
                 diff,
                 current: viewer.change,
                 side_by_side: viewer.side_by_side,
                 scroll: &viewer.scroll,
                 rollback,
+                stage,
+                syntax,
                 columns: 0,
                 select,
                 top: viewer.view_top.get(),
@@ -848,11 +1115,12 @@ pub fn view<'a>(viewer: &'a Viewer, nav: &Nav, dark: bool, empty: String) -> Ele
                 // Both sides share the width, long lines wrap in them.
                 let columns = &viewer.columns;
                 iced::widget::responsive(move |size| {
-                    let cols = columns_for(size.width, rollback.is_some());
+                    let cols =
+                        columns_for(size.width, arrows_w(rollback.is_some(), stage.is_some()));
                     columns.set(cols);
                     body(Body {
                         columns: cols,
-                        ..args
+                        ..args.clone()
                     })
                 })
                 .into()
@@ -870,6 +1138,10 @@ pub fn view<'a>(viewer: &'a Viewer, nav: &Nav, dark: bool, empty: String) -> Ele
     let content: Element<Message> = if viewer.file_diff().is_some() {
         let can_copy = viewer.has_selection();
         let (copy, select_all) = (nav.copy.clone(), nav.select_all.clone());
+        // Stage (or unstage) the changed lines picked.
+        let stage_lines = viewer
+            .index_patch(None)
+            .map(|(_, undo)| (undo, nav.stage_selection.clone()));
         let key = |letter: &str| {
             if cfg!(target_os = "macos") {
                 format!("⌘{letter}")
@@ -890,8 +1162,22 @@ pub fn view<'a>(viewer: &'a Viewer, nav: &Nav, dark: bool, empty: String) -> Ele
             } else {
                 disabled_item(t!("ctx.copy").to_string(), dark)
             };
+            let stage_item = match &stage_lines {
+                Some((undo, msg)) => item(
+                    if *undo {
+                        t!("git.unstage_lines").to_string()
+                    } else {
+                        t!("git.stage_lines").to_string()
+                    },
+                    None,
+                    dark,
+                    msg.clone(),
+                ),
+                None => disabled_item(t!("git.stage_lines").to_string(), dark),
+            };
             let card = container(
                 column![
+                    stage_item,
                     disabled_item(t!("ctx.cut").to_string(), dark),
                     copy_item,
                     disabled_item(t!("ctx.paste").to_string(), dark),
@@ -954,11 +1240,11 @@ mod tests {
     #[test]
     fn the_sides_share_the_width_and_leave_room_for_the_numbers() {
         // 1200 px: two sides of ~590 px, minus numbers and padding.
-        let columns = columns_for(1200.0, true);
+        let columns = columns_for(1200.0, ARROW_W);
         assert!((60..=75).contains(&columns), "{columns}");
         // Narrower frame, fewer characters; never fewer than ten.
-        assert!(columns_for(800.0, true) < columns);
-        assert_eq!(columns_for(50.0, false), 10);
+        assert!(columns_for(800.0, ARROW_W) < columns);
+        assert_eq!(columns_for(50.0, 0.0), 10);
     }
 
     #[test]
@@ -1145,5 +1431,83 @@ mod tests {
         assert_eq!(copied.lines().count(), 5000);
         // Quadratic work took tens of seconds here.
         assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    #[test]
+    fn the_words_that_changed_in_a_line_are_marked_in_both() {
+        let (old, new) = word_marks("let total = price * 2;", "let total = price * 3;");
+        assert_eq!(old, vec![(20, 21)]);
+        assert_eq!(new, vec![(20, 21)]);
+        // An insertion in the middle.
+        let (old, new) = word_marks("hello world", "hello brave world");
+        assert!(old.is_empty());
+        assert_eq!(new, vec![(6, 12)]);
+        // Lines with little in common: nothing marked (all of it would be).
+        let (old, new) = word_marks("completely different", "xyzzy 12345 !!");
+        assert!(old.is_empty() && new.is_empty());
+    }
+
+    #[test]
+    fn a_removed_line_goes_with_the_added_line_in_its_place() {
+        let text = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,4 +1,5 @@\n keep\n-old one\n-old two\n+new one\n+new two\n+new three\n tail\n";
+        let file = parse_diff(text).remove(0);
+        let rows = file.rows();
+        let partners = partners(&rows);
+        // rows: hunk, keep, -one, -two, +one, +two, +three, tail
+        assert_eq!(partners[2], Some(4));
+        assert_eq!(partners[4], Some(2));
+        assert_eq!(partners[3], Some(5));
+        assert_eq!(partners[6], None, "the extra added line has none");
+        assert_eq!(partners[1], None);
+    }
+
+    #[test]
+    fn staging_is_offered_by_the_source_and_not_when_blanks_are_left_out() {
+        use crate::git::Source;
+        let text = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,2 +1,2 @@\n keep\n-old\n+new\n";
+        let entry = |source| crate::git_panel::Entry {
+            source,
+            change: crate::git::Change {
+                path: "f".into(),
+                from: None,
+                kind: crate::git::Kind::Modified,
+            },
+            staged: false,
+        };
+        let mut viewer = Viewer {
+            diff: Some(Ok(parse_diff(text).remove(0))),
+            entries: vec![entry(Source::Unstaged)],
+            index: Some(0),
+            ..Default::default()
+        };
+        let (patch, undo) = viewer.index_patch(Some(0)).unwrap();
+        assert!(!undo && patch.contains("-old") && patch.contains("+new"));
+        // Lines: nothing picked, nothing to stage.
+        assert!(viewer.index_patch(None).is_none());
+        viewer.pick(DiffPointer::Press(1, true, 0));
+        viewer.pick(DiffPointer::Drag(2, 3));
+        assert!(viewer.index_patch(None).is_some());
+        // The staged diff takes it out, the others don't do it at all.
+        viewer.entries[0].source = Source::Staged;
+        assert!(viewer.index_patch(Some(0)).unwrap().1);
+        viewer.entries[0].source = Source::Commit("abc".into());
+        assert!(viewer.index_patch(Some(0)).is_none());
+        // Blanks left out: the patch would not fit the index.
+        viewer.entries[0].source = Source::Unstaged;
+        viewer.ignore_blanks = true;
+        assert!(viewer.index_patch(Some(0)).is_none());
+    }
+
+    #[test]
+    fn the_context_goes_through_its_steps() {
+        let mut viewer = Viewer::default();
+        let steps: Vec<u32> = (0..5)
+            .map(|_| {
+                let at = viewer.context;
+                viewer.cycle_context();
+                at
+            })
+            .collect();
+        assert_eq!(steps, vec![3, 10, 30, u32::MAX, 3]);
     }
 }

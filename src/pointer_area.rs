@@ -18,6 +18,10 @@ pub struct PointerArea<'a, Message> {
     on_move: Option<At<'a, Message>>,
     on_release: Option<Message>,
     quiet: bool,
+    /// Sees the events before its content does and takes none from it (a
+    /// button under it still gets its press).
+    early: bool,
+    on_press_abs: Option<At<'a, Message>>,
 }
 
 pub fn pointer_area<'a, Message>(
@@ -29,6 +33,54 @@ pub fn pointer_area<'a, Message>(
         on_move: None,
         on_release: None,
         quiet: false,
+        early: false,
+        on_press_abs: None,
+    }
+}
+
+impl<'a, Message: Clone> PointerArea<'a, Message> {
+    /// What this area makes of an event: presses, releases, moves, exits.
+    fn pointer_events(
+        &self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        shell: &mut Shell<'_, Message>,
+    ) {
+        let state: &mut State = tree.state.downcast_mut();
+        let here = cursor.position_in(layout.bounds());
+        match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                if let (Some(at), Some(p)) = (self.on_press.as_ref(), here) {
+                    shell.publish(at(p));
+                    if !self.early {
+                        shell.capture_event();
+                    }
+                }
+                if let (Some(at), Some(p), true) = (
+                    self.on_press_abs.as_ref(),
+                    cursor.position(),
+                    here.is_some(),
+                ) {
+                    shell.publish(at(p));
+                }
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                if let Some(message) = self.on_release.as_ref() {
+                    shell.publish(message.clone());
+                }
+            }
+            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                if let (Some(at), Some(p)) = (self.on_move.as_ref(), here) {
+                    if state.last != Some(p) {
+                        state.last = Some(p);
+                        shell.publish(at(p));
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -50,6 +102,19 @@ impl<'a, Message> PointerArea<'a, Message> {
     /// layout of the widget underneath, which a deeper overlay doesn't fit.
     pub fn quiet(mut self) -> Self {
         self.quiet = true;
+        self
+    }
+
+    /// Over a widget that takes the press itself (a button): this hears it
+    /// first and captures nothing.
+    pub fn watching(mut self) -> Self {
+        self.early = true;
+        self
+    }
+
+    /// A left press, with the pointer's place in the window.
+    pub fn on_press_in_window(mut self, f: impl Fn(Point) -> Message + 'a) -> Self {
+        self.on_press_abs = Some(Box::new(f));
         self
     }
 
@@ -122,6 +187,9 @@ impl<Message: Clone> Widget<Message, iced::Theme, iced::Renderer> for PointerAre
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        if self.early {
+            self.pointer_events(tree, event, layout, cursor, shell);
+        }
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
@@ -132,32 +200,8 @@ impl<Message: Clone> Widget<Message, iced::Theme, iced::Renderer> for PointerAre
             shell,
             viewport,
         );
-        if shell.is_event_captured() {
-            return;
-        }
-        let state: &mut State = tree.state.downcast_mut();
-        let here = cursor.position_in(layout.bounds());
-        match event {
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                if let (Some(at), Some(p)) = (self.on_press.as_ref(), here) {
-                    shell.publish(at(p));
-                    shell.capture_event();
-                }
-            }
-            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                if let Some(message) = self.on_release.as_ref() {
-                    shell.publish(message.clone());
-                }
-            }
-            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
-                if let (Some(at), Some(p)) = (self.on_move.as_ref(), here) {
-                    if state.last != Some(p) {
-                        state.last = Some(p);
-                        shell.publish(at(p));
-                    }
-                }
-            }
-            _ => {}
+        if !self.early && !shell.is_event_captured() {
+            self.pointer_events(tree, event, layout, cursor, shell);
         }
     }
 

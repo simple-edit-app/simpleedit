@@ -6,6 +6,7 @@
 
 pub mod branches;
 pub mod conflicts_view;
+pub mod diff_syntax;
 pub mod diff_view;
 pub mod icon;
 pub mod log;
@@ -72,8 +73,14 @@ pub struct Viewer {
     /// around that are built.
     pub view_top: std::cell::Cell<f32>,
     pub view_height: std::cell::Cell<f32>,
+    /// The syntax colors of the open diff (for the theme they were made for,
+    /// and the request they belong to).
+    syntax: std::cell::RefCell<Option<(bool, u64, std::sync::Arc<diff_syntax::Spans>)>>,
     /// The rows picked with the mouse (to copy them).
     pub selection: Option<Selection>,
+    /// How the diff is read: changes of blanks left out, lines of context.
+    pub ignore_blanks: bool,
+    pub context: u32,
     /// The mouse button is held down over the diff.
     dragging: bool,
     /// The last press, to tell a double click.
@@ -190,7 +197,10 @@ impl Default for Viewer {
             view_top: std::cell::Cell::new(0.0),
             // Until the scrollable says, a tall screen's worth.
             view_height: std::cell::Cell::new(1400.0),
+            syntax: std::cell::RefCell::new(None),
             selection: None,
+            ignore_blanks: false,
+            context: 3,
             dragging: false,
             last_press: None,
         }
@@ -198,6 +208,88 @@ impl Default for Viewer {
 }
 
 impl Viewer {
+    /// The syntax colors of the open diff, made when first asked for.
+    pub fn syntax_spans(&self, dark: bool) -> Option<std::sync::Arc<diff_syntax::Spans>> {
+        let diff = self.file_diff()?;
+        let path = &self.current()?.change.path;
+        let mut cache = self.syntax.borrow_mut();
+        match &*cache {
+            Some((was_dark, token, spans)) if *was_dark == dark && *token == self.token => {
+                return Some(spans.clone());
+            }
+            _ => {}
+        }
+        let spans = std::sync::Arc::new(diff_syntax::highlight(diff, path, dark));
+        *cache = Some((dark, self.token, spans.clone()));
+        Some(spans)
+    }
+
+    pub fn options(&self) -> git::DiffOptions {
+        git::DiffOptions {
+            context: self.context,
+            ignore_blanks: self.ignore_blanks,
+        }
+    }
+
+    /// 3 lines of context, then 10, 30, the whole file, and back.
+    pub fn cycle_context(&mut self) {
+        self.context = match self.context {
+            3 => 10,
+            10 => 30,
+            30 => u32::MAX,
+            _ => 3,
+        };
+    }
+
+    /// The same file read again with the options (the place in it is kept).
+    pub fn reopen(&mut self, repo: &Path) -> Task<Message> {
+        match self.index {
+            Some(i) => {
+                let keep = self.change;
+                let task = self.open(repo, i, Land::First);
+                self.change = keep;
+                task
+            }
+            None => Task::none(),
+        }
+    }
+
+    /// The changed lines of the rows picked, by their place in the diff.
+    pub fn picked_changes(&self) -> std::collections::HashSet<(usize, usize)> {
+        let Some(sel) = self.selection else {
+            return Default::default();
+        };
+        let (lo, hi) = sel.ends();
+        self.row_lines(sel.right)
+            .into_iter()
+            .enumerate()
+            .filter(|(row, _)| (lo.row..=hi.row).contains(row))
+            .filter_map(|(_, line)| line.filter(|l| l.tag != crate::git::diff::Tag::Context))
+            .map(|l| l.pos)
+            .collect()
+    }
+
+    /// What staging (or unstaging) a block or lines of the open diff takes:
+    /// the patch and which way it goes, when this diff can do it.
+    pub fn index_patch(&self, block: Option<usize>) -> Option<(String, bool)> {
+        use crate::git::Source;
+        // Blanks left out or a file that is new: the patch would not fit.
+        if self.ignore_blanks {
+            return None;
+        }
+        let reverse = match self.current()?.source {
+            Source::Unstaged => false,
+            Source::Staged => true,
+            _ => return None,
+        };
+        let diff = self.file_diff()?;
+        let patch = match block {
+            Some(b) => diff.block_patch(b, reverse)?,
+            None => diff.lines_patch(&self.picked_changes(), reverse)?,
+        };
+        Some((patch, reverse))
+    }
+
     pub fn is_dragging(&self) -> bool {
         self.dragging
     }
@@ -378,10 +470,11 @@ impl Viewer {
         self.token = TOKENS.fetch_add(1, Ordering::Relaxed);
         let token = self.token;
         let repo = repo.to_path_buf();
+        let options = self.options();
         let source = entry.source.clone();
         let path = entry.change.path.clone();
         Task::perform(
-            async move { git::diff_of(&repo, &source, &path).await },
+            async move { git::diff_with(&repo, &source, &path, options).await },
             move |result| Message::Git(GitMsg::DiffLoaded(token, result)),
         )
     }
@@ -429,8 +522,9 @@ impl Viewer {
         self.token = TOKENS.fetch_add(1, Ordering::Relaxed);
         self.silent = true;
         let (token, repo) = (self.token, repo.to_path_buf());
+        let options = self.options();
         Task::perform(
-            async move { git::diff_of(&repo, &entry.source, &entry.change.path).await },
+            async move { git::diff_with(&repo, &entry.source, &entry.change.path, options).await },
             move |result| Message::Git(GitMsg::DiffLoaded(token, result)),
         )
     }
@@ -526,6 +620,9 @@ pub struct Panel {
     pub only: Option<String>,
     pub busy: bool,
     pub branches: branches::State,
+    /// How a pull and a merge are made (the Preferences, changed here too).
+    pub pull_mode: git::PullMode,
+    pub merge_mode: git::MergeMode,
     /// What was asked once and waits for a second click to be done.
     pub pending: Option<Pending>,
     /// A repository chosen by hand (from a file's Git menu), kept until
@@ -553,6 +650,8 @@ impl Default for Panel {
             only: None,
             busy: false,
             branches: branches::State::default(),
+            pull_mode: git::PullMode::default(),
+            merge_mode: git::MergeMode::default(),
             pending: None,
             pinned: None,
             notice: None,
@@ -567,6 +666,8 @@ pub enum Pending {
     Rollback(String),
     StashDrop(usize),
     Abort,
+    /// Take back a commit that is already on the remote.
+    UndoCommit,
 }
 
 /// The folder a repository was chosen from, and the file in front then.
@@ -620,6 +721,12 @@ pub enum GitMsg {
     ToggleSideBySide,
     /// The diff was scrolled: (offset, height shown).
     DiffScrolled(i32, i32),
+    /// Stage (or unstage) a block of the open diff, or the lines picked.
+    StageBlock(usize),
+    StageSelection,
+    /// Leave changes of blanks out of the diff; more or less context.
+    ToggleBlanks,
+    CycleContext,
     /// The commit list was scrolled: (offset, height shown).
     LogScrolled(i32, i32),
     /// The mouse on the rows of the diff.
@@ -638,6 +745,14 @@ pub enum GitMsg {
     RollbackBlock(usize),
     /// Opens the file of the diff in the editor.
     OpenFile,
+    /// Pushes the current branch (from its Git shortcut).
+    PushCurrent,
+    /// Opens the modes behind the chevron of a split button, or closes them.
+    OpenSplit(branches::Split, iced::Point),
+    CloseSplit,
+    /// Nothing (a button that only looks pressable).
+    Noop,
+
     // Conflicts
     /// Keep your side (`true`) or theirs of a conflicted file.
     AcceptSide(String, bool),
@@ -658,7 +773,21 @@ pub enum GitMsg {
     // The Branches tab
     SelectRef(branches::Ref),
     RefName(String),
+    /// Opens (or closes) the popin that names a new branch or tag.
+    RefDialog(Option<branches::RefDialog>),
+    RefDialogOk,
+    RefTagName(String),
+    RefTagMessage(String),
     RefAction(branches::RefAction),
+    /// A fetch in the background, and whether it worked.
+    AutoFetch,
+    AutoFetched(bool),
+    /// Takes the last commit back (its changes stay staged, its message
+    /// comes back to the box).
+    UndoCommit,
+    /// Puts one file of the list aside (stash), or has git ignore it.
+    StashFile(usize),
+    IgnoreFile(usize),
     /// Back to the history of the whole branch.
     ClearLogFile,
     Commit(bool),
@@ -694,6 +823,20 @@ pub enum GitMsg {
     CommitFileDiff(usize),
     CopyHash,
     Rewrite(log::Action),
+    /// What the menu of a commit does besides rewriting history.
+    LogAction(log::LogAction),
+    /// The name typed in a dialog of the log.
+    DialogName(String),
+    /// The log is searched (text, in what, and go).
+    LogSearch(String),
+    LogSearchMode(git::history::SearchMode),
+    LogSearchRun,
+    /// An interactive rebase: its plan is read, a commit is moved, given
+    /// another action or another subject.
+    RebasePlanReady(Option<String>, Result<Vec<git::history::PlanItem>, String>),
+    RebaseMove(usize, bool),
+    RebaseSet(usize, git::history::PlanAction),
+    RebaseSubject(usize, String),
     RewriteReady(log::Action, bool, String),
     DialogMessage(text_editor::Action),
     DialogOk,
@@ -712,6 +855,9 @@ impl GitMsg {
                 | GitMsg::StatusLoaded(_)
                 | GitMsg::DiffLoaded(..)
                 | GitMsg::DiffScrolled(..)
+                | GitMsg::AutoFetched(_)
+                | GitMsg::RebasePlanReady(..)
+                | GitMsg::Noop
                 | GitMsg::LogScrolled(..)
                 | GitMsg::StashesLoaded(_)
                 | GitMsg::StashFilesLoaded(..)
@@ -829,6 +975,32 @@ impl Panel {
         entries
     }
 
+    /// Stages (or unstages) a block of the open diff, or the lines picked in
+    /// it, through a patch applied to the index.
+    fn stage_patch(&mut self, block: Option<usize>) -> Task<Message> {
+        let Some((patch, reverse)) = self.active_viewer().index_patch(block) else {
+            return Task::none();
+        };
+        self.act(move |repo| async move {
+            git::apply_patch(&repo, &patch, reverse).await?;
+            Ok(String::new())
+        })
+    }
+
+    /// Switches to a branch of the list (made first when `create`), from the
+    /// switcher of the status bar.
+    pub fn switch_branch(&mut self, name: String, create: bool) -> Task<Message> {
+        if create {
+            let name = name.split_whitespace().collect::<Vec<_>>().join("-");
+            self.act(move |repo| async move {
+                git::history::create_branch(&repo, &name, None).await?;
+                Ok(format!("\u{4}{name}"))
+            })
+        } else {
+            self.checkout(name)
+        }
+    }
+
     /// Another repository: what the tabs showed of the previous one is gone.
     fn reset_for_another_repo(&mut self) {
         self.status = None;
@@ -913,10 +1085,17 @@ impl Panel {
         if !msg.is_background()
             && !matches!(
                 msg,
-                GitMsg::Rollback(_) | GitMsg::StashDrop(_) | GitMsg::AbortOperation
+                GitMsg::Rollback(_)
+                    | GitMsg::StashDrop(_)
+                    | GitMsg::AbortOperation
+                    | GitMsg::UndoCommit
             )
         {
             self.pending = None;
+        }
+        // The modes of a split button give way to anything but its chevron.
+        if !msg.is_background() && !matches!(msg, GitMsg::OpenSplit(..)) {
+            self.branches.menu = None;
         }
         match msg {
             GitMsg::Tick => {
@@ -1016,6 +1195,24 @@ impl Panel {
                 self.log.view_top.set(top as f32);
                 self.log.view_height.set(height as f32);
                 Task::none()
+            }
+            GitMsg::StageBlock(block) => self.stage_patch(Some(block)),
+            GitMsg::StageSelection => self.stage_patch(None),
+            GitMsg::ToggleBlanks => {
+                let Some(repo) = self.repo.clone() else {
+                    return Task::none();
+                };
+                let viewer = self.active_viewer();
+                viewer.ignore_blanks = !viewer.ignore_blanks;
+                viewer.reopen(&repo)
+            }
+            GitMsg::CycleContext => {
+                let Some(repo) = self.repo.clone() else {
+                    return Task::none();
+                };
+                let viewer = self.active_viewer();
+                viewer.cycle_context();
+                viewer.reopen(&repo)
             }
             GitMsg::DiffScrolled(top, height) => {
                 let viewer = self.active_viewer();
@@ -1200,10 +1397,13 @@ impl Panel {
                     Ok(String::new())
                 })
             }
-            GitMsg::MergeBranch(branch) => self.act(move |repo| async move {
-                git::merge_branch(&repo, &branch).await?;
-                Ok(String::new())
-            }),
+            GitMsg::MergeBranch(branch) => {
+                let mode = self.merge_mode;
+                self.act(move |repo| async move {
+                    git::merge_branch(&repo, &branch, mode).await?;
+                    Ok(String::new())
+                })
+            }
             GitMsg::RebaseOnto(branch) => self.act(move |repo| async move {
                 git::rebase_onto(&repo, &branch).await?;
                 Ok(String::new())
@@ -1308,6 +1508,94 @@ impl Panel {
                 self.branches.confirm = None;
                 Task::none()
             }
+            GitMsg::RefDialog(kind) => {
+                self.typing = kind.is_some();
+                self.branches.dialog = kind;
+                if kind.is_some() {
+                    return iced::widget::operation::focus(branches::ref_dialog_field());
+                }
+                Task::none()
+            }
+            GitMsg::RefDialogOk => {
+                let action = match self.branches.dialog {
+                    Some(branches::RefDialog::Branch) => branches::RefAction::Create,
+                    Some(branches::RefDialog::Tag) => branches::RefAction::CreateTag,
+                    None => return Task::none(),
+                };
+                if !self.can(action) {
+                    return Task::none();
+                }
+                self.branches.dialog = None;
+                self.typing = false;
+                self.ref_action(action)
+            }
+            GitMsg::RefTagName(name) => {
+                self.typing = true;
+                self.branches.tag_name = name;
+                self.branches.confirm = None;
+                Task::none()
+            }
+            GitMsg::RefTagMessage(text) => {
+                self.typing = true;
+                self.branches.tag_message = text;
+                Task::none()
+            }
+            GitMsg::AutoFetch => {
+                let Some(repo) = self.repo.clone().filter(|_| !self.busy) else {
+                    return Task::none();
+                };
+                Task::perform(async move { git::fetch(&repo).await.is_ok() }, |worked| {
+                    Message::Git(GitMsg::AutoFetched(worked))
+                })
+            }
+            GitMsg::AutoFetched(worked) => {
+                if !worked || self.busy {
+                    return Task::none();
+                }
+                // The branches and the counts of the remote look again.
+                let more = match self.tab {
+                    Tab::Log | Tab::Branches => self.load_refs(),
+                    _ => Task::none(),
+                };
+                Task::batch([self.load_status(), more])
+            }
+            GitMsg::UndoCommit => {
+                // A commit that is already on the remote: asks first.
+                let pushed = self
+                    .status
+                    .as_ref()
+                    .is_some_and(|s| s.upstream.is_some() && s.ahead == 0);
+                if pushed
+                    && !self.confirmed(
+                        Pending::UndoCommit,
+                        t!("git.confirm_undo_commit").to_string(),
+                    )
+                {
+                    return Task::none();
+                }
+                self.act(move |repo| async move {
+                    let message = git::undo_last_commit(&repo).await?;
+                    Ok(format!("\u{8}{message}"))
+                })
+            }
+            GitMsg::StashFile(index) => {
+                let Some(entry) = self.viewer.entries.get(index).cloned() else {
+                    return Task::none();
+                };
+                self.act(move |repo| async move {
+                    git::stash_file(&repo, &entry.change.path, "").await?;
+                    Ok(String::new())
+                })
+            }
+            GitMsg::IgnoreFile(index) => {
+                let Some(entry) = self.viewer.entries.get(index).cloned() else {
+                    return Task::none();
+                };
+                self.act(move |repo| async move {
+                    git::ignore_file(&repo, &entry.change.path).await?;
+                    Ok("\u{a}ignored".to_string())
+                })
+            }
             GitMsg::RefName(name) => {
                 self.typing = true;
                 self.branches.name = name;
@@ -1315,6 +1603,30 @@ impl Panel {
                 Task::none()
             }
             GitMsg::RefAction(action) => self.ref_action(action),
+            GitMsg::OpenSplit(which, at) => {
+                self.branches.menu = Some((which, at));
+                Task::none()
+            }
+            GitMsg::Noop => Task::none(),
+            // (anything that isn't an opening already closed them)
+            GitMsg::CloseSplit => Task::none(),
+            GitMsg::PushCurrent => {
+                let Some((branch, upstream)) = self
+                    .status
+                    .as_ref()
+                    .map(|s| (s.branch.clone(), s.upstream.clone()))
+                else {
+                    return Task::none();
+                };
+                if branch.starts_with('(') {
+                    self.notice = Some((t!("git.err_detached_push").to_string(), true));
+                    return Task::none();
+                }
+                self.act(move |repo| async move {
+                    git::history::push_branch(&repo, &branch, upstream.as_deref(), false).await?;
+                    Ok("\u{3}pushed".to_string())
+                })
+            }
             GitMsg::CancelOnly => {
                 self.only = None;
                 Task::none()
@@ -1379,6 +1691,26 @@ impl Panel {
                                     t!("git.branch_created", name = &created[1..]).to_string(),
                                     false,
                                 ));
+                            }
+                            "\u{7}fetched" => {
+                                self.notice = Some((t!("git.fetched").to_string(), false));
+                            }
+                            "\u{a}ignored" => {
+                                self.notice = Some((t!("git.ignored").to_string(), false));
+                            }
+                            tag if tag.starts_with('\u{9}') => {
+                                self.notice = Some((
+                                    t!("git.tag_created", name = &tag[1..]).to_string(),
+                                    false,
+                                ));
+                            }
+                            undone if undone.starts_with('\u{8}') => {
+                                // The commit is back in the index; its message in the box.
+                                self.message = text_editor::Content::with_text(&undone[1..]);
+                                self.notice = Some((t!("git.commit_undone").to_string(), false));
+                            }
+                            "\u{6}pulled" => {
+                                self.notice = Some((t!("git.pulled").to_string(), false));
                             }
                             "\u{3}pushed" => {
                                 self.notice = Some((t!("git.pushed").to_string(), false));
@@ -1472,6 +1804,47 @@ impl Panel {
                 Task::none()
             }
             GitMsg::DialogOk => self.dialog_ok(),
+            GitMsg::LogAction(action) => self.log_action(action),
+            GitMsg::DialogName(text) => {
+                if let Some(log::Dialog::Name { input, .. }) = &mut self.log.dialog {
+                    *input = text;
+                }
+                Task::none()
+            }
+            GitMsg::LogSearch(text) => {
+                self.typing = true;
+                self.log.search = text;
+                Task::none()
+            }
+            GitMsg::LogSearchMode(mode) => {
+                self.log.search_mode = mode;
+                if self.log.search.trim().is_empty() {
+                    return Task::none();
+                }
+                let rev = self.log.shown.clone().unwrap_or_else(|| "HEAD".into());
+                self.show_log(&rev)
+            }
+            GitMsg::LogSearchRun => {
+                let rev = self.log.shown.clone().unwrap_or_else(|| "HEAD".into());
+                self.show_log(&rev)
+            }
+            GitMsg::RebasePlanReady(base, plan) => {
+                self.rebase_plan_ready(base, plan);
+                Task::none()
+            }
+            GitMsg::RebaseMove(index, up) => {
+                self.rebase_move(index, up);
+                Task::none()
+            }
+            GitMsg::RebaseSet(index, action) => {
+                self.rebase_set(index, action);
+                Task::none()
+            }
+            GitMsg::RebaseSubject(index, subject) => {
+                self.typing = true;
+                self.rebase_subject(index, subject);
+                Task::none()
+            }
             GitMsg::DialogCancel => {
                 self.log.dialog = None;
                 Task::none()
@@ -1793,5 +2166,279 @@ mod tests {
         let before = viewer.token;
         assert!(viewer.owns(before));
         assert!(!viewer.owns(before + 1));
+    }
+
+    #[test]
+    fn the_chevron_opens_the_modes_and_the_button_runs_the_action() {
+        use branches::{RefAction, Split};
+        let mut panel = panel_with_branches();
+        let _ = panel.update(GitMsg::OpenSplit(Split::Pull, iced::Point::ORIGIN), &ctx());
+        assert_eq!(panel.branches.menu.map(|m| m.0), Some(Split::Pull));
+        assert!(!panel.busy, "opening the modes runs nothing");
+        // A click outside (or on the chevron again) closes them.
+        let _ = panel.update(GitMsg::CloseSplit, &ctx());
+        assert!(panel.branches.menu.is_none());
+        // Another one takes the place of the first; anything else closes it,
+        // a timer doesn't.
+        let _ = panel.update(GitMsg::OpenSplit(Split::Pull, iced::Point::ORIGIN), &ctx());
+        let _ = panel.update(GitMsg::OpenSplit(Split::Merge, iced::Point::ORIGIN), &ctx());
+        assert_eq!(panel.branches.menu.map(|m| m.0), Some(Split::Merge));
+        let _ = panel.update(GitMsg::Tick, &ctx());
+        assert_eq!(panel.branches.menu.map(|m| m.0), Some(Split::Merge));
+        let _ = panel.update(GitMsg::DismissNotice, &ctx());
+        assert!(panel.branches.menu.is_none());
+        // The button itself runs the action, as the mode of the settings says.
+        let _ = panel.update(GitMsg::RefAction(RefAction::Pull), &ctx());
+        assert!(panel.busy);
+        // What can't be done now can't be run.
+        let mut panel = panel_with_branches();
+        panel.status.as_mut().unwrap().operation = Some(git::Operation::Merge);
+        assert!(!panel.can(RefAction::Merge));
+    }
+
+    #[test]
+    fn fetching_and_tags_are_actions_of_the_branches_tab() {
+        use branches::{Ref, RefAction::*};
+        let mut panel = panel_with_branches();
+        assert!(panel.can(Fetch));
+        // A tag: pushed or removed on origin (asks twice), made from it.
+        assert!(!panel.can(PushTag) && !panel.can(DeleteRemoteTag));
+        panel.branches.selected = Some(Ref::Tag("v1".into()));
+        assert!(panel.can(PushTag) && panel.can(DeleteRemoteTag));
+        let _ = panel.ref_action(DeleteRemoteTag);
+        assert_eq!(panel.branches.confirm, Some(DeleteRemoteTag));
+        assert!(!panel.busy);
+        // Creating one needs a name.
+        assert!(!panel.can(CreateTag));
+        let _ = panel.update(GitMsg::RefTagName("v2".into()), &ctx());
+        assert!(panel.typing && panel.can(CreateTag));
+        let _ = panel.update(GitMsg::RefAction(CreateTag), &ctx());
+        assert!(panel.busy);
+        assert!(panel.branches.tag_name.is_empty(), "the field is emptied");
+        // Fetching runs.
+        let mut panel = panel_with_branches();
+        let _ = panel.update(GitMsg::RefAction(Fetch), &ctx());
+        assert!(panel.busy);
+    }
+
+    #[test]
+    fn a_fetch_in_the_background_is_silent_and_never_during_another_action() {
+        let mut panel = panel_with_branches();
+        let _ = panel.update(GitMsg::AutoFetch, &ctx());
+        assert!(!panel.busy, "it doesn't show as an action");
+        // A fetch that failed (no network) changes nothing.
+        let before = panel.notice.clone();
+        let _ = panel.update(GitMsg::AutoFetched(false), &ctx());
+        assert_eq!(panel.notice, before);
+        // While something runs, it waits.
+        panel.busy = true;
+        let _ = panel.update(GitMsg::AutoFetch, &ctx());
+        assert!(panel.busy);
+    }
+
+    #[test]
+    fn taking_the_last_commit_back_asks_when_it_is_already_on_the_remote() {
+        let mut panel = panel_with_branches();
+        // No upstream: nothing was pushed, it just goes.
+        let _ = panel.update(GitMsg::UndoCommit, &ctx());
+        assert!(panel.busy);
+        // Pushed (an upstream, nothing ahead): asks first.
+        let mut panel = panel_with_branches();
+        panel.status.as_mut().unwrap().upstream = Some("origin/main".into());
+        let _ = panel.update(GitMsg::UndoCommit, &ctx());
+        assert_eq!(panel.pending, Some(Pending::UndoCommit));
+        assert!(!panel.busy);
+        let _ = panel.update(GitMsg::UndoCommit, &ctx());
+        assert!(panel.busy);
+        // Its message comes back to the box.
+        let _ = panel.update(GitMsg::Done(Ok("\u{8}the old message".into())), &ctx());
+        assert_eq!(panel.message.text().trim_end(), "the old message");
+    }
+
+    fn panel_with_log(selected: &[usize]) -> Panel {
+        let mut panel = panel_with_branches();
+        let commit = |sha: &str, parent: Option<&str>| git::graph::Commit {
+            sha: sha.into(),
+            parents: parent.into_iter().map(str::to_string).collect(),
+            author: "A".into(),
+            email: "a@example.com".into(),
+            time: 0,
+            subject: format!("commit {sha}"),
+            refs: vec![],
+        };
+        panel.log.commits = vec![
+            commit("ccc", Some("bbb")),
+            commit("bbb", Some("aaa")),
+            commit("aaa", None),
+        ];
+        panel.log.head_set = ["ccc", "bbb", "aaa"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        panel.log.selected = selected.to_vec();
+        panel
+    }
+
+    #[test]
+    fn the_menu_of_a_commit_makes_branches_tags_resets_and_comparisons() {
+        use log::{Dialog, LogAction, NameKind};
+        // One commit: a name to type, a reset to confirm.
+        let mut panel = panel_with_log(&[1]);
+        let _ = panel.update(GitMsg::LogAction(LogAction::BranchHere), &ctx());
+        assert!(matches!(
+            &panel.log.dialog,
+            Some(Dialog::Name { kind: NameKind::Branch, sha, .. }) if sha == "bbb"
+        ));
+        assert!(panel.typing);
+        let _ = panel.update(GitMsg::DialogName("topic x".into()), &ctx());
+        let _ = panel.update(GitMsg::DialogOk, &ctx());
+        assert!(panel.busy, "the branch is made");
+        // An empty name does nothing, and the dialog stays.
+        let mut panel = panel_with_log(&[1]);
+        let _ = panel.update(GitMsg::LogAction(LogAction::TagHere), &ctx());
+        let _ = panel.update(GitMsg::DialogOk, &ctx());
+        assert!(!panel.busy);
+        assert!(matches!(panel.log.dialog, Some(Dialog::Name { .. })));
+        // Reset asks first, whatever its mode.
+        let mut panel = panel_with_log(&[1]);
+        let _ = panel.update(
+            GitMsg::LogAction(LogAction::Reset(git::ResetMode::Hard)),
+            &ctx(),
+        );
+        assert!(matches!(
+            panel.log.dialog,
+            Some(Dialog::Reset {
+                mode: git::ResetMode::Hard,
+                ..
+            })
+        ));
+        assert!(!panel.busy);
+        let _ = panel.update(GitMsg::DialogOk, &ctx());
+        assert!(panel.busy);
+        // Checking out a commit needs exactly one.
+        let mut panel = panel_with_log(&[0, 1]);
+        let _ = panel.update(GitMsg::LogAction(LogAction::CheckoutHere), &ctx());
+        assert!(!panel.busy);
+        let mut panel = panel_with_log(&[2]);
+        let _ = panel.update(GitMsg::LogAction(LogAction::CheckoutHere), &ctx());
+        assert!(panel.busy);
+        // Comparing the two needs two.
+        let avail = panel_with_log(&[0, 2]).log.availability();
+        assert!(avail.two && !avail.one && !avail.rebase);
+        let avail = panel_with_log(&[1]).log.availability();
+        assert!(avail.one && !avail.two && avail.rebase);
+    }
+
+    #[test]
+    fn an_interactive_rebase_is_arranged_in_a_dialog_before_it_runs() {
+        use git::history::{PlanAction, PlanItem};
+        use log::Dialog;
+        let item = |sha: &str, subject: &str| PlanItem {
+            sha: sha.into(),
+            action: PlanAction::Pick,
+            subject: subject.into(),
+            message: format!("{subject}\n\nbody of {sha}"),
+        };
+        let mut panel = panel_with_log(&[1]);
+        let plan = vec![item("bbb", "second"), item("ccc", "third")];
+        let _ = panel.update(
+            GitMsg::RebasePlanReady(Some("aaa".into()), Ok(plan)),
+            &ctx(),
+        );
+        let order = |panel: &Panel| -> Vec<String> {
+            match &panel.log.dialog {
+                Some(Dialog::Rebase { items, .. }) => items.iter().map(|i| i.sha.clone()).collect(),
+                _ => vec![],
+            }
+        };
+        assert_eq!(order(&panel), vec!["bbb", "ccc"]);
+        // Moving: the edges stay.
+        let _ = panel.update(GitMsg::RebaseMove(1, true), &ctx());
+        assert_eq!(order(&panel), vec!["ccc", "bbb"]);
+        let _ = panel.update(GitMsg::RebaseMove(0, true), &ctx());
+        let _ = panel.update(GitMsg::RebaseMove(1, false), &ctx());
+        assert_eq!(order(&panel), vec!["ccc", "bbb"]);
+        // A reworded commit takes the subject typed and keeps its body.
+        let _ = panel.update(GitMsg::RebaseSet(1, PlanAction::Reword), &ctx());
+        let _ = panel.update(GitMsg::RebaseSubject(1, "better".into()), &ctx());
+        let Some(Dialog::Rebase { items, .. }) = &panel.log.dialog else {
+            panic!("the dialog is open");
+        };
+        assert_eq!(items[1].message, "better\n\nbody of bbb");
+        // The first one folded into nothing: refused, and the dialog stays.
+        let _ = panel.update(GitMsg::RebaseSet(0, PlanAction::Squash), &ctx());
+        let _ = panel.update(GitMsg::DialogOk, &ctx());
+        assert!(!panel.busy);
+        assert!(panel.notice.as_ref().is_some_and(|n| n.1));
+        assert!(matches!(panel.log.dialog, Some(Dialog::Rebase { .. })));
+        // Fixed, it runs.
+        let _ = panel.update(GitMsg::RebaseSet(0, PlanAction::Pick), &ctx());
+        let _ = panel.update(GitMsg::DialogOk, &ctx());
+        assert!(panel.busy);
+        assert!(panel.log.dialog.is_none());
+        // A plan that could not be read says why.
+        let mut panel = panel_with_log(&[1]);
+        let _ = panel.update(GitMsg::RebasePlanReady(None, Err("merges".into())), &ctx());
+        assert!(panel.log.dialog.is_none());
+        assert_eq!(panel.notice, Some(("merges".into(), true)));
+    }
+
+    #[test]
+    fn the_log_search_keeps_the_keyboard_and_looks_again_when_asked() {
+        let mut panel = panel_with_log(&[]);
+        let _ = panel.update(GitMsg::LogSearch("fix".into()), &ctx());
+        assert!(panel.typing);
+        assert_eq!(panel.log.search, "fix");
+        let _ = panel.update(
+            GitMsg::LogSearchMode(git::history::SearchMode::Author),
+            &ctx(),
+        );
+        assert_eq!(panel.log.search_mode, git::history::SearchMode::Author);
+        // The log being searched shows in the shown rev.
+        assert_eq!(panel.log.shown.as_deref(), Some("HEAD"));
+    }
+
+    #[test]
+    fn staging_a_block_or_lines_goes_through_the_index_and_one_command_at_a_time() {
+        let mut panel = panel_with_branches();
+        panel.viewer = viewer_on(diff(&["added"]));
+        panel.viewer.index = Some(0);
+        // A block of the working tree's diff: staged.
+        let _ = panel.update(GitMsg::StageBlock(0), &ctx());
+        assert!(panel.busy);
+        // Lines: nothing picked, nothing to do.
+        panel.busy = false;
+        let _ = panel.update(GitMsg::StageSelection, &ctx());
+        assert!(!panel.busy);
+        // A diff that can't be staged (a commit's) does nothing.
+        panel.viewer.entries[0].source = Source::Commit("abc".into());
+        let _ = panel.update(GitMsg::StageBlock(0), &ctx());
+        assert!(!panel.busy);
+        // Blanks left out and more context: the same file, read again.
+        let _ = panel.update(GitMsg::ToggleBlanks, &ctx());
+        assert!(panel.viewer.ignore_blanks);
+        let _ = panel.update(GitMsg::CycleContext, &ctx());
+        assert_eq!(panel.viewer.context, 10);
+        assert!(panel.viewer.file_diff().is_none(), "being read again");
+    }
+
+    #[test]
+    fn a_branch_or_a_tag_is_named_in_a_popin() {
+        use branches::RefDialog;
+        let mut panel = panel_with_branches();
+        let _ = panel.update(GitMsg::RefDialog(Some(RefDialog::Tag)), &ctx());
+        assert_eq!(panel.branches.dialog, Some(RefDialog::Tag));
+        assert!(panel.typing);
+        // Without a name, OK does nothing and the popin stays.
+        let _ = panel.update(GitMsg::RefDialogOk, &ctx());
+        assert!(!panel.busy && panel.branches.dialog.is_some());
+        let _ = panel.update(GitMsg::RefTagName("v3".into()), &ctx());
+        let _ = panel.update(GitMsg::RefDialogOk, &ctx());
+        assert!(panel.busy && panel.branches.dialog.is_none() && !panel.typing);
+        // Cancelling closes it.
+        let mut panel = panel_with_branches();
+        let _ = panel.update(GitMsg::RefDialog(Some(RefDialog::Branch)), &ctx());
+        let _ = panel.update(GitMsg::RefDialog(None), &ctx());
+        assert!(panel.branches.dialog.is_none() && !panel.typing);
     }
 }
