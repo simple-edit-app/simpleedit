@@ -1,5 +1,21 @@
 # Journal des modifications
 
+## [1.6.0] - 2026-11-04
+
+### Ajouté
+- La liste des fichiers se redimensionne en tirant son bord (sa largeur est retenue) et affiche le chemin complet dans une infobulle. Clic droit, Supprimer, supprime vraiment un fichier, avec une confirmation et une case pour le retirer aussi de Git quand il est suivi.
+- Les modifications d'un fichier versionné sont aussi marquées dans la minimap par une bande, comme les signets. Dans la marge, le curseur est une flèche, et une main sur les chevrons de repli, les modifications et les signets. Le blame affiche une carte à la IntelliJ après un court délai, et « version précédente de cette ligne » ouvre le fichier tel qu'il était avant ce commit.
+- Raccourcis clavier revus d'après IntelliJ (les raccourcis personnalisés sont conservés), et Ctrl+Maj+B pour la liste des branches.
+- Panneau Git : Fetch (et fetch automatique réglé dans les Préférences) avec une alerte de nouveaux commits ; Pull et Merge en boutons scindés dont les modes (pull, pull --rebase, fast-forward seul, merge, squash...) se règlent dans les Préférences ; les nouvelles branches et tags se nomment dans une fenêtre ; les tags se poussent et se suppriment sur origin ; annuler le dernier commit ; mettre un seul fichier de côté ; ajouter un fichier à .gitignore.
+- Diffs : indexer ou désindexer un bloc ou les lignes sélectionnées, mots modifiés surlignés dans une ligne, un bouton pour ignorer les espaces, un bouton pour changer le contexte (3, 10, 30 lignes, fichier entier), et la coloration syntaxique.
+- Log : un menu clic droit pour créer une branche ou un tag ici, checkout, reset (soft, mixed, hard) et comparer ; une recherche par message, auteur, texte ajouté ou retiré, fichier ou date ; et un rebase interactif (réordonner, renommer, éditer, squash, fixup, supprimer).
+- Un sélecteur de branche dans la barre d'état, avec filtre et création de branche.
+- Les panneaux du bas (Git, terminal, fichiers scratch, signets) se redimensionnent en tirant leur bord haut. Les boutons sous la liste des fichiers suivent la largeur de la liste, qui ne peut pas être plus étroite que ce qu'ils demandent.
+- Un fichier scratch créé sans nom s'appelle `scratch1`, `scratch2`...
+
+### Corrigé
+- Une erreur Git s'affiche dans la barre d'état quand le panneau Git est fermé.
+
 ## [1.5.0] - 2026-11-03
 
 ### Ajouté

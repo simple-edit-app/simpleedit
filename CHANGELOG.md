@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.6.0] - 2026-11-04
+
+### Added
+- The file list can be resized by dragging its edge (its width is remembered) and shows the full path in a tooltip. Right click, Delete, removes a file for real, with a confirmation and a check box to remove it from Git as well when it is tracked.
+- Changes of a versioned file are also marked in the minimap as a band, like bookmarks. In the gutter the cursor is an arrow, and a hand over the fold chevrons, the changes and the bookmarks. The blame shows an IntelliJ-style card after a short delay, and "previous version of this line" opens the file as it was before that commit.
+- Keyboard shortcuts reviewed after IntelliJ (existing custom shortcuts are kept), and Ctrl+Shift+B for the list of branches.
+- Git panel: Fetch (and an automatic fetch, set in the Preferences) with a notice of new commits; Pull and Merge as split buttons whose modes (pull, pull --rebase, fast-forward only, merge, squash...) are set in the Preferences; new branches and tags are named in a pop-up; tags can be pushed and deleted on origin; undo the last commit; stash a single file; add a file to .gitignore.
+- Diffs: stage or unstage a block or the selected lines, changed words highlighted inside a line, a button to ignore whitespace, a button to change the context (3, 10, 30 lines, whole file), and syntax colors.
+- Log: a right click menu to create a branch or a tag here, check out, reset (soft, mixed, hard) and compare; a search by message, author, added or removed text, file or date; and an interactive rebase (reorder, reword, edit, squash, fixup, drop).
+- A branch switcher in the status bar, with a filter and branch creation.
+- The panels at the bottom (Git, terminal, scratch files, bookmarks) can be resized by dragging their top edge. The buttons under the file list follow the width of the list, which cannot get narrower than they need.
+- A scratch file made without a name is called `scratch1`, `scratch2`...
+
+### Fixed
+- A Git error is shown in the status bar when the Git panel is closed.
+
 ## [1.5.0] - 2026-11-03
 
 ### Added
