@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.8.0] - 2026-11-04
+
+### Added
+- Lint: problems found by linters and language servers are shown in the editor, with a card on hover that gives the message, the rule and the fixes. Off to begin with: you turn it on for each language in Preferences > Lint (a language can also be turned on from the right click menu of the editor).
+- Tools found by themselves, never installed: the project's own (`node_modules/.bin`, `.venv`, `vendor/bin`), then the system's; a path can be chosen for each tool. ESLint, TypeScript (language server), Ruff, flake8, pycodestyle, pylint, mypy, Clippy, go vet, golangci-lint, cppcheck, ShellCheck, Stylelint, yamllint, markdownlint, RuboCop, php, luacheck, ktlint, SwiftLint, SQLFluff, HLint, xmllint, JSON, and the language servers of Rust, Go, C/C++, Java, C#, Ruby, PHP, Kotlin, Swift, Dart, Lua, Haskell and more.
+- Fixes: one problem from its card, or all the problems of the same source (ESLint, TypeScript…) in the file; "Fix the problems of the file" from the Edit menu, the palette, the right click of the editor and of a file in the list. By default only errors are fixed (warnings, or everything, in the settings); fixes can also be applied when a file is saved.
+- Each severity has its own marking (wavy line, plain line, highlight, or wavy line and highlight) and its own color. Problems also show in the minimap and in the status bar (`✖ 2 ⚠ 3`, a click goes to the next one); next and previous problem in the Edit menu and the palette.
+- When the lint runs: as you type, when you save or only when asked, and a first look when a file is opened (an option). The status bar says when no tool was found, and what a failing tool complained about.
+- The Preferences are in the File menu.
+
+### Fixed
+- The editor no longer loses its focus and its caret when a floating card opens or closes.
+
 ## [1.7.0] - 2026-11-04
 
 ### Added

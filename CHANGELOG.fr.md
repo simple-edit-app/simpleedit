@@ -1,5 +1,18 @@
 # Journal des modifications
 
+## [1.8.0] - 2026-11-04
+
+### Ajouté
+- Lint : les problèmes trouvés par les linters et les serveurs de langage s'affichent dans l'éditeur, avec une carte au survol qui donne le message, la règle et les corrections. Désactivé au départ : on l'active pour chaque langage dans Préférences > Lint (on peut aussi l'activer depuis le clic droit de l'éditeur).
+- Les outils sont trouvés tout seuls, jamais installés : ceux du projet (`node_modules/.bin`, `.venv`, `vendor/bin`), puis ceux du système ; on peut choisir un chemin pour chaque outil. ESLint, TypeScript (serveur de langage), Ruff, flake8, pycodestyle, pylint, mypy, Clippy, go vet, golangci-lint, cppcheck, ShellCheck, Stylelint, yamllint, markdownlint, RuboCop, php, luacheck, ktlint, SwiftLint, SQLFluff, HLint, xmllint, JSON, et les serveurs de langage de Rust, Go, C/C++, Java, C#, Ruby, PHP, Kotlin, Swift, Dart, Lua, Haskell et d'autres.
+- Corrections : un problème depuis sa carte, ou tous les problèmes de la même source (ESLint, TypeScript…) du fichier ; « Corriger les problèmes du fichier » depuis le menu Édition, la palette, le clic droit de l'éditeur et d'un fichier de la liste. Par défaut, seules les erreurs sont corrigées (les avertissements, ou tout, dans les réglages) ; les corrections peuvent aussi être appliquées à l'enregistrement.
+- Chaque gravité a son marquage (trait ondulé, trait droit, surlignage, ou trait ondulé et surlignage) et sa couleur. Les problèmes apparaissent aussi dans la minimap et dans la barre d'état (`✖ 2 ⚠ 3`, un clic va au suivant) ; problème suivant et précédent dans le menu Édition et la palette.
+- Quand le lint tourne : pendant la frappe, à l'enregistrement ou seulement sur demande, et une première analyse à l'ouverture d'un fichier (une option). La barre d'état dit quand aucun outil n'a été trouvé, et ce dont un outil en échec s'est plaint.
+- Les Préférences sont dans le menu Fichier.
+
+### Corrigé
+- L'éditeur ne perd plus son focus ni son curseur quand une carte flottante s'ouvre ou se ferme.
+
 ## [1.7.0] - 2026-11-04
 
 ### Ajouté
