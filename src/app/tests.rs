@@ -442,7 +442,9 @@ mod behavior_tests {
         let _ = app.update(Message::TreeOpenFile(c.clone()));
         open_named(&mut app, &c);
         assert!(app.sidebar.files().contains(&b) && app.sidebar.files().contains(&c));
-        // Clicked twice at once, it is kept.
+        // Clicked twice at once, it is kept (the first click is dated now:
+        // opening the file may take longer than a double click).
+        app.tree_click = Some((c.clone(), std::time::Instant::now()));
         let _ = app.update(Message::TreeOpenFile(c.clone()));
         assert_eq!(app.preview_tab, None);
         // Or from the menu of its tab.

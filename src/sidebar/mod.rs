@@ -183,16 +183,6 @@ impl SidebarState {
             .iter()
             .zip(labels)
             .map(|(path, name)| {
-                let untitled = crate::app::is_untitled(path);
-                // Short extension in mono, e.g. "rs", "json".
-                let ext = if untitled {
-                    String::new()
-                } else {
-                    path.extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("")
-                        .to_lowercase()
-                };
                 let is_active = current_file.as_ref() == Some(path);
                 let is_selected = is_active;
                 let is_dirty = dirty.contains(path);
@@ -211,11 +201,7 @@ impl SidebarState {
 
                 let row_button = button(
                     row![
-                        text(ext)
-                            .size(9.5)
-                            .font(theme::MONO)
-                            .color(ext_color)
-                            .width(20),
+                        crate::file_icons::file(path, dark),
                         text(name)
                             .size(13)
                             .shaping(iced::widget::text::Shaping::Advanced)
@@ -570,6 +556,12 @@ fn project_tree<'a>(
             let mut label = row![
                 Space::new().width(Length::Fixed(line.depth as f32 * 14.0)),
                 text(chevron).size(11).color(p.muted).width(14),
+                if line.entry.is_dir {
+                    crate::file_icons::folder(line.open, dark)
+                } else {
+                    crate::file_icons::file(&path, dark)
+                },
+                Space::new().width(2),
                 text(line.entry.name.clone())
                     .size(13)
                     .shaping(iced::widget::text::Shaping::Advanced)

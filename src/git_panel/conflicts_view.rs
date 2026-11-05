@@ -130,6 +130,7 @@ impl Panel {
             list = list.push(
                 row![
                     row![
+                        crate::file_icons::file(std::path::Path::new(name), dark),
                         text(name).size(13),
                         text(dir)
                             .size(12)

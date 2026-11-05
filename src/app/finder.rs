@@ -356,6 +356,7 @@ impl SimpleEditApp {
                     dark,
                     highlighted,
                     row![
+                        crate::file_icons::file(std::path::Path::new(&name), dark),
                         text(name)
                             .size(13)
                             .font(se_theme::UI_SEMIBOLD)
@@ -477,6 +478,7 @@ impl SimpleEditApp {
                     dark,
                     highlighted,
                     row![
+                        crate::file_icons::file(&hit.path, dark),
                         text(format!("{name}:{}", hit.line + 1))
                             .size(12)
                             .color(if highlighted { p.accent } else { p.muted })

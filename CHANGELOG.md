@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.10.0] - 2026-11-05
+
+### Added
+- Colored icons before the files' names, by kind of file (Rust, TypeScript, JSON, Docker, npm, YAML, Markdown, images…), in the tree, the open files, the tabs, the Git, scratch and bookmark panels, Go to file and Find in files; folders get a thin outline. The icons come from the Seti set of the Nerd Font and from Lucide.
+
+### Fixed
+- A project reached through a symbolic link (and any project on macOS under `/var`) is colored by Git again in the tree.
+
 ## [1.9.0] - 2026-11-05
 
 ### Added

@@ -1,5 +1,13 @@
 # Journal des modifications
 
+## [1.10.0] - 2026-11-05
+
+### Ajouté
+- Des icônes colorées devant le nom des fichiers, selon leur type (Rust, TypeScript, JSON, Docker, npm, YAML, Markdown, images…), dans l'arborescence, les fichiers ouverts, les onglets, les panneaux Git, scratch et signets, Aller à un fichier et Chercher dans les fichiers ; les dossiers ont un contour fin. Les icônes viennent du jeu Seti de la Nerd Font et de Lucide.
+
+### Corrigé
+- Un projet ouvert par un lien symbolique (et tout projet sous `/var` sur macOS) est de nouveau coloré selon Git dans l'arborescence.
+
 ## [1.9.0] - 2026-11-05
 
 ### Ajouté

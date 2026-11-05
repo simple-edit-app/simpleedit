@@ -152,7 +152,7 @@ pub fn parse_file_states(out: &str) -> Vec<(String, FileState)> {
 /// (a folder that is ignored as a whole ends with `/`). `None` outside a
 /// repository.
 pub async fn file_states(dir: &Path) -> Option<Vec<(PathBuf, FileState, bool)>> {
-    let root = repo_root(dir).await?;
+    let root = spelled_like(dir, &repo_root(dir).await?);
     let out = run(
         &root,
         &[
@@ -174,6 +174,23 @@ pub async fn file_states(dir: &Path) -> Option<Vec<(PathBuf, FileState, bool)>> 
             })
             .collect(),
     )
+}
+
+/// The root Git gives has its links resolved (`/private/var` for `/var` on
+/// macOS): it is written as the folder `dir` that is inside it, so that the
+/// paths found match the ones of the tree.
+fn spelled_like(dir: &Path, root: &Path) -> PathBuf {
+    let Ok(real) = dir.canonicalize() else {
+        return root.to_path_buf();
+    };
+    let Ok(rest) = real.strip_prefix(root) else {
+        return root.to_path_buf();
+    };
+    let mut spelled = dir.to_path_buf();
+    for _ in rest.components() {
+        spelled.pop();
+    }
+    spelled
 }
 
 /// The same for every repository holding one of `dirs`, each looked at once.
@@ -1177,6 +1194,22 @@ mod tree_state_tests {
         );
         let outside = tempfile::tempdir().unwrap();
         assert!(testing::block(file_states(outside.path())).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_repository_reached_through_a_link_keeps_the_link_in_its_paths() {
+        let repo = testing::Repo::new();
+        std::fs::create_dir_all(repo.path().join("sub")).unwrap();
+        std::fs::write(repo.path().join("sub/new.txt"), "").unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let link = links.path().join("link");
+        std::os::unix::fs::symlink(repo.path(), &link).unwrap();
+        let states = testing::block(file_states(&link.join("sub"))).expect("a repository");
+        assert!(
+            states.contains(&(link.join("sub/new.txt"), FileState::Untracked, false)),
+            "{states:?}"
+        );
     }
 }
 

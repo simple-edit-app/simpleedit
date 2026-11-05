@@ -17,6 +17,7 @@ mod code_editor;
 mod config;
 mod definition;
 mod editor;
+mod file_icons;
 mod finder;
 mod floating;
 mod folding;

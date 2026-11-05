@@ -270,6 +270,7 @@ impl SimpleEditApp {
                 label = label.push(ribbon(amber, true));
             }
             label = label
+                .push(crate::file_icons::file(&entry.path, dark))
                 .push(
                     text(name)
                         .size(13)

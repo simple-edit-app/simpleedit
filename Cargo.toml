@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 iced = { version = "0.14", features = ["advanced", "tokio", "lazy", "selector", "canvas"] }
 iced_aw = { version = "0.14", default-features = false, features = ["context_menu", "wrap"] }
+iced_fonts = { version = "0.3", features = ["nerd", "lucide"] }
 syntect = { version = "5", default-features = false, features = ["default-syntaxes", "regex-onig"] }
 two-face = { version = "0.5", default-features = false, features = ["syntect-onig"] }
 regex = "1"
@@ -39,6 +40,9 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock", "s
 similar = "3.2.1"
 unicode-width = "0.2"
 
+[dev-dependencies]
+# Checks that every file icon is a glyph of the bundled Nerd Font.
+ttf-parser = "0.25"
 
 # Text shaping and syntax highlighting are very slow unoptimized: jumping
 # to the middle of a 3 000-line file took 30 s in a debug build.

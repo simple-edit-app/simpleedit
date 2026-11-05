@@ -393,9 +393,14 @@ impl SimpleEditApp {
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_default();
             let open = button(
-                text(name)
-                    .size(13)
-                    .shaping(iced::widget::text::Shaping::Advanced),
+                row![
+                    crate::file_icons::file(path, dark),
+                    text(name)
+                        .size(13)
+                        .shaping(iced::widget::text::Shaping::Advanced),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
             )
             .padding([4, 8])
             .width(Length::Fill)
@@ -1091,21 +1096,9 @@ impl SimpleEditApp {
             .map(|(path, name)| {
                 let active = self.current_file.as_ref() == Some(path);
                 let preview = self.preview_tab.as_ref() == Some(path);
-                // Its kind, as the list of files shows it.
-                let ext = if is_untitled(path) {
-                    String::new()
-                } else {
-                    path.extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("")
-                        .to_lowercase()
-                };
                 let mut label = row![
-                    text(ext).size(9.5).font(se_theme::MONO).color(if active {
-                        p.accent
-                    } else {
-                        p.muted
-                    }),
+                    // Its kind, as the list of files shows it.
+                    crate::file_icons::file(path, dark),
                     text(name)
                         .size(12.5)
                         .shaping(iced::widget::text::Shaping::Advanced)
@@ -1263,6 +1256,7 @@ impl SimpleEditApp {
                     .map(short_dir)
                     .unwrap_or_default();
                 let mut line = row![
+                    crate::file_icons::file(path, dark),
                     text(name)
                         .size(13)
                         .shaping(iced::widget::text::Shaping::Advanced)

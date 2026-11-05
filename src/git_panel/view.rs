@@ -383,6 +383,7 @@ impl Panel {
                 .font(se_theme::MONO)
                 .color(kind_color(change.kind, dark))
                 .width(12),
+            crate::file_icons::file(std::path::Path::new(name), dark),
             text(name).size(12.5).color(p.text),
             text(dir)
                 .size(11.5)

@@ -59,6 +59,9 @@ pub fn font_files() -> Vec<std::borrow::Cow<'static, [u8]>> {
         &include_bytes!("../assets/fonts/InstrumentSans-BoldItalic.ttf")[..],
         &include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf")[..],
         &include_bytes!("../assets/fonts/JetBrainsMono-Medium.ttf")[..],
+        // The icons before the files' names.
+        iced_fonts::NERD_FONT_BYTES,
+        iced_fonts::LUCIDE_FONT_BYTES,
     ]
     .into_iter()
     .map(std::borrow::Cow::Borrowed)
