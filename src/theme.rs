@@ -1,7 +1,8 @@
 //! Visual identity for SimpleEdit: "Nocturne".
 //!
-//! Deep night blue surfaces, floating rounded panels and one warm coral
-//! accent (a darker coral in the light theme). Style helpers take
+//! One flat dark grey background (IntelliJ's), square panels that touch,
+//! split by hairlines (as in Zed), and one warm coral accent (a darker coral
+//! in the light theme). Style helpers take
 //! `dark: bool` directly instead of deriving colors from `iced::Theme`, since
 //! the two custom themes only carry the base palette and we want exact
 //! control over surfaces, borders and hairlines.
@@ -12,15 +13,14 @@ use iced::{font, Background, Border, Color, Font, Shadow, Theme, Vector};
 pub const ACCENT_DARK: Color = rgb(0xFF, 0x9B, 0x6B);
 pub const ACCENT_LIGHT: Color = rgb(0xD2, 0x56, 0x1F);
 
-// Radii (px)
-pub const R_PANEL: f32 = 14.0;
-pub const R_PALETTE: f32 = 18.0;
-pub const R_ROW: f32 = 10.0;
-pub const R_SM: f32 = 8.0;
-pub const R_MENU_TITLE: f32 = 6.0;
-pub const R_PILL: f32 = 99.0;
-/// Space between the floating panels, and the margin around them.
-pub const PANEL_GAP: f32 = 10.0;
+// Radii (px): nothing is rounded; the constants stay so that a radius can be
+// given back to a kind of element in one place.
+pub const R_PANEL: f32 = 0.0;
+pub const R_PALETTE: f32 = 0.0;
+pub const R_ROW: f32 = 0.0;
+pub const R_SM: f32 = 0.0;
+pub const R_MENU_TITLE: f32 = 0.0;
+pub const R_PILL: f32 = 0.0;
 
 // Fonts. The files are embedded and registered at startup (see `main.rs`).
 pub const UI: Font = Font::with_name("Instrument Sans");
@@ -136,27 +136,30 @@ pub struct Palette {
     pub current_line: Color,
     pub search_match: Color,
     pub scrim: Color,
+    /// The bar of the tabs, behind the ones that are not open.
+    pub tabs: Color,
 }
 
 pub fn palette(dark: bool) -> Palette {
     if dark {
         Palette {
-            bg: rgb(0x07, 0x09, 0x0E),
-            surface: rgb(0x0F, 0x12, 0x1B),
-            panel: rgb(0x12, 0x16, 0x22),
-            elevated: rgb(0x1A, 0x1F, 0x2E),
+            bg: rgb(0x19, 0x1A, 0x1C),
+            surface: rgb(0x19, 0x1A, 0x1C),
+            panel: rgb(0x19, 0x1A, 0x1C),
+            elevated: rgb(0x2B, 0x2D, 0x30),
             hover: rgba(0xFF, 0xFF, 0xFF, 0.05),
-            border: rgb(0x22, 0x28, 0x39),
-            border_strong: rgb(0x2D, 0x35, 0x50),
+            border: rgb(0x2B, 0x2D, 0x30),
+            border_strong: rgb(0x39, 0x3B, 0x40),
             text: rgb(0xE9, 0xEC, 0xF4),
             muted: rgb(0x80, 0x89, 0xA0),
-            gutter: rgb(0x5C, 0x63, 0x78),
+            gutter: rgb(0x64, 0x6A, 0x7C),
             accent: ACCENT_DARK,
             accent_ink: rgb(0x1A, 0x0C, 0x05),
             accent_soft: rgba(0xFF, 0x9B, 0x6B, 0.14),
             current_line: rgba(0xFF, 0xFF, 0xFF, 0.035),
             search_match: rgba(0xFF, 0xC8, 0x50, 0.28),
             scrim: rgba(0x00, 0x00, 0x00, 0.5),
+            tabs: rgb(0x21, 0x22, 0x25),
         }
     } else {
         Palette {
@@ -176,6 +179,7 @@ pub fn palette(dark: bool) -> Palette {
             current_line: rgba(0x00, 0x00, 0x00, 0.035),
             search_match: rgba(0xFF, 0xBE, 0x28, 0.45),
             scrim: rgba(0x1E, 0x1E, 0x32, 0.22),
+            tabs: rgb(0xEE, 0xF0, 0xF5),
         }
     }
 }
@@ -198,7 +202,7 @@ pub fn syntax(dark: bool) -> Syntax {
             string: rgb(0x9B, 0xE3, 0xA4),
             function: rgb(0x7C, 0xB6, 0xFF),
             number: rgb(0xF5, 0xD0, 0x7A),
-            comment: rgb(0x78, 0x80, 0x94),
+            comment: rgb(0x80, 0x87, 0x99),
             type_: rgb(0xC4, 0xA6, 0xFF),
         }
     } else {
@@ -266,13 +270,14 @@ pub fn window(dark: bool) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
-/// The sidebar panel: a rounded, bordered surface.
+/// The sidebar panel: a square surface, split from its neighbors by
+/// hairlines.
 pub fn panel(dark: bool) -> impl Fn(&Theme) -> container::Style {
     let p = palette(dark);
     move |_theme: &Theme| container::Style {
         text_color: Some(p.text),
         background: Some(Background::Color(p.surface)),
-        border: border(p.border, 1.0, R_PANEL),
+        border: no_border(),
         shadow: Shadow::default(),
         ..container::Style::default()
     }
@@ -284,15 +289,54 @@ pub fn editor_panel(dark: bool) -> impl Fn(&Theme) -> container::Style {
     move |_theme: &Theme| container::Style {
         text_color: Some(p.text),
         background: Some(Background::Color(p.panel)),
+        border: no_border(),
+        shadow: Shadow::default(),
+        ..container::Style::default()
+    }
+}
+
+/// A settings card: rows on the panel color, separated by hairlines, in a
+/// rounded frame.
+pub fn settings_card(dark: bool) -> impl Fn(&Theme) -> container::Style {
+    let p = palette(dark);
+    move |_theme: &Theme| container::Style {
+        text_color: Some(p.text),
+        background: Some(Background::Color(p.panel)),
         border: border(p.border, 1.0, R_PANEL),
         shadow: Shadow::default(),
         ..container::Style::default()
     }
 }
 
-/// A settings card: rows on the panel color, separated by hairlines.
-pub fn settings_card(dark: bool) -> impl Fn(&Theme) -> container::Style {
-    editor_panel(dark)
+/// The bar of the tabs.
+pub fn tab_bar(dark: bool) -> impl Fn(&Theme) -> container::Style {
+    let p = palette(dark);
+    move |_theme: &Theme| container::Style {
+        background: Some(Background::Color(p.tabs)),
+        ..container::Style::default()
+    }
+}
+
+/// A tab: the open one has the editor's color and joins it.
+pub fn tab_frame(dark: bool, open: bool) -> impl Fn(&Theme) -> container::Style {
+    let p = palette(dark);
+    move |_theme: &Theme| container::Style {
+        background: open.then_some(Background::Color(p.panel)),
+        ..container::Style::default()
+    }
+}
+
+/// The square button of a tab, lit under the pointer.
+pub fn tab(dark: bool, open: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    let p = palette(dark);
+    move |_theme, status| {
+        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        button_appearance(
+            (hovered && !open).then_some(p.hover),
+            if open { p.text } else { p.muted },
+            no_border(),
+        )
+    }
 }
 
 /// A floating card (dropdown menus, context menu, search card, dialogs).
@@ -954,7 +998,10 @@ impl Slider {
                     border: border(Color::TRANSPARENT, 0.0, 2.0),
                 },
                 handle: slider::Handle {
-                    shape: slider::HandleShape::Circle { radius: 7.0 },
+                    shape: slider::HandleShape::Rectangle {
+                        width: 10,
+                        border_radius: 0.0.into(),
+                    },
                     background: Background::Color(handle),
                     border_width: 0.0,
                     border_color: Color::TRANSPARENT,
@@ -1103,7 +1150,8 @@ mod tests {
     #[test]
     fn palettes_follow_the_design_tokens() {
         let d = palette(true);
-        assert_eq!(d.bg, rgb(0x07, 0x09, 0x0E));
+        assert_eq!(d.bg, rgb(0x19, 0x1A, 0x1C));
+        assert_eq!(d.panel, d.bg, "one background, as IntelliJ");
         assert_eq!(d.accent, ACCENT_DARK);
         let l = palette(false);
         assert_eq!(l.panel, rgb(0xFF, 0xFF, 0xFF));

@@ -1859,6 +1859,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "iced_test"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b56c26cc6e63958ce6be06a68fa3136fd5f646da6302ee12abf1a0f311dd0166"
+dependencies = [
+ "iced_futures",
+ "iced_program",
+ "iced_renderer",
+ "iced_runtime",
+ "iced_selector",
+ "nom",
+ "png",
+ "sha2",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "iced_tiny_skia"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2549,6 +2566,15 @@ dependencies = [
  "cfg_aliases 0.2.2",
  "libc",
  "memoffset",
+]
+
+[[package]]
+name = "nom"
+version = "8.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df9761775871bdef83bee530e60050f7e54b1105350d6884eb0fb4f46c2f9405"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
@@ -4031,6 +4057,7 @@ dependencies = [
  "iced",
  "iced_aw",
  "iced_fonts",
+ "iced_test",
  "image",
  "once_cell",
  "portable-pty",

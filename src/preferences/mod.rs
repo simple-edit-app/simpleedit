@@ -1114,7 +1114,7 @@ fn lint_page<'a>(
                         container::Style {
                             background: Some(iced::Background::Color(shown)),
                             border: iced::Border {
-                                radius: 4.0.into(),
+                                radius: 0.0.into(),
                                 ..iced::Border::default()
                             },
                             ..container::Style::default()

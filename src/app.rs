@@ -1304,7 +1304,6 @@ impl SimpleEditApp {
         // The editor panel: toolbar, (formatting banner), body, (errors), status.
         let mut panel = column![
             self.tab_bar(dark),
-            rule(dark),
             self.toolbar_view(preview_kind, view_mode, dark),
             rule(dark)
         ];
@@ -1341,20 +1340,10 @@ impl SimpleEditApp {
             .height(Length::Fill)
             .style(se_theme::editor_panel(dark));
 
-        // The floating panels, separated by a gap, on the window background.
-        // The panels touch: the gap between the list and the editor is the
-        // handle that resizes the list.
-        let mut main_row = row![]
-            .padding(iced::Padding {
-                top: 0.0,
-                right: se_theme::PANEL_GAP,
-                bottom: se_theme::PANEL_GAP,
-                left: se_theme::PANEL_GAP,
-            })
-            .height(Length::Fill);
-        main_row = main_row
-            .push(self.activity_bar(dark))
-            .push(Space::new().width(Length::Fixed(se_theme::PANEL_GAP)));
+        // The panels touch, split by hairlines; the edge between the list
+        // and the editor is the handle that resizes the list.
+        let mut main_row = row![].height(Length::Fill);
+        main_row = main_row.push(self.activity_bar(dark)).push(vrule(dark));
         if self.show_sidebar && (self.panels.files || self.panels.projects) {
             main_row = main_row.push(
                 container(self.sidebar.view(
@@ -1369,12 +1358,16 @@ impl SimpleEditApp {
                 ))
                 .width(Length::Fixed(self.sidebar_width)),
             );
-            // The gap between the list and the editor: drag it to resize.
+            // The edge between the list and the editor (a strip of the list
+            // and the hairline): drag it to resize.
             main_row = main_row.push(
                 iced::widget::mouse_area(
-                    container(Space::new())
-                        .width(Length::Fixed(se_theme::PANEL_GAP))
-                        .height(Length::Fill),
+                    row![
+                        container(Space::new().width(SIDEBAR_GRIP).height(Length::Fill))
+                            .style(se_theme::panel(dark)),
+                        vrule(dark),
+                    ]
+                    .height(Length::Fill),
                 )
                 .on_press(Message::SidebarResizeStart)
                 .interaction(iced::mouse::Interaction::ResizingHorizontally),
@@ -1382,7 +1375,7 @@ impl SimpleEditApp {
         }
         main_row = main_row.push(editor_panel);
 
-        let base: Element<Message> = container(column![title_bar, main_row])
+        let base: Element<Message> = container(column![title_bar, rule(dark), main_row])
             .width(Length::Fill)
             .height(Length::Fill)
             .style(se_theme::window(dark))
@@ -6268,7 +6261,7 @@ impl SimpleEditApp {
     }
 
     /// The 40px bar above the editor: file name and folder on the left, the
-    /// Raw/Preview/Split switch (Markdown, JSON) or Format button on the right.
+    /// Raw/Preview/Split switch (Markdown, JSON) on the right.
     fn toolbar_view(
         &self,
         kind: Option<PreviewKind>,
@@ -6292,18 +6285,7 @@ impl SimpleEditApp {
         let right: Element<Message> = match kind {
             _ if on_diff => Space::new().into(),
             Some(kind) => crate::preview::segmented(kind, mode, dark),
-            None => {
-                let has_formatter = self
-                    .editor
-                    .language
-                    .as_deref()
-                    .is_some_and(crate::formatter::has_formatter);
-                button(text(t!("menu.edit_format").to_string()).size(12))
-                    .padding([5, 11])
-                    .on_press_maybe(has_formatter.then_some(Message::FormatFile))
-                    .style((se_theme::Outline { dark }).style())
-                    .into()
-            }
+            None => Space::new().into(),
         };
 
         row![
@@ -6737,6 +6719,13 @@ fn rule<'a>(dark: bool) -> Element<'a, Message> {
         .into()
 }
 
+/// A hairline between two panels side by side.
+fn vrule<'a>(dark: bool) -> Element<'a, Message> {
+    container(Space::new().width(1).height(Length::Fill))
+        .style(se_theme::rule(dark))
+        .into()
+}
+
 /// A folder for the toolbar: the home directory shown as `~`, with a
 /// trailing slash.
 fn short_dir(dir: &Path) -> String {
@@ -6891,7 +6880,10 @@ fn commit_card(line: &crate::git::history::BlameLine) -> Vec<String> {
 pub(crate) const PANEL_HEIGHT: f32 = 340.0;
 pub(crate) const PANEL_MIN_HEIGHT: f32 = 160.0;
 /// Where the list starts: the gap, the bar of panels, and a gap.
-const SIDEBAR_LEFT: f32 = se_theme::PANEL_GAP * 2.0 + ACTIVITY_WIDTH;
+const SIDEBAR_LEFT: f32 = ACTIVITY_WIDTH + 1.0;
+/// The strip at the right of the list that grabs to resize it, before the
+/// hairline.
+const SIDEBAR_GRIP: f32 = 4.0;
 /// Width of the bar of panels.
 pub(crate) const ACTIVITY_WIDTH: f32 = 44.0;
 const SIDEBAR_MIN: f32 = 160.0;

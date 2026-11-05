@@ -43,6 +43,8 @@ unicode-width = "0.2"
 [dev-dependencies]
 # Checks that every file icon is a glyph of the bundled Nerd Font.
 ttf-parser = "0.25"
+# Draws the window to a PNG without a screen (`look_tests`, run by hand).
+iced_test = "0.14"
 
 # Text shaping and syntax highlighting are very slow unoptimized: jumping
 # to the middle of a 3 000-line file took 30 s in a debug build.

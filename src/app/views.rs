@@ -980,6 +980,9 @@ impl SimpleEditApp {
 }
 
 /// The top edge of a bottom panel: a rule that can be dragged to resize it.
+/// The height of a tab, and of their bar.
+const TAB_HEIGHT: f32 = 34.0;
+
 pub(crate) fn resize_edge<'a>(dark: bool) -> Element<'a, Message> {
     iced::widget::mouse_area(
         container(Space::new().height(1))
@@ -1137,18 +1140,10 @@ impl SimpleEditApp {
                             .style(),
                         ),
                 );
-                let tab = button(label)
-                    .padding([8, 12])
+                let tab = button(container(label).center_y(Length::Fixed(TAB_HEIGHT)))
+                    .padding([0, 12])
                     .on_press(Message::Sidebar(SidebarMessage::OpenFile(path.clone())))
-                    .style((se_theme::GhostButton { dark, active }).style());
-                // The tab that is open is underlined.
-                let accent = p.accent;
-                let underline = container(Space::new().height(2)).width(Length::Fill).style(
-                    move |_: &iced::Theme| container::Style {
-                        background: active.then_some(iced::Background::Color(accent)),
-                        ..container::Style::default()
-                    },
-                );
+                    .style(se_theme::tab(dark, active));
                 let menu_path = path.clone();
                 let labels = (
                     t!("sidebar.close").to_string(),
@@ -1207,7 +1202,16 @@ impl SimpleEditApp {
                     .style(se_theme::card(dark))
                     .into()
                 });
-                column![with_menu, underline].into()
+                // The open tab has the editor's color, over the bar's bottom
+                // hairline: it joins the editor. A hairline splits the tabs.
+                row![
+                    container(with_menu)
+                        .height(Length::Fixed(TAB_HEIGHT))
+                        .style(se_theme::tab_frame(dark, active)),
+                    container(Space::new().width(1).height(Length::Fixed(TAB_HEIGHT)))
+                        .style(se_theme::rule(dark)),
+                ]
+                .into()
             })
             .collect();
         // The bar scrolls with the wheel and its tabs are dragged to reorder
@@ -1219,7 +1223,7 @@ impl SimpleEditApp {
             tabs,
             active,
             Message::TabMoved,
-            p.elevated,
+            p.tabs,
             iced::Color { a: 0.45, ..p.muted },
         )
         .on_close(Message::CloseTabAt)
@@ -1228,13 +1232,25 @@ impl SimpleEditApp {
         let list = crate::pointer_area::pointer_area(
             iced::widget::mouse_area(
                 container(text("⌄").size(14).color(p.muted))
-                    .padding([6, 10])
-                    .center_y(Length::Shrink),
+                    .padding([0, 10])
+                    .center_y(Length::Fixed(TAB_HEIGHT)),
             )
             .interaction(iced::mouse::Interaction::Pointer),
         )
         .on_press_in_window(Message::OpenTabList);
-        row![strip, list].align_y(Alignment::Center).into()
+        // Under the tabs, the bar's bottom hairline, that the open tab hides.
+        let bottom = column![
+            Space::new().width(Length::Fill).height(TAB_HEIGHT - 1.0),
+            container(Space::new().height(1))
+                .width(Length::Fill)
+                .style(se_theme::rule(dark)),
+        ];
+        container(iced::widget::stack![
+            bottom,
+            row![strip, list].align_y(Alignment::Center)
+        ])
+        .style(se_theme::tab_bar(dark))
+        .into()
     }
 }
 

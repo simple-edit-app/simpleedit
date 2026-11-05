@@ -471,7 +471,7 @@ impl<'a, Message> Widget<Message, iced::Theme, iced::Renderer> for TabStrip<'a, 
                         renderer::Quad {
                             bounds: Rectangle { x: left, ..b },
                             border: iced::Border {
-                                radius: 6.0.into(),
+                                radius: 0.0.into(),
                                 ..iced::Border::default()
                             },
                             ..renderer::Quad::default()
@@ -506,7 +506,7 @@ impl<'a, Message> Widget<Message, iced::Theme, iced::Renderer> for TabStrip<'a, 
                             height: 3.0,
                         },
                         border: iced::Border {
-                            radius: 1.5.into(),
+                            radius: 0.0.into(),
                             ..iced::Border::default()
                         },
                         ..renderer::Quad::default()

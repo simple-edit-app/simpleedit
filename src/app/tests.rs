@@ -114,8 +114,8 @@ mod behavior_tests {
         assert!(!app.sidebar_resizing);
         let _ = app.handle(Message::SidebarResizeStart);
         assert!(app.sidebar_resizing);
-        // The list starts after a gap, the bar of panels and another gap.
-        let gap = se_theme::PANEL_GAP * 2.0 + super::ACTIVITY_WIDTH;
+        // The list starts after the bar of panels and its hairline.
+        let gap = super::ACTIVITY_WIDTH + 1.0;
         let _ = app.handle(Message::SidebarResize(300.0 + gap));
         assert_eq!(app.sidebar_width, 300.0);
         // Never thinner than the names need, nor wider than the window allows.
@@ -2082,5 +2082,52 @@ mod behavior_tests {
         let _ = app.handle(Message::BlamePreviousLoaded(Err("no such path".into())));
         assert_eq!(app.current_file, before);
         assert!(app.status_message.contains("no such path"));
+    }
+}
+
+/// Draws the window to a PNG, to look at the design without a screen:
+/// `SNAPSHOT=/tmp/look.png cargo test look_tests -- --ignored`.
+#[cfg(test)]
+mod look_tests {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn the_window_is_drawn_to_a_png() {
+        let Ok(out) = std::env::var("SNAPSHOT") else {
+            return;
+        };
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let config = Config {
+            dark_mode: std::env::var("LIGHT").is_err(),
+            ..Config::default()
+        };
+        let mut app = SimpleEditApp::blank(config);
+        let _ = app.restore_session(crate::session::Session::default());
+        let _ = app.update(Message::ProjectPicked(Some(root.clone())));
+        let _ = app.update(Message::ToggleProjectFolder(root.join("src")));
+        for name in ["src/theme.rs", "Cargo.toml", "README.md", "src/main.rs"] {
+            let path = root.join(name);
+            let _ = app.update(Message::TabRead(Ok(Loaded {
+                text: std::fs::read_to_string(&path).unwrap(),
+                path,
+                format: TextFormat::default(),
+                stamp: None,
+            })));
+        }
+        let theme = if app.config.dark_mode {
+            se_theme::ink_dark()
+        } else {
+            se_theme::ink_light()
+        };
+        let settings = iced::Settings {
+            default_font: se_theme::UI,
+            fonts: se_theme::font_files(),
+            ..Default::default()
+        };
+        let _ = std::fs::remove_file(&out);
+        let mut ui = iced_test::Simulator::with_size(settings, (1280.0, 800.0), app.view());
+        let shot = ui.snapshot(&theme).unwrap();
+        assert!(shot.matches_image(&out).unwrap());
     }
 }

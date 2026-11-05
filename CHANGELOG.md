@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.11.0] - 2026-11-05
+
+### Changed
+- A new look: the background is IntelliJ's dark grey, the panels (files, editor, bar of the panels) touch and are split by hairlines, as in Zed, and nothing is rounded any more (buttons, fields, menus, cards, highlights).
+- The tabs follow Zed: a bar a little lighter than the editor, hairlines between the tabs, and the open tab in the editor's color, joined to it.
+
+### Removed
+- The "Format code" button above the editor: it is in the Edit menu, in the right click menu of the editor, in the palette and has its shortcut.
+
 ## [1.10.0] - 2026-11-05
 
 ### Added

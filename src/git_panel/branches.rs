@@ -678,7 +678,7 @@ impl Panel {
         ]
         .spacing(10)
         .width(Length::Fixed(320.0));
-        let card = container(form).padding(16).style(se_theme::panel(dark));
+        let card = container(form).padding(16).style(se_theme::card(dark));
         iced::widget::mouse_area(
             container(card)
                 .width(Length::Fill)

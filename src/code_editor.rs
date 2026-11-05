@@ -679,7 +679,7 @@ where
                         border: iced::Border {
                             color: minimap.viewport_border,
                             width: 1.0,
-                            radius: 3.0.into(),
+                            radius: 0.0.into(),
                         },
                         ..renderer::Quad::default()
                     },
@@ -2036,7 +2036,7 @@ where
                                     Color::TRANSPARENT
                                 },
                                 width: if current { 1.0 } else { 0.0 },
-                                radius: 3.0.into(),
+                                radius: 0.0.into(),
                             },
                             ..renderer::Quad::default()
                         },
@@ -2093,7 +2093,7 @@ where
                                 renderer::Quad {
                                     bounds: rect,
                                     border: iced::Border {
-                                        radius: 2.0.into(),
+                                        radius: 0.0.into(),
                                         ..iced::Border::default()
                                     },
                                     ..renderer::Quad::default()
@@ -2237,7 +2237,7 @@ where
                                     renderer::Quad {
                                         bounds: visible,
                                         border: iced::Border {
-                                            radius: 5.0.into(),
+                                            radius: 0.0.into(),
                                             ..iced::Border::default()
                                         },
                                         ..renderer::Quad::default()
@@ -2481,7 +2481,7 @@ where
                         renderer::Quad {
                             bounds: visible,
                             border: iced::Border {
-                                radius: 4.0.into(),
+                                radius: 0.0.into(),
                                 ..iced::Border::default()
                             },
                             ..renderer::Quad::default()
@@ -2539,7 +2539,7 @@ where
                             border: iced::Border {
                                 color: fold.tooltip_border,
                                 width: 1.0,
-                                radius: 6.0.into(),
+                                radius: 0.0.into(),
                             },
                             ..renderer::Quad::default()
                         },
@@ -2608,7 +2608,7 @@ where
                             border: iced::Border {
                                 color: notes.card_border,
                                 width: 1.0,
-                                radius: 6.0.into(),
+                                radius: 0.0.into(),
                             },
                             ..renderer::Quad::default()
                         },
@@ -2653,7 +2653,7 @@ where
                         border: iced::Border {
                             color: changes.popup_border,
                             width: 1.0,
-                            radius: 6.0.into(),
+                            radius: 0.0.into(),
                         },
                         ..renderer::Quad::default()
                     },

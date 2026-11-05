@@ -1,5 +1,14 @@
 # Journal des modifications
 
+## [1.11.0] - 2026-11-05
+
+### Modifié
+- Un nouveau look : le fond est le gris foncé d'IntelliJ, les cadres (fichiers, éditeur, barre des panneaux) se touchent et sont séparés par des traits fins, comme dans Zed, et plus rien n'est arrondi (boutons, champs, menus, cartes, surlignages).
+- Les onglets suivent Zed : une barre un peu plus claire que l'éditeur, des traits fins entre les onglets, et l'onglet ouvert de la couleur de l'éditeur, dans son prolongement.
+
+### Retiré
+- Le bouton « Formater le code » au-dessus de l'éditeur : il est dans le menu Édition, dans le menu du clic droit de l'éditeur, dans la palette et a son raccourci.
+
 ## [1.10.0] - 2026-11-05
 
 ### Ajouté
