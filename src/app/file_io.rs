@@ -56,6 +56,15 @@ pub(super) async fn open_file() -> Result<Loaded, String> {
     read_file(handle.path().to_path_buf(), false).await
 }
 
+/// Asks for a folder.
+pub(super) async fn pick_folder() -> Option<PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .set_title(t!("dialog.add_project_title").to_string())
+        .pick_folder()
+        .await
+        .map(|h| h.path().to_path_buf())
+}
+
 /// Reads a file for a tab. With `missing_ok`, a file that doesn't exist yet
 /// opens as an empty one that the first save creates (`simpleedit new.txt`).
 pub(super) async fn read_file(path: PathBuf, missing_ok: bool) -> Result<Loaded, String> {

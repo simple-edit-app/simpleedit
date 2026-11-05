@@ -13,6 +13,14 @@ pub type Key = (PathBuf, u64, u64);
 /// left out (they read the disk and the file has unsaved changes).
 pub type Outcome = (Vec<Diagnostic>, Vec<String>, Vec<String>, Vec<String>);
 
+/// How many of the problems are errors.
+fn found_errors(diagnostics: &[Diagnostic]) -> usize {
+    diagnostics
+        .iter()
+        .filter(|d| d.severity == lint::Severity::Error)
+        .count()
+}
+
 /// How long the text must rest before it is looked at again.
 const QUIET: std::time::Duration = std::time::Duration::from_millis(600);
 
@@ -201,6 +209,11 @@ impl SimpleEditApp {
             self.set_status(format!("{}: {}", t!("lint.failed"), failed[0]), true);
         }
         self.lint.ran = ran;
+        // The tree and the tabs show which files have errors.
+        let errors = found_errors(&self.lint.diagnostics);
+        if let Some(path) = &self.lint.file {
+            self.file_marks.set_errors(path, errors);
+        }
         self.lint.failed = failed;
         self.lint.fetched.clear();
         self.lint.hover = None;
@@ -792,6 +805,51 @@ mod tests {
         assert!(error.wash.is_some() && !error.wavy && !error.straight);
         assert!(warning.straight && warning.wash.is_none() && !warning.wavy);
         assert_eq!(warning.color, iced::Color::from_rgb8(0, 0, 255));
+    }
+
+    #[test]
+    fn a_file_with_errors_is_marked_for_the_tree_and_the_tabs() {
+        let mut app = blank();
+        let path = open_json(&mut app, "{\"a\": }\n");
+        let key = app.lint.launched.clone().unwrap();
+        let generation = app.lint.generation;
+        app.lint_done(
+            generation,
+            key.clone(),
+            (
+                vec![
+                    problem(0, 6, 7, Severity::Error),
+                    problem(0, 0, 1, Severity::Warning),
+                ],
+                vec![],
+                vec![],
+                vec!["Test".to_string()],
+            ),
+        );
+        assert!(app.file_marks.has_errors(&path, false));
+        assert!(app.file_marks.has_errors(Path::new("/s"), true));
+        // Warnings alone are no errors.
+        app.lint_done(
+            generation,
+            key,
+            (
+                vec![problem(0, 0, 1, Severity::Warning)],
+                vec![],
+                vec![],
+                vec!["Test".to_string()],
+            ),
+        );
+        assert!(!app.file_marks.has_errors(&path, false));
+        // What Git says comes in as well.
+        let _ = app.update(Message::FileStates(vec![(
+            path.clone(),
+            crate::git::FileState::Modified,
+            false,
+        )]));
+        assert_eq!(
+            app.file_marks.git(&path, false),
+            Some(crate::git::FileState::Modified)
+        );
     }
 
     #[test]

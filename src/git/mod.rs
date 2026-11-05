@@ -108,6 +108,94 @@ pub async fn repo_root(path: &Path) -> Option<PathBuf> {
     (!top.is_empty()).then(|| PathBuf::from(top))
 }
 
+// ─── How the files stand, for the tree ──────────────────────────────────────
+
+/// How a file of a repository stands, as the tree of projects colors it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileState {
+    Modified,
+    Added,
+    Untracked,
+    Conflicted,
+    Ignored,
+}
+
+/// What `git status --porcelain=v1 -z` says, read: each path (from the
+/// repository's top; a folder ends with `/`) and how it stands.
+pub fn parse_file_states(out: &str) -> Vec<(String, FileState)> {
+    let mut entries = out.split('\0').filter(|e| !e.is_empty());
+    let mut found = Vec::new();
+    while let Some(entry) = entries.next() {
+        let (Some(xy), Some(path)) = (entry.get(..2), entry.get(3..)) else {
+            continue;
+        };
+        let (x, y) = (xy.as_bytes()[0], xy.as_bytes()[1]);
+        // A rename or a copy is followed by the path it came from.
+        if matches!(x, b'R' | b'C') {
+            entries.next();
+        }
+        let state = match (x, y) {
+            (b'!', b'!') => FileState::Ignored,
+            (b'?', b'?') => FileState::Untracked,
+            (b'U', _) | (_, b'U') | (b'A', b'A') | (b'D', b'D') => FileState::Conflicted,
+            (b'A', _) => FileState::Added,
+            // Deleted: not in the tree any more.
+            (_, b'D') | (b'D', _) => continue,
+            _ => FileState::Modified,
+        };
+        found.push((path.to_string(), state));
+    }
+    found
+}
+
+/// How the files of the repository holding `dir` stand: absolute paths
+/// (a folder that is ignored as a whole ends with `/`). `None` outside a
+/// repository.
+pub async fn file_states(dir: &Path) -> Option<Vec<(PathBuf, FileState, bool)>> {
+    let root = repo_root(dir).await?;
+    let out = run(
+        &root,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--ignored=matching",
+            "-uall",
+        ],
+    )
+    .await
+    .ok()?;
+    Some(
+        parse_file_states(&out)
+            .into_iter()
+            .map(|(path, state)| {
+                let is_dir = path.ends_with('/');
+                (root.join(path.trim_end_matches('/')), state, is_dir)
+            })
+            .collect(),
+    )
+}
+
+/// The same for every repository holding one of `dirs`, each looked at once.
+pub async fn file_states_of(dirs: Vec<PathBuf>) -> Vec<(PathBuf, FileState, bool)> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for dir in dirs {
+        if roots.iter().any(|r| dir.starts_with(r)) {
+            continue;
+        }
+        if let Some(root) = repo_root(&dir).await {
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+    }
+    let mut all = Vec::new();
+    for root in roots {
+        all.extend(file_states(&root).await.unwrap_or_default());
+    }
+    all
+}
+
 // ─── Status ─────────────────────────────────────────────────────────────────
 
 /// What changed in a file.
@@ -1048,6 +1136,47 @@ pub(crate) mod testing {
             .build()
             .expect("a runtime")
             .block_on(future)
+    }
+}
+
+#[cfg(test)]
+mod tree_state_tests {
+    use super::*;
+
+    #[test]
+    fn the_status_says_how_each_file_stands() {
+        let out = " M src/app.rs\0A  new.rs\0?? notes.txt\0UU both.rs\0R  to.rs\0from.rs\0 D gone.rs\0!! target/\0!! debug.log\0";
+        let states = parse_file_states(out);
+        assert_eq!(
+            states,
+            vec![
+                ("src/app.rs".to_string(), FileState::Modified),
+                ("new.rs".to_string(), FileState::Added),
+                ("notes.txt".to_string(), FileState::Untracked),
+                ("both.rs".to_string(), FileState::Conflicted),
+                ("to.rs".to_string(), FileState::Modified),
+                ("target/".to_string(), FileState::Ignored),
+                ("debug.log".to_string(), FileState::Ignored),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_repository_tells_its_files_and_its_ignored_folders() {
+        let repo = testing::Repo::new();
+        std::fs::write(repo.path().join(".gitignore"), "target/\n").unwrap();
+        std::fs::create_dir_all(repo.path().join("target/debug")).unwrap();
+        std::fs::write(repo.path().join("target/debug/x"), "").unwrap();
+        std::fs::write(repo.path().join("new.txt"), "").unwrap();
+        let states = testing::block(file_states(repo.path())).expect("a repository");
+        assert!(states.contains(&(repo.path().join("new.txt"), FileState::Untracked, false)));
+        assert!(states.contains(&(repo.path().join("target"), FileState::Ignored, true)));
+        assert!(
+            !states.iter().any(|(p, ..)| p.ends_with("x")),
+            "not what is in it"
+        );
+        let outside = tempfile::tempdir().unwrap();
+        assert!(testing::block(file_states(outside.path())).is_none());
     }
 }
 

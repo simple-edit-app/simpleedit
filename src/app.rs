@@ -165,6 +165,16 @@ pub enum ActiveOverlay {
     ConfirmOverwrite(PathBuf),
     /// A scratch file is about to be deleted for good.
     ConfirmScratchDelete(PathBuf),
+    /// A file of the projects asked for by its name.
+    GotoFile,
+    /// A text looked for in the files of the projects.
+    FindInFiles,
+    /// A name asked for a file or folder of a project.
+    ProjectName(project_ops::NameDialog),
+    /// A folder to delete for good, everything in it.
+    ConfirmFolderDelete(PathBuf),
+    /// A file or folder dragged onto a folder, to move there.
+    ConfirmMove(PathBuf, PathBuf),
     /// A file to delete for good; `Some(on)`: git tracks it, and the box
     /// "remove it from Git too" is (un)checked.
     ConfirmFileDelete(PathBuf, Option<bool>),
@@ -205,6 +215,45 @@ pub enum Message {
     ConfirmDiscardMany(Vec<PathBuf>),
     ToggleSearch,
     ToggleSidebar,
+    /// A tab was dragged from a place to another.
+    TabMoved(usize, usize),
+    /// A click on a file of the tree: it opens in the preview tab (a second
+    /// click, at once, keeps it open).
+    TreeOpenFile(PathBuf),
+    /// The preview tab becomes a tab like the others.
+    KeepTab,
+    /// Two clicks on a tab (the preview one stays then).
+    TabDoubleClick(usize),
+    /// The middle button closed the tab at this place.
+    CloseTabAt(usize),
+    /// Opens again the tab closed last.
+    ReopenTab,
+    /// Asks for a file of the projects by its name.
+    OpenGotoFile,
+    /// Looks for a text in the files of the projects.
+    OpenFindInFiles,
+    /// The files of the projects, listed in the background.
+    FinderFiles(Vec<(PathBuf, String)>),
+    GotoFileQuery(String),
+    /// Opens a file of the list (by its place), or the one highlighted.
+    GotoFileOpen(Option<usize>),
+    FindQuery(String),
+    FindToggleCase,
+    FindToggleRegex,
+    /// What a search found (its generation, the places or what went wrong).
+    FindResults(u64, Result<Vec<crate::finder::TextHit>, String>),
+    FindOpen(Option<usize>),
+    /// Looks in this folder only (from the tree's menu).
+    FindInFolder(PathBuf),
+    /// Looks in every project, not only in a folder.
+    FindEverywhere,
+    /// The list of every open tab, opened from its button (where it was pressed).
+    OpenTabList(iced::Point),
+    CloseTabList,
+    /// A tab picked in that list.
+    PickTab(PathBuf),
+    /// Opens or closes a panel of the sidebar from the bar on its left.
+    TogglePanel(crate::sidebar::Panel),
     /// A setting of the lint, changed in the Preferences.
     Lint(crate::lint::Setting),
     /// A run of the linters is done (its generation, the text it read).
@@ -226,6 +275,49 @@ pub enum Message {
     LintNow,
     /// Opens the Preferences on the Lint page.
     OpenLintSettings,
+    /// Asks for a folder to add to the sidebar as a project.
+    AddProject,
+    ProjectPicked(Option<PathBuf>),
+    /// Opens or closes a folder of the tree.
+    ToggleProjectFolder(PathBuf),
+    /// Takes a project out of the sidebar (nothing is deleted).
+    RemoveProject(PathBuf),
+    RefreshProjects,
+    /// How the files of the repositories stand (paths, states, folder or not).
+    FileStates(Vec<(PathBuf, crate::git::FileState, bool)>),
+    /// Opens the folders of the tree down to a file.
+    ShowInProjects(PathBuf),
+    /// Closes every folder of the trees.
+    CollapseProjects,
+    /// A line of the tree pressed (it is picked, and may be dragged), the
+    /// pointer over another line, the button let go.
+    TreePress(PathBuf),
+    TreeHover(PathBuf),
+    TreeRelease,
+    /// Moves a file or folder into a folder (after the question).
+    MoveEntry(PathBuf, PathBuf),
+    /// The tree was scrolled: how far, and how high it is.
+    TreeScrolled(f32, f32),
+    /// The names left out of the trees (as typed: separated by commas).
+    SetProjectsExclude(String),
+    /// A terminal that starts in this folder.
+    OpenTerminalAt(PathBuf),
+    /// Shows a file or folder in the system's file manager.
+    RevealInFileManager(PathBuf),
+    /// Asks a name for a copy of a file or folder.
+    DuplicateEntry(PathBuf),
+    /// Asks a name for a file (false) or a folder (true) in a folder.
+    NewProjectEntry(PathBuf, bool),
+    RenameProjectEntry(PathBuf),
+    ProjectNameChanged(String),
+    ProjectNameSubmit,
+    AskDeleteFolder(PathBuf),
+    DeleteFolder(PathBuf),
+    FolderDeleted(Result<PathBuf, String>),
+    /// Puts a path on the clipboard.
+    CopyPath(PathBuf),
+    /// What Git ignores is left out of the trees (or shown again).
+    ToggleHideIgnored,
     /// The cursor goes to the next problem (false: the previous one).
     LintNext(bool),
     /// Splits the editor in two (side by side, or one above the other).
@@ -502,6 +594,12 @@ pub struct SimpleEditApp {
     /// Marked lines of every file, saved between runs.
     bookmarks: crate::bookmarks::Bookmarks,
     editor: EditorState,
+    /// How the files stand (Git, lint), for their colors.
+    file_marks: crate::projects::Marks,
+    /// What "go to file" and "find in files" look into and found.
+    finder: finder::FinderState,
+    /// The folders added as projects, shown as trees in the sidebar.
+    projects: crate::projects::Projects,
     lint: lint::LintState,
     /// The editor split in two panes, if it is.
     split: Option<split::Split>,
@@ -510,6 +608,28 @@ pub struct SimpleEditApp {
     preferences: PreferencesState,
     show_search: bool,
     show_sidebar: bool,
+    /// The open files from the one seen last, and, while Ctrl+Tab is held,
+    /// that order frozen and how far into it the switch went.
+    mru: Vec<PathBuf>,
+    tab_switch: Option<(Vec<PathBuf>, usize)>,
+    /// The tab a file of the tree opened in, to be replaced by the next one
+    /// (it is kept once it is edited or opened twice), the one it replaces
+    /// with its place, and the last click in the tree.
+    preview_tab: Option<PathBuf>,
+    preview_replaces: Option<(PathBuf, usize)>,
+    tree_click: Option<(PathBuf, std::time::Instant)>,
+    /// The arrows move in the tree (it was clicked last).
+    tree_focus: bool,
+    /// The line pressed in the tree, and whether it was dragged since.
+    tree_drag: Option<(PathBuf, bool)>,
+    /// How far the tree is scrolled and how high it is.
+    tree_view: (f32, f32),
+    /// The tabs closed, last one last (Ctrl+Shift+T opens them again).
+    closed_tabs: Vec<PathBuf>,
+    /// The list of every tab is open, from where its button was pressed.
+    tab_list: Option<iced::Point>,
+    /// The panels of the sidebar that are open (the bar on its left).
+    panels: crate::sidebar::Panels,
     /// Width of the file list, and whether its edge is being dragged.
     sidebar_width: f32,
     sidebar_resizing: bool,
@@ -696,6 +816,14 @@ impl SimpleEditApp {
         Self {
             bookmarks: crate::bookmarks::Bookmarks::default(),
             editor: EditorState::new(),
+            file_marks: crate::projects::Marks::default(),
+            finder: finder::FinderState::default(),
+            projects: crate::projects::Projects::new(
+                config.projects.clone(),
+                config.projects_open.clone(),
+                config.projects_hide_ignored,
+                config.projects_exclude.clone(),
+            ),
             lint: lint::LintState::default(),
             split: None,
             sidebar: SidebarState::new(),
@@ -703,6 +831,24 @@ impl SimpleEditApp {
             preferences: PreferencesState::from_config(&config),
             show_search: false,
             show_sidebar: config.show_sidebar,
+            // One panel at a time: with both asked for, the projects win once
+            // there are some.
+            mru: Vec::new(),
+            tab_switch: None,
+            closed_tabs: Vec::new(),
+            preview_tab: None,
+            preview_replaces: None,
+            tree_click: None,
+            tree_focus: false,
+            tree_drag: None,
+            tree_view: (0.0, 0.0),
+            tab_list: None,
+            panels: crate::sidebar::Panels {
+                files: config.show_files_panel
+                    && !(config.show_projects_panel && !config.projects.is_empty()),
+                projects: config.show_projects_panel
+                    && (!config.show_files_panel || !config.projects.is_empty()),
+            },
             sidebar_width: config.sidebar_width.clamp(SIDEBAR_MIN, SIDEBAR_MAX),
             sidebar_resizing: false,
             panel_height: PANEL_HEIGHT,
@@ -877,6 +1023,8 @@ impl SimpleEditApp {
         let command = self.handle(message);
         self.sync_split();
         let marks_task = self.after_message(edits_text, status_before, git_done);
+        self.track_mru();
+        self.settle_preview();
         let lint_task = self.lint_tick();
         let command = Task::batch([command, marks_task, lint_task]);
         if !typing {
@@ -989,6 +1137,16 @@ impl SimpleEditApp {
                     iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
                         iced::mouse::Button::Left,
                     )) => Some(Message::SidebarResizeEnd),
+                    _ => None,
+                },
+            ));
+        }
+        if self.tree_drag.is_some() {
+            subscriptions.push(iced::event::listen_with(
+                |event, _status, _window| match event {
+                    iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                        iced::mouse::Button::Left,
+                    )) => Some(Message::TreeRelease),
                     _ => None,
                 },
             ));
@@ -1144,7 +1302,12 @@ impl SimpleEditApp {
         };
 
         // The editor panel: toolbar, (formatting banner), body, (errors), status.
-        let mut panel = column![self.toolbar_view(preview_kind, view_mode, dark), rule(dark)];
+        let mut panel = column![
+            self.tab_bar(dark),
+            rule(dark),
+            self.toolbar_view(preview_kind, view_mode, dark),
+            rule(dark)
+        ];
         if self.is_formatting {
             panel = panel.push(
                 container(
@@ -1189,19 +1352,21 @@ impl SimpleEditApp {
                 left: se_theme::PANEL_GAP,
             })
             .height(Length::Fill);
-        if self.show_sidebar {
+        main_row = main_row
+            .push(self.activity_bar(dark))
+            .push(Space::new().width(Length::Fixed(se_theme::PANEL_GAP)));
+        if self.show_sidebar && (self.panels.files || self.panels.projects) {
             main_row = main_row.push(
-                column![
-                    self.sidebar.view(
-                        dark,
-                        &self.current_file,
-                        &self.dirty_files(),
-                        &self.bookmarks.marked_paths(),
-                        self.sidebar_width,
-                    ),
-                    self.terminal_button(dark),
-                ]
-                .spacing(se_theme::PANEL_GAP)
+                container(self.sidebar.view(
+                    dark,
+                    &self.current_file,
+                    &self.dirty_files(),
+                    &self.bookmarks.marked_paths(),
+                    &self.projects,
+                    &self.file_marks,
+                    self.panels,
+                    self.sidebar_width,
+                ))
                 .width(Length::Fixed(self.sidebar_width)),
             );
             // The gap between the list and the editor: drag it to resize.
@@ -1295,6 +1460,23 @@ impl SimpleEditApp {
         let with_dropdown: Element<Message> =
             crate::floating::at_point(with_dropdown, card, card_at.x, card_at.y);
 
+        // The list of every tab, under its button; a click elsewhere closes it.
+        let with_dropdown: Element<Message> = match self.tab_list {
+            Some(at) => {
+                let outside =
+                    iced::widget::mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
+                        .on_press(Message::CloseTabList)
+                        .on_right_press(Message::CloseTabList);
+                crate::floating::at_point(
+                    iced::widget::stack![with_dropdown, outside],
+                    self.tab_list_view(dark),
+                    (at.x - views::TAB_LIST_WIDTH + 16.0).max(4.0),
+                    at.y + 14.0,
+                )
+            }
+            None => with_dropdown,
+        };
+
         // The Preferences window floats over everything but the dialogs.
         let with_prefs: Element<Message> = if self.show_preferences {
             let window = container(self.preferences.view(
@@ -1331,6 +1513,20 @@ impl SimpleEditApp {
                 let shown = self.palette_entries();
                 let card =
                     crate::palette::view(dark, &self.palette_query, &shown, self.palette_selected);
+                crate::floating::modal(
+                    with_prefs,
+                    column![Space::new().height(84), card].align_x(Alignment::Center),
+                    Some(Message::CloseOverlay),
+                    dark,
+                    true,
+                )
+            }
+            ActiveOverlay::GotoFile | ActiveOverlay::FindInFiles => {
+                let card = if self.overlay == ActiveOverlay::GotoFile {
+                    self.view_goto_file(dark)
+                } else {
+                    self.view_find_in_files(dark)
+                };
                 crate::floating::modal(
                     with_prefs,
                     column![Space::new().height(84), card].align_x(Alignment::Center),
@@ -1390,6 +1586,21 @@ impl SimpleEditApp {
                             Message::DeleteFile(path.clone(), from_git.unwrap_or(false)),
                         )
                     }
+                    ActiveOverlay::ProjectName(dialog) => self.view_name_overlay(dark, dialog),
+                    ActiveOverlay::ConfirmMove(source, dir) => confirm_card(
+                        dark,
+                        t!("projects.move_title").to_string(),
+                        move_message(source, dir),
+                        t!("projects.move").to_string(),
+                        Message::MoveEntry(source.clone(), dir.clone()),
+                    ),
+                    ActiveOverlay::ConfirmFolderDelete(dir) => confirm_card(
+                        dark,
+                        t!("projects.delete_title").to_string(),
+                        t!("projects.delete_message", name = file_label(dir).as_str()).to_string(),
+                        t!("projects.delete_confirm").to_string(),
+                        Message::DeleteFolder(dir.clone()),
+                    ),
                     ActiveOverlay::ConfirmScratchDelete(path) => confirm_card(
                         dark,
                         t!("scratch.delete_title").to_string(),
@@ -1437,6 +1648,18 @@ impl Message {
         match self {
             Message::Git(msg) => msg.is_background(),
             Message::BlameLoaded(..) | Message::MarksBase(..) => true,
+            // What comes by itself (answers, timers) or from the pointer
+            // merely passing over something: an open menu stays open.
+            Message::FileStates(_)
+            | Message::LintDone(..)
+            | Message::LintFixesLoaded(..)
+            | Message::LintCloseCheck(_)
+            | Message::LintHover(_)
+            | Message::LintCardHover(_)
+            | Message::FinderFiles(_)
+            | Message::FindResults(..)
+            | Message::TreeScrolled(..)
+            | Message::TreeHover(_) => true,
             _ => false,
         }
     }
@@ -1498,6 +1721,7 @@ impl SimpleEditApp {
         match message {
             Message::EditorAction(action) => {
                 self.git.typing = false;
+                self.tree_focus = false;
                 // Back in the editor: Ctrl+A / Ctrl+C / Ctrl+Z are its own again.
                 self.git.viewer.selection = None;
                 self.git.stash.viewer.selection = None;
@@ -2162,6 +2386,177 @@ impl SimpleEditApp {
             Message::LintFixedAll(key, text) => self.lint_fixed_all(key, text),
             Message::LintFixFile(path) => self.lint_fix_file(path),
             Message::LintNow => self.lint_now(),
+            Message::AddProject => Task::perform(pick_folder(), Message::ProjectPicked),
+            Message::ProjectPicked(Some(dir)) => {
+                if self.projects.add(dir) {
+                    self.save_projects();
+                }
+                Task::none()
+            }
+            Message::ProjectPicked(None) => Task::none(),
+            Message::ToggleProjectFolder(dir) => {
+                self.tree_focus = true;
+                self.projects.selected = Some(dir.clone());
+                self.projects.toggle(&dir);
+                self.save_projects();
+                Task::none()
+            }
+            Message::RemoveProject(root) => {
+                self.projects.remove(&root);
+                self.save_projects();
+                Task::none()
+            }
+            Message::NewProjectEntry(dir, folder) => self.ask_name(if folder {
+                project_ops::NameFor::Folder(dir)
+            } else {
+                project_ops::NameFor::File(dir)
+            }),
+            Message::RenameProjectEntry(path) => self.ask_name(project_ops::NameFor::Rename(path)),
+            Message::ProjectNameChanged(text) => {
+                self.name_typed(text);
+                Task::none()
+            }
+            Message::ProjectNameSubmit => self.name_submitted(),
+            Message::AskDeleteFolder(dir) => {
+                self.ask_delete_folder(dir);
+                Task::none()
+            }
+            Message::DeleteFolder(dir) => self.delete_folder(dir),
+            Message::FolderDeleted(result) => self.folder_deleted(result),
+            Message::CopyPath(path) => iced::clipboard::write(path.to_string_lossy().into_owned()),
+            Message::ToggleHideIgnored => {
+                let hide = !self.projects.hide_ignored;
+                self.projects.set_hide_ignored(hide);
+                self.config.projects_hide_ignored = hide;
+                self.config_dirty = true;
+                Task::none()
+            }
+            Message::TreePress(path) => {
+                self.tree_focus = true;
+                self.projects.selected = Some(path.clone());
+                self.tree_drag = Some((path, false));
+                Task::none()
+            }
+            Message::TreeHover(over) => {
+                if let Some((source, moved)) = &mut self.tree_drag {
+                    if *source != over {
+                        *moved = true;
+                    }
+                    if *moved {
+                        // Onto a file: into its folder.
+                        let dir = if over.is_dir() {
+                            Some(over)
+                        } else {
+                            over.parent().map(Path::to_path_buf)
+                        };
+                        let source = source.clone();
+                        self.projects.drop_target = dir
+                            .filter(|d| movable(&source, d))
+                            .filter(|d| self.projects.roots.iter().any(|r| d.starts_with(r)));
+                    }
+                }
+                Task::none()
+            }
+            Message::TreeRelease => {
+                let drag = self.tree_drag.take();
+                let target = self.projects.drop_target.take();
+                if let (Some((source, true)), Some(dir)) = (drag, target) {
+                    self.overlay = ActiveOverlay::ConfirmMove(source, dir);
+                }
+                Task::none()
+            }
+            Message::MoveEntry(source, dir) => {
+                self.overlay = ActiveOverlay::None;
+                let Some(name) = source.file_name() else {
+                    return Task::none();
+                };
+                let target = dir.join(name);
+                if target.exists() {
+                    let name = name.to_string_lossy().into_owned();
+                    self.set_status(t!("projects.exists", name = name.as_str()), true);
+                    return Task::none();
+                }
+                self.projects.open(&dir);
+                self.move_entry(source, target)
+            }
+            Message::TreeScrolled(offset, height) => {
+                self.tree_view = (offset, height);
+                Task::none()
+            }
+            Message::CollapseProjects => {
+                self.projects.collapse_all();
+                self.save_projects();
+                Task::none()
+            }
+            Message::SetProjectsExclude(typed) => {
+                let patterns: Vec<String> = typed
+                    .split(',')
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect();
+                self.preferences.exclude_draft = patterns.join(", ");
+                self.projects.set_exclude(patterns.clone());
+                self.config.projects_exclude = patterns;
+                self.config_dirty = true;
+                Task::none()
+            }
+            Message::OpenTerminalAt(dir) => {
+                if let Err(error) = self.terminal.add(&dir, &t!("terminal.local")) {
+                    self.set_status(format!("{}: {error}", t!("status.error")), true);
+                    return Task::none();
+                }
+                self.terminal.open = true;
+                self.terminal.focused = true;
+                self.scratch.open = false;
+                self.bookmark_panel.open = false;
+                self.git.open = false;
+                Task::none()
+            }
+            Message::RevealInFileManager(path) => {
+                if let Err(e) = reveal_in_file_manager(&path) {
+                    self.set_status(format!("{}: {e}", t!("status.error")), true);
+                }
+                Task::none()
+            }
+            Message::DuplicateEntry(path) => self.ask_name(project_ops::NameFor::Duplicate(path)),
+            Message::ShowInProjects(file) => {
+                if !self.projects.show(&file) {
+                    return Task::none();
+                }
+                self.save_projects();
+                // The tree is brought up: the sidebar, with the projects.
+                self.panels = crate::sidebar::Panels {
+                    files: false,
+                    projects: true,
+                };
+                self.show_sidebar = true;
+                self.config.show_sidebar = true;
+                self.config.show_files_panel = false;
+                self.config.show_projects_panel = true;
+                self.config_dirty = true;
+                // And scrolled to the file.
+                let index = self
+                    .projects
+                    .rows()
+                    .iter()
+                    .position(|r| r.entry.path == file)
+                    .unwrap_or(0);
+                iced::widget::operation::scroll_to(
+                    crate::sidebar::tree_id(),
+                    iced::widget::scrollable::AbsoluteOffset {
+                        x: 0.0,
+                        y: crate::sidebar::tree_offset(index),
+                    },
+                )
+            }
+            Message::FileStates(states) => {
+                self.file_marks.set_git(states);
+                Task::none()
+            }
+            Message::RefreshProjects => {
+                self.projects.refresh(true);
+                Task::none()
+            }
             Message::OpenLintSettings => {
                 self.show_preferences = true;
                 self.handle(Message::Preferences(PreferencesMessage::PageSelected(
@@ -2181,6 +2576,88 @@ impl SimpleEditApp {
             Message::ClosePane(id) => self.close_pane(id),
             Message::SplitFocus(id) => self.focus_pane(id),
             Message::SplitAction(id, action) => self.split_action(id, action),
+            Message::TabMoved(from, to) => {
+                self.sidebar.move_tab(from, to);
+                Task::none()
+            }
+            Message::TreeOpenFile(path) => self.tree_open(path),
+            Message::KeepTab => {
+                self.preview_tab = None;
+                Task::none()
+            }
+            Message::TabDoubleClick(index) => {
+                if self.preview_tab.is_some()
+                    && self.preview_tab.as_ref() == self.sidebar.files().get(index)
+                {
+                    self.preview_tab = None;
+                }
+                Task::none()
+            }
+            Message::CloseTabAt(index) => match self.sidebar.files().get(index).cloned() {
+                Some(path) => self.request_close(path),
+                None => Task::none(),
+            },
+            Message::ReopenTab => self.reopen_tab(),
+            Message::OpenGotoFile => self.open_goto_file(),
+            Message::OpenFindInFiles => self.open_find_in_files(),
+            Message::FinderFiles(files) => self.finder_files(files),
+            Message::GotoFileQuery(name) => {
+                self.goto_typed(name);
+                Task::none()
+            }
+            Message::GotoFileOpen(pick) => self.goto_open(pick),
+            Message::FindQuery(text) => {
+                self.finder.text = text;
+                self.search_files(true)
+            }
+            Message::FindToggleCase => {
+                self.finder.case_sensitive = !self.finder.case_sensitive;
+                self.search_files(false)
+            }
+            Message::FindToggleRegex => {
+                self.finder.regex = !self.finder.regex;
+                self.search_files(false)
+            }
+            Message::FindResults(generation, result) => {
+                self.find_results(generation, result);
+                Task::none()
+            }
+            Message::FindOpen(pick) => self.find_open(pick),
+            Message::FindInFolder(dir) => self.find_in_folder(dir),
+            Message::FindEverywhere => self.find_everywhere(),
+            Message::OpenTabList(at) => {
+                self.tab_list = Some(at);
+                Task::none()
+            }
+            Message::CloseTabList => {
+                self.tab_list = None;
+                Task::none()
+            }
+            Message::PickTab(path) => {
+                self.tab_list = None;
+                self.activate(path)
+            }
+            Message::TogglePanel(panel) => {
+                // One panel at a time: the one asked for takes the place of
+                // the other, and asking for the one that is open closes it.
+                let was_open = match panel {
+                    crate::sidebar::Panel::Files => self.panels.files,
+                    crate::sidebar::Panel::Projects => self.panels.projects,
+                };
+                self.panels = crate::sidebar::Panels {
+                    files: panel == crate::sidebar::Panel::Files && !was_open,
+                    projects: panel == crate::sidebar::Panel::Projects && !was_open,
+                };
+                // A panel that is asked for shows the sidebar if it was hidden.
+                if !was_open {
+                    self.show_sidebar = true;
+                    self.config.show_sidebar = true;
+                }
+                self.config.show_files_panel = self.panels.files;
+                self.config.show_projects_panel = self.panels.projects;
+                self.config_dirty = true;
+                Task::none()
+            }
             Message::ToggleSidebar => {
                 self.show_sidebar = !self.show_sidebar;
                 self.config.show_sidebar = self.show_sidebar;
@@ -2256,9 +2733,10 @@ impl SimpleEditApp {
                 Task::none()
             }
             Message::SidebarResize(x) => {
-                // The list starts one gap in from the window's edge.
+                // The list starts after the bar, a gap from the window's edge
+                // and a gap from the bar.
                 let most = (self.config.window_width * 0.6).clamp(SIDEBAR_MIN, SIDEBAR_MAX);
-                self.sidebar_width = (x - se_theme::PANEL_GAP).clamp(SIDEBAR_MIN, most);
+                self.sidebar_width = (x - SIDEBAR_LEFT).clamp(SIDEBAR_MIN, most);
                 Task::none()
             }
             Message::PanelResizeStart => {
@@ -2652,6 +3130,14 @@ impl SimpleEditApp {
                     self.config_dirty = false;
                     self.config.save();
                 }
+                // The tree follows what happens on the disk, and its colors
+                // what Git says (now and then).
+                self.projects.refresh(false);
+                let states = if self.ticks.is_multiple_of(3) {
+                    self.refresh_file_states()
+                } else {
+                    Task::none()
+                };
                 let external = self.check_external_change();
                 self.ticks = self.ticks.wrapping_add(1);
                 // The marks follow HEAD, which a commit made elsewhere moves.
@@ -2681,7 +3167,14 @@ impl SimpleEditApp {
                 } else {
                     Task::none()
                 };
-                let external = Task::batch([external, self.auto_save_files(), marks, probe, fetch]);
+                let external = Task::batch([
+                    external,
+                    self.auto_save_files(),
+                    marks,
+                    probe,
+                    fetch,
+                    states,
+                ]);
                 if self.rev == self.session_rev {
                     return external;
                 }
@@ -2867,6 +3360,17 @@ impl SimpleEditApp {
                     }
                     return Task::none();
                 }
+                // The finder cards: arrows move in the list.
+                if matches!(
+                    self.overlay,
+                    ActiveOverlay::GotoFile | ActiveOverlay::FindInFiles
+                ) {
+                    return match key.as_str() {
+                        "ArrowDown" => self.finder_step(1),
+                        "ArrowUp" => self.finder_step(-1),
+                        _ => Task::none(),
+                    };
+                }
                 // The usages list: arrows move, Enter opens the highlighted one.
                 if let ActiveOverlay::References(list) = &mut self.overlay {
                     match key.as_str() {
@@ -2887,6 +3391,32 @@ impl SimpleEditApp {
                 // window is open
                 if !matches!(self.overlay, ActiveOverlay::None) || self.show_preferences {
                     return Task::none();
+                }
+                // The tree, clicked last: the arrows move in it, Enter opens.
+                if self.tree_focus && !ctrl && !alt && self.show_sidebar && self.panels.projects {
+                    match key.as_str() {
+                        "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight" => {
+                            self.projects.step(&key);
+                            self.save_projects();
+                            return self.scroll_tree_to_selected();
+                        }
+                        "Return" => {
+                            let Some(path) = self.projects.selected.clone() else {
+                                return Task::none();
+                            };
+                            if path.is_dir() {
+                                self.projects.toggle(&path);
+                                self.save_projects();
+                                return Task::none();
+                            }
+                            // Enter keeps the file open, as a second click does.
+                            if self.preview_tab.as_ref() == Some(&path) {
+                                self.preview_tab = None;
+                            }
+                            return self.activate(path);
+                        }
+                        _ => {}
+                    }
                 }
                 // On a diff, Ctrl+A picks every row and Ctrl+C / Ctrl+X copy the
                 // picked ones (a diff can't be cut from).
@@ -2912,6 +3442,11 @@ impl SimpleEditApp {
                 }
                 // Tab indents, Shift+Tab dedents; a search field keeps it.
                 if key == "Tab" {
+                    // Ctrl+Tab goes to the tab seen before (again for older
+                    // ones while Ctrl is held), Ctrl+Shift+Tab back.
+                    if ctrl && !alt {
+                        return self.switch_tab(!shift);
+                    }
                     if ctrl || alt {
                         return Task::none();
                     }
@@ -2935,7 +3470,7 @@ impl SimpleEditApp {
                 };
                 let sh = &self.config.shortcuts;
                 // Order matters: Ctrl+Shift+S must be tried before Ctrl+S.
-                let bindings: [(&ShortcutConfig, Message); 31] = [
+                let bindings: [(&ShortcutConfig, Message); 34] = [
                     (&sh.toggle_git, Message::ToggleGit),
                     (&sh.git_commit, Message::GitShortcut(GitShortcut::Commit)),
                     (&sh.git_push, Message::GitShortcut(GitShortcut::Push)),
@@ -2967,6 +3502,9 @@ impl SimpleEditApp {
                     (&sh.goto_line, Message::OpenGotoLine),
                     (&sh.command_palette, Message::OpenPalette),
                     (&sh.toggle_sidebar, Message::ToggleSidebar),
+                    (&sh.goto_file, Message::OpenGotoFile),
+                    (&sh.find_in_files, Message::OpenFindInFiles),
+                    (&sh.reopen_tab, Message::ReopenTab),
                 ];
                 let msg = bindings
                     .into_iter()
@@ -3401,6 +3939,10 @@ impl SimpleEditApp {
                 Task::none()
             }
             Message::ModifiersChanged { ctrl, alt, shift } => {
+                // Ctrl let go: the tab reached is the one seen last.
+                if !ctrl {
+                    self.tab_switch = None;
+                }
                 self.mod_ctrl = ctrl;
                 self.mod_alt = alt;
                 self.mod_shift = shift;
@@ -4962,6 +5504,17 @@ impl SimpleEditApp {
     /// Removes a tab and, if it was the active one, switches to its neighbour.
     fn close_path(&mut self, path: PathBuf) -> Task<Message> {
         let index = self.sidebar.files().iter().position(|p| *p == path);
+        if self.preview_tab.as_ref() == Some(&path) {
+            self.preview_tab = None;
+        }
+        // A file's tab can be opened again (Ctrl+Shift+T).
+        if index.is_some() && !is_untitled(&path) && !is_virtual(&path) {
+            self.closed_tabs.retain(|p| *p != path);
+            self.closed_tabs.push(path.clone());
+            if self.closed_tabs.len() > 50 {
+                self.closed_tabs.remove(0);
+            }
+        }
         self.file_cache.remove(&path);
         self.undo_cache.remove(&path);
         self.diff_tabs.remove(&path);
@@ -5090,6 +5643,173 @@ impl SimpleEditApp {
         self.scratch.refresh();
         tasks.push(self.ensure_tab());
         Task::batch(tasks)
+    }
+
+    /// A file of the tree, clicked: it takes the preview tab (the file that
+    /// was in it goes, unless it was edited); clicked twice, it stays.
+    fn tree_open(&mut self, path: PathBuf) -> Task<Message> {
+        self.tree_focus = true;
+        self.projects.selected = Some(path.clone());
+        let now = std::time::Instant::now();
+        let twice = self.tree_click.as_ref().is_some_and(|(p, at)| {
+            *p == path && now.duration_since(*at) < std::time::Duration::from_millis(450)
+        });
+        self.tree_click = Some((path.clone(), now));
+        if twice {
+            if self.preview_tab.as_ref() == Some(&path) {
+                self.preview_tab = None;
+            }
+            return self.activate(path);
+        }
+        // Already a tab (the preview, or one that stays): it is shown.
+        if self.sidebar.files().contains(&path) {
+            return self.activate(path);
+        }
+        let dirty = self.dirty_files();
+        if let Some(old) = self.preview_tab.take() {
+            if !dirty.contains(&old) {
+                if let Some(index) = self.sidebar.files().iter().position(|p| *p == old) {
+                    self.preview_replaces = Some((old, index));
+                }
+            }
+        }
+        self.preview_tab = Some(path.clone());
+        self.activate(path)
+    }
+
+    /// Once the file of the preview is in the editor, the one it replaces
+    /// goes and it takes its place; once it is edited, it stays.
+    fn settle_preview(&mut self) {
+        let Some(preview) = self.preview_tab.clone() else {
+            return;
+        };
+        if self.current_file.as_ref() != Some(&preview) {
+            return;
+        }
+        if self.is_dirty {
+            self.preview_tab = None;
+        }
+        if let Some((old, index)) = self.preview_replaces.take() {
+            if old != preview {
+                let _ = self.close_path(old);
+                let files = self.sidebar.files();
+                if let Some(at) = files.iter().position(|p| *p == preview) {
+                    let to = index.min(files.len().saturating_sub(1));
+                    self.sidebar.move_tab(at, to);
+                }
+            }
+        }
+    }
+
+    /// The file in the editor goes first in the order of the ones seen.
+    fn track_mru(&mut self) {
+        if self.tab_switch.is_some() {
+            return;
+        }
+        if let Some(current) = &self.current_file {
+            if self.mru.first() != Some(current) {
+                self.mru.retain(|p| p != current);
+                self.mru.insert(0, current.clone());
+                self.mru.truncate(200);
+            }
+        }
+    }
+
+    /// Ctrl+Tab: the open files in the order they were seen, the one in the
+    /// editor first; each press while Ctrl is held goes one further.
+    fn switch_tab(&mut self, forward: bool) -> Task<Message> {
+        if self.tab_switch.is_none() {
+            let open = self.sidebar.files();
+            let mut order: Vec<PathBuf> = self
+                .mru
+                .iter()
+                .filter(|p| open.contains(p))
+                .cloned()
+                .collect();
+            let rest: Vec<PathBuf> = open
+                .iter()
+                .filter(|p| !order.contains(p))
+                .cloned()
+                .collect();
+            order.extend(rest);
+            self.tab_switch = Some((order, 0));
+        }
+        let Some((order, at)) = &mut self.tab_switch else {
+            return Task::none();
+        };
+        if order.len() < 2 {
+            return Task::none();
+        }
+        *at = if forward {
+            (*at + 1) % order.len()
+        } else {
+            (*at + order.len() - 1) % order.len()
+        };
+        let target = order[*at].clone();
+        self.activate(target)
+    }
+
+    /// Ctrl+Shift+T: the last tab closed that can still be read.
+    fn reopen_tab(&mut self) -> Task<Message> {
+        while let Some(path) = self.closed_tabs.pop() {
+            if self.sidebar.files().contains(&path) || !path.is_file() {
+                continue;
+            }
+            return self.activate(path);
+        }
+        Task::none()
+    }
+
+    /// Asks Git how the files of the projects and of the tabs stand.
+    fn refresh_file_states(&self) -> Task<Message> {
+        let mut dirs: Vec<PathBuf> = self.projects.roots.clone();
+        for file in self.sidebar.files() {
+            if let Some(dir) = file
+                .parent()
+                .filter(|_| !is_untitled(file) && !is_virtual(file))
+            {
+                if !dirs.iter().any(|d| dir.starts_with(d)) {
+                    dirs.push(dir.to_path_buf());
+                }
+            }
+        }
+        if dirs.is_empty() {
+            return Task::none();
+        }
+        Task::perform(crate::git::file_states_of(dirs), Message::FileStates)
+    }
+
+    /// Scrolls the tree just enough to show the line picked.
+    fn scroll_tree_to_selected(&self) -> Task<Message> {
+        let Some(index) = self
+            .projects
+            .selected
+            .as_ref()
+            .and_then(|s| self.projects.index_of(s))
+        else {
+            return Task::none();
+        };
+        let row = crate::sidebar::TREE_ROW + 1.0;
+        let (offset, height) = self.tree_view;
+        let top = index as f32 * row;
+        let y = if top < offset {
+            top
+        } else if height > 0.0 && top + row > offset + height {
+            top + row - height
+        } else {
+            return Task::none();
+        };
+        iced::widget::operation::scroll_to(
+            crate::sidebar::tree_id(),
+            iced::widget::scrollable::AbsoluteOffset { x: 0.0, y },
+        )
+    }
+
+    /// Keeps the projects and their open folders in the settings.
+    fn save_projects(&mut self) {
+        self.config.projects = self.projects.roots.clone();
+        self.config.projects_open = self.projects.expanded.iter().cloned().collect();
+        self.config_dirty = true;
     }
 
     /// Parks the active buffer (text, cursor, scroll, language, dirty flag,
@@ -5879,10 +6599,14 @@ mod file_io;
 use file_io::*;
 #[path = "app/bookmark_panel.rs"]
 mod bookmark_panel;
+#[path = "app/finder.rs"]
+mod finder;
 #[path = "app/git_file.rs"]
 mod git_file;
 #[path = "app/lint.rs"]
 mod lint;
+#[path = "app/project_ops.rs"]
+mod project_ops;
 #[path = "app/split.rs"]
 mod split;
 #[path = "app/views.rs"]
@@ -6083,6 +6807,42 @@ pub fn untitled_path(n: u32) -> PathBuf {
     PathBuf::from(format!("untitled://{}", n))
 }
 
+/// The question asked before moving `source` into `dir`.
+fn move_message(source: &Path, dir: &Path) -> String {
+    let (n, d) = (file_label(source), file_label(dir));
+    t!("projects.move_message", name = n.as_str(), dir = d.as_str()).to_string()
+}
+
+/// Whether `source` may be moved into the folder `dir`: not into itself,
+/// what is inside it, or the folder it already is in.
+fn movable(source: &Path, dir: &Path) -> bool {
+    !dir.starts_with(source) && source.parent() != Some(dir)
+}
+
+/// Opens the system's file manager on a folder, or on the folder of a
+/// file.
+fn reveal_in_file_manager(path: &Path) -> std::io::Result<()> {
+    let dir = if path.is_dir() {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    };
+    let program = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(windows) {
+        "explorer"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(program)
+        .arg(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(drop)
+}
+
 /// Whether a tab can be shown in a pane of the split: not a diff or a merge.
 pub fn splittable(path: &Path) -> bool {
     !is_virtual(path)
@@ -6130,7 +6890,11 @@ fn commit_card(line: &crate::git::history::BlameLine) -> Vec<String> {
 /// The height the bottom panels start with, and the least they can take.
 pub(crate) const PANEL_HEIGHT: f32 = 340.0;
 pub(crate) const PANEL_MIN_HEIGHT: f32 = 160.0;
-const SIDEBAR_MIN: f32 = 200.0;
+/// Where the list starts: the gap, the bar of panels, and a gap.
+const SIDEBAR_LEFT: f32 = se_theme::PANEL_GAP * 2.0 + ACTIVITY_WIDTH;
+/// Width of the bar of panels.
+pub(crate) const ACTIVITY_WIDTH: f32 = 44.0;
+const SIDEBAR_MIN: f32 = 160.0;
 const SIDEBAR_MAX: f32 = 700.0;
 
 /// A path for a person: the home folder written `~`.

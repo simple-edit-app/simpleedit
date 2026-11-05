@@ -1,0 +1,84 @@
+//! The small drawn icons of the bar beside the panels.
+
+use iced::widget::canvas::{Canvas, Frame, Path, Program, Stroke};
+use iced::{mouse, Color, Element, Length, Point, Rectangle, Renderer, Theme};
+
+#[derive(Clone, Copy)]
+enum Shape {
+    /// A folder.
+    Folder,
+    /// Two sheets, one behind the other.
+    Files,
+}
+
+struct Icon {
+    shape: Shape,
+    color: Color,
+}
+
+impl<Message> Program<Message> for Icon {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &(),
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<iced::widget::canvas::Geometry> {
+        let mut frame = Frame::new(renderer, bounds.size());
+        let stroke = Stroke::default().with_color(self.color).with_width(1.4);
+        match self.shape {
+            Shape::Folder => {
+                let outline = Path::new(|p| {
+                    p.move_to(Point::new(1.5, 4.0));
+                    p.line_to(Point::new(1.5, 13.5));
+                    p.line_to(Point::new(14.5, 13.5));
+                    p.line_to(Point::new(14.5, 5.5));
+                    p.line_to(Point::new(7.5, 5.5));
+                    p.line_to(Point::new(6.0, 3.0));
+                    p.line_to(Point::new(2.5, 3.0));
+                    p.line_to(Point::new(1.5, 4.0));
+                });
+                frame.stroke(&outline, stroke);
+            }
+            Shape::Files => {
+                // The sheet behind, then the one in front.
+                frame.stroke(
+                    &Path::new(|p| {
+                        p.move_to(Point::new(5.0, 4.0));
+                        p.line_to(Point::new(5.0, 1.5));
+                        p.line_to(Point::new(13.5, 1.5));
+                        p.line_to(Point::new(13.5, 11.0));
+                        p.line_to(Point::new(11.0, 11.0));
+                    }),
+                    stroke,
+                );
+                frame.stroke(
+                    &Path::rectangle(Point::new(2.0, 4.0), iced::Size::new(9.0, 10.5)),
+                    stroke,
+                );
+                for y in [7.5, 10.5] {
+                    frame.stroke(&Path::line(Point::new(4.0, y), Point::new(9.0, y)), stroke);
+                }
+            }
+        }
+        vec![frame.into_geometry()]
+    }
+}
+
+fn icon<'a, Message: 'a>(shape: Shape, color: Color) -> Element<'a, Message> {
+    Canvas::new(Icon { shape, color })
+        .width(Length::Fixed(16.0))
+        .height(Length::Fixed(16.0))
+        .into()
+}
+
+pub fn folder<'a, Message: 'a>(color: Color) -> Element<'a, Message> {
+    icon(Shape::Folder, color)
+}
+
+pub fn files<'a, Message: 'a>(color: Color) -> Element<'a, Message> {
+    icon(Shape::Files, color)
+}

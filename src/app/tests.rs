@@ -33,6 +33,29 @@ mod behavior_tests {
     }
 
     #[test]
+    fn what_comes_by_itself_or_from_passing_over_leaves_a_menu_open() {
+        let mut app = app();
+        let _ = app.handle(Message::ToggleMenu(TopMenu::Edit));
+        assert_eq!(app.open_menu, Some(TopMenu::Edit));
+        for message in [
+            Message::FileStates(Vec::new()),
+            Message::TreeHover(PathBuf::from("/x")),
+            Message::TreeScrolled(0.0, 100.0),
+            Message::LintHover(None),
+            Message::LintCardHover(false),
+            Message::LintCloseCheck(0),
+            Message::FinderFiles(Vec::new()),
+            Message::FindResults(0, Ok(Vec::new())),
+        ] {
+            let _ = app.update(message);
+            assert_eq!(app.open_menu, Some(TopMenu::Edit));
+        }
+        // A real action closes it.
+        let _ = app.update(Message::ToggleSidebar);
+        assert_eq!(app.open_menu, None);
+    }
+
+    #[test]
     fn the_recents_submenu_opens_and_closes_with_the_menu() {
         let mut app = app();
         let _ = app.handle(Message::ToggleMenu(TopMenu::File));
@@ -91,7 +114,8 @@ mod behavior_tests {
         assert!(!app.sidebar_resizing);
         let _ = app.handle(Message::SidebarResizeStart);
         assert!(app.sidebar_resizing);
-        let gap = se_theme::PANEL_GAP;
+        // The list starts after a gap, the bar of panels and another gap.
+        let gap = se_theme::PANEL_GAP * 2.0 + super::ACTIVITY_WIDTH;
         let _ = app.handle(Message::SidebarResize(300.0 + gap));
         assert_eq!(app.sidebar_width, 300.0);
         // Never thinner than the names need, nor wider than the window allows.
@@ -235,6 +259,299 @@ mod behavior_tests {
             text_editor::Action::Move(text_editor::Motion::Down),
         ));
         assert_eq!(app.split.as_ref().unwrap().active, second);
+    }
+
+    #[test]
+    fn a_folder_added_becomes_a_project_that_is_kept_and_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        let mut app = app();
+        let _ = app.update(Message::ProjectPicked(Some(dir.path().to_path_buf())));
+        assert_eq!(app.projects.roots, vec![dir.path().to_path_buf()]);
+        assert_eq!(
+            app.config.projects, app.projects.roots,
+            "kept in the settings"
+        );
+        // A folder of the tree opens, and the settings remember it.
+        let src = dir.path().join("src");
+        let _ = app.update(Message::ToggleProjectFolder(src.clone()));
+        assert!(app.config.projects_open.contains(&src));
+        assert!(app
+            .projects
+            .rows()
+            .iter()
+            .any(|r| r.entry.name == "main.rs"));
+        // The same folder again, or none chosen: nothing changes.
+        let _ = app.update(Message::ProjectPicked(Some(dir.path().to_path_buf())));
+        let _ = app.update(Message::ProjectPicked(None));
+        assert_eq!(app.projects.roots.len(), 1);
+        // A file of the tree opens like any file of the list.
+        let file = src.join("main.rs");
+        let _ = app.update(Message::Sidebar(crate::sidebar::SidebarMessage::OpenFile(
+            file.clone(),
+        )));
+        assert_eq!(app.pending_open.as_ref(), Some(&file));
+        // A file of the list can be shown in the tree: its folders open.
+        let _ = app.update(Message::ToggleProjectFolder(src.clone()));
+        assert!(!app
+            .projects
+            .rows()
+            .iter()
+            .any(|r| r.entry.name == "main.rs"));
+        let _ = app.update(Message::ShowInProjects(file.clone()));
+        assert!(app
+            .projects
+            .rows()
+            .iter()
+            .any(|r| r.entry.name == "main.rs"));
+        // What appears on the disk shows up by itself.
+        std::fs::write(src.join("lib.rs"), "").unwrap();
+        let _ = app.update(Message::RefreshProjects);
+        assert!(app.projects.rows().iter().any(|r| r.entry.name == "lib.rs"));
+        // The next run starts with the same projects, folders open as they were.
+        let again = SimpleEditApp::blank(app.config.clone());
+        assert_eq!(again.projects.roots, app.projects.roots);
+        assert!(again
+            .projects
+            .rows()
+            .iter()
+            .any(|r| r.entry.name == "main.rs"));
+        // Taking it out of the sidebar deletes nothing.
+        let _ = app.update(Message::RemoveProject(dir.path().to_path_buf()));
+        assert!(app.projects.roots.is_empty() && app.config.projects.is_empty());
+        assert!(file.is_file());
+    }
+
+    #[test]
+    fn the_bar_shows_one_panel_at_a_time_and_remembers_it() {
+        use crate::sidebar::Panel;
+        let mut app = app();
+        assert!(app.panels.files && !app.panels.projects);
+        // Asking for the other one takes its place.
+        let _ = app.update(Message::TogglePanel(Panel::Projects));
+        assert!(!app.panels.files && app.panels.projects);
+        assert!(app.config.show_projects_panel && !app.config.show_files_panel);
+        let _ = app.update(Message::TogglePanel(Panel::Files));
+        assert!(app.panels.files && !app.panels.projects);
+        // Asking for the one that is open closes it.
+        let _ = app.update(Message::TogglePanel(Panel::Files));
+        assert!(!app.panels.files && !app.panels.projects);
+        // The sidebar was hidden: asking for a panel shows it again.
+        app.show_sidebar = false;
+        let _ = app.update(Message::TogglePanel(Panel::Projects));
+        assert!(app.show_sidebar && app.panels.projects && app.config.show_sidebar);
+        // The next run starts as it was left.
+        let again = SimpleEditApp::blank(app.config.clone());
+        assert!(!again.panels.files && again.panels.projects);
+        // An old setting with both open keeps the projects, once there are some.
+        let mut old = Config {
+            show_files_panel: true,
+            show_projects_panel: true,
+            ..Config::default()
+        };
+        let none = SimpleEditApp::blank(old.clone());
+        assert!(none.panels.files && !none.panels.projects);
+        old.projects = vec![PathBuf::from("/tmp")];
+        let some = SimpleEditApp::blank(old);
+        assert!(!some.panels.files && some.panels.projects);
+    }
+
+    #[test]
+    fn a_tab_dragged_elsewhere_keeps_its_new_place() {
+        let mut app = app();
+        for name in ["a", "b", "c", "d"] {
+            let _ = app.update(Message::TabRead(Ok(Loaded {
+                path: PathBuf::from(format!("/s/{name}.txt")),
+                text: String::new(),
+                format: TextFormat::default(),
+                stamp: None,
+            })));
+        }
+        let order = |app: &SimpleEditApp| -> Vec<String> {
+            app.sidebar
+                .files()
+                .iter()
+                .filter(|p| p.starts_with("/s"))
+                .map(|p| p.file_stem().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        let first = app
+            .sidebar
+            .files()
+            .iter()
+            .position(|p| p.starts_with("/s"))
+            .unwrap();
+        let _ = app.update(Message::TabMoved(first, first + 3));
+        assert_eq!(order(&app), ["b", "c", "d", "a"]);
+        // It is the order that is saved.
+        let saved: Vec<String> = app
+            .build_session()
+            .files
+            .iter()
+            .filter(|f| f.path.starts_with("/s"))
+            .map(|f| f.path.clone())
+            .collect();
+        assert_eq!(saved, ["/s/b.txt", "/s/c.txt", "/s/d.txt", "/s/a.txt"]);
+    }
+
+    fn open_named(app: &mut SimpleEditApp, path: &Path) {
+        let _ = app.update(Message::TabRead(Ok(Loaded {
+            path: path.to_path_buf(),
+            text: String::new(),
+            format: TextFormat::default(),
+            stamp: None,
+        })));
+    }
+
+    #[test]
+    fn a_file_of_the_tree_opens_in_the_preview_tab_until_it_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            std::fs::write(dir.path().join(name), "x\n").unwrap();
+        }
+        let (a, b, c) = (
+            dir.path().join("a.rs"),
+            dir.path().join("b.rs"),
+            dir.path().join("c.rs"),
+        );
+        let mut app = app();
+        let _ = app.update(Message::TreeOpenFile(a.clone()));
+        assert_eq!(app.preview_tab.as_ref(), Some(&a));
+        open_named(&mut app, &a);
+        // Another file of the tree takes its tab, at its place.
+        let place = app.sidebar.files().iter().position(|p| *p == a).unwrap();
+        app.tree_click = None;
+        let _ = app.update(Message::TreeOpenFile(b.clone()));
+        open_named(&mut app, &b);
+        assert!(
+            !app.sidebar.files().contains(&a),
+            "the preview was replaced"
+        );
+        assert_eq!(
+            app.sidebar.files().iter().position(|p| *p == b),
+            Some(place)
+        );
+        assert_eq!(app.preview_tab.as_ref(), Some(&b));
+        // Edited, it stays: the next file gets a tab of its own.
+        let _ = app.update(Message::EditorAction(text_editor::Action::Edit(
+            text_editor::Edit::Insert('y'),
+        )));
+        assert_eq!(app.preview_tab, None);
+        app.tree_click = None;
+        let _ = app.update(Message::TreeOpenFile(c.clone()));
+        open_named(&mut app, &c);
+        assert!(app.sidebar.files().contains(&b) && app.sidebar.files().contains(&c));
+        // Clicked twice at once, it is kept.
+        let _ = app.update(Message::TreeOpenFile(c.clone()));
+        assert_eq!(app.preview_tab, None);
+        // Or from the menu of its tab.
+        app.preview_tab = Some(c.clone());
+        let _ = app.update(Message::KeepTab);
+        assert_eq!(app.preview_tab, None);
+        // Or with two clicks on its tab (on another tab, nothing changes).
+        app.preview_tab = Some(c.clone());
+        let at = app.sidebar.files().iter().position(|p| *p == c).unwrap();
+        let other = app.sidebar.files().iter().position(|p| *p == b).unwrap();
+        let _ = app.update(Message::TabDoubleClick(other));
+        assert_eq!(app.preview_tab.as_ref(), Some(&c));
+        let _ = app.update(Message::TabDoubleClick(at));
+        assert_eq!(app.preview_tab, None);
+    }
+
+    #[test]
+    fn tabs_close_with_the_middle_button_and_come_back_with_ctrl_shift_t() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.rs"), dir.path().join("b.rs"));
+        std::fs::write(&a, "").unwrap();
+        std::fs::write(&b, "").unwrap();
+        let mut app = app();
+        open_named(&mut app, &a);
+        open_named(&mut app, &b);
+        let at = app.sidebar.files().iter().position(|p| *p == a).unwrap();
+        let _ = app.update(Message::CloseTabAt(at));
+        assert!(!app.sidebar.files().contains(&a));
+        let _ = app.update(Message::ReopenTab);
+        assert_eq!(app.pending_open.as_ref(), Some(&a));
+        // Nothing left to open again: nothing happens.
+        open_named(&mut app, &a);
+        app.pending_open = None;
+        let _ = app.update(Message::ReopenTab);
+        assert_eq!(app.pending_open, None);
+    }
+
+    #[test]
+    fn ctrl_tab_goes_to_the_tabs_seen_before_while_ctrl_is_held() {
+        let mut app = app();
+        let tab = |n: &str| PathBuf::from(format!("/s/{n}.txt"));
+        for name in ["a", "b", "c"] {
+            open_named(&mut app, &tab(name));
+        }
+        // Seen in the order a, b, c; then b again: b, c, a from the latest.
+        let _ = app.update(Message::Sidebar(crate::sidebar::SidebarMessage::OpenFile(
+            tab("b"),
+        )));
+        let ctrl_tab = |app: &mut SimpleEditApp, shift: bool| {
+            let _ = app.update(Message::KeyPressed {
+                key: "Tab".into(),
+                ctrl: true,
+                shift,
+                alt: false,
+            });
+        };
+        ctrl_tab(&mut app, false);
+        assert_eq!(app.current_file, Some(tab("c")), "the one seen before");
+        ctrl_tab(&mut app, false);
+        assert_eq!(app.current_file, Some(tab("a")), "Ctrl still held: older");
+        ctrl_tab(&mut app, true);
+        assert_eq!(app.current_file, Some(tab("c")), "and back");
+        // Ctrl let go: the tab reached is now the latest.
+        let _ = app.update(Message::ModifiersChanged {
+            ctrl: false,
+            alt: false,
+            shift: false,
+        });
+        ctrl_tab(&mut app, false);
+        assert_eq!(app.current_file, Some(tab("b")));
+    }
+
+    #[test]
+    fn the_list_of_tabs_opens_under_its_button_and_a_pick_closes_it() {
+        let mut app = app();
+        let file = PathBuf::from("/s/a.txt");
+        open_named(&mut app, &file);
+        let _ = app.update(Message::OpenTabList(iced::Point::new(900.0, 40.0)));
+        assert!(app.tab_list.is_some());
+        let _ = app.update(Message::CloseTabList);
+        assert!(app.tab_list.is_none());
+        let _ = app.update(Message::OpenTabList(iced::Point::new(900.0, 40.0)));
+        let _ = app.update(Message::PickTab(file.clone()));
+        assert!(app.tab_list.is_none());
+        assert_eq!(app.current_file, Some(file));
+    }
+
+    #[test]
+    fn showing_a_file_in_the_tree_brings_the_projects_up() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "").unwrap();
+        let mut app = app();
+        let _ = app.update(Message::ProjectPicked(Some(dir.path().to_path_buf())));
+        // The files were on show, the sidebar hidden.
+        app.panels = crate::sidebar::Panels {
+            files: true,
+            projects: false,
+        };
+        app.show_sidebar = false;
+        let file = dir.path().join("src/main.rs");
+        let _ = app.update(Message::ShowInProjects(file.clone()));
+        assert!(app.show_sidebar && app.panels.projects && !app.panels.files);
+        assert!(app.config.show_projects_panel && !app.config.show_files_panel);
+        assert!(app.projects.rows().iter().any(|r| r.entry.path == file));
+        // A file that is in no project: nothing happens.
+        let _ = app.update(Message::TogglePanel(crate::sidebar::Panel::Files));
+        let _ = app.update(Message::ShowInProjects(PathBuf::from("/elsewhere/x.rs")));
+        assert!(app.panels.files && !app.panels.projects);
     }
 
     #[test]

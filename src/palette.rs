@@ -15,6 +15,10 @@ use crate::theme;
 pub enum PaletteCommand {
     NewFile,
     OpenFile,
+    AddProject,
+    GotoFile,
+    FindInFiles,
+    ReopenTab,
     SaveFile,
     SaveFileAs,
     CloseFile,
@@ -56,6 +60,10 @@ impl PaletteCommand {
         match self {
             PaletteCommand::NewFile => Message::NewFile,
             PaletteCommand::OpenFile => Message::OpenFile,
+            PaletteCommand::AddProject => Message::AddProject,
+            PaletteCommand::GotoFile => Message::OpenGotoFile,
+            PaletteCommand::FindInFiles => Message::OpenFindInFiles,
+            PaletteCommand::ReopenTab => Message::ReopenTab,
             PaletteCommand::Find => Message::ToggleSearch,
             PaletteCommand::FormatCode => Message::FormatFile,
             PaletteCommand::GotoLine => Message::OpenGotoLine,
@@ -149,6 +157,30 @@ pub fn entries(config: &Config, has_formatter: bool, language_enabled: bool) -> 
             PaletteCommand::OpenFile,
             t!("palette.open_file").to_string(),
             Some(sh.open_file.display()),
+            true,
+        ),
+        entry(
+            PaletteCommand::AddProject,
+            t!("menu.file_add_project").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::GotoFile,
+            t!("shortcuts.goto_file").to_string(),
+            Some(sh.goto_file.display()),
+            true,
+        ),
+        entry(
+            PaletteCommand::FindInFiles,
+            t!("shortcuts.find_in_files").to_string(),
+            Some(sh.find_in_files.display()),
+            true,
+        ),
+        entry(
+            PaletteCommand::ReopenTab,
+            t!("shortcuts.reopen_tab").to_string(),
+            Some(sh.reopen_tab.display()),
             true,
         ),
         entry(

@@ -182,6 +182,11 @@ impl SimpleEditApp {
             | ActiveOverlay::ConfirmQuit(_)
             | ActiveOverlay::ConfirmScratchDelete(_)
             | ActiveOverlay::ConfirmFileDelete(..)
+            | ActiveOverlay::ProjectName(_)
+            | ActiveOverlay::GotoFile
+            | ActiveOverlay::FindInFiles
+            | ActiveOverlay::ConfirmFolderDelete(_)
+            | ActiveOverlay::ConfirmMove(..)
             | ActiveOverlay::BranchSwitch(_)
             | ActiveOverlay::GitFile(_)
             | ActiveOverlay::GitPick(_)
@@ -326,69 +331,6 @@ impl SimpleEditApp {
         )
         .width(320)
         .style(se_theme::card(dark))
-        .into()
-    }
-
-    /// The block under the file list: buttons that show or hide the terminal
-    /// and the scratch files.
-    pub(super) fn terminal_button(&self, dark: bool) -> Element<'_, Message> {
-        let tool = |label: Element<'static, Message>, open: bool, msg: Message| {
-            button(container(label).center_x(Length::Fill))
-                .padding([5, 10])
-                .width(Length::Fill)
-                .on_press(msg)
-                // Open: the accent wash; closed: an outline, so it reads as a button.
-                .style(move |theme: &iced::Theme, status| {
-                    if open {
-                        (se_theme::GhostButton { dark, active: true }).style()(theme, status)
-                    } else {
-                        (se_theme::Outline { dark }).style()(theme, status)
-                    }
-                })
-        };
-        container(
-            row![
-                tool(
-                    text(">_").size(13).font(se_theme::MONO).into(),
-                    self.terminal.open,
-                    Message::ToggleTerminal
-                ),
-                tool(
-                    crate::scratch::icon(if self.scratch.open {
-                        se_theme::palette(dark).accent
-                    } else {
-                        se_theme::palette(dark).text
-                    }),
-                    self.scratch.open,
-                    Message::ToggleScratch
-                ),
-                tool(
-                    super::bookmark_panel::ribbon(
-                        if self.bookmark_panel.open {
-                            se_theme::palette(dark).accent
-                        } else {
-                            se_theme::palette(dark).text
-                        },
-                        false
-                    ),
-                    self.bookmark_panel.open,
-                    Message::ToggleBookmarkPanel
-                ),
-                tool(
-                    crate::git_panel::icon::branch(if self.git.open {
-                        se_theme::palette(dark).accent
-                    } else {
-                        se_theme::palette(dark).text
-                    }),
-                    self.git.open,
-                    Message::ToggleGit
-                ),
-            ]
-            .spacing(6),
-        )
-        .padding([6, 10])
-        .width(Length::Fill)
-        .style(se_theme::panel(dark))
         .into()
     }
 
@@ -1048,3 +990,320 @@ pub(crate) fn resize_edge<'a>(dark: bool) -> Element<'a, Message> {
     .interaction(iced::mouse::Interaction::ResizingVertically)
     .into()
 }
+
+impl SimpleEditApp {
+    /// The narrow bar at the left: a button for each panel of the sidebar.
+    pub(super) fn activity_bar(&self, dark: bool) -> Element<'_, Message> {
+        let p = se_theme::palette(dark);
+        let tool = |icon: Element<'static, Message>,
+                    open: bool,
+                    tip: String,
+                    msg: Message|
+         -> Element<'_, Message> {
+            let button = button(container(icon).center_x(Length::Fill))
+                .padding([7, 0])
+                .width(Length::Fill)
+                .on_press(msg)
+                .style(move |theme: &iced::Theme, status| {
+                    if open {
+                        (se_theme::GhostButton { dark, active: true }).style()(theme, status)
+                    } else {
+                        (se_theme::Outline { dark }).style()(theme, status)
+                    }
+                });
+            iced::widget::tooltip(
+                button,
+                container(text(tip).size(12))
+                    .padding([4, 8])
+                    .style(se_theme::tooltip(dark)),
+                iced::widget::tooltip::Position::Right,
+            )
+            .gap(6)
+            .delay(std::time::Duration::from_millis(400))
+            .into()
+        };
+        let shown = |on: bool| if on { p.accent } else { p.text };
+        // The panels of the sidebar at the top, the tools that open under the
+        // editor at the bottom.
+        container(
+            column![
+                tool(
+                    crate::sidebar::icons::files(shown(self.panels.files)),
+                    self.panels.files,
+                    t!("sidebar.files").to_string(),
+                    Message::TogglePanel(crate::sidebar::Panel::Files),
+                ),
+                tool(
+                    crate::sidebar::icons::folder(shown(self.panels.projects)),
+                    self.panels.projects,
+                    t!("sidebar.projects").to_string(),
+                    Message::TogglePanel(crate::sidebar::Panel::Projects),
+                ),
+                Space::new().height(Length::Fill),
+                tool(
+                    text(">_")
+                        .size(13)
+                        .font(se_theme::MONO)
+                        .color(shown(self.terminal.open))
+                        .into(),
+                    self.terminal.open,
+                    t!("terminal.title").to_string(),
+                    Message::ToggleTerminal,
+                ),
+                tool(
+                    crate::scratch::icon(shown(self.scratch.open)),
+                    self.scratch.open,
+                    t!("scratch.title").to_string(),
+                    Message::ToggleScratch,
+                ),
+                tool(
+                    super::bookmark_panel::ribbon(shown(self.bookmark_panel.open), false),
+                    self.bookmark_panel.open,
+                    t!("bookmarks.title").to_string(),
+                    Message::ToggleBookmarkPanel,
+                ),
+                tool(
+                    crate::git_panel::icon::branch(shown(self.git.open)),
+                    self.git.open,
+                    t!("git.title").to_string(),
+                    Message::ToggleGit,
+                ),
+            ]
+            .spacing(6),
+        )
+        .padding([8, 6])
+        .width(Length::Fixed(super::ACTIVITY_WIDTH))
+        .height(Length::Fill)
+        .style(se_theme::panel(dark))
+        .into()
+    }
+
+    /// The open files as tabs above the editor.
+    pub(super) fn tab_bar(&self, dark: bool) -> Element<'_, Message> {
+        use crate::sidebar::SidebarMessage;
+        let p = se_theme::palette(dark);
+        let files = self.sidebar.files();
+        let labels = unique_labels(files);
+        let dirty = self.dirty_files();
+        let tabs: Vec<Element<Message>> = files
+            .iter()
+            .zip(labels)
+            .map(|(path, name)| {
+                let active = self.current_file.as_ref() == Some(path);
+                let preview = self.preview_tab.as_ref() == Some(path);
+                // Its kind, as the list of files shows it.
+                let ext = if is_untitled(path) {
+                    String::new()
+                } else {
+                    path.extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("")
+                        .to_lowercase()
+                };
+                let mut label = row![
+                    text(ext).size(9.5).font(se_theme::MONO).color(if active {
+                        p.accent
+                    } else {
+                        p.muted
+                    }),
+                    text(name)
+                        .size(12.5)
+                        .shaping(iced::widget::text::Shaping::Advanced)
+                        // The preview tab, in italics: the next file opened
+                        // from the tree takes its place.
+                        .font(if preview {
+                            se_theme::UI_ITALIC
+                        } else {
+                            iced::Font::DEFAULT
+                        })
+                        // How it stands in Git, as in the tree.
+                        .color(
+                            crate::sidebar::state_color(self.file_marks.git(path, false), dark)
+                                .unwrap_or(if active { p.text } else { p.muted })
+                        )
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center);
+                if self.file_marks.has_errors(path, false) {
+                    label = label.push(crate::sidebar::error_dot(dark));
+                }
+                if dirty.contains(path) {
+                    label = label.push(
+                        container(Space::new().width(6).height(6)).style(se_theme::dot(p.accent)),
+                    );
+                }
+                label = label.push(
+                    button(text("×").size(13).color(p.muted))
+                        .padding([0, 4])
+                        .on_press(Message::Sidebar(SidebarMessage::RemoveFile(path.clone())))
+                        .style(
+                            (se_theme::GhostButton {
+                                dark,
+                                active: false,
+                            })
+                            .style(),
+                        ),
+                );
+                let tab = button(label)
+                    .padding([8, 12])
+                    .on_press(Message::Sidebar(SidebarMessage::OpenFile(path.clone())))
+                    .style((se_theme::GhostButton { dark, active }).style());
+                // The tab that is open is underlined.
+                let accent = p.accent;
+                let underline = container(Space::new().height(2)).width(Length::Fill).style(
+                    move |_: &iced::Theme| container::Style {
+                        background: active.then_some(iced::Background::Color(accent)),
+                        ..container::Style::default()
+                    },
+                );
+                let menu_path = path.clone();
+                let labels = (
+                    t!("sidebar.close").to_string(),
+                    t!("menu.file_close_others").to_string(),
+                    t!("menu.file_close_all").to_string(),
+                    t!("sidebar.show_in_tree").to_string(),
+                    t!("sidebar.copy_path").to_string(),
+                    t!("tabs.keep").to_string(),
+                );
+                let in_project = self.projects.roots.iter().any(|r| path.starts_with(r));
+                let untitled = is_untitled(path);
+                let with_menu = crate::pointer_area::context_menu(tab, move || {
+                    let item = |label: String, msg: Option<Message>| -> Element<'static, Message> {
+                        let mut b = button(text(label).size(13))
+                            .padding([7, 10])
+                            .width(Length::Fixed(190.0))
+                            .style(
+                                (se_theme::MenuItem {
+                                    dark,
+                                    radius: se_theme::R_SM,
+                                    highlighted: false,
+                                })
+                                .style(),
+                            );
+                        if let Some(m) = msg {
+                            b = b.on_press(m);
+                        }
+                        b.into()
+                    };
+                    container(
+                        column![
+                            item(
+                                labels.0.clone(),
+                                Some(Message::Sidebar(SidebarMessage::RemoveFile(
+                                    menu_path.clone()
+                                )))
+                            ),
+                            item(
+                                labels.1.clone(),
+                                Some(Message::CloseTabs(Some(menu_path.clone())))
+                            ),
+                            item(labels.2.clone(), Some(Message::CloseTabs(None))),
+                            item(
+                                labels.3.clone(),
+                                in_project.then(|| Message::ShowInProjects(menu_path.clone()))
+                            ),
+                            item(
+                                labels.4.clone(),
+                                (!untitled).then(|| Message::CopyPath(menu_path.clone()))
+                            ),
+                            item(labels.5.clone(), preview.then_some(Message::KeepTab)),
+                        ]
+                        .spacing(1)
+                        .padding(6),
+                    )
+                    .style(se_theme::card(dark))
+                    .into()
+                });
+                column![with_menu, underline].into()
+            })
+            .collect();
+        // The bar scrolls with the wheel and its tabs are dragged to reorder
+        // them, all inside the widget so that it follows the pointer.
+        let active = files
+            .iter()
+            .position(|p| Some(p) == self.current_file.as_ref());
+        let strip = crate::tab_strip::tab_strip(
+            tabs,
+            active,
+            Message::TabMoved,
+            p.elevated,
+            iced::Color { a: 0.45, ..p.muted },
+        )
+        .on_close(Message::CloseTabAt)
+        .on_double_click(Message::TabDoubleClick);
+        // Every tab in a list, for when they don't all fit.
+        let list = crate::pointer_area::pointer_area(
+            iced::widget::mouse_area(
+                container(text("⌄").size(14).color(p.muted))
+                    .padding([6, 10])
+                    .center_y(Length::Shrink),
+            )
+            .interaction(iced::mouse::Interaction::Pointer),
+        )
+        .on_press_in_window(Message::OpenTabList);
+        row![strip, list].align_y(Alignment::Center).into()
+    }
+}
+
+impl SimpleEditApp {
+    /// The list of every open tab, under its button.
+    pub(super) fn tab_list_view(&self, dark: bool) -> Element<'_, Message> {
+        let p = se_theme::palette(dark);
+        let files = self.sidebar.files();
+        let labels = unique_labels(files);
+        let dirty = self.dirty_files();
+        let rows: Vec<Element<Message>> = files
+            .iter()
+            .zip(labels)
+            .map(|(path, name)| {
+                let current = self.current_file.as_ref() == Some(path);
+                let folder = path
+                    .parent()
+                    .filter(|_| !is_untitled(path))
+                    .map(short_dir)
+                    .unwrap_or_default();
+                let mut line = row![
+                    text(name)
+                        .size(13)
+                        .shaping(iced::widget::text::Shaping::Advanced)
+                        .color(if current { p.accent } else { p.text }),
+                    text(folder)
+                        .size(11.5)
+                        .color(p.muted)
+                        .shaping(iced::widget::text::Shaping::Advanced),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center);
+                if dirty.contains(path) {
+                    line = line.push(
+                        container(Space::new().width(6).height(6)).style(se_theme::dot(p.accent)),
+                    );
+                }
+                button(line)
+                    .padding([6, 10])
+                    .width(Length::Fill)
+                    .on_press(Message::PickTab(path.clone()))
+                    .style(
+                        (se_theme::MenuItem {
+                            dark,
+                            radius: se_theme::R_SM,
+                            highlighted: current,
+                        })
+                        .style(),
+                    )
+                    .into()
+            })
+            .collect();
+        container(
+            scrollable(column(rows).spacing(1).padding(6))
+                .style(se_theme::Scrollbar { dark }.style()),
+        )
+        .width(Length::Fixed(TAB_LIST_WIDTH))
+        .max_height(420)
+        .style(se_theme::card(dark))
+        .into()
+    }
+}
+
+/// Width of the list of open tabs.
+pub(super) const TAB_LIST_WIDTH: f32 = 340.0;

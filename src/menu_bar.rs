@@ -273,6 +273,30 @@ fn menu_items(
                     dark,
                     Message::OpenFile,
                 ),
+                item(
+                    t!("menu.file_add_project").to_string(),
+                    None,
+                    dark,
+                    Message::AddProject,
+                ),
+                item(
+                    t!("shortcuts.goto_file").to_string(),
+                    sc(&sh.goto_file),
+                    dark,
+                    Message::OpenGotoFile,
+                ),
+                item(
+                    t!("shortcuts.find_in_files").to_string(),
+                    sc(&sh.find_in_files),
+                    dark,
+                    Message::OpenFindInFiles,
+                ),
+                item(
+                    t!("shortcuts.reopen_tab").to_string(),
+                    sc(&sh.reopen_tab),
+                    dark,
+                    Message::ReopenTab,
+                ),
             ];
 
             items.push(separator(dark));

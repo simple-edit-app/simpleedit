@@ -17,6 +17,7 @@ use crate::{
 #[derive(Debug, Clone)]
 pub enum PreferencesMessage {
     PageSelected(PrefsPage),
+    ExcludeTyped(String),
     FontSizeChanged(f32),
     TabWidthChanged(usize),
     UseSpacesToggled(bool),
@@ -146,6 +147,8 @@ pub struct ServerStatus {
 pub struct PreferencesState {
     pub page: PrefsPage,
     pub scratch_draft: String,
+    /// The names left out of the trees, as typed.
+    pub exclude_draft: String,
 }
 
 impl PreferencesState {
@@ -153,6 +156,7 @@ impl PreferencesState {
         Self {
             page: PrefsPage::Editor,
             scratch_draft: config.scratch_dir.clone(),
+            exclude_draft: config.projects_exclude.join(", "),
         }
     }
 
@@ -160,6 +164,10 @@ impl PreferencesState {
     /// navigation doesn't touch it).
     pub fn update(&mut self, msg: PreferencesMessage, config: &mut Config) -> bool {
         match msg {
+            PreferencesMessage::ExcludeTyped(v) => {
+                self.exclude_draft = v;
+                return false;
+            }
             PreferencesMessage::PageSelected(page) => {
                 self.page = page;
                 return false;
@@ -291,6 +299,7 @@ impl PreferencesState {
         let page: Element<Message> = match self.page {
             PrefsPage::Editor => column![
                 self.editor_card(config, dark),
+                self.projects_card(config, dark),
                 self.scratch_card(dark),
                 self.language_card(config, dark)
             ]
@@ -504,6 +513,41 @@ impl PreferencesState {
     }
 
     /// Where scratch files are kept.
+    /// What the trees of the projects (and the finders) leave out.
+    fn projects_card(&self, config: &Config, dark: bool) -> Element<'_, Message> {
+        let field = text_input("node_modules/, *.log, dist/", &self.exclude_draft)
+            .on_input(|v| Message::Preferences(PreferencesMessage::ExcludeTyped(v)))
+            .on_submit(Message::SetProjectsExclude(self.exclude_draft.clone()))
+            .padding([6, 10])
+            .size(13)
+            .width(260)
+            .style(theme::Field::new(dark).style());
+        let apply = button(text(t!("prefs.apply").to_string()).size(12))
+            .padding([6, 12])
+            .on_press(Message::SetProjectsExclude(self.exclude_draft.clone()))
+            .style((theme::Outline { dark }).style());
+        card_of_rows(
+            dark,
+            vec![
+                setting_row(
+                    t!("sidebar.hide_ignored").to_string(),
+                    switch(
+                        dark,
+                        config.projects_hide_ignored,
+                        Message::ToggleHideIgnored,
+                    ),
+                ),
+                setting_row(
+                    t!("prefs.projects_exclude").to_string(),
+                    row![field, apply]
+                        .spacing(8)
+                        .align_y(Alignment::Center)
+                        .into(),
+                ),
+            ],
+        )
+    }
+
     fn scratch_card(&self, dark: bool) -> Element<'_, Message> {
         let field = text_input(
             crate::scratch::default_dir().to_string_lossy().as_ref(),
@@ -819,6 +863,21 @@ pub fn shortcuts_list(
             ShortcutTarget::BookmarkPanel,
             t!("shortcuts.bookmark_panel").to_string(),
             sc.bookmark_panel.display(),
+        ),
+        (
+            ShortcutTarget::GotoFile,
+            t!("shortcuts.goto_file").to_string(),
+            sc.goto_file.display(),
+        ),
+        (
+            ShortcutTarget::FindInFiles,
+            t!("shortcuts.find_in_files").to_string(),
+            sc.find_in_files.display(),
+        ),
+        (
+            ShortcutTarget::ReopenTab,
+            t!("shortcuts.reopen_tab").to_string(),
+            sc.reopen_tab.display(),
         ),
         (
             ShortcutTarget::ToggleFold,

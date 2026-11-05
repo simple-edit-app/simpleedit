@@ -36,6 +36,9 @@ pub enum ShortcutTarget {
     GitPull,
     GitBranches,
     BookmarkPanel,
+    GotoFile,
+    FindInFiles,
+    ReopenTab,
 }
 
 /// How a key is named to the user.
@@ -207,6 +210,9 @@ pub struct Shortcuts {
     pub git_pull: ShortcutConfig,
     pub git_branches: ShortcutConfig,
     pub bookmark_panel: ShortcutConfig,
+    pub goto_file: ShortcutConfig,
+    pub find_in_files: ShortcutConfig,
+    pub reopen_tab: ShortcutConfig,
 }
 
 /// Back and forward, as the IDEs do: Ctrl+Alt+←/→ on Windows, ⌘[ / ⌘] on
@@ -298,6 +304,9 @@ shortcut_slots! {
     GitPull => git_pull,
     GitBranches => git_branches,
     BookmarkPanel => bookmark_panel,
+    GotoFile => goto_file,
+    FindInFiles => find_in_files,
+    ReopenTab => reopen_tab,
 }
 
 impl Shortcuts {
@@ -358,6 +367,9 @@ impl Default for Shortcuts {
             git_pull: ShortcutConfig::ctrl("t"),
             git_branches: ShortcutConfig::ctrl_shift("b"),
             bookmark_panel: ShortcutConfig::shift("F11"),
+            goto_file: ShortcutConfig::ctrl_shift("n"),
+            find_in_files: ShortcutConfig::ctrl_shift("f"),
+            reopen_tab: ShortcutConfig::ctrl_shift("t"),
         }
     }
 }
@@ -437,6 +449,9 @@ pub struct Config {
     pub locale: String,
     /// Whether the file list is shown.
     pub show_sidebar: bool,
+    /// Which panels the bar beside the sidebar has open.
+    pub show_files_panel: bool,
+    pub show_projects_panel: bool,
     /// Width of the file list, in pixels (dragged by its right edge).
     pub sidebar_width: f32,
     /// How `pull` and `merge` are made in the Git panel.
@@ -481,6 +496,15 @@ pub struct Config {
     #[serde(default = "first_keymap")]
     pub shortcuts_version: u32,
     pub recent_files: Vec<String>,
+    /// The folders added to the sidebar as projects, and those of them that
+    /// are open in the tree.
+    pub projects: Vec<std::path::PathBuf>,
+    pub projects_open: Vec<std::path::PathBuf>,
+    /// What Git ignores is left out of the trees.
+    pub projects_hide_ignored: bool,
+    /// Names left out of the trees and of the finders: `*` for anything, a
+    /// trailing `/` for folders only.
+    pub projects_exclude: Vec<String>,
     /// Where scratch files are kept; empty: the default folder.
     pub scratch_dir: String,
 }
@@ -504,6 +528,8 @@ impl Default for Config {
             auto_save: true,
             locale: "en".to_string(),
             show_sidebar: true,
+            show_files_panel: true,
+            show_projects_panel: false,
             sidebar_width: 208.0,
             git_pull_mode: crate::git::PullMode::default(),
             git_merge_mode: crate::git::MergeMode::default(),
@@ -526,6 +552,10 @@ impl Default for Config {
             shortcuts: Shortcuts::default(),
             shortcuts_version: KEYMAP_VERSION,
             recent_files: Vec::new(),
+            projects: Vec::new(),
+            projects_open: Vec::new(),
+            projects_hide_ignored: false,
+            projects_exclude: Vec::new(),
             scratch_dir: String::new(),
         }
     }
