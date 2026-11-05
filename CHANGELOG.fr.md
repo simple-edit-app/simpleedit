@@ -1,5 +1,17 @@
 # Journal des modifications
 
+## [1.9.0] - 2026-11-05
+
+### Ajouté
+- Projets : les dossiers ajoutés à la sidebar (Fichier > Ajouter un dossier, ou le `+` du panneau Projets) s'affichent en arborescence, lue au fil de l'ouverture des dossiers et tenue à jour quand le disque change. Depuis l'arbre : nouveau fichier, nouveau dossier, renommer, dupliquer, supprimer (un dossier après confirmation), déplacer en glissant sur un dossier, copier le chemin, ouvrir un terminal ici, afficher dans le gestionnaire de fichiers, chercher dans ce dossier. Les flèches se déplacent dans l'arbre et Entrée ouvre. Tout replier, masquer ce que Git ignore, et des noms à exclure (`node_modules/, *.log`) dans Préférences > Éditeur.
+- Une barre à gauche ouvre le panneau Fichiers ou Projets (un à la fois) et regroupe les boutons du terminal, des fichiers scratch, des signets et de Git ; la barre sous la liste des fichiers disparaît.
+- Des onglets au-dessus de l'éditeur : ils défilent à la molette, se réordonnent en glissant, se ferment au clic du milieu, montrent le type de fichier, et une liste (`⌄`) les regroupe tous. Ctrl+Tab va à l'onglet vu avant (plus loin en gardant Ctrl), Ctrl+Maj+T rouvre l'onglet fermé. Un fichier ouvert depuis l'arbre prend un onglet d'aperçu (en italique), gardé dès qu'il est modifié ou ouvert d'un double-clic.
+- Aller à un fichier (Ctrl+Maj+N) : un fichier des projets retrouvé par son nom. Chercher dans les fichiers (Ctrl+Maj+F) : un texte dans tous les fichiers des projets, ou du dossier choisi dans l'arbre, avec la casse et les expressions régulières.
+- Les fichiers sont colorés selon leur état Git dans l'arbre et sur les onglets (modifié, nouveau, en conflit, ignoré), et un point rouge marque les fichiers où le lint a trouvé des erreurs.
+
+### Corrigé
+- Un menu ouvert ne se ferme plus tout seul pendant qu'on le parcourt à la souris.
+
 ## [1.8.1] - 2026-11-04
 
 ### Corrigé

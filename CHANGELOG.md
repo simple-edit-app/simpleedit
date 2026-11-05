@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.9.0] - 2026-11-05
+
+### Added
+- Projects: folders added to the sidebar (File > Add a folder, or the `+` of the Projects panel) are shown as trees, read as they are opened and followed as the disk changes. From the tree: new file, new folder, rename, duplicate, delete (a folder after a question), move by dragging onto a folder, copy the path, open a terminal there, show in the file manager, find in this folder. The arrows move in the tree and Enter opens. Fold everything, hide what Git ignores, and names to leave out (`node_modules/, *.log`) in Preferences > Editor.
+- A bar on the left opens the Files or the Projects panel (one at a time) and holds the buttons of the terminal, the scratch files, the bookmarks and Git; the bar under the file list is gone.
+- Tabs above the editor: they scroll with the wheel, are reordered by dragging, close with the middle button, show the kind of file, and a list (`⌄`) holds them all. Ctrl+Tab goes to the tab seen before (further while Ctrl is held), Ctrl+Shift+T opens the closed tab again. A file opened from the tree takes a preview tab (in italics), kept once it is edited or clicked twice.
+- Go to file (Ctrl+Shift+N): a file of the projects found by its name. Find in files (Ctrl+Shift+F): a text in every file of the projects, or of the folder picked in the tree, with case and regular expressions.
+- Files are colored by how they stand in Git in the tree and on the tabs (changed, new, in conflict, ignored), and a red dot marks the files where the lint found errors.
+
+### Fixed
+- An open menu no longer closes by itself while the pointer goes down it.
+
 ## [1.8.1] - 2026-11-04
 
 ### Fixed
