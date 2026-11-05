@@ -23,6 +23,10 @@ pub enum PreferencesMessage {
     UseSpacesToggled(bool),
     ShowLineNumbersToggled(bool),
     AutoIndentToggled(bool),
+    CompletionToggled(bool),
+    CompletionAutoToggled(bool),
+    /// A completion setting of a language (`rust.postfix`, …).
+    CompletionOption(String, bool),
     AutocompleteBracketsToggled(bool),
     AutocompleteQuotesToggled(bool),
     HighlightCurrentLineToggled(bool),
@@ -186,6 +190,15 @@ impl PreferencesState {
             }
             PreferencesMessage::AutoIndentToggled(v) => {
                 config.auto_indent = v;
+            }
+            PreferencesMessage::CompletionToggled(v) => {
+                config.completion_enabled = v;
+            }
+            PreferencesMessage::CompletionAutoToggled(v) => {
+                config.completion_auto = v;
+            }
+            PreferencesMessage::CompletionOption(key, v) => {
+                config.completion_options.insert(key, v);
             }
             PreferencesMessage::AutocompleteBracketsToggled(v) => {
                 config.autocomplete_brackets = v;
@@ -420,7 +433,45 @@ impl PreferencesState {
             setting_row(label, switch(dark, on, Message::Preferences(msg(!on))))
         };
 
-        let rows: Vec<Element<Message>> = vec![
+        // What each language's server proposes.
+        let option = |key: &str, label: String| {
+            let on = config.completion_options.get(key).copied().unwrap_or(true);
+            setting_row(
+                label,
+                switch(
+                    dark,
+                    on,
+                    Message::Preferences(PreferencesMessage::CompletionOption(
+                        key.to_string(),
+                        !on,
+                    )),
+                ),
+            )
+        };
+        let completion_options = vec![
+            option(
+                "typescript.auto_import",
+                t!("prefs.completion_ts_imports").to_string(),
+            ),
+            option(
+                "rust.auto_import",
+                t!("prefs.completion_rust_imports").to_string(),
+            ),
+            option(
+                "rust.postfix",
+                t!("prefs.completion_rust_postfix").to_string(),
+            ),
+            option(
+                "rust.call_arguments",
+                t!("prefs.completion_rust_arguments").to_string(),
+            ),
+            option(
+                "python.auto_import",
+                t!("prefs.completion_python_imports").to_string(),
+            ),
+        ];
+
+        let mut rows: Vec<Element<Message>> = vec![
             setting_row(t!("prefs.font_size").to_string(), font_size.into()),
             setting_row(t!("prefs.tab_width").to_string(), tab_width.into()),
             toggle(
@@ -437,6 +488,16 @@ impl PreferencesState {
                 t!("prefs.auto_indent").to_string(),
                 config.auto_indent,
                 PreferencesMessage::AutoIndentToggled,
+            ),
+            toggle(
+                t!("prefs.completion").to_string(),
+                config.completion_enabled,
+                PreferencesMessage::CompletionToggled,
+            ),
+            toggle(
+                t!("prefs.completion_auto").to_string(),
+                config.completion_auto,
+                PreferencesMessage::CompletionAutoToggled,
             ),
             toggle(
                 t!("prefs.autocomplete_brackets").to_string(),
@@ -478,6 +539,9 @@ impl PreferencesState {
                 PreferencesMessage::WordWrapToggled,
             ),
         ];
+        // The languages' settings come under the completion switches.
+        let after = rows.len().min(7);
+        rows.splice(after..after, completion_options);
 
         card_of_rows(dark, rows)
     }
@@ -873,6 +937,16 @@ pub fn shortcuts_list(
             ShortcutTarget::FindInFiles,
             t!("shortcuts.find_in_files").to_string(),
             sc.find_in_files.display(),
+        ),
+        (
+            ShortcutTarget::Complete,
+            t!("shortcuts.complete").to_string(),
+            sc.complete.display(),
+        ),
+        (
+            ShortcutTarget::ParameterInfo,
+            t!("shortcuts.parameter_info").to_string(),
+            sc.parameter_info.display(),
         ),
         (
             ShortcutTarget::ReopenTab,

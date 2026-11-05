@@ -328,6 +328,30 @@ const DIAG_DELAY: std::time::Duration = std::time::Duration::from_millis(350);
 
 type DiagHover<'a, Message> = Box<dyn Fn(Option<(usize, Point)>) -> Message + 'a>;
 
+/// A place of the text in the window: the bottom-left corner of its
+/// character and the height of a row (`None` when out of view).
+pub type Spot = Option<(Point, f32)>;
+
+/// What hears where the list of completions and the help on parameters
+/// hang in the window.
+type AnchorHeard<'a, Message> = Box<dyn Fn(Spot, Spot) -> Message + 'a>;
+
+/// Where the list of completions goes: the place of the text it is anchored
+/// to, and what hears where that place is in the window (the bottom-left
+/// corner of its character and the height of a row; `None` when it is
+/// scrolled out of view).
+pub struct CompletionHook<'a, Message> {
+    /// Where the list hangs, (line, byte column); `None`: no list, its keys
+    /// are the editor's.
+    pub anchor: Option<(usize, usize)>,
+    /// Where the help on the parameters of a call hangs.
+    pub hint: Option<(usize, usize)>,
+    /// The list's own area in the window: a click there leaves the focus in
+    /// the editor.
+    pub area: Option<Rectangle>,
+    pub on_anchor: AnchorHeard<'a, Message>,
+}
+
 /// A multi-line text input.
 #[allow(missing_debug_implementations)]
 pub struct CodeEditor<'a, Highlighter, Message, Theme = iced::Theme>
@@ -361,6 +385,8 @@ where
     on_definition: Option<Box<dyn Fn() -> Message + 'a>>,
     diagnostics: Option<DiagPaint>,
     on_diagnostic: Option<DiagHover<'a, Message>>,
+    /// The list of completions is open: its keys are left to it.
+    completion: Option<CompletionHook<'a, Message>>,
     style: Style,
     on_edit: Option<Box<dyn Fn(Action) -> Message + 'a>>,
     highlighter_settings: Highlighter::Settings,
@@ -393,6 +419,7 @@ impl<'a, Message, Theme> CodeEditor<'a, highlighter::PlainText, Message, Theme> 
             on_definition: None,
             diagnostics: None,
             on_diagnostic: None,
+            completion: None,
             style: Style {
                 background: Background::Color(Color::TRANSPARENT),
                 border: Border::default(),
@@ -509,6 +536,14 @@ where
         self
     }
 
+    /// The list of completions is open: the arrows, Page Up/Down, Enter, Tab
+    /// and Escape are its own (the editor leaves them), and the place it is
+    /// anchored to is followed in the window.
+    pub fn completion(mut self, hook: CompletionHook<'a, Message>) -> Self {
+        self.completion = Some(hook);
+        self
+    }
+
     /// Ctrl/Cmd+click on a name: the cursor is put there, then `on_definition`
     /// hears about it.
     pub fn on_definition(mut self, on_definition: impl Fn() -> Message + 'a) -> Self {
@@ -570,6 +605,7 @@ where
             on_definition: self.on_definition,
             diagnostics: self.diagnostics,
             on_diagnostic: self.on_diagnostic,
+            completion: self.completion,
             style: self.style,
             on_edit: self.on_edit,
             highlighter_settings: settings,
@@ -934,6 +970,46 @@ where
             // The most serious one when several overlap: the first listed.
             .map(|m| m.id)
             .next()
+    }
+
+    /// Where (line, byte `col`) is in the window: the bottom-left corner of
+    /// its character, and the height of a row; `None` out of view.
+    fn anchor_point(
+        &self,
+        (line, col): (usize, usize),
+        bounds: Rectangle,
+        padding: Padding,
+        renderer: &iced::Renderer,
+    ) -> Option<(Point, f32)> {
+        let internal = self.content.0.borrow();
+        let row = self
+            .line_height
+            .to_absolute(Pixels(self.size_px(renderer)))
+            .0;
+        internal
+            .editor
+            .buffer()
+            .layout_runs()
+            .filter(|run| run.line_i == line && run.line_height > 0.0)
+            .find_map(|run| {
+                let col = col.min(run.text.len());
+                let x = run
+                    .highlight(Cursor_::new(line, col), Cursor_::new(line, col))
+                    .map(|(x, _)| x)
+                    .or_else(|| {
+                        // An empty stretch has no box: the end of the run.
+                        let end = run.glyphs.last()?;
+                        (end.end <= col).then_some(end.x + end.w)
+                    })
+                    .or_else(|| run.glyphs.is_empty().then_some(0.0))?;
+                let y = run.line_top + row;
+                (y > 0.0 && y <= bounds.height - padding.top).then(|| {
+                    (
+                        Point::new(bounds.x + padding.left + x, bounds.y + padding.top + y),
+                        row,
+                    )
+                })
+            })
     }
 
     /// Where the card of a problem goes: under where it starts.
@@ -1525,6 +1601,9 @@ struct State<Highlighter: text::Highlighter> {
     hovered_diag: Option<usize>,
     diag_since: Option<std::time::Instant>,
     diag_shown: bool,
+    /// Where the list of completions and the help on parameters were last
+    /// said to be.
+    completion_anchor: Option<(Spot, Spot)>,
     highlighter: RefCell<Highlighter>,
     highlighter_settings: Highlighter::Settings,
     highlighter_format_address: usize,
@@ -1569,6 +1648,7 @@ where
             hovered_diag: None,
             diag_since: None,
             diag_shown: false,
+            completion_anchor: None,
             highlighter: RefCell::new(Highlighter::new(&self.highlighter_settings)),
             highlighter_settings: self.highlighter_settings.clone(),
             highlighter_format_address: self.highlighter_format as usize,
@@ -1670,6 +1750,44 @@ where
 
         if let Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) = event {
             state.modifiers = *modifiers;
+        }
+
+        if let Some(hook) = &self.completion {
+            // Where they go, told again whenever it moves.
+            let spot = |at: Option<(usize, usize)>| {
+                at.and_then(|at| self.anchor_point(at, layout.bounds(), padding, renderer))
+            };
+            let spots = (spot(hook.anchor), spot(hook.hint));
+            if state.completion_anchor != Some(spots) {
+                state.completion_anchor = Some(spots);
+                shell.publish((hook.on_anchor)(spots.0, spots.1));
+            }
+            // The list takes its keys; the help on parameters only Escape
+            // (which closes it rather than leave the editor).
+            let taken = if hook.anchor.is_some() {
+                completion_key(event)
+            } else {
+                matches!(
+                    event,
+                    Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(key::Named::Escape),
+                        ..
+                    })
+                )
+            };
+            if taken {
+                return;
+            }
+            // A click on the list is not a click outside the editor.
+            if let (Event::Mouse(mouse::Event::ButtonPressed(_)), Some(area), Some(at)) =
+                (event, hook.area, cursor.land().position())
+            {
+                if area.contains(at) {
+                    return;
+                }
+            }
+        } else {
+            state.completion_anchor = None;
         }
 
         if self.annotations.is_some() {
@@ -2898,6 +3016,28 @@ impl Update {
     }
 }
 
+/// A key the open list of completions takes: the arrows up and down, Page
+/// Up/Down, Enter, Tab and Escape, without Ctrl or Alt.
+fn completion_key(event: &Event) -> bool {
+    let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event else {
+        return false;
+    };
+    !modifiers.command()
+        && !modifiers.alt()
+        && matches!(
+            key.as_ref(),
+            keyboard::Key::Named(
+                key::Named::ArrowUp
+                    | key::Named::ArrowDown
+                    | key::Named::PageUp
+                    | key::Named::PageDown
+                    | key::Named::Enter
+                    | key::Named::Tab
+                    | key::Named::Escape
+            )
+        )
+}
+
 /// Whether the editor itself handles this key combination (a shortcut bound
 /// to it could never fire while the editor has the focus). `key` is the
 /// name an app shortcut uses.
@@ -3017,6 +3157,7 @@ mod tests {
             hovered_fold: None,
             hovered_note: None,
             note_since: std::cell::Cell::new(None),
+            completion_anchor: None,
             hovered_diag: None,
             diag_since: None,
             diag_shown: false,

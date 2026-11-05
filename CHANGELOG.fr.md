@@ -1,5 +1,13 @@
 # Journal des modifications
 
+## [1.12.0] - 2026-11-05
+
+### Ajouté
+- Complétion du code par les serveurs de langage (TypeScript/JavaScript, Rust, Python, Go, C/C++, Java et les autres que l'éditeur connaît). La liste s'ouvre en tapant un nom ou après `.`, `::`… (Ctrl+Espace pour la demander), ne contient que ce que le serveur propose, filtré par ce qui est tapé, dans l'ordre du serveur, avec le type de chaque élément, sa signature et sa documentation. Entrée insère l'élément, Tab remplace la fin du mot ; les imports sont ajoutés avec lui (une seule annulation), et les arguments d'une fonction se remplissent avec Tab. Une liste que le serveur annonce incomplète est redemandée pendant la frappe, et tant que le serveur charge le projet la liste l'indique puis est redemandée quand il a fini. Sans serveur de langage, rien n'est proposé.
+- Infos sur les paramètres : la signature de l'appel en cours, avec le paramètre sous le curseur mis en avant, s'ouvre sur `(` et `,` (Ctrl+P pour la demander) ; Alt+↑/↓ parcourt les surcharges.
+- Préférences > Éditeur : complétion activée ou non, pendant la frappe ou seulement au raccourci, et par langage : imports depuis les autres modules (TypeScript/JavaScript, Rust, Python), complétions postfixes et arguments des appels (Rust).
+- Les serveurs de langage démarrent à l'ouverture d'un fichier de leur projet et le chargent en arrière-plan ; à chaque frappe, seule la partie modifiée leur est envoyée.
+
 ## [1.11.0] - 2026-11-05
 
 ### Modifié

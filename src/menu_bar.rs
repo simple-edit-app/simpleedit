@@ -525,7 +525,22 @@ fn menu_items(
                 dark,
                 Message::UnfoldAll,
             ));
-            items.extend([separator(dark), format_item]);
+            items.extend([
+                separator(dark),
+                item(
+                    t!("shortcuts.complete").to_string(),
+                    sc(&sh.complete),
+                    dark,
+                    Message::CompletionInvoke,
+                ),
+                item(
+                    t!("shortcuts.parameter_info").to_string(),
+                    sc(&sh.parameter_info),
+                    dark,
+                    Message::HintInvoke,
+                ),
+                format_item,
+            ]);
             items
         }
         TopMenu::View => {

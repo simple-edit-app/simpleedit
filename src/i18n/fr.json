@@ -641,5 +641,19 @@
   "git.open_file": "Ouvrir le fichier",
   "git.file_gone": "Ce fichier n'existe plus",
   "git.view_unified": "Passer à l'affichage unifié",
-  "git.view_side": "Passer à l'affichage côte à côte"
+  "git.view_side": "Passer à l'affichage côte à côte",
+  "prefs.completion": "Complétion du code (serveurs de langage)",
+  "prefs.completion_auto": "Proposer pendant la frappe",
+  "shortcuts.complete": "Compléter le code",
+  "completion.indexing": "Le serveur de langage charge le projet : la liste peut être incomplète",
+  "completion.loading": "Recherche des complétions…",
+  "completion.none": "Aucune complétion ici",
+  "completion.no_server": "Aucun serveur de langage pour .%{ext} : installez-en un dans Préférences > Serveurs",
+  "shortcuts.parameter_info": "Infos sur les paramètres",
+  "hint.none": "Pas d'appel de fonction ici",
+  "prefs.completion_ts_imports": "TypeScript / JavaScript : noms des autres modules (importés à l'insertion)",
+  "prefs.completion_rust_imports": "Rust : éléments des autres modules (importés à l'insertion)",
+  "prefs.completion_rust_postfix": "Rust : complétions postfixes (.if, .match, .ref…)",
+  "prefs.completion_rust_arguments": "Rust : remplir les arguments d'un appel",
+  "prefs.completion_python_imports": "Python : noms des autres modules (importés à l'insertion)"
 }

@@ -260,6 +260,32 @@ pub enum Message {
     LintDone(u64, lint::Key, lint::Outcome),
     /// The pointer rests on a problem (and where its card goes), or left it.
     LintHover(Option<(usize, iced::Point)>),
+    /// Completion: the shortcut, what a server told about it, its answer,
+    /// where the list hangs in the window, a click on an item, the wheel
+    /// over the list, an item's documentation, the import an accepted item
+    /// needs, whether the server still loads the project.
+    CompletionInvoke,
+    CompletionInfo(
+        (String, PathBuf),
+        Result<crate::lsp::CompletionInfo, String>,
+    ),
+    CompletionAnswer(
+        u64,
+        Box<(
+            crate::completion::Base,
+            Result<crate::lsp::Completions, String>,
+        )>,
+    ),
+    CompletionAnchor(crate::code_editor::Spot, crate::code_editor::Spot),
+    /// The help on the parameters of a call: asked with the shortcut, its
+    /// answer, the next or previous signature of an overloaded function.
+    HintInvoke,
+    HintAnswer(u64, Result<Option<serde_json::Value>, String>),
+    CompletionPick(usize),
+    CompletionWheel(f32),
+    CompletionResolved(u64, usize, Result<serde_json::Value, String>),
+    CompletionImport(u64, Result<serde_json::Value, String>),
+    CompletionBusy(u64, bool),
     LintCardHover(bool),
     LintCloseCheck(u64),
     /// The fixes a language server has for a problem.
@@ -601,6 +627,7 @@ pub struct SimpleEditApp {
     /// The folders added as projects, shown as trees in the sidebar.
     projects: crate::projects::Projects,
     lint: lint::LintState,
+    completion: completion::CompletionState,
     /// The editor split in two panes, if it is.
     split: Option<split::Split>,
     sidebar: SidebarState,
@@ -813,6 +840,7 @@ enum PreviewDoc {
 impl SimpleEditApp {
     /// An app with one empty untitled tab, reading nothing from disk.
     fn blank(config: Config) -> Self {
+        crate::lsp::set_completion_options(&config.completion_options);
         Self {
             bookmarks: crate::bookmarks::Bookmarks::default(),
             editor: EditorState::new(),
@@ -825,6 +853,7 @@ impl SimpleEditApp {
                 config.projects_exclude.clone(),
             ),
             lint: lint::LintState::default(),
+            completion: completion::CompletionState::default(),
             split: None,
             sidebar: SidebarState::new(),
             search: SearchState::new(),
@@ -1021,6 +1050,30 @@ impl SimpleEditApp {
         .then(|| self.git.status.clone());
         let git_done = matches!(&message, Message::Git(crate::git_panel::GitMsg::Done(_)));
         let command = self.handle(message);
+        if edits_text {
+            self.snippet_follow();
+        }
+        if self
+            .completion
+            .session
+            .as_ref()
+            .is_some_and(|s| self.current_file.as_ref() != Some(&s.path))
+        {
+            self.completion_close();
+        }
+        if self
+            .completion
+            .hint
+            .as_ref()
+            .is_some_and(|h| self.current_file.as_ref() != Some(h.path()))
+        {
+            self.completion.hint = None;
+        }
+        let command = if passive {
+            command
+        } else {
+            Task::batch([command, self.completion_prepare()])
+        };
         self.sync_split();
         let marks_task = self.after_message(edits_text, status_before, git_done);
         self.track_mru();
@@ -1452,6 +1505,21 @@ impl SimpleEditApp {
         };
         let with_dropdown: Element<Message> =
             crate::floating::at_point(with_dropdown, card, card_at.x, card_at.y);
+        // The list of completions, under the word being typed; its layer
+        // is always there too, for the same reason.
+        let (list_at, list): (iced::Point, Element<Message>) = match self.completion_view(dark) {
+            Some(open) => open,
+            None => (iced::Point::ORIGIN, Space::new().into()),
+        };
+        let with_dropdown: Element<Message> =
+            crate::floating::at_point(with_dropdown, list, list_at.x, list_at.y);
+        // The help on the parameters of the call being typed.
+        let (hint_at, hint): (iced::Point, Element<Message>) = match self.hint_view(dark) {
+            Some(open) => open,
+            None => (iced::Point::ORIGIN, Space::new().into()),
+        };
+        let with_dropdown: Element<Message> =
+            crate::floating::at_point(with_dropdown, hint, hint_at.x, hint_at.y);
 
         // The list of every tab, under its button; a click elsewhere closes it.
         let with_dropdown: Element<Message> = match self.tab_list {
@@ -1652,7 +1720,14 @@ impl Message {
             | Message::FinderFiles(_)
             | Message::FindResults(..)
             | Message::TreeScrolled(..)
-            | Message::TreeHover(_) => true,
+            | Message::TreeHover(_)
+            | Message::CompletionInfo(..)
+            | Message::CompletionAnswer(..)
+            | Message::CompletionAnchor(..)
+            | Message::HintAnswer(..)
+            | Message::CompletionWheel(_)
+            | Message::CompletionResolved(..)
+            | Message::CompletionBusy(..) => true,
             _ => false,
         }
     }
@@ -1728,11 +1803,13 @@ impl SimpleEditApp {
                 }
                 // Lines added or removed by an edit move the bookmarks below.
                 let probe = action.is_edit().then(|| self.edit_probe());
+                let completion_action = action.clone();
                 let command = self.editor_action(action);
                 if let Some((count, top)) = probe {
                     self.shift_bookmarks(count, top);
                 }
-                command
+                let completion = self.completion_after_edit(&completion_action);
+                Task::batch([command, completion])
             }
             Message::InsertTab => {
                 if !self.editing_blocked() {
@@ -2361,6 +2438,41 @@ impl SimpleEditApp {
                 Task::none()
             }
             Message::LintHover(over) => self.lint_hover(over),
+            Message::CompletionInvoke => {
+                self.completion_request(crate::lsp::Trigger::Invoked, true)
+            }
+            Message::CompletionInfo(key, info) => {
+                self.completion_info_loaded(key, info);
+                Task::none()
+            }
+            Message::CompletionAnswer(generation, answer) => {
+                let (base, found) = *answer;
+                self.completion_answer(generation, base, found)
+            }
+            Message::CompletionAnchor(list, hint) => {
+                if let Some(session) = self.completion.session.as_mut() {
+                    session.anchor_at = list;
+                }
+                if let Some(open) = self.completion.hint.as_mut() {
+                    open.anchor_at = hint;
+                }
+                Task::none()
+            }
+            Message::HintInvoke => self.hint_request(1, None, true),
+            Message::HintAnswer(generation, answer) => self.hint_answer(generation, answer),
+            Message::CompletionPick(pos) => self.completion_accept(pos, false),
+            Message::CompletionWheel(lines) => {
+                self.completion_wheel(lines);
+                Task::none()
+            }
+            Message::CompletionResolved(of, index, resolved) => {
+                self.completion_resolved(of, index, resolved);
+                Task::none()
+            }
+            Message::CompletionImport(token, resolved) => self.completion_import(token, resolved),
+            Message::CompletionBusy(generation, busy) => {
+                self.completion_busy_answer(generation, busy)
+            }
             Message::LintCardHover(over) => self.lint_card_hovered(over),
             Message::LintCloseCheck(token) => {
                 self.lint_close_check(token);
@@ -2856,6 +2968,15 @@ impl SimpleEditApp {
                 command
             }
             Message::Preferences(msg) => {
+                // A language's completion setting: its servers start again
+                // with it.
+                if let PreferencesMessage::CompletionOption(..) = &msg {
+                    let _ = self.preferences.update(msg, &mut self.config);
+                    self.config_dirty = true;
+                    crate::lsp::set_completion_options(&self.config.completion_options);
+                    self.completion_servers_restarted();
+                    return Task::future(crate::lsp::restart_servers()).discard();
+                }
                 let servers_page = matches!(
                     msg,
                     PreferencesMessage::PageSelected(crate::preferences::PrefsPage::Servers)
@@ -3337,6 +3458,25 @@ impl SimpleEditApp {
                     }
                     return Task::none();
                 }
+                // The list of completions: its arrows, pages, Enter and Tab.
+                if self.completion_visible() && !ctrl && !alt {
+                    if let Some(task) = self.completion_key(&key) {
+                        return task;
+                    }
+                }
+                // Alt+↑ / Alt+↓: another signature of an overloaded call.
+                if alt
+                    && !ctrl
+                    && !shift
+                    && (key == "ArrowUp" || key == "ArrowDown")
+                    && self.hint_cycle(if key == "ArrowDown" { 1 } else { -1 })
+                {
+                    return Task::none();
+                }
+                // Tab in a snippet: its next place.
+                if key == "Tab" && !ctrl && !alt && !shift && self.snippet_next() {
+                    return Task::none();
+                }
                 // The palette: arrows move the selection (Enter is the
                 // field's own submit, Escape closes).
                 if self.overlay == ActiveOverlay::Palette {
@@ -3463,7 +3603,9 @@ impl SimpleEditApp {
                 };
                 let sh = &self.config.shortcuts;
                 // Order matters: Ctrl+Shift+S must be tried before Ctrl+S.
-                let bindings: [(&ShortcutConfig, Message); 34] = [
+                let bindings: [(&ShortcutConfig, Message); 36] = [
+                    (&sh.complete, Message::CompletionInvoke),
+                    (&sh.parameter_info, Message::HintInvoke),
                     (&sh.toggle_git, Message::ToggleGit),
                     (&sh.git_commit, Message::GitShortcut(GitShortcut::Commit)),
                     (&sh.git_push, Message::GitShortcut(GitShortcut::Push)),
@@ -3830,9 +3972,14 @@ impl SimpleEditApp {
                 }
             }
             Message::EscapePressed => {
-                // Innermost first: a pending rebind, a dialog, the
-                // Preferences window, the search card.
-                if self.capturing.is_some() {
+                // Innermost first: the list of completions, a pending
+                // rebind, a dialog, the Preferences window, the search card.
+                self.completion.snippet = None;
+                if self.completion_visible() {
+                    self.completion_close();
+                } else if self.completion.hint.is_some() {
+                    self.completion.hint = None;
+                } else if self.capturing.is_some() {
                     self.capturing = None;
                 } else if !matches!(self.overlay, ActiveOverlay::None) {
                     if self.overlay_is_dismissable() {
@@ -6237,6 +6384,7 @@ impl SimpleEditApp {
                     self.blame_annotations(),
                     self.change_paint(),
                     self.problem_paint(),
+                    self.completion_hook(),
                 ),
                 dark,
             )
@@ -6581,6 +6729,9 @@ mod file_io;
 use file_io::*;
 #[path = "app/bookmark_panel.rs"]
 mod bookmark_panel;
+#[path = "app/completion.rs"]
+mod completion;
+pub(crate) use completion::Floating;
 #[path = "app/finder.rs"]
 mod finder;
 #[path = "app/git_file.rs"]

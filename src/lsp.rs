@@ -98,17 +98,117 @@ pub(crate) fn spec_for(ext: &str) -> Option<(&'static str, Candidates)> {
     })
 }
 
-/// `typescript-language-server` needs a TypeScript installation. The
-/// project's own (`node_modules/typescript`) wins; otherwise point it to the
-/// copy installed next to the server from the Preferences.
-fn init_options(root: &Path) -> Value {
+// ---- Completion settings, per language ------------------------------------
+
+/// The completion settings the servers are started with (`language.option`
+/// → on); a missing one is on.
+static OPTIONS: OnceLock<StdMutex<std::collections::BTreeMap<String, bool>>> = OnceLock::new();
+
+/// The settings of the Preferences, for the servers started from now on.
+pub fn set_completion_options(options: &std::collections::BTreeMap<String, bool>) {
+    let store = OPTIONS.get_or_init(Default::default);
+    if let Ok(mut current) = store.lock() {
+        *current = options.clone();
+    }
+}
+
+fn option(key: &str) -> bool {
+    OPTIONS
+        .get()
+        .and_then(|o| o.lock().ok().and_then(|o| o.get(key).copied()))
+        .unwrap_or(true)
+}
+
+/// Which family a server program is of, for its settings.
+fn family(exe: &Path) -> &'static str {
+    let name = exe
+        .file_stem()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    match name.as_str() {
+        "typescript-language-server" | "vtsls" => "typescript",
+        "rust-analyzer" => "rust",
+        "pyright-langserver" | "basedpyright-langserver" | "pylsp" | "jedi-language-server" => {
+            "python"
+        }
+        _ => "",
+    }
+}
+
+/// rust-analyzer's completion settings.
+fn rust_settings() -> Value {
+    json!({ "completion": {
+        "autoimport": { "enable": option("rust.auto_import") },
+        "postfix": { "enable": option("rust.postfix") },
+        "callable": { "snippets": if option("rust.call_arguments") {
+            "fill_arguments"
+        } else {
+            "add_parentheses"
+        } },
+    } })
+}
+
+/// What a server asks with `workspace/configuration`, for one section.
+fn configuration(family: &str, section: &str) -> Value {
+    let auto_import = option("python.auto_import");
+    match (family, section) {
+        ("rust", "rust-analyzer") => rust_settings(),
+        ("python", "python") => json!({ "analysis": { "autoImportCompletions": auto_import } }),
+        ("python", "python.analysis") => json!({ "autoImportCompletions": auto_import }),
+        _ => Value::Null,
+    }
+}
+
+/// Stops every server: they start again, with the settings of now, when
+/// next needed.
+pub async fn restart_servers() {
+    let Some(servers) = SERVERS.get() else {
+        return;
+    };
+    let mut servers = servers.lock().await;
+    for server in servers.values() {
+        server.alive.store(false, Ordering::SeqCst);
+        if let Ok(mut child) = server._child.lock() {
+            let _ = child.start_kill();
+        }
+    }
+    servers.clear();
+}
+
+/// What a server is started with: rust-analyzer's settings; for
+/// TypeScript, its completion preferences and its installation (the
+/// project's own `node_modules/typescript` wins, else the copy installed
+/// next to the server from the Preferences).
+fn init_options(exe: &Path, root: &Path) -> Value {
+    match family(exe) {
+        "typescript" => typescript_options(root),
+        "rust" => rust_settings(),
+        _ => json!({}),
+    }
+}
+
+fn typescript_options(root: &Path) -> Value {
     let project = root.join("node_modules/typescript/lib/tsserver.js");
     let managed = crate::lsp_install::managed_dir()
         .map(|d| d.join("lib/node_modules/typescript/lib/tsserver.js"))
         .filter(|p| p.is_file());
+    // Completion as complete as the editor of TypeScript's own makes it:
+    // names of other modules (imported on accept), snippets, `?.`.
+    let preferences = json!({
+        "includeCompletionsForModuleExports": option("typescript.auto_import"),
+        "includeCompletionsForImportStatements": option("typescript.auto_import"),
+        "includeCompletionsWithInsertText": true,
+        "includeCompletionsWithSnippetText": true,
+        "includeAutomaticOptionalChainCompletions": true,
+        "includeCompletionsWithClassMemberSnippets": true,
+        "includeCompletionsWithObjectLiteralMethodSnippets": true,
+        "useLabelDetailsInCompletionEntries": true,
+    });
     match managed {
-        Some(path) if !project.is_file() => json!({ "tsserver": { "path": path } }),
-        _ => json!({}),
+        Some(path) if !project.is_file() => {
+            json!({ "tsserver": { "path": path }, "preferences": preferences })
+        }
+        _ => json!({ "preferences": preferences }),
     }
 }
 
@@ -728,6 +828,250 @@ pub async fn code_actions(
     fixes_of(&server, &uri, text, params).await
 }
 
+// ---- Completion -----------------------------------------------------------
+
+/// What a server proposes at a place of a file.
+#[derive(Debug, Clone, Default)]
+pub struct Completions {
+    pub items: Vec<crate::completion::Item>,
+    /// Not everything: to be asked again as one types.
+    pub incomplete: bool,
+    /// The server is still loading the project: the list may lack items.
+    pub busy: bool,
+}
+
+/// What a server tells about its completion.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompletionInfo {
+    pub supported: bool,
+    /// The characters that ask for it (`.`, `::`, …) besides a name.
+    pub triggers: Vec<String>,
+    pub busy: bool,
+    /// The server tells the parameters of a call; the characters that open
+    /// that help (`(`, `,`) and those that update it once open.
+    pub signatures: bool,
+    pub signature_triggers: Vec<String>,
+    pub signature_retriggers: Vec<String>,
+}
+
+/// Why completion is asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Trigger {
+    /// A name typed, or the shortcut.
+    Invoked,
+    /// One of the server's characters typed.
+    Character(String),
+    /// The server said its last list was not everything.
+    Incomplete,
+}
+
+impl Server {
+    fn completion_info(&self) -> CompletionInfo {
+        let provider = self.capability(&["completionProvider"]);
+        let signature = self.capability(&["signatureHelpProvider"]);
+        let strings = |v: &Value| -> Vec<String> {
+            v.as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        };
+        CompletionInfo {
+            signatures: !signature.is_null(),
+            signature_triggers: strings(&signature["triggerCharacters"]),
+            signature_retriggers: strings(&signature["retriggerCharacters"]),
+            supported: !provider.is_null(),
+            triggers: provider["triggerCharacters"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+            busy: self.loading(),
+        }
+    }
+
+    /// Still loading the project: reporting progress, or just started (the
+    /// first report may not have come yet).
+    fn loading(&self) -> bool {
+        self.is_busy() || self.started.elapsed() < SETTLE
+    }
+}
+
+/// Starts the server of the file's language and tells it about the file, so
+/// that it loads the project in the background before completion is asked.
+pub async fn prepare_completion(
+    ext: &str,
+    path: &Path,
+    text: &str,
+) -> Result<CompletionInfo, String> {
+    let (server, language_id, _) = connect(ext, path).await?;
+    server.sync(&path_to_uri(path), language_id, text).await?;
+    Ok(server.completion_info())
+}
+
+/// Whether the server of the file's language is still loading the project.
+pub async fn completion_busy(ext: &str, path: &Path) -> bool {
+    match connect(ext, path).await {
+        Ok((server, ..)) => server.loading(),
+        Err(_) => false,
+    }
+}
+
+/// What the server proposes at (`line`, byte `col`) of `text`, the content of
+/// `path`.
+pub async fn complete(
+    ext: &str,
+    path: &Path,
+    text: &str,
+    line: usize,
+    col: usize,
+    trigger: Trigger,
+) -> Result<Completions, String> {
+    let (server, language_id, _) = connect(ext, path).await?;
+    complete_on(&server, language_id, path, text, line, col, trigger).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn complete_on(
+    server: &Server,
+    language_id: &str,
+    path: &Path,
+    text: &str,
+    line: usize,
+    col: usize,
+    trigger: Trigger,
+) -> Result<Completions, String> {
+    if !server.completion_info().supported {
+        return Ok(Completions::default());
+    }
+    let uri = path_to_uri(path);
+    server.sync(&uri, language_id, text).await?;
+    let context = match &trigger {
+        Trigger::Invoked => json!({ "triggerKind": 1 }),
+        Trigger::Character(c) => json!({ "triggerKind": 2, "triggerCharacter": c }),
+        Trigger::Incomplete => json!({ "triggerKind": 3 }),
+    };
+    let params = json!({
+        "textDocument": { "uri": uri },
+        "position": { "line": line, "character": utf16_col(text, line, col) },
+        "context": context,
+    });
+    let mut tries = 0;
+    loop {
+        match server
+            .request_completion("textDocument/completion", params.clone())
+            .await
+        {
+            Ok(value) => {
+                let (items, incomplete) = crate::completion::parse_list(&value, text);
+                return Ok(Completions {
+                    items,
+                    incomplete,
+                    busy: server.loading(),
+                });
+            }
+            // The server was busy with the text: ask again, a few times.
+            Err(e) if (e.code == CONTENT_MODIFIED || e.code == SERVER_CANCELLED) && tries < 5 => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_millis(60)).await;
+            }
+            Err(e) => return Err(e.message),
+        }
+    }
+}
+
+/// Why the parameters of a call are asked.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SignatureTrigger {
+    /// 1: asked (shortcut, an item accepted), 2: a character typed, 3: the
+    /// text or the cursor moved while the help is open.
+    pub kind: u8,
+    pub character: Option<String>,
+    /// The help is open: the answer it shows, sent back to the server.
+    pub open: Option<Value>,
+}
+
+/// The parameters of the call at (`line`, byte `col`) of `text`, as the
+/// server answers `textDocument/signatureHelp` (`None`: not in a call).
+pub async fn signature_help(
+    ext: &str,
+    path: &Path,
+    text: &str,
+    line: usize,
+    col: usize,
+    trigger: SignatureTrigger,
+) -> Result<Option<Value>, String> {
+    let (server, language_id, _) = connect(ext, path).await?;
+    signature_help_on(&server, language_id, path, text, line, col, trigger).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn signature_help_on(
+    server: &Server,
+    language_id: &str,
+    path: &Path,
+    text: &str,
+    line: usize,
+    col: usize,
+    trigger: SignatureTrigger,
+) -> Result<Option<Value>, String> {
+    if !server.completion_info().signatures {
+        return Ok(None);
+    }
+    let uri = path_to_uri(path);
+    server.sync(&uri, language_id, text).await?;
+    let mut context = json!({
+        "triggerKind": trigger.kind,
+        "isRetrigger": trigger.open.is_some(),
+    });
+    if let Some(character) = trigger.character {
+        context["triggerCharacter"] = json!(character);
+    }
+    if let Some(open) = trigger.open {
+        context["activeSignatureHelp"] = open;
+    }
+    let params = json!({
+        "textDocument": { "uri": uri },
+        "position": { "line": line, "character": utf16_col(text, line, col) },
+        "context": context,
+    });
+    let mut tries = 0;
+    loop {
+        match server
+            .request("textDocument/signatureHelp", params.clone())
+            .await
+        {
+            Ok(Value::Null) => return Ok(None),
+            Ok(value) => return Ok(Some(value)),
+            Err(e) if (e.code == CONTENT_MODIFIED || e.code == SERVER_CANCELLED) && tries < 5 => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_millis(60)).await;
+            }
+            Err(e) => return Err(e.message),
+        }
+    }
+}
+
+/// The rest of an item (documentation, detail, the import it needs), as the
+/// server sends it on demand; `raw` is the item as it came.
+pub async fn resolve_completion(ext: &str, path: &Path, raw: Value) -> Result<Value, String> {
+    let (server, ..) = connect(ext, path).await?;
+    resolve_on(&server, raw).await
+}
+
+async fn resolve_on(server: &Server, raw: Value) -> Result<Value, String> {
+    if server.capability(&["completionProvider", "resolveProvider"]) != Value::Bool(true) {
+        return Ok(raw);
+    }
+    server
+        .request("completionItem/resolve", raw)
+        .await
+        .map_err(|e| e.message)
+}
+
 // ---- The connection to one server -----------------------------------------
 
 #[derive(Debug)]
@@ -751,15 +1095,22 @@ struct Server {
     /// What the server last published as problems, per document: how many
     /// times it did, and the problems as it said them.
     published: StdMutex<HashMap<String, (u64, Vec<Value>)>>,
+    /// What the server said it can do (its `initialize` answer).
+    capabilities: StdMutex<Value>,
+    /// The completion request still running, cancelled by the next one.
+    completing: AtomicI64,
+    /// Which family of server it is, for its settings.
+    family: &'static str,
     /// Kept so the process dies with the program.
     _child: StdMutex<Child>,
 }
 
 type Servers = Mutex<HashMap<(PathBuf, PathBuf), Arc<Server>>>;
 
+static SERVERS: OnceLock<Servers> = OnceLock::new();
+
 /// The running server for this program and project, started if need be.
 async fn server_for(exe: &Path, args: &[&str], root: &Path) -> Result<Arc<Server>, String> {
-    static SERVERS: OnceLock<Servers> = OnceLock::new();
     let mut servers = SERVERS.get_or_init(Default::default).lock().await;
     let key = (exe.to_path_buf(), root.to_path_buf());
     if let Some(server) = servers.get(&key).filter(|s| s.alive.load(Ordering::SeqCst)) {
@@ -792,6 +1143,9 @@ impl Server {
             progress: Default::default(),
             docs: Default::default(),
             published: Default::default(),
+            capabilities: StdMutex::new(Value::Null),
+            completing: AtomicI64::new(0),
+            family: family(exe),
             _child: StdMutex::new(child),
         });
         tokio::spawn(read_loop(server.clone(), stdout));
@@ -804,7 +1158,7 @@ impl Server {
         let params = json!({
             "processId": std::process::id(),
             "clientInfo": { "name": "SimpleEdit" },
-            "initializationOptions": init_options(root),
+            "initializationOptions": init_options(exe, root),
             "rootUri": root_uri,
             "workspaceFolders": [{ "uri": root_uri, "name": name }],
             "capabilities": {
@@ -813,6 +1167,36 @@ impl Server {
                 "workspace": { "configuration": true, "workspaceFolders": true },
                 "textDocument": {
                     "synchronization": { "didSave": false },
+                    "signatureHelp": {
+                        "contextSupport": true,
+                        "signatureInformation": {
+                            "documentationFormat": ["markdown", "plaintext"],
+                            "parameterInformation": { "labelOffsetSupport": true },
+                            "activeParameterSupport": true,
+                        },
+                    },
+                    "completion": {
+                        "contextSupport": true,
+                        "completionItem": {
+                            "snippetSupport": true,
+                            "commitCharactersSupport": false,
+                            "documentationFormat": ["markdown", "plaintext"],
+                            "deprecatedSupport": true,
+                            "preselectSupport": true,
+                            "insertReplaceSupport": true,
+                            "labelDetailsSupport": true,
+                            "tagSupport": { "valueSet": [1] },
+                            "resolveSupport": { "properties": [
+                                "documentation", "detail", "additionalTextEdits"
+                            ] },
+                            "insertTextModeSupport": { "valueSet": [1, 2] },
+                        },
+                        "completionItemKind": { "valueSet": (1..=25).collect::<Vec<u8>>() },
+                        "completionList": { "itemDefaults": [
+                            "commitCharacters", "editRange", "insertTextFormat",
+                            "insertTextMode", "data"
+                        ] },
+                    },
                     "definition": { "linkSupport": true },
                     "publishDiagnostics": { "versionSupport": true },
                     "codeAction": {
@@ -824,10 +1208,13 @@ impl Server {
                 },
             },
         });
-        server
+        let answer = server
             .request("initialize", params)
             .await
             .map_err(|e| e.message)?;
+        if let Ok(mut capabilities) = server.capabilities.lock() {
+            *capabilities = answer.get("capabilities").cloned().unwrap_or(Value::Null);
+        }
         server
             .send(&json!({
                 "jsonrpc": "2.0", "method": "initialized", "params": {}
@@ -867,6 +1254,57 @@ impl Server {
         rx.await.unwrap_or_else(|_| Err(stopped()))
     }
 
+    /// A completion request; the one still running before it is cancelled:
+    /// its answer would be for a text that is no more.
+    async fn request_completion(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let previous = self.completing.swap(id, Ordering::SeqCst);
+        let running = self.pending.lock().is_ok_and(|p| p.contains_key(&previous));
+        if previous != 0 && running {
+            let _ = self
+                .send(&json!({
+                    "jsonrpc": "2.0", "method": "$/cancelRequest", "params": { "id": previous }
+                }))
+                .await;
+        }
+        let (tx, rx) = oneshot::channel();
+        if !self.alive.load(Ordering::SeqCst) {
+            return Err(stopped());
+        }
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.insert(id, tx);
+        }
+        let message = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        if let Err(message) = self.send(&message).await {
+            return Err(RpcError { code: -1, message });
+        }
+        rx.await.unwrap_or_else(|_| Err(stopped()))
+    }
+
+    /// How the server wants changes: 2 for the changed part only, else the
+    /// whole text.
+    fn sync_kind(&self) -> u64 {
+        let capabilities = self
+            .capabilities
+            .lock()
+            .map(|c| c.clone())
+            .unwrap_or_default();
+        match &capabilities["textDocumentSync"] {
+            Value::Number(n) => n.as_u64().unwrap_or(1),
+            Value::Object(o) => o.get("change").and_then(Value::as_u64).unwrap_or(1),
+            _ => 1,
+        }
+    }
+
+    fn capability(&self, path: &[&str]) -> Value {
+        let capabilities = self
+            .capabilities
+            .lock()
+            .map(|c| c.clone())
+            .unwrap_or_default();
+        path.iter().fold(&capabilities, |v, key| &v[*key]).clone()
+    }
+
     /// Tells the server the current text of a document.
     async fn sync(&self, uri: &str, language_id: &str, text: &str) -> Result<bool, String> {
         let mut docs = self.docs.lock().await;
@@ -883,12 +1321,19 @@ impl Server {
             Some((_, known)) if known == text => return Ok(false),
             Some((version, known)) => {
                 *version += 1;
+                // Only what changed, if the server takes that: a keystroke
+                // in a long file sends a character, not the file.
+                let change = if self.sync_kind() == 2 {
+                    text_change(known, text)
+                } else {
+                    json!({ "text": text })
+                };
                 *known = text.to_string();
                 json!({
                     "jsonrpc": "2.0", "method": "textDocument/didChange",
                     "params": {
                         "textDocument": { "uri": uri, "version": *version },
-                        "contentChanges": [{ "text": text }],
+                        "contentChanges": [change],
                     },
                 })
             }
@@ -923,8 +1368,18 @@ impl Server {
             // The server asks us something: nothing to tell it.
             (Some(method), Some(id)) => {
                 let result = if method == "workspace/configuration" {
-                    let count = message["params"]["items"].as_array().map_or(0, Vec::len);
-                    Value::Array(vec![Value::Null; count])
+                    let items = message["params"]["items"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
+                    Value::Array(
+                        items
+                            .iter()
+                            .map(|i| {
+                                configuration(self.family, i["section"].as_str().unwrap_or(""))
+                            })
+                            .collect(),
+                    )
                 } else {
                     Value::Null
                 };
@@ -964,6 +1419,40 @@ impl Server {
             _ => {}
         }
     }
+}
+
+/// The one change that turns `old` into `new`: the stretch between what they
+/// start and end with in common, as LSP positions of `old`, and its new text.
+fn text_change(old: &str, new: &str) -> Value {
+    let mut prefix = old
+        .bytes()
+        .zip(new.bytes())
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !old.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    let most = old.len().min(new.len()) - prefix;
+    let mut suffix = old
+        .bytes()
+        .rev()
+        .zip(new.bytes().rev())
+        .take(most)
+        .take_while(|(a, b)| a == b)
+        .count();
+    while !old.is_char_boundary(old.len() - suffix) || !new.is_char_boundary(new.len() - suffix) {
+        suffix -= 1;
+    }
+    let position = |at: usize| {
+        let before = &old[..at];
+        let line = before.matches('\n').count();
+        let start = before.rfind('\n').map_or(0, |i| i + 1);
+        json!({ "line": line, "character": before[start..].encode_utf16().count() })
+    };
+    json!({
+        "range": { "start": position(prefix), "end": position(old.len() - suffix) },
+        "text": &new[prefix..new.len() - suffix],
+    })
 }
 
 fn stopped() -> RpcError {
@@ -1259,5 +1748,435 @@ while True:
         // A string literal is no name.
         let (line, col) = find("\"status.no_definition\"", 0);
         assert_eq!(go(line, col + 3), Outcome::NotFound);
+    }
+
+    #[test]
+    fn each_server_gets_the_completion_settings_of_its_language() {
+        let mut options = std::collections::BTreeMap::new();
+        options.insert("rust.postfix".to_string(), false);
+        options.insert("python.auto_import".to_string(), false);
+        options.insert("typescript.auto_import".to_string(), false);
+        set_completion_options(&options);
+        let rust = init_options(Path::new("/x/rust-analyzer"), Path::new("/p"));
+        assert_eq!(rust["completion"]["postfix"]["enable"], false);
+        assert_eq!(
+            rust["completion"]["autoimport"]["enable"], true,
+            "missing: on"
+        );
+        assert_eq!(rust["completion"]["callable"]["snippets"], "fill_arguments");
+        let ts = init_options(Path::new("/x/typescript-language-server"), Path::new("/p"));
+        assert_eq!(
+            ts["preferences"]["includeCompletionsForModuleExports"],
+            false
+        );
+        assert_eq!(
+            configuration("python", "python.analysis")["autoImportCompletions"],
+            false
+        );
+        assert_eq!(configuration("rust", "rust-analyzer"), rust);
+        assert_eq!(configuration("", "anything"), Value::Null);
+        assert_eq!(
+            init_options(Path::new("/x/gopls"), Path::new("/p")),
+            json!({})
+        );
+        set_completion_options(&std::collections::BTreeMap::new());
+    }
+
+    #[test]
+    fn a_change_is_sent_as_the_part_that_changed() {
+        let change = text_change("ab\ncd\n", "ab\ncXd\n");
+        assert_eq!(
+            change["range"]["start"],
+            json!({ "line": 1, "character": 1 })
+        );
+        assert_eq!(change["range"]["end"], json!({ "line": 1, "character": 1 }));
+        assert_eq!(change["text"], "X");
+        // A deletion across lines, after a character of two UTF-16 units.
+        let change = text_change("😀ab\ncd", "😀d");
+        assert_eq!(
+            change["range"]["start"],
+            json!({ "line": 0, "character": 2 })
+        );
+        assert_eq!(change["range"]["end"], json!({ "line": 1, "character": 1 }));
+        assert_eq!(change["text"], "");
+        // Multi-byte characters that share their first bytes stay whole.
+        let change = text_change("é", "è");
+        assert_eq!(change["range"]["end"], json!({ "line": 0, "character": 1 }));
+        assert_eq!(change["text"], "è");
+        // Repeated letters: the change is within the common prefix/suffix.
+        let change = text_change("aaa", "aa");
+        assert_eq!(change["text"], "");
+    }
+
+    /// A server that applies changes as they come (only the changed part)
+    /// and proposes what it sees left of the cursor: what it proposes shows
+    /// whether its copy of the text is right.
+    const FAKE_COMPLETION_SERVER: &str = r#"
+import json, sys
+def read():
+    n = 0
+    while True:
+        h = sys.stdin.buffer.readline()
+        if not h: return None
+        h = h.strip()
+        if not h: break
+        if h.lower().startswith(b"content-length:"): n = int(h.split(b":")[1])
+    return json.loads(sys.stdin.buffer.read(n))
+def send(m):
+    b = json.dumps(m).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(b) + b)
+    sys.stdout.buffer.flush()
+def offset(text, pos):
+    lines = text.split("\n")
+    before = sum(len(l) + 1 for l in lines[:pos["line"]])
+    return before + pos["character"]
+docs = {}
+while True:
+    m = read()
+    if m is None: break
+    meth = m.get("method")
+    if meth == "initialize":
+        send({"jsonrpc": "2.0", "id": m["id"], "result": {"capabilities": {
+            "textDocumentSync": {"openClose": True, "change": 2},
+            "completionProvider": {"triggerCharacters": [".", "::"], "resolveProvider": True}}}})
+    elif meth == "textDocument/didOpen":
+        d = m["params"]["textDocument"]; docs[d["uri"]] = d["text"]
+    elif meth == "textDocument/didChange":
+        uri = m["params"]["textDocument"]["uri"]
+        for c in m["params"]["contentChanges"]:
+            t = docs[uri]
+            if "range" in c:
+                a, b = offset(t, c["range"]["start"]), offset(t, c["range"]["end"])
+                docs[uri] = t[:a] + c["text"] + t[b:]
+            else:
+                docs[uri] = c["text"]
+    elif meth == "textDocument/completion":
+        p = m["params"]; t = docs[p["textDocument"]["uri"]]
+        line = t.split("\n")[p["position"]["line"]][:p["position"]["character"]]
+        kind = p["context"]["triggerKind"]
+        send({"jsonrpc": "2.0", "id": m["id"], "result": {"isIncomplete": True, "items": [
+            {"label": "seen:" + line, "kind": 6, "data": {"n": 1}},
+            {"label": "kind:%d" % kind, "kind": 14}]}})
+    elif meth == "completionItem/resolve":
+        item = m["params"]; item["documentation"] = {"kind": "markdown", "value": "resolved"}
+        send({"jsonrpc": "2.0", "id": m["id"], "result": item})
+"#;
+
+    #[test]
+    fn completion_sees_the_text_as_it_is_after_every_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake.py");
+        std::fs::write(&script, FAKE_COMPLETION_SERVER).unwrap();
+        let file = dir.path().join("m.txt");
+        let script = script.to_string_lossy().into_owned();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let server = server_for(Path::new(PYTHON), &[script.as_str()], dir.path())
+                .await
+                .unwrap();
+            let info = server.completion_info();
+            assert!(info.supported);
+            assert_eq!(info.triggers, vec![".", "::"]);
+            let ask = |text: &'static str, line, col, trigger| {
+                let server = server.clone();
+                let file = file.clone();
+                async move {
+                    complete_on(&server, "plaintext", &file, text, line, col, trigger)
+                        .await
+                        .unwrap()
+                }
+            };
+            let first = ask("ab\ncd", 1, 2, Trigger::Invoked).await;
+            assert!(first.incomplete);
+            assert_eq!(first.items[0].label, "seen:cd");
+            assert_eq!(first.items[1].label, "kind:1");
+            // Typed in the middle, then at the end, accents included.
+            let next = ask("ab\ncéd.", 1, 5, Trigger::Character(".".into())).await;
+            assert_eq!(next.items[0].label, "seen:céd.");
+            assert_eq!(next.items[1].label, "kind:2");
+            let next = ask("ab\ncéd.x", 1, 6, Trigger::Incomplete).await;
+            assert_eq!(next.items[0].label, "seen:céd.x");
+            assert_eq!(next.items[1].label, "kind:3");
+            // Lines joined.
+            let next = ask("abcéd.x", 0, 8, Trigger::Invoked).await;
+            assert_eq!(next.items[0].label, "seen:abcéd.x");
+            // The rest of an item, on demand.
+            let resolved = resolve_on(&server, next.items[0].raw.clone())
+                .await
+                .unwrap();
+            assert_eq!(resolved["documentation"]["value"], "resolved");
+        });
+    }
+
+    /// Waits until the server has loaded the project, then asks.
+    async fn complete_when_ready(
+        server: &Server,
+        language_id: &str,
+        path: &Path,
+        text: &str,
+        line: usize,
+        col: usize,
+    ) -> Completions {
+        let started = Instant::now();
+        loop {
+            let found = complete_on(server, language_id, path, text, line, col, Trigger::Invoked)
+                .await
+                .unwrap();
+            if (!found.busy && !found.items.is_empty())
+                || started.elapsed() > Duration::from_secs(90)
+            {
+                return found;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    fn labels(found: &Completions, typed: &str, text: &str, origin: (usize, usize)) -> Vec<String> {
+        let base = crate::completion::Base {
+            text: text.to_string(),
+            origin,
+        };
+        let line = text.split('\n').nth(origin.0).unwrap_or("");
+        crate::completion::rank(&found.items, &base, line, origin)
+            .iter()
+            .map(|r| found.items[r.index].filter_text.clone())
+            .filter(|l| l.starts_with(typed) || typed.is_empty())
+            .collect()
+    }
+
+    /// Against a real typescript-language-server, in a project prepared by
+    /// hand: `COMPLETION_TS=<dir> cargo test -- --ignored real_typescript`,
+    /// `<dir>` holding `node_modules/.bin/typescript-language-server` and
+    /// TypeScript.
+    #[test]
+    #[ignore]
+    fn real_typescript_completion_is_exact_and_imports() {
+        let Some(root) = std::env::var_os("COMPLETION_TS").map(PathBuf::from) else {
+            return;
+        };
+        let exe = root.join("node_modules/.bin/typescript-language-server");
+        let dir = root.join("src");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{ "compilerOptions": { "strict": true, "module": "esnext", "target": "es2022", "moduleResolution": "bundler" }, "include": ["src"] }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.ts"),
+            "export function formatDate(d: Date): string { return d.toISOString(); }\n",
+        )
+        .unwrap();
+        let path = dir.join("c.ts");
+        // `user.` last: on the line before a name, it would read `user.name`.
+        let text = "interface User { name: string; age: number }\nconst user: User = { name: \"x\", age: 1 };\nformatD\nuser.\n";
+        std::fs::write(&path, text).unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let server = server_for(&exe, &["--stdio"], &root).await.unwrap();
+            // After `user.`: its two fields, nothing else.
+            let found = complete_when_ready(&server, "typescript", &path, text, 3, 5).await;
+            let members = labels(&found, "", text, (3, 5));
+            assert_eq!(members, vec![".age", ".name"], "{members:?}");
+            // A function of another file, imported when accepted.
+            let found = complete_when_ready(&server, "typescript", &path, text, 2, 7).await;
+            let base = crate::completion::Base {
+                text: text.to_string(),
+                origin: (2, 7),
+            };
+            let ranked = crate::completion::rank(&found.items, &base, "formatD", (2, 7));
+            let index = ranked
+                .iter()
+                .map(|r| r.index)
+                .find(|&i| found.items[i].label == "formatDate")
+                .expect("formatDate is proposed");
+            let mut item = found.items[index].clone();
+            let resolved = resolve_on(&server, item.raw.clone()).await.unwrap();
+            crate::completion::merge_resolved(&mut item, &resolved, text);
+            let plan =
+                crate::completion::plan(&item, &base, text, (2, 7), false, &|_| None).unwrap();
+            assert!(
+                plan.text
+                    .starts_with("import { formatDate } from \"./b\";\n"),
+                "{}",
+                plan.text
+            );
+            assert!(plan.text.contains("\nformatDate\n"), "{}", plan.text);
+            // The parameters of a call to it.
+            let call = "import { formatDate } from \"./b\";\nformatDate(\n";
+            let help = signature_help_on(
+                &server,
+                "typescript",
+                &path,
+                call,
+                1,
+                11,
+                SignatureTrigger {
+                    kind: 2,
+                    character: Some("(".into()),
+                    open: None,
+                },
+            )
+            .await
+            .unwrap()
+            .expect("a call");
+            let signatures = crate::completion::parse_signatures(&help).unwrap();
+            let sig = &signatures.list[signatures.active];
+            assert!(sig.label.contains("d: Date"), "{}", sig.label);
+            assert_eq!(signatures.param_of(signatures.active), Some(0));
+        });
+    }
+
+    /// Against a real rust-analyzer, on a project made for the test:
+    /// `cargo test -- --ignored real_rust_analyzer_completion`.
+    #[test]
+    #[ignore]
+    fn real_rust_analyzer_completion_is_exact() {
+        let Some(exe) = find_executable("rust-analyzer").filter(|_| usable("rust-analyzer")) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let path = dir.path().join("src/main.rs");
+        let text = "struct User { name: String, age: u32 }\nimpl User {\n    fn greet(&self, loud: bool) -> String { self.name.clone() }\n}\nfn main() {\n    let u = User { name: \"x\".into(), age: 1 };\n    u.\n    let v = vec![1, 2, 3];\n    v.iter().ma\n}\n";
+        std::fs::write(&path, text).unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let server = server_for(&exe, &[], dir.path()).await.unwrap();
+            // After `u.`: its fields and methods first, as the server ranks.
+            let found = complete_when_ready(&server, "rust", &path, text, 6, 6).await;
+            let all = labels(&found, "", text, (6, 6));
+            for wanted in ["name", "age", "greet"] {
+                assert!(all.iter().any(|l| l == wanted), "{wanted} in {all:?}");
+            }
+            assert!(
+                all.iter().position(|l| l == "name") < all.iter().position(|l| l == "into"),
+                "{all:?}"
+            );
+            // `v.iter().ma`: every kept item has a word starting with `ma`.
+            let found = complete_when_ready(&server, "rust", &path, text, 8, 15).await;
+            let kept = labels(&found, "", text, (8, 15));
+            assert!(kept.iter().any(|l| l == "map"), "{kept:?}");
+            assert!(kept.iter().any(|l| l == "max"), "{kept:?}");
+            assert!(
+                kept.iter()
+                    .all(|l| l.starts_with("ma") || l.contains("_ma") || l.contains("Ma")),
+                "{kept:?}"
+            );
+            // Accepting `greet` gives its call with the argument selected.
+            let found = complete_when_ready(&server, "rust", &path, text, 6, 6).await;
+            let greet = found
+                .items
+                .iter()
+                .find(|i| i.filter_text == "greet")
+                .unwrap();
+            let base = crate::completion::Base {
+                text: text.to_string(),
+                origin: (6, 6),
+            };
+            let plan =
+                crate::completion::plan(greet, &base, text, (6, 6), false, &|_| None).unwrap();
+            assert!(plan.text.contains("    u.greet(loud)\n"), "{}", plan.text);
+            assert_eq!((plan.caret, plan.select), ((6, 12), 4));
+        });
+    }
+
+    /// Against a real rust-analyzer: the parameters of a call, and the
+    /// settings of the Preferences reaching it (`cargo test -- --ignored
+    /// real_rust_analyzer_parameters`).
+    #[test]
+    #[ignore]
+    fn real_rust_analyzer_parameters_and_settings() {
+        let Some(exe) = find_executable("rust-analyzer").filter(|_| usable("rust-analyzer")) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let path = dir.path().join("src/main.rs");
+        // `x.` last: before another line, it would read `x.greet(…)`.
+        let text = "fn greet(loud: bool, n: u32) -> u32 { n }\nfn main() {\n    greet(true, 2);\n    let x = 1;\n    x.\n}\n";
+        std::fs::write(&path, text).unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let has_dbg = |found: &Completions| found.items.iter().any(|i| i.filter_text == "dbg");
+            let mut options = std::collections::BTreeMap::new();
+            options.insert("rust.postfix".to_string(), false);
+            set_completion_options(&options);
+            let server = server_for(&exe, &[], dir.path()).await.unwrap();
+            let found = complete_when_ready(&server, "rust", &path, text, 4, 6).await;
+            assert!(!found.items.is_empty());
+            assert!(!has_dbg(&found), "postfix completions are off");
+            // The parameter being typed: the second one, after the comma.
+            let help = signature_help_on(
+                &server,
+                "rust",
+                &path,
+                text,
+                2,
+                16,
+                SignatureTrigger {
+                    kind: 1,
+                    character: None,
+                    open: None,
+                },
+            )
+            .await
+            .unwrap()
+            .expect("a call");
+            let signatures = crate::completion::parse_signatures(&help).unwrap();
+            let sig = &signatures.list[signatures.active];
+            let param = signatures.param_of(signatures.active).unwrap();
+            assert_eq!(
+                &sig.label[sig.params[param].0..sig.params[param].1],
+                "n: u32"
+            );
+            // Out of any call: nothing.
+            let none = signature_help_on(
+                &server,
+                "rust",
+                &path,
+                text,
+                3,
+                4,
+                SignatureTrigger {
+                    kind: 1,
+                    character: None,
+                    open: None,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(none.is_none_or(|v| crate::completion::parse_signatures(&v).is_none()));
+            // Turned on again: the server starts again with it.
+            restart_servers().await;
+            options.insert("rust.postfix".to_string(), true);
+            set_completion_options(&options);
+            let server = server_for(&exe, &[], dir.path()).await.unwrap();
+            let found = complete_when_ready(&server, "rust", &path, text, 4, 6).await;
+            assert!(has_dbg(&found), "postfix completions are back");
+            set_completion_options(&std::collections::BTreeMap::new());
+        });
     }
 }

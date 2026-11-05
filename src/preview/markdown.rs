@@ -742,7 +742,11 @@ pub fn view(blocks: &[Block], dark: bool) -> Element<'static, Message> {
     .into()
 }
 
-fn block_view(block: &Block, dark: bool, slug: Option<&str>) -> Element<'static, Message> {
+pub(crate) fn block_view(
+    block: &Block,
+    dark: bool,
+    slug: Option<&str>,
+) -> Element<'static, Message> {
     let p = theme::palette(dark);
     match block {
         Block::Heading { level, spans } => {

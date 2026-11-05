@@ -39,6 +39,8 @@ pub enum ShortcutTarget {
     GotoFile,
     FindInFiles,
     ReopenTab,
+    Complete,
+    ParameterInfo,
 }
 
 /// How a key is named to the user.
@@ -213,6 +215,10 @@ pub struct Shortcuts {
     pub goto_file: ShortcutConfig,
     pub find_in_files: ShortcutConfig,
     pub reopen_tab: ShortcutConfig,
+    /// Opens the list of completions where the cursor is.
+    pub complete: ShortcutConfig,
+    /// Shows the parameters of the call at the cursor.
+    pub parameter_info: ShortcutConfig,
 }
 
 /// Back and forward, as the IDEs do: Ctrl+Alt+←/→ on Windows, ⌘[ / ⌘] on
@@ -233,6 +239,14 @@ fn default_nav_forward() -> ShortcutConfig {
         ShortcutConfig::ctrl_alt("ArrowRight")
     } else {
         ShortcutConfig::alt("ArrowRight")
+    }
+}
+/// Ctrl+Space, as the IDEs; on macOS ⌘Space is Spotlight's.
+fn default_complete() -> ShortcutConfig {
+    if cfg!(target_os = "macos") {
+        ShortcutConfig::ctrl_shift("Space")
+    } else {
+        ShortcutConfig::ctrl("Space")
     }
 }
 fn default_duplicate_line() -> ShortcutConfig {
@@ -307,6 +321,8 @@ shortcut_slots! {
     GotoFile => goto_file,
     FindInFiles => find_in_files,
     ReopenTab => reopen_tab,
+    Complete => complete,
+    ParameterInfo => parameter_info,
 }
 
 impl Shortcuts {
@@ -370,6 +386,8 @@ impl Default for Shortcuts {
             goto_file: ShortcutConfig::ctrl_shift("n"),
             find_in_files: ShortcutConfig::ctrl_shift("f"),
             reopen_tab: ShortcutConfig::ctrl_shift("t"),
+            complete: default_complete(),
+            parameter_info: ShortcutConfig::ctrl("p"),
         }
     }
 }
@@ -476,6 +494,13 @@ pub struct Config {
     pub lint_colors: std::collections::BTreeMap<String, String>,
     /// A first look when a file is opened (and when the editor starts).
     pub lint_on_open: bool,
+    /// Completion from the language servers.
+    pub completion_enabled: bool,
+    /// The list opens by itself while typing (else with the shortcut only).
+    pub completion_auto: bool,
+    /// What each language's server proposes (`rust.postfix`, …); a missing
+    /// one is on.
+    pub completion_options: std::collections::BTreeMap<String, bool>,
     pub lint_trigger: crate::lint::Trigger,
     pub lint_level: crate::lint::Level,
     /// Fixes are applied when a file is saved.
@@ -541,6 +566,9 @@ impl Default for Config {
             lint_markings: std::collections::BTreeMap::new(),
             lint_colors: std::collections::BTreeMap::new(),
             lint_on_open: true,
+            completion_enabled: true,
+            completion_auto: true,
+            completion_options: std::collections::BTreeMap::new(),
             lint_trigger: crate::lint::Trigger::default(),
             lint_level: crate::lint::Level::default(),
             lint_fix_on_save: false,

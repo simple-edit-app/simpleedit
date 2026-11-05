@@ -229,6 +229,7 @@ impl EditorState {
         editor.padding(padding(config)).into()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn view<'a>(
         &'a self,
         config: &Config,
@@ -237,6 +238,7 @@ impl EditorState {
         blame: Option<crate::code_editor::Annotations>,
         changes: Option<crate::code_editor::ChangePaint>,
         problems: Option<crate::code_editor::DiagPaint>,
+        completion: Option<crate::app::Floating>,
     ) -> Element<'a, Message> {
         let dark = config.dark_mode;
         self.content.set_wrapping(config.word_wrap);
@@ -294,6 +296,14 @@ impl EditorState {
         }
         if let Some(problems) = problems {
             editor = editor.diagnostics(problems, Message::LintHover);
+        }
+        if let Some(floating) = completion {
+            editor = editor.completion(crate::code_editor::CompletionHook {
+                anchor: floating.list,
+                hint: floating.hint,
+                area: floating.area,
+                on_anchor: Box::new(Message::CompletionAnchor),
+            });
         }
 
         editor = editor.folding(

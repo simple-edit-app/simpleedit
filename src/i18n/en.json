@@ -641,5 +641,19 @@
   "git.open_file": "Open file",
   "git.file_gone": "This file no longer exists",
   "git.view_unified": "Switch to the unified view",
-  "git.view_side": "Switch to the side-by-side view"
+  "git.view_side": "Switch to the side-by-side view",
+  "prefs.completion": "Code completion (language servers)",
+  "prefs.completion_auto": "Show completions while typing",
+  "shortcuts.complete": "Complete code",
+  "completion.indexing": "The language server is loading the project: the list may be incomplete",
+  "completion.loading": "Looking for completions…",
+  "completion.none": "No completions here",
+  "completion.no_server": "No language server for .%{ext}: install one in Preferences > Servers",
+  "shortcuts.parameter_info": "Parameter info",
+  "hint.none": "Not in a function call",
+  "prefs.completion_ts_imports": "TypeScript / JavaScript: names of other modules (imported on accept)",
+  "prefs.completion_rust_imports": "Rust: items of other modules (imported on accept)",
+  "prefs.completion_rust_postfix": "Rust: postfix completions (.if, .match, .ref…)",
+  "prefs.completion_rust_arguments": "Rust: fill in the arguments of a call",
+  "prefs.completion_python_imports": "Python: names of other modules (imported on accept)"
 }

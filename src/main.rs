@@ -14,6 +14,7 @@ mod app;
 mod bookmarks;
 mod changelog;
 mod code_editor;
+mod completion;
 mod config;
 mod definition;
 mod editor;

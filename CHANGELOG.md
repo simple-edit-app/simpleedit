@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.12.0] - 2026-11-05
+
+### Added
+- Code completion from the language servers (TypeScript/JavaScript, Rust, Python, Go, C/C++, Java and the others the editor knows). The list opens while typing a name or after `.`, `::`… (Ctrl+Space to ask), holds only what the server proposes, narrowed by what was typed, in the server's order, with each item's kind, type and documentation. Enter puts the item in, Tab replaces the rest of the word; imports are added with it (one undo step), and the places of a function's arguments are filled with Tab. A list the server says is incomplete is asked again while typing, and while the server is still loading the project the list says so and is asked again once it is done. Without a language server, nothing is proposed.
+- Parameter info: the signature of the call being typed, the parameter at the cursor marked, opens on `(` and `,` (Ctrl+P to ask); Alt+↑/↓ go through the overloads.
+- Preferences > Editor: completion on or off, while typing or on the shortcut only, and per language: imports from other modules (TypeScript/JavaScript, Rust, Python), postfix completions and call arguments (Rust).
+- Language servers start when a file of their project is opened and load it in the background; only the changed part of a file is sent to them on each keystroke.
+
 ## [1.11.0] - 2026-11-05
 
 ### Changed
