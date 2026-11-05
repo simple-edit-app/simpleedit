@@ -176,14 +176,13 @@ impl SimpleEditApp {
             | ActiveOverlay::References(_)
             | ActiveOverlay::Shortcuts
             | ActiveOverlay::Conflicts
-            | ActiveOverlay::Palette
+            | ActiveOverlay::Everywhere
             | ActiveOverlay::ConfirmClose(_)
             | ActiveOverlay::ConfirmCloseMany(..)
             | ActiveOverlay::ConfirmQuit(_)
             | ActiveOverlay::ConfirmScratchDelete(_)
             | ActiveOverlay::ConfirmFileDelete(..)
             | ActiveOverlay::ProjectName(_)
-            | ActiveOverlay::GotoFile
             | ActiveOverlay::FindInFiles
             | ActiveOverlay::ConfirmFolderDelete(_)
             | ActiveOverlay::ConfirmMove(..)

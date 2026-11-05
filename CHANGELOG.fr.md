@@ -1,5 +1,14 @@
 # Journal des modifications
 
+## [1.13.0] - 2026-11-05
+
+### Ajouté
+- Recherche partout, comme dans IntelliJ IDEA : Maj deux fois ouvre un champ qui trouve classes, fichiers et dossiers, symboles, actions, réglages et texte, par onglet (Tout, Classes, Fichiers, Symboles, Actions, Texte, et Git une fois activé dans les Préférences) ou tout à la fois. Sans rien taper, elle liste les fichiers récents. Maj deux fois encore (ou Alt+N) inclut les éléments hors projet : ce que Git ignore, les bibliothèques. `nom:ligne:colonne` ouvre un fichier à un endroit, `Type.nom` trouve un nom qualifié, `/` liste les réglages (basculés ON/OFF sur place) et les pages des Préférences, un calcul (`2^10`, `sqrt(2)`, `0xff + 1`) est fait et copié avec Entrée. Les actions se trouvent par leurs mots dans n'importe quel ordre, par synonymes et par des abréviations à soi (clic droit sur une action), et Alt+Entrée définit le raccourci d'une action. Les résultats se filtrent par type de fichier et s'ouvrent dans Chercher dans les fichiers. Tab et Maj+Tab changent d'onglet, Ctrl+↑/↓ vont au premier et au dernier résultat.
+- Raccourcis des onglets : Ctrl+Maj+N (fichiers), Ctrl+Alt+N (classes), Ctrl+Alt+Maj+N (symboles), Ctrl+Maj+A (actions).
+
+### Modifié
+- Aller à un fichier et la palette de commandes sont maintenant les onglets Fichiers et Actions de la recherche partout.
+
 ## [1.12.0] - 2026-11-05
 
 ### Ajouté

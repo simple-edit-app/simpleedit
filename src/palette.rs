@@ -1,14 +1,8 @@
-//! The command palette: a searchable list of the app's main actions, opened
-//! with a shortcut (Ctrl/Cmd+Shift+P by default).
-
-use iced::{
-    widget::{button, column, container, row, scrollable, text, text_input, Space},
-    Alignment, Element, Length,
-};
+//! The app's main actions, as search everywhere lists them on its Actions
+//! tab (Ctrl/Cmd+Shift+A by default).
 
 use crate::app::Message;
 use crate::config::Config;
-use crate::theme;
 
 /// What a palette entry does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +51,82 @@ pub enum PaletteCommand {
 }
 
 impl PaletteCommand {
+    /// What the command is called in the settings (its abbreviations).
+    pub fn id(self) -> String {
+        format!("{self:?}")
+    }
+
+    /// Other words it is known by, for search everywhere (English and
+    /// French, the languages of the app).
+    pub fn synonyms(self) -> &'static [&'static str] {
+        use PaletteCommand::*;
+        match self {
+            NewFile => &["create", "créer", "untitled"],
+            OpenFile => &["load", "charger"],
+            GotoFile => &["navigate", "naviguer"],
+            FindInFiles => &["grep", "search text", "rechercher texte"],
+            Complete => &["autocomplete", "suggestion", "autocomplétion"],
+            ParameterInfo => &["signature", "arguments", "hint"],
+            FormatCode => &["reformat", "prettier", "indent", "reformater"],
+            GotoLine => &["jump", "sauter"],
+            ToggleSidebar => &["panel", "files", "panneau", "toggle", "basculer"],
+            SplitRight | SplitDown => &["divide", "pane", "diviser", "vertical", "horizontal"],
+            ToggleTerminal => &["console", "shell", "toggle", "basculer"],
+            ToggleGit => &["vcs", "commit", "version control", "toggle", "basculer"],
+            ToggleTheme => &[
+                "dark", "light", "sombre", "clair", "mode", "toggle", "basculer",
+            ],
+            Preferences => &[
+                "settings",
+                "options",
+                "réglages",
+                "paramètres",
+                "configuration",
+            ],
+            Shortcuts => &["keymap", "keys", "touches", "raccourcis"],
+            Quit => &["exit", "close app", "sortir"],
+            CloseFile => &["close tab", "fermer onglet"],
+            LintNow | LintFix => &["inspect", "problems", "errors", "erreurs", "problèmes"],
+            ToggleFold | FoldAll | UnfoldAll => &["collapse", "expand", "replier", "déplier"],
+            ToggleBookmark | NextBookmark | PrevBookmark => &["mark", "favorite", "signet"],
+            NavBack | NavForward => &["history", "historique", "previous", "next"],
+            CheckForUpdate => &["upgrade", "version", "mise à jour"],
+            _ => &[],
+        }
+    }
+
+    /// The configurable shortcut that runs it, if it has one.
+    pub fn shortcut_target(self) -> Option<crate::config::ShortcutTarget> {
+        use crate::config::ShortcutTarget as T;
+        use PaletteCommand::*;
+        Some(match self {
+            NewFile => T::NewFile,
+            OpenFile => T::OpenFile,
+            GotoFile => T::GotoFile,
+            FindInFiles => T::FindInFiles,
+            ReopenTab => T::ReopenTab,
+            Complete => T::Complete,
+            ParameterInfo => T::ParameterInfo,
+            SaveFile => T::SaveFile,
+            SaveFileAs => T::SaveAs,
+            CloseFile => T::CloseFile,
+            Find => T::Find,
+            FormatCode => T::FormatCode,
+            GotoLine => T::GotoLine,
+            ToggleSidebar => T::ToggleSidebar,
+            ToggleTerminal => T::ToggleTerminal,
+            ToggleGit => T::ToggleGit,
+            ToggleBookmark => T::ToggleBookmark,
+            NextBookmark => T::NextBookmark,
+            PrevBookmark => T::PrevBookmark,
+            NavBack => T::NavBack,
+            NavForward => T::NavForward,
+            ToggleFold => T::ToggleFold,
+            Quit => T::Quit,
+            _ => return None,
+        })
+    }
+
     /// The message that performs the command.
     pub fn message(self) -> Message {
         match self {
@@ -116,29 +186,6 @@ pub struct Entry {
     /// Disabled entries are listed but do nothing (no formatter for this
     /// file type, or a language that is already detected).
     pub enabled: bool,
-}
-
-pub fn input_id() -> iced::widget::Id {
-    iced::widget::Id::new("command-palette")
-}
-
-pub fn list_id() -> iced::widget::Id {
-    iced::widget::Id::new("command-palette-list")
-}
-
-/// Approximate height of one row, with its spacing.
-const ROW_HEIGHT: f32 = 35.0;
-
-/// Scrolls the list so the selected row stays in view (about four rows of
-/// context above it).
-pub fn scroll_to_selected<T: 'static>(selected: usize) -> iced::Task<T> {
-    iced::widget::operation::scroll_to(
-        list_id(),
-        iced::widget::scrollable::AbsoluteOffset {
-            x: 0.0,
-            y: ((selected as f32 - 4.0) * ROW_HEIGHT).max(0.0),
-        },
-    )
 }
 
 /// Every command, with its current shortcut.
@@ -423,26 +470,12 @@ fn fold(c: char) -> char {
     }
 }
 
-/// Lowercase letters with their accents removed.
-fn folded(text: &str) -> impl Iterator<Item = char> + '_ {
-    text.chars().flat_map(char::to_lowercase).map(fold)
-}
-
-/// Whether `query` matches `label`: every character of the query appears in
-/// the label, in order, ignoring case and accents ("frmt" finds "Formater le
-/// code", "pref" finds "Préférences").
-fn matches(label: &str, query: &str) -> bool {
-    let mut label = folded(label);
-    folded(query)
-        .filter(|c| !c.is_whitespace())
-        .all(|q| label.any(|l| l == q))
-}
-
-/// The entries that match the query, in their original order.
-pub fn filter(entries: Vec<Entry>, query: &str) -> Vec<Entry> {
-    entries
-        .into_iter()
-        .filter(|e| matches(&e.label, query))
+/// Lowercase letters with their accents removed: "Préférences" and
+/// "preferences" read the same.
+pub fn folded(text: &str) -> String {
+    text.chars()
+        .flat_map(char::to_lowercase)
+        .map(fold)
         .collect()
 }
 
@@ -454,162 +487,14 @@ pub fn step(selected: usize, delta: i32, len: usize) -> usize {
     (selected as i64 + delta as i64).rem_euclid(len as i64) as usize
 }
 
-/// The palette box: query field, then the list.
-pub fn view<'a>(
-    dark: bool,
-    query: &'a str,
-    shown: &[Entry],
-    selected: usize,
-) -> Element<'a, Message> {
-    let p = theme::palette(dark);
-
-    let field = row![
-        text(">").size(15).font(theme::MONO).color(p.accent),
-        text_input(&t!("palette.placeholder"), query)
-            .id(input_id())
-            .on_input(Message::PaletteQueryChanged)
-            .on_submit(Message::PaletteSubmit)
-            .size(15)
-            .padding(0)
-            .style((theme::BareField { dark }).style()),
-        container(
-            text(t!("key.escape").to_string())
-                .size(11)
-                .font(theme::MONO)
-                .color(p.muted)
-        )
-        .padding([2, 6])
-        .style(theme::badge(dark)),
-    ]
-    .spacing(10)
-    .padding([0, 16])
-    .height(52)
-    .align_y(Alignment::Center);
-
-    let mut list = column![container(
-        text(t!("palette.title").to_string().to_uppercase())
-            .size(10.5)
-            .font(theme::UI_MEDIUM)
-            .color(p.muted)
-    )
-    .padding(iced::Padding {
-        top: 8.0,
-        right: 10.0,
-        bottom: 4.0,
-        left: 10.0
-    })]
-    .spacing(1)
-    .padding(6);
-
-    if shown.is_empty() {
-        list = list.push(
-            container(
-                text(t!("palette.no_results").to_string())
-                    .size(13)
-                    .color(p.muted),
-            )
-            .padding([9, 10]),
-        );
-    }
-    for (i, e) in shown.iter().enumerate() {
-        let highlighted = i == selected;
-        let shortcut_color = if highlighted { p.accent } else { p.muted };
-        let label_color = if !e.enabled {
-            p.muted
-        } else if highlighted {
-            p.accent
-        } else {
-            p.text
-        };
-        let content = row![
-            text(e.label.clone()).size(13).color(label_color),
-            Space::new().width(Length::Fill),
-            text(e.shortcut.clone().unwrap_or_default())
-                .size(11.5)
-                .font(theme::MONO)
-                .color(shortcut_color),
-        ]
-        .spacing(10)
-        .align_y(Alignment::Center);
-        let mut b = button(content).padding([9, 10]).width(Length::Fill).style(
-            (theme::MenuItem {
-                dark,
-                radius: theme::R_ROW,
-                highlighted,
-            })
-            .style(),
-        );
-        if e.enabled {
-            b = b.on_press(Message::PaletteRun(e.command));
-        }
-        list = list.push(b);
-    }
-
-    container(column![
-        field,
-        container(Space::new().height(1))
-            .width(Length::Fill)
-            .style(theme::rule(dark)),
-        scrollable(list)
-            .id(list_id())
-            .style(theme::Scrollbar { dark }.style())
-            .height(Length::Fixed(380.0)),
-    ])
-    .width(540)
-    .style(theme::palette_card(dark))
-    .into()
-}
-
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn accents_do_not_matter_in_either_direction() {
-        assert!(matches("Préférences", "pref"));
-        assert!(matches("Préférences", "préf"));
-        assert!(matches("Préférences", "PREF"));
-        assert!(matches("Preferences", "préf"));
-        assert!(matches("Ouvrir… un fichier récent", "recent"));
-        assert!(matches("Écrire", "ecr"));
-        assert!(!matches("Préférences", "prx"));
-    }
-
     use super::*;
 
-    fn entry(command: PaletteCommand, label: &str) -> Entry {
-        Entry {
-            command,
-            label: label.to_string(),
-            shortcut: None,
-            enabled: true,
-        }
-    }
-
-    // Built by hand: `entries` uses translations, whose locale is global
-    // state shared with other tests.
-    fn sample() -> Vec<Entry> {
-        vec![
-            entry(PaletteCommand::NewFile, "New file"),
-            entry(PaletteCommand::OpenFile, "Open…"),
-            entry(PaletteCommand::Find, "Find / Replace…"),
-            entry(PaletteCommand::FormatCode, "Format code"),
-            entry(PaletteCommand::GotoLine, "Go to line…"),
-        ]
-    }
-
     #[test]
-    fn empty_query_lists_everything() {
-        assert_eq!(filter(sample(), "").len(), 5);
-        assert_eq!(filter(sample(), "   ").len(), 5);
-    }
-
-    #[test]
-    fn query_is_a_case_insensitive_subsequence() {
-        let hits = filter(sample(), "FRMT");
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].command, PaletteCommand::FormatCode);
-        // Spaces in the query are ignored: "g l" finds "Go to line…" only.
-        assert_eq!(filter(sample(), "g l").len(), 1);
-        assert!(filter(sample(), "zzzz").is_empty());
+    fn accents_are_folded() {
+        assert_eq!(folded("Préférences"), "preferences");
+        assert_eq!(folded("Écrire"), "ecrire");
     }
 
     #[test]

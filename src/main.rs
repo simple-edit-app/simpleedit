@@ -18,6 +18,7 @@ mod completion;
 mod config;
 mod definition;
 mod editor;
+mod everywhere;
 mod file_icons;
 mod finder;
 mod floating;

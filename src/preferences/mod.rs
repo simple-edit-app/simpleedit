@@ -27,6 +27,8 @@ pub enum PreferencesMessage {
     CompletionAutoToggled(bool),
     /// A completion setting of a language (`rust.postfix`, …).
     CompletionOption(String, bool),
+    EverywhereTextToggled(bool),
+    EverywhereGitToggled(bool),
     AutocompleteBracketsToggled(bool),
     AutocompleteQuotesToggled(bool),
     HighlightCurrentLineToggled(bool),
@@ -54,7 +56,7 @@ pub enum PrefsPage {
 }
 
 impl PrefsPage {
-    const ALL: [PrefsPage; 8] = [
+    pub(crate) const ALL: [PrefsPage; 8] = [
         PrefsPage::Editor,
         PrefsPage::Appearance,
         PrefsPage::Shortcuts,
@@ -65,7 +67,7 @@ impl PrefsPage {
         PrefsPage::Updates,
     ];
 
-    fn label(self) -> String {
+    pub(crate) fn label(self) -> String {
         match self {
             PrefsPage::Editor => t!("prefs.nav_editor"),
             PrefsPage::Appearance => t!("prefs.nav_appearance"),
@@ -199,6 +201,12 @@ impl PreferencesState {
             }
             PreferencesMessage::CompletionOption(key, v) => {
                 config.completion_options.insert(key, v);
+            }
+            PreferencesMessage::EverywhereTextToggled(v) => {
+                config.everywhere_text = v;
+            }
+            PreferencesMessage::EverywhereGitToggled(v) => {
+                config.everywhere_git = v;
             }
             PreferencesMessage::AutocompleteBracketsToggled(v) => {
                 config.autocomplete_brackets = v;
@@ -537,6 +545,16 @@ impl PreferencesState {
                 t!("prefs.word_wrap").to_string(),
                 config.word_wrap,
                 PreferencesMessage::WordWrapToggled,
+            ),
+            toggle(
+                t!("prefs.everywhere_text").to_string(),
+                config.everywhere_text,
+                PreferencesMessage::EverywhereTextToggled,
+            ),
+            toggle(
+                t!("prefs.everywhere_git").to_string(),
+                config.everywhere_git,
+                PreferencesMessage::EverywhereGitToggled,
             ),
         ];
         // The languages' settings come under the completion switches.
@@ -947,6 +965,16 @@ pub fn shortcuts_list(
             ShortcutTarget::ParameterInfo,
             t!("shortcuts.parameter_info").to_string(),
             sc.parameter_info.display(),
+        ),
+        (
+            ShortcutTarget::GotoClass,
+            t!("shortcuts.goto_class").to_string(),
+            sc.goto_class.display(),
+        ),
+        (
+            ShortcutTarget::GotoSymbol,
+            t!("shortcuts.goto_symbol").to_string(),
+            sc.goto_symbol.display(),
         ),
         (
             ShortcutTarget::ReopenTab,

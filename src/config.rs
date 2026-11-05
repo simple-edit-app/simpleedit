@@ -41,6 +41,8 @@ pub enum ShortcutTarget {
     ReopenTab,
     Complete,
     ParameterInfo,
+    GotoClass,
+    GotoSymbol,
 }
 
 /// How a key is named to the user.
@@ -93,6 +95,14 @@ impl ShortcutConfig {
         Self {
             ctrl: true,
             shift: false,
+            alt: true,
+            key: key.to_string(),
+        }
+    }
+    fn ctrl_alt_shift(key: &str) -> Self {
+        Self {
+            ctrl: true,
+            shift: true,
             alt: true,
             key: key.to_string(),
         }
@@ -219,6 +229,10 @@ pub struct Shortcuts {
     pub complete: ShortcutConfig,
     /// Shows the parameters of the call at the cursor.
     pub parameter_info: ShortcutConfig,
+    /// Search everywhere, on its Classes tab.
+    pub goto_class: ShortcutConfig,
+    /// Search everywhere, on its Symbols tab.
+    pub goto_symbol: ShortcutConfig,
 }
 
 /// Back and forward, as the IDEs do: Ctrl+Alt+←/→ on Windows, ⌘[ / ⌘] on
@@ -323,6 +337,8 @@ shortcut_slots! {
     ReopenTab => reopen_tab,
     Complete => complete,
     ParameterInfo => parameter_info,
+    GotoClass => goto_class,
+    GotoSymbol => goto_symbol,
 }
 
 impl Shortcuts {
@@ -388,6 +404,9 @@ impl Default for Shortcuts {
             reopen_tab: ShortcutConfig::ctrl_shift("t"),
             complete: default_complete(),
             parameter_info: ShortcutConfig::ctrl("p"),
+            // IntelliJ's Ctrl+N is New file here.
+            goto_class: ShortcutConfig::ctrl_alt("n"),
+            goto_symbol: ShortcutConfig::ctrl_alt_shift("n"),
         }
     }
 }
@@ -501,6 +520,12 @@ pub struct Config {
     /// What each language's server proposes (`rust.postfix`, …); a missing
     /// one is on.
     pub completion_options: std::collections::BTreeMap<String, bool>,
+    /// Search everywhere: text results at the end of "All" when few others.
+    pub everywhere_text: bool,
+    /// Search everywhere: the Git tab (branches and commits).
+    pub everywhere_git: bool,
+    /// Abbreviations of actions, by action (search everywhere).
+    pub action_abbreviations: std::collections::BTreeMap<String, Vec<String>>,
     pub lint_trigger: crate::lint::Trigger,
     pub lint_level: crate::lint::Level,
     /// Fixes are applied when a file is saved.
@@ -569,6 +594,9 @@ impl Default for Config {
             completion_enabled: true,
             completion_auto: true,
             completion_options: std::collections::BTreeMap::new(),
+            everywhere_text: true,
+            everywhere_git: false,
+            action_abbreviations: std::collections::BTreeMap::new(),
             lint_trigger: crate::lint::Trigger::default(),
             lint_level: crate::lint::Level::default(),
             lint_fix_on_save: false,

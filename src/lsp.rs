@@ -570,6 +570,11 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
 
 // ---- Problems and fixes ---------------------------------------------------
 
+/// The main program that serves a file extension (to tell servers apart).
+pub fn server_of(ext: &str) -> Option<&'static str> {
+    spec_for(&ext.to_ascii_lowercase()).and_then(|(_, c)| c.first().map(|c| c.0))
+}
+
 /// Whether a server for the language of `ext` is installed.
 pub fn installed(ext: &str) -> bool {
     spec_for(&ext.to_ascii_lowercase())
@@ -1053,6 +1058,121 @@ async fn signature_help_on(
             Err(e) => return Err(e.message),
         }
     }
+}
+
+// ---- Symbols of the projects (search everywhere) ---------------------------
+
+/// A name a server knows in a project: a class, a function, a field…
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolHit {
+    pub name: String,
+    /// LSP `SymbolKind` (5 class, 10 enum, 11 interface, 23 struct, …).
+    pub kind: u64,
+    pub container: Option<String>,
+    pub path: PathBuf,
+    /// From 0; the column in bytes.
+    pub line: usize,
+    pub col: usize,
+}
+
+/// What the servers found, and whether one is still loading its project.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Symbols {
+    pub hits: Vec<SymbolHit>,
+    pub busy: bool,
+}
+
+/// Classes, interfaces, structs and enums: what the "Classes" tab lists.
+pub fn is_class_kind(kind: u64) -> bool {
+    matches!(kind, 5 | 10 | 11 | 23)
+}
+
+/// The names of an answer to `workspace/symbol`, with byte columns (the
+/// files read once each).
+fn symbols_of(value: &Value, texts: &mut HashMap<PathBuf, String>) -> Vec<SymbolHit> {
+    value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| {
+            let location = s.get("location")?;
+            let path = uri_to_path(location.get("uri")?.as_str()?)?;
+            let start = location.get("range").and_then(|r| r.get("start"));
+            let line = start
+                .and_then(|p| p.get("line"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            let character = start
+                .and_then(|p| p.get("character"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            let text = texts
+                .entry(path.clone())
+                .or_insert_with(|| std::fs::read_to_string(&path).unwrap_or_default());
+            let col = byte_col(text.lines().nth(line).unwrap_or(""), character);
+            Some(SymbolHit {
+                name: s.get("name")?.as_str()?.to_string(),
+                kind: s.get("kind").and_then(Value::as_u64).unwrap_or(0),
+                container: s
+                    .get("containerName")
+                    .and_then(Value::as_str)
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_string),
+                path,
+                line,
+                col,
+            })
+        })
+        .collect()
+}
+
+/// The names matching `query` in the projects, from their servers: each is
+/// given as (language, a file of the project in that language). `all` asks
+/// for every kind of name (else the servers may give only types);
+/// `dependencies` looks in the libraries too.
+pub async fn workspace_symbols(
+    servers: Vec<(String, PathBuf)>,
+    query: String,
+    all: bool,
+    dependencies: bool,
+) -> Symbols {
+    let mut found = Symbols::default();
+    let mut texts = HashMap::new();
+    for (ext, file) in servers {
+        let Ok((server, language_id, _)) = connect(&ext, &file).await else {
+            continue;
+        };
+        // TypeScript needs a file of the project open to know it.
+        if let Ok(text) = std::fs::read_to_string(&file) {
+            let _ = server.sync(&path_to_uri(&file), language_id, &text).await;
+        }
+        found.busy |= server.loading();
+        // rust-analyzer reads `#` as "every kind", `*` as "libraries too".
+        let mut asked = query.clone();
+        if server.family == "rust" {
+            if all {
+                asked.push('#');
+            }
+            if dependencies {
+                asked.push('*');
+            }
+        }
+        let answer = tokio::time::timeout(
+            Duration::from_secs(8),
+            server.request("workspace/symbol", json!({ "query": asked })),
+        )
+        .await;
+        if let Ok(Ok(value)) = answer {
+            found.hits.extend(symbols_of(&value, &mut texts));
+        }
+    }
+    found
+        .hits
+        .sort_by(|a, b| (&a.name, &a.path, a.line).cmp(&(&b.name, &b.path, b.line)));
+    found
+        .hits
+        .dedup_by(|a, b| a.name == b.name && a.path == b.path && a.line == b.line);
+    found
 }
 
 /// The rest of an item (documentation, detail, the import it needs), as the
@@ -1783,6 +1903,27 @@ while True:
     }
 
     #[test]
+    fn workspace_symbols_are_read_in_both_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.rs");
+        std::fs::write(&file, "x\n  é struct User {}\n").unwrap();
+        let uri = path_to_uri(&file);
+        let answer = json!([
+            { "name": "User", "kind": 23, "containerName": "",
+              "location": { "uri": uri, "range": { "start": { "line": 1, "character": 11 }, "end": { "line": 1, "character": 15 } } } },
+            { "name": "lazy", "kind": 12, "location": { "uri": uri } },
+            { "name": "bad" }
+        ]);
+        let mut texts = HashMap::new();
+        let hits = symbols_of(&answer, &mut texts);
+        assert_eq!(hits.len(), 2);
+        assert_eq!((hits[0].line, hits[0].col), (1, 12), "after the two-byte é");
+        assert_eq!(hits[0].container, None);
+        assert_eq!((hits[1].line, hits[1].col), (0, 0));
+        assert!(is_class_kind(23) && is_class_kind(5) && !is_class_kind(12));
+    }
+
+    #[test]
     fn a_change_is_sent_as_the_part_that_changed() {
         let change = text_change("ab\ncd\n", "ab\ncXd\n");
         assert_eq!(
@@ -2177,6 +2318,63 @@ while True:
             let found = complete_when_ready(&server, "rust", &path, text, 4, 6).await;
             assert!(has_dbg(&found), "postfix completions are back");
             set_completion_options(&std::collections::BTreeMap::new());
+        });
+    }
+
+    /// Against a real rust-analyzer: the names of a project, every kind or
+    /// only the types (`cargo test -- --ignored real_rust_analyzer_symbols`).
+    #[test]
+    #[ignore]
+    fn real_rust_analyzer_symbols() {
+        if find_executable("rust-analyzer")
+            .filter(|_| usable("rust-analyzer"))
+            .is_none()
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let path = dir.path().join("src/main.rs");
+        std::fs::write(
+            &path,
+            "struct UserAccount { name: String }\nfn user_name(u: &UserAccount) -> &str { &u.name }\nfn main() {}\n",
+        )
+        .unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let servers = vec![("rs".to_string(), path.clone())];
+            let started = Instant::now();
+            let all = loop {
+                let found = workspace_symbols(servers.clone(), "user".into(), true, false).await;
+                if (!found.busy && !found.hits.is_empty())
+                    || started.elapsed() > Duration::from_secs(90)
+                {
+                    break found;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            };
+            let names: Vec<&str> = all.hits.iter().map(|h| h.name.as_str()).collect();
+            assert!(
+                names.contains(&"UserAccount") && names.contains(&"user_name"),
+                "{names:?}"
+            );
+            let account = all.hits.iter().find(|h| h.name == "UserAccount").unwrap();
+            assert_eq!((account.line, account.col), (0, 7));
+            assert!(is_class_kind(account.kind));
+            let types = workspace_symbols(servers, "user".into(), false, false).await;
+            assert!(
+                types.hits.iter().all(|h| h.name != "user_name"),
+                "{:?}",
+                types.hits
+            );
         });
     }
 }

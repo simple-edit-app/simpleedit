@@ -135,6 +135,8 @@ pub struct MarksState {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ActiveOverlay {
     None,
+    /// Search everywhere (Shift twice).
+    Everywhere,
     About,
     /// Every release.
     Changelog,
@@ -147,7 +149,6 @@ pub enum ActiveOverlay {
     Shortcuts,
     /// The files of an operation that are in conflict.
     Conflicts,
-    Palette,
     UpdateChecking,
     UpdateUpToDate,
     /// The new version, and what it changes.
@@ -165,8 +166,6 @@ pub enum ActiveOverlay {
     ConfirmOverwrite(PathBuf),
     /// A scratch file is about to be deleted for good.
     ConfirmScratchDelete(PathBuf),
-    /// A file of the projects asked for by its name.
-    GotoFile,
     /// A text looked for in the files of the projects.
     FindInFiles,
     /// A name asked for a file or folder of a project.
@@ -234,9 +233,6 @@ pub enum Message {
     OpenFindInFiles,
     /// The files of the projects, listed in the background.
     FinderFiles(Vec<(PathBuf, String)>),
-    GotoFileQuery(String),
-    /// Opens a file of the list (by its place), or the one highlighted.
-    GotoFileOpen(Option<usize>),
     FindQuery(String),
     FindToggleCase,
     FindToggleRegex,
@@ -534,9 +530,29 @@ pub enum Message {
     StartCaptureShortcut(ShortcutTarget),
     // Task palette
     OpenPalette,
-    PaletteQueryChanged(String),
-    PaletteSubmit,
-    PaletteRun(crate::palette::PaletteCommand),
+    /// Search everywhere: opened on a tab, Shift twice, what is typed,
+    /// another tab, a line opened, what the searches found, the options.
+    OpenEverywhere(crate::everywhere::Tab),
+    DoubleShift,
+    EverywhereQuery(String),
+    EverywhereTab(crate::everywhere::Tab),
+    EverywhereOpen(Option<usize>),
+    EverywhereFiles(u64, Vec<(PathBuf, String)>),
+    EverywhereSymbolsDue(u64),
+    EverywhereSymbols(u64, crate::lsp::Symbols),
+    EverywhereTextDue(u64),
+    EverywhereText(u64, Result<Vec<crate::finder::TextHit>, String>),
+    EverywhereGit(Vec<String>, Vec<Commit>),
+    EverywhereNonProject,
+    EverywhereFilter,
+    EverywhereFilterType(String, bool),
+    EverywhereTextOption(u8),
+    EverywhereExport,
+    EverywhereAbbreviate(crate::palette::PaletteCommand),
+    EverywhereAbbreviationTyped(String),
+    EverywhereAbbreviationSubmit,
+    EverywhereAbbreviationRemove(crate::palette::PaletteCommand, String),
+    EverywhereAssign(crate::palette::PaletteCommand),
     // Line-level editing
     DuplicateLine,
     MoveLineUp,
@@ -668,8 +684,7 @@ pub struct SimpleEditApp {
     show_preferences: bool,
     /// The shortcut being rebound, while waiting for its new key.
     capturing: Option<ShortcutTarget>,
-    palette_query: String,
-    palette_selected: usize,
+    everywhere: everywhere::Everywhere,
     open_menu: Option<TopMenu>,
     /// The recent files submenu of the File menu is showing.
     recents_open: bool,
@@ -885,8 +900,7 @@ impl SimpleEditApp {
             panel_drag: None,
             show_preferences: false,
             capturing: None,
-            palette_query: String::new(),
-            palette_selected: 0,
+            everywhere: everywhere::Everywhere::default(),
             open_menu: None,
             recents_open: false,
             menu_bounds: HashMap::new(),
@@ -1152,6 +1166,16 @@ impl SimpleEditApp {
             })
         });
 
+        // Shift twice: search everywhere.
+        let double_shift = iced::event::listen_with(|event, _status, _window| match event {
+            iced::Event::Keyboard(key)
+                if everywhere::double_shift::hear(&key, std::time::Instant::now()) =>
+            {
+                Some(Message::DoubleShift)
+            }
+            _ => None,
+        });
+
         // Chevron clicks need the modifier state at click time, which a button
         // press message does not carry.
         let modifiers = iced::event::listen_with(|event, _status, _window| match event {
@@ -1180,7 +1204,7 @@ impl SimpleEditApp {
         let autosave =
             iced::time::every(std::time::Duration::from_secs(1)).map(|_| Message::AutoSave);
 
-        let mut subscriptions = vec![keys, modifiers, autosave];
+        let mut subscriptions = vec![keys, double_shift, modifiers, autosave];
         if self.sidebar_resizing {
             subscriptions.push(iced::event::listen_with(
                 |event, _status, _window| match event {
@@ -1570,24 +1594,18 @@ impl SimpleEditApp {
         // Modal overlays
         match &self.overlay {
             ActiveOverlay::None => with_prefs,
-            ActiveOverlay::Palette => {
-                let shown = self.palette_entries();
-                let card =
-                    crate::palette::view(dark, &self.palette_query, &shown, self.palette_selected);
+            ActiveOverlay::Everywhere => {
+                let card = self.view_everywhere(dark);
                 crate::floating::modal(
                     with_prefs,
-                    column![Space::new().height(84), card].align_x(Alignment::Center),
+                    column![Space::new().height(70), card].align_x(Alignment::Center),
                     Some(Message::CloseOverlay),
                     dark,
                     true,
                 )
             }
-            ActiveOverlay::GotoFile | ActiveOverlay::FindInFiles => {
-                let card = if self.overlay == ActiveOverlay::GotoFile {
-                    self.view_goto_file(dark)
-                } else {
-                    self.view_find_in_files(dark)
-                };
+            ActiveOverlay::FindInFiles => {
+                let card = self.view_find_in_files(dark);
                 crate::floating::modal(
                     with_prefs,
                     column![Space::new().height(84), card].align_x(Alignment::Center),
@@ -1721,6 +1739,12 @@ impl Message {
             | Message::FindResults(..)
             | Message::TreeScrolled(..)
             | Message::TreeHover(_)
+            | Message::EverywhereFiles(..)
+            | Message::EverywhereSymbolsDue(_)
+            | Message::EverywhereSymbols(..)
+            | Message::EverywhereTextDue(_)
+            | Message::EverywhereText(..)
+            | Message::EverywhereGit(..)
             | Message::CompletionInfo(..)
             | Message::CompletionAnswer(..)
             | Message::CompletionAnchor(..)
@@ -2703,14 +2727,9 @@ impl SimpleEditApp {
                 None => Task::none(),
             },
             Message::ReopenTab => self.reopen_tab(),
-            Message::OpenGotoFile => self.open_goto_file(),
+            Message::OpenGotoFile => self.open_everywhere(crate::everywhere::Tab::Files),
             Message::OpenFindInFiles => self.open_find_in_files(),
             Message::FinderFiles(files) => self.finder_files(files),
-            Message::GotoFileQuery(name) => {
-                self.goto_typed(name);
-                Task::none()
-            }
-            Message::GotoFileOpen(pick) => self.goto_open(pick),
             Message::FindQuery(text) => {
                 self.finder.text = text;
                 self.search_files(true)
@@ -3362,31 +3381,58 @@ impl SimpleEditApp {
                 self.capturing = Some(target);
                 Task::none()
             }
-            Message::OpenPalette => {
-                self.palette_query.clear();
-                self.palette_selected = 0;
-                self.overlay = ActiveOverlay::Palette;
-                iced::widget::operation::focus(crate::palette::input_id())
-            }
-            Message::PaletteQueryChanged(query) => {
-                self.palette_query = query;
-                self.palette_selected = 0;
-                crate::palette::scroll_to_selected(0)
-            }
-            Message::PaletteSubmit => {
-                let shown = self.palette_entries();
-                match shown.get(self.palette_selected) {
-                    Some(entry) if entry.enabled => {
-                        let command = entry.command;
-                        self.handle(Message::PaletteRun(command))
-                    }
-                    _ => Task::none(),
+            Message::OpenPalette => self.open_everywhere(crate::everywhere::Tab::Actions),
+            Message::OpenEverywhere(tab) => self.open_everywhere(tab),
+            Message::DoubleShift => {
+                if self.capturing.is_some() {
+                    return Task::none();
                 }
+                if self.overlay == ActiveOverlay::Everywhere {
+                    return self.everywhere_non_project();
+                }
+                if !matches!(self.overlay, ActiveOverlay::None) && !self.overlay_is_dismissable() {
+                    return Task::none();
+                }
+                self.open_everywhere(crate::everywhere::Tab::All)
             }
-            Message::PaletteRun(command) => {
-                self.overlay = ActiveOverlay::None;
-                self.handle(command.message())
+            Message::EverywhereQuery(query) => self.everywhere_typed(query),
+            Message::EverywhereTab(tab) => self.everywhere_switch(tab),
+            Message::EverywhereOpen(pick) => self.everywhere_open(pick),
+            Message::EverywhereFiles(generation, files) => self.everywhere_files(generation, files),
+            Message::EverywhereSymbolsDue(generation) => self.everywhere_symbols_due(generation),
+            Message::EverywhereSymbols(generation, found) => {
+                self.everywhere_symbols(generation, found)
             }
+            Message::EverywhereTextDue(generation) => self.everywhere_text_due(generation),
+            Message::EverywhereText(generation, found) => {
+                self.everywhere_text(generation, found);
+                Task::none()
+            }
+            Message::EverywhereGit(branches, commits) => {
+                self.everywhere_git(branches, commits);
+                Task::none()
+            }
+            Message::EverywhereNonProject => self.everywhere_non_project(),
+            Message::EverywhereFilter => {
+                self.everywhere.filter_open = !self.everywhere.filter_open;
+                Task::none()
+            }
+            Message::EverywhereFilterType(kind, on) => self.everywhere_filter_type(kind, on),
+            Message::EverywhereTextOption(option) => self.everywhere_text_option(option),
+            Message::EverywhereExport => self.everywhere_export(),
+            Message::EverywhereAbbreviate(command) => self.everywhere_abbreviate(command),
+            Message::EverywhereAbbreviationTyped(text) => {
+                if let Some((_, typed)) = self.everywhere.abbreviating.as_mut() {
+                    *typed = text;
+                }
+                Task::none()
+            }
+            Message::EverywhereAbbreviationSubmit => self.everywhere_abbreviation_submit(),
+            Message::EverywhereAbbreviationRemove(command, abbreviation) => {
+                self.everywhere_abbreviation_remove(command, abbreviation);
+                Task::none()
+            }
+            Message::EverywhereAssign(command) => self.everywhere_assign(command),
             // Raw key forwarded from the subscription fn pointer
             Message::KeyPressed {
                 key,
@@ -3477,27 +3523,36 @@ impl SimpleEditApp {
                 if key == "Tab" && !ctrl && !alt && !shift && self.snippet_next() {
                     return Task::none();
                 }
-                // The palette: arrows move the selection (Enter is the
-                // field's own submit, Escape closes).
-                if self.overlay == ActiveOverlay::Palette {
-                    let delta = match key.as_str() {
-                        "ArrowDown" => 1,
-                        "ArrowUp" => -1,
-                        _ => 0,
+                // Search everywhere: its keys; the shortcut of a tab goes to
+                // that tab (again: beyond the project).
+                if self.overlay == ActiveOverlay::Everywhere {
+                    if let Some(task) = self.everywhere_key(&key, ctrl, shift, alt) {
+                        return task;
+                    }
+                    let sh = &self.config.shortcuts;
+                    let is = |s: &ShortcutConfig| {
+                        s.key.eq_ignore_ascii_case(&key)
+                            && s.ctrl == ctrl
+                            && s.alt == alt
+                            && s.shift == shift
                     };
-                    if delta != 0 {
-                        let len = self.palette_entries().len();
-                        self.palette_selected =
-                            crate::palette::step(self.palette_selected, delta, len);
-                        return crate::palette::scroll_to_selected(self.palette_selected);
+                    use crate::everywhere::Tab;
+                    let tab = [
+                        (&sh.goto_file, Tab::Files),
+                        (&sh.goto_class, Tab::Classes),
+                        (&sh.goto_symbol, Tab::Symbols),
+                        (&sh.command_palette, Tab::Actions),
+                    ]
+                    .into_iter()
+                    .find(|(s, _)| is(s))
+                    .map(|(_, t)| t);
+                    if let Some(tab) = tab {
+                        return self.open_everywhere(tab);
                     }
                     return Task::none();
                 }
                 // The finder cards: arrows move in the list.
-                if matches!(
-                    self.overlay,
-                    ActiveOverlay::GotoFile | ActiveOverlay::FindInFiles
-                ) {
+                if self.overlay == ActiveOverlay::FindInFiles {
                     return match key.as_str() {
                         "ArrowDown" => self.finder_step(1),
                         "ArrowUp" => self.finder_step(-1),
@@ -3603,7 +3658,7 @@ impl SimpleEditApp {
                 };
                 let sh = &self.config.shortcuts;
                 // Order matters: Ctrl+Shift+S must be tried before Ctrl+S.
-                let bindings: [(&ShortcutConfig, Message); 36] = [
+                let bindings: [(&ShortcutConfig, Message); 38] = [
                     (&sh.complete, Message::CompletionInvoke),
                     (&sh.parameter_info, Message::HintInvoke),
                     (&sh.toggle_git, Message::ToggleGit),
@@ -3638,6 +3693,14 @@ impl SimpleEditApp {
                     (&sh.command_palette, Message::OpenPalette),
                     (&sh.toggle_sidebar, Message::ToggleSidebar),
                     (&sh.goto_file, Message::OpenGotoFile),
+                    (
+                        &sh.goto_class,
+                        Message::OpenEverywhere(crate::everywhere::Tab::Classes),
+                    ),
+                    (
+                        &sh.goto_symbol,
+                        Message::OpenEverywhere(crate::everywhere::Tab::Symbols),
+                    ),
                     (&sh.find_in_files, Message::OpenFindInFiles),
                     (&sh.reopen_tab, Message::ReopenTab),
                 ];
@@ -3975,7 +4038,12 @@ impl SimpleEditApp {
                 // Innermost first: the list of completions, a pending
                 // rebind, a dialog, the Preferences window, the search card.
                 self.completion.snippet = None;
-                if self.completion_visible() {
+                if self.overlay == ActiveOverlay::Everywhere
+                    && (self.everywhere.abbreviating.is_some() || self.everywhere.filter_open)
+                {
+                    self.everywhere.abbreviating = None;
+                    self.everywhere.filter_open = false;
+                } else if self.completion_visible() {
                     self.completion_close();
                 } else if self.completion.hint.is_some() {
                     self.completion.hint = None;
@@ -6662,19 +6730,6 @@ impl SimpleEditApp {
         dirty
     }
 
-    /// The command palette's rows for the current query.
-    fn palette_entries(&self) -> Vec<crate::palette::Entry> {
-        let has_formatter = self
-            .editor
-            .language
-            .as_deref()
-            .is_some_and(crate::formatter::has_formatter);
-        crate::palette::filter(
-            crate::palette::entries(&self.config, has_formatter, self.language_picker_enabled()),
-            &self.palette_query,
-        )
-    }
-
     /// The rendered document, or the parser error when the JSON is invalid.
     fn preview_view(&self, dark: bool) -> Element<'_, Message> {
         match &self.preview {
@@ -6731,7 +6786,10 @@ use file_io::*;
 mod bookmark_panel;
 #[path = "app/completion.rs"]
 mod completion;
+#[path = "app/everywhere.rs"]
+mod everywhere;
 pub(crate) use completion::Floating;
+pub(crate) use everywhere::Commit;
 #[path = "app/finder.rs"]
 mod finder;
 #[path = "app/git_file.rs"]

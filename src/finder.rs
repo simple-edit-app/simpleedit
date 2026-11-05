@@ -111,6 +111,35 @@ pub fn list_files(root: &Path, exclude: &[String]) -> Vec<PathBuf> {
     files
 }
 
+/// Every file of a folder, what Git ignores and the heavy folders included
+/// (the libraries in `node_modules`, `target`…): "non-project items".
+pub fn list_all_files(root: &Path) -> Vec<PathBuf> {
+    fn walk_all(dir: &Path, found: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            if found.len() >= MAX_FILES {
+                return;
+            }
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                if entry.file_name() != ".git" {
+                    walk_all(&entry.path(), found);
+                }
+            } else if kind.is_file() {
+                found.push(entry.path());
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk_all(root, &mut found);
+    found.sort();
+    found
+}
+
 fn walk(dir: &Path, exclude: &[String], found: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -199,17 +228,6 @@ fn score_chars(query: &[char], lower: &[char], original: &[char]) -> Option<i64>
     // Shorter paths first, all else equal.
     score -= lower.len() as i64 / 4;
     Some(score)
-}
-
-/// The best `limit` of `paths` for `query`, best first.
-pub fn rank(query: &str, paths: &[String], limit: usize) -> Vec<usize> {
-    let mut scored: Vec<(i64, usize)> = paths
-        .iter()
-        .enumerate()
-        .filter_map(|(i, p)| score(query, p).map(|s| (s, i)))
-        .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-    scored.into_iter().take(limit).map(|(_, i)| i).collect()
 }
 
 /// A place where the text was found.
@@ -311,6 +329,17 @@ fn excerpt(line: &str, start: usize, len: usize) -> (String, (usize, usize)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The best `limit` of `paths` for `query`, best first.
+    fn rank(query: &str, paths: &[String], limit: usize) -> Vec<usize> {
+        let mut scored: Vec<(i64, usize)> = paths
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| score(query, p).map(|s| (s, i)))
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        scored.into_iter().take(limit).map(|(_, i)| i).collect()
+    }
 
     #[test]
     fn patterns_leave_out_names_and_folders() {
@@ -433,5 +462,22 @@ mod tests {
         let (text, (from, to)) = excerpt(&line, 300, 6);
         assert!(text.len() < 200 && text.starts_with('…'));
         assert_eq!(&text[from..to], "needle");
+    }
+
+    #[test]
+    fn non_project_items_include_what_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules/lib")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join("node_modules/lib/index.js"), "").unwrap();
+        std::fs::write(dir.path().join(".git/HEAD"), "").unwrap();
+        std::fs::write(dir.path().join("a.ts"), "").unwrap();
+        let all = list_all_files(dir.path());
+        assert!(all.contains(&dir.path().join("node_modules/lib/index.js")));
+        assert!(all.contains(&dir.path().join("a.ts")));
+        assert!(!all.iter().any(|p| p.starts_with(dir.path().join(".git"))));
+        assert!(
+            !list_files(dir.path(), &[]).contains(&dir.path().join("node_modules/lib/index.js"))
+        );
     }
 }

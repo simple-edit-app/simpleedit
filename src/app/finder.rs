@@ -1,12 +1,10 @@
-//! "Go to file" and "find in files": two cards over the editor that look
-//! into every file of the projects.
+//! "Find in files": a card over the editor that looks into every file of
+//! the projects.
 
 use super::*;
 use crate::finder::TextHit;
 use iced::widget::{column, text_input};
 
-/// Most files shown for a name typed.
-const SHOWN: usize = 60;
 /// Height of a line of the lists, to scroll them to the one picked.
 const ROW: f32 = 34.0;
 
@@ -16,8 +14,6 @@ pub struct FinderState {
     pub files: Vec<(PathBuf, String)>,
     pub loading: bool,
     pub selected: usize,
-    /// What is typed in "go to file".
-    pub name: String,
     /// "Find in files": what is looked for, how, and what was found.
     pub text: String,
     pub case_sensitive: bool,
@@ -30,10 +26,6 @@ pub struct FinderState {
     pub scope: Option<PathBuf>,
 }
 
-pub(super) fn goto_field_id() -> iced::widget::Id {
-    iced::widget::Id::new("goto-file")
-}
-
 pub(super) fn find_field_id() -> iced::widget::Id {
     iced::widget::Id::new("find-in-files")
 }
@@ -44,7 +36,7 @@ fn list_id() -> iced::widget::Id {
 
 impl SimpleEditApp {
     /// Where to look: the projects, or the project of the file in the editor.
-    fn finder_roots(&self) -> Vec<PathBuf> {
+    pub(super) fn finder_roots(&self) -> Vec<PathBuf> {
         if !self.projects.roots.is_empty() {
             return self.projects.roots.clone();
         }
@@ -107,16 +99,6 @@ impl SimpleEditApp {
         )
     }
 
-    pub(super) fn open_goto_file(&mut self) -> Task<Message> {
-        self.finder.name.clear();
-        self.finder.selected = 0;
-        self.overlay = ActiveOverlay::GotoFile;
-        Task::batch([
-            self.load_finder_files(None),
-            iced::widget::operation::focus(goto_field_id()),
-        ])
-    }
-
     pub(super) fn open_find_in_files(&mut self) -> Task<Message> {
         self.finder.selected = 0;
         self.finder.error = None;
@@ -175,30 +157,6 @@ impl SimpleEditApp {
             return self.search_files(false);
         }
         Task::none()
-    }
-
-    /// The files whose name matches what is typed, best first.
-    pub(super) fn goto_matches(&self) -> Vec<usize> {
-        let shown: Vec<String> = self.finder.files.iter().map(|(_, s)| s.clone()).collect();
-        crate::finder::rank(&self.finder.name, &shown, SHOWN)
-    }
-
-    pub(super) fn goto_typed(&mut self, name: String) {
-        self.finder.name = name;
-        self.finder.selected = 0;
-    }
-
-    /// Opens the file picked (or the one highlighted).
-    pub(super) fn goto_open(&mut self, pick: Option<usize>) -> Task<Message> {
-        let matches = self.goto_matches();
-        let index = pick.unwrap_or(self.finder.selected);
-        let Some(&file) = matches.get(index) else {
-            return Task::none();
-        };
-        let path = self.finder.files[file].0.clone();
-        self.overlay = ActiveOverlay::None;
-        self.remember_place();
-        self.activate(path)
     }
 
     /// Looks for the text again, a moment after the last key (`now`: at once).
@@ -268,11 +226,10 @@ impl SimpleEditApp {
 
     /// The arrows move in the list of a finder card.
     pub(super) fn finder_step(&mut self, delta: i32) -> Task<Message> {
-        let len = match self.overlay {
-            ActiveOverlay::GotoFile => self.goto_matches().len(),
-            ActiveOverlay::FindInFiles => self.finder.hits.len(),
-            _ => return Task::none(),
-        };
+        if self.overlay != ActiveOverlay::FindInFiles {
+            return Task::none();
+        }
+        let len = self.finder.hits.len();
         self.finder.selected = crate::palette::step(self.finder.selected, delta, len);
         iced::widget::operation::scroll_to(
             list_id(),
@@ -330,60 +287,6 @@ impl SimpleEditApp {
         .width(680)
         .style(se_theme::palette_card(dark))
         .into()
-    }
-
-    pub(super) fn view_goto_file(&self, dark: bool) -> Element<'_, Message> {
-        let p = se_theme::palette(dark);
-        let field = text_input(&t!("finder.goto_placeholder"), &self.finder.name)
-            .id(goto_field_id())
-            .on_input(Message::GotoFileQuery)
-            .on_submit(Message::GotoFileOpen(None))
-            .size(15)
-            .padding(0)
-            .style((se_theme::BareField { dark }).style());
-        let matches = self.goto_matches();
-        let rows = matches
-            .iter()
-            .enumerate()
-            .map(|(i, &file)| {
-                let shown = &self.finder.files[file].1;
-                let (dir, name) = match shown.rsplit_once('/') {
-                    Some((dir, name)) => (dir.to_string(), name.to_string()),
-                    None => (String::new(), shown.clone()),
-                };
-                let highlighted = i == self.finder.selected;
-                self.finder_row(
-                    dark,
-                    highlighted,
-                    row![
-                        crate::file_icons::file(std::path::Path::new(&name), dark),
-                        text(name)
-                            .size(13)
-                            .font(se_theme::UI_SEMIBOLD)
-                            .shaping(iced::widget::text::Shaping::Advanced)
-                            .color(if highlighted { p.accent } else { p.text }),
-                        text(dir)
-                            .size(12)
-                            .color(p.muted)
-                            .shaping(iced::widget::text::Shaping::Advanced),
-                    ]
-                    .spacing(10)
-                    .align_y(Alignment::Center)
-                    .into(),
-                    Message::GotoFileOpen(Some(i)),
-                )
-            })
-            .collect();
-        let note = if self.finder.loading && self.finder.files.is_empty() {
-            t!("finder.loading").to_string()
-        } else if self.finder_roots().is_empty() {
-            t!("finder.no_project").to_string()
-        } else if matches.is_empty() {
-            t!("palette.no_results").to_string()
-        } else {
-            String::new()
-        };
-        self.finder_card(dark, field.into(), note, rows)
     }
 
     pub(super) fn view_find_in_files(&self, dark: bool) -> Element<'_, Message> {
@@ -554,26 +457,6 @@ mod tests {
             })
             .collect();
         let _ = app.update(Message::FinderFiles(files));
-    }
-
-    #[test]
-    fn a_file_is_found_by_its_name_and_opened() {
-        let dir = project();
-        let mut app = app_on(dir.path());
-        let _ = app.update(Message::OpenGotoFile);
-        assert_eq!(app.overlay, ActiveOverlay::GotoFile);
-        listed(&mut app, dir.path());
-        let _ = app.update(Message::GotoFileQuery("sbmod".into()));
-        let first = app.goto_matches()[0];
-        assert_eq!(app.finder.files[first].1, "src/sidebar/mod.rs");
-        // The arrows move, Enter opens the one highlighted.
-        let _ = app.update(Message::GotoFileQuery("rs".into()));
-        assert_eq!(app.goto_matches().len(), 2);
-        let _ = app.finder_step(1);
-        let second = app.finder.files[app.goto_matches()[1]].0.clone();
-        let _ = app.update(Message::GotoFileOpen(None));
-        assert_eq!(app.overlay, ActiveOverlay::None);
-        assert_eq!(app.pending_open.as_ref(), Some(&second));
     }
 
     #[test]

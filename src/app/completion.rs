@@ -221,6 +221,15 @@ impl SimpleEditApp {
         installed.then_some((path, ext))
     }
 
+    /// Whether a server is installed for files of `ext` (asked once).
+    pub(super) fn server_installed(&mut self, ext: &str) -> bool {
+        *self
+            .completion
+            .installed
+            .entry(ext.to_string())
+            .or_insert_with(|| lsp::installed(ext))
+    }
+
     /// Starts the server of the file shown, once per project: it loads the
     /// project in the background before the first list is asked.
     pub(super) fn completion_prepare(&mut self) -> Task<Message> {

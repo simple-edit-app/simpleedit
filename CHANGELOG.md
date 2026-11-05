@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.13.0] - 2026-11-05
+
+### Added
+- Search everywhere, as in IntelliJ IDEA: Shift twice opens one field that finds classes, files and folders, symbols, actions, settings and text, by tab (All, Classes, Files, Symbols, Actions, Text, and Git when turned on in Preferences) or all at once. With nothing typed it lists the recent files. Shift twice again (or Alt+N) includes non-project items: what Git ignores, the libraries. `name:line:col` opens a file at a place, `Type.name` finds a qualified name, `/` lists the settings (turned ON/OFF in place) and the pages of the Preferences, a calculation (`2^10`, `sqrt(2)`, `0xff + 1`) is worked out and copied with Enter. Actions are found by their words in any order, by synonyms and by abbreviations of one's own (right click on an action), and Alt+Enter sets an action's shortcut. Results can be filtered by file type and opened in Find in files. Tab and Shift+Tab change tabs, Ctrl+↑/↓ go to the first and last results.
+- Shortcuts for the tabs: Ctrl+Shift+N (files), Ctrl+Alt+N (classes), Ctrl+Alt+Shift+N (symbols), Ctrl+Shift+A (actions).
+
+### Changed
+- Go to file and the command palette are now the Files and Actions tabs of search everywhere.
+
 ## [1.12.0] - 2026-11-05
 
 ### Added
