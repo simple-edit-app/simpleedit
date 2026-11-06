@@ -95,6 +95,19 @@ impl Marks {
 
     /// How a file or folder stands (a folder: changed when something in it
     /// is).
+    /// The files Git sees as changed (modified, new, in conflict).
+    pub fn changed_files(&self) -> Vec<PathBuf> {
+        use crate::git::FileState;
+        let mut files: Vec<PathBuf> = self
+            .files
+            .iter()
+            .filter(|(_, s)| !matches!(s, FileState::Ignored))
+            .map(|(p, _)| p.clone())
+            .collect();
+        files.sort();
+        files
+    }
+
     pub fn git(&self, path: &Path, is_dir: bool) -> Option<crate::git::FileState> {
         use crate::git::FileState;
         if self.ignored.iter().any(|d| path.starts_with(d)) {

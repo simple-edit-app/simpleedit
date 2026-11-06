@@ -236,13 +236,40 @@ pub enum Message {
     FindQuery(String),
     FindToggleCase,
     FindToggleRegex,
+    /// Replace in files, and the rest of the window: the replacement, whole
+    /// words, keeping the case, find or replace, the context, the file mask,
+    /// where, subfolders, a list under the fields, a past search, the pin, a
+    /// match picked, replacing one or all (and the confirmation), undoing,
+    /// the matches to the Results panel.
+    OpenReplaceInFiles,
+    ReplaceInFolder(PathBuf),
+    FindReplaceText(String),
+    FindToggleWords,
+    FindToggleMultiline,
+    FindIgnored(bool),
+    FindLines(text_editor::Action),
+    FindTogglePreserve,
+    FindMode(bool),
+    FindContext(crate::find_replace::Context),
+    FindMaskOn(bool),
+    FindMask(String),
+    FindScope(finder::Scope),
+    FindRecursive,
+    FindMenu(Option<finder::Menu>),
+    FindHistory(String),
+    FindPin,
+    FindSelect(usize),
+    FindReplaceOne,
+    FindReplaceAll,
+    FindReplaceConfirm(bool),
+    FindUndoReplace,
+    FindToWindow,
+    Results(results::ResultsMsg),
     /// What a search found (its generation, the places or what went wrong).
-    FindResults(u64, Result<Vec<crate::finder::TextHit>, String>),
+    FindResults(u64, Result<Vec<finder::Occurrence>, String>),
     FindOpen(Option<usize>),
     /// Looks in this folder only (from the tree's menu).
     FindInFolder(PathBuf),
-    /// Looks in every project, not only in a folder.
-    FindEverywhere,
     /// The list of every open tab, opened from its button (where it was pressed).
     OpenTabList(iced::Point),
     CloseTabList,
@@ -685,6 +712,7 @@ pub struct SimpleEditApp {
     /// The shortcut being rebound, while waiting for its new key.
     capturing: Option<ShortcutTarget>,
     everywhere: everywhere::Everywhere,
+    results: results::Results,
     open_menu: Option<TopMenu>,
     /// The recent files submenu of the File menu is showing.
     recents_open: bool,
@@ -901,6 +929,7 @@ impl SimpleEditApp {
             show_preferences: false,
             capturing: None,
             everywhere: everywhere::Everywhere::default(),
+            results: results::Results::default(),
             open_menu: None,
             recents_open: false,
             menu_bounds: HashMap::new(),
@@ -1133,6 +1162,7 @@ impl SimpleEditApp {
                 Key::Named(Named::PageUp) => "PageUp".to_string(),
                 Key::Named(Named::PageDown) => "PageDown".to_string(),
                 Key::Named(Named::Delete) => "Delete".to_string(),
+                Key::Named(Named::Insert) => "Insert".to_string(),
                 Key::Named(Named::Backspace) => "Backspace".to_string(),
                 Key::Named(Named::Space) => "Space".to_string(),
                 Key::Named(Named::F1) => "F1".to_string(),
@@ -1412,6 +1442,9 @@ impl SimpleEditApp {
         if self.bookmark_panel.open {
             panel = panel.push(self.bookmark_panel_view(dark));
         }
+        if self.results.open && !self.results.tabs.is_empty() {
+            panel = panel.push(self.results_view(dark));
+        }
         let editor_panel = container(panel.push(status_bar))
             .width(Length::Fill)
             .height(Length::Fill)
@@ -1606,10 +1639,12 @@ impl SimpleEditApp {
             }
             ActiveOverlay::FindInFiles => {
                 let card = self.view_find_in_files(dark);
+                // Pinned, it stays when the editor is clicked.
+                let blur = (!self.finder.pinned).then_some(Message::CloseOverlay);
                 crate::floating::modal(
                     with_prefs,
-                    column![Space::new().height(84), card].align_x(Alignment::Center),
-                    Some(Message::CloseOverlay),
+                    column![Space::new().height(40), card].align_x(Alignment::Center),
+                    blur,
                     dark,
                     true,
                 )
@@ -1740,6 +1775,8 @@ impl Message {
             | Message::TreeScrolled(..)
             | Message::TreeHover(_)
             | Message::EverywhereFiles(..)
+            | Message::Results(results::ResultsMsg::Rerun_(..))
+            | Message::Results(results::ResultsMsg::Exported(_))
             | Message::EverywhereSymbolsDue(_)
             | Message::EverywhereSymbols(..)
             | Message::EverywhereTextDue(_)
@@ -1814,6 +1851,7 @@ impl SimpleEditApp {
             Message::EditorAction(action) => {
                 self.git.typing = false;
                 self.tree_focus = false;
+                self.results.focus = false;
                 // Back in the editor: Ctrl+A / Ctrl+C / Ctrl+Z are its own again.
                 self.git.viewer.selection = None;
                 self.git.stash.viewer.selection = None;
@@ -2747,8 +2785,93 @@ impl SimpleEditApp {
                 Task::none()
             }
             Message::FindOpen(pick) => self.find_open(pick),
-            Message::FindInFolder(dir) => self.find_in_folder(dir),
-            Message::FindEverywhere => self.find_everywhere(),
+            Message::FindInFolder(dir) => self.find_in_folder(dir, false),
+            Message::ReplaceInFolder(dir) => self.find_in_folder(dir, true),
+            Message::OpenReplaceInFiles => self.open_finder(true),
+            Message::FindReplaceText(text) => {
+                self.finder.replace = text;
+                self.search_files(true)
+            }
+            Message::FindToggleMultiline => self.finder_toggle_multiline(),
+            Message::FindIgnored(on) => {
+                self.config.find_ignored = on;
+                self.config_dirty = true;
+                self.load_scope_files()
+            }
+            Message::FindLines(action) => self.finder_lines_action(action),
+            Message::FindToggleWords => {
+                self.finder.words = !self.finder.words;
+                self.search_files(false)
+            }
+            Message::FindTogglePreserve => {
+                self.finder.preserve_case = !self.finder.preserve_case;
+                self.search_files(false)
+            }
+            Message::FindMode(replace) => {
+                self.finder.replace_mode = replace;
+                self.search_files(false)
+            }
+            Message::FindContext(context) => {
+                self.finder.context = context;
+                self.finder.menu = None;
+                self.search_files(false)
+            }
+            Message::FindMaskOn(on) => {
+                self.finder.mask_on = on;
+                self.search_files(false)
+            }
+            Message::FindMask(mask) => {
+                self.finder.mask = mask;
+                self.search_files(true)
+            }
+            Message::FindScope(scope) => {
+                let reload = (scope == finder::Scope::Directory)
+                    != (self.finder.scope == finder::Scope::Directory);
+                self.finder.scope = scope;
+                if reload {
+                    self.load_scope_files()
+                } else {
+                    self.search_files(false)
+                }
+            }
+            Message::FindRecursive => {
+                self.finder.recursive = !self.finder.recursive;
+                self.search_files(false)
+            }
+            Message::FindMenu(menu) => {
+                self.finder.menu = if self.finder.menu == menu { None } else { menu };
+                Task::none()
+            }
+            Message::FindHistory(past) => {
+                self.finder.multiline = past.contains('\n');
+                self.finder_set_text(past);
+                self.finder.menu = None;
+                self.search_files(false)
+            }
+            Message::FindPin => {
+                self.finder.pinned = !self.finder.pinned;
+                Task::none()
+            }
+            Message::FindSelect(index) => {
+                self.finder_select(index);
+                Task::none()
+            }
+            Message::FindReplaceOne => self.finder_replace_one(),
+            Message::FindReplaceAll => {
+                self.finder.confirm_all = true;
+                Task::none()
+            }
+            Message::FindReplaceConfirm(yes) => {
+                if yes {
+                    self.finder_replace_all()
+                } else {
+                    self.finder.confirm_all = false;
+                    Task::none()
+                }
+            }
+            Message::FindUndoReplace => self.undo_replacement(),
+            Message::FindToWindow => self.finder_to_window(),
+            Message::Results(msg) => self.results_update(msg),
             Message::OpenTabList(at) => {
                 self.tab_list = Some(at);
                 Task::none()
@@ -3553,9 +3676,21 @@ impl SimpleEditApp {
                 }
                 // The finder cards: arrows move in the list.
                 if self.overlay == ActiveOverlay::FindInFiles {
-                    return match key.as_str() {
-                        "ArrowDown" => self.finder_step(1),
-                        "ArrowUp" => self.finder_step(-1),
+                    return match (key.as_str(), ctrl, alt) {
+                        // Alt+↓: the searches made.
+                        ("ArrowDown", false, true) => {
+                            self.handle(Message::FindMenu(Some(finder::Menu::History)))
+                        }
+                        // On several lines the arrows are the text's:
+                        // Ctrl+Alt+↑/↓ go through the matches.
+                        ("ArrowDown", true, true) => self.finder_step(1),
+                        ("ArrowUp", true, true) => self.finder_step(-1),
+                        ("ArrowDown", false, false) if !self.finder.multiline => {
+                            self.finder_step(1)
+                        }
+                        ("ArrowUp", false, false) if !self.finder.multiline => self.finder_step(-1),
+                        // Ctrl+Enter: to the Results panel.
+                        ("Return", true, false) => self.finder_to_window(),
                         _ => Task::none(),
                     };
                 }
@@ -3579,6 +3714,19 @@ impl SimpleEditApp {
                 // window is open
                 if !matches!(self.overlay, ActiveOverlay::None) || self.show_preferences {
                     return Task::none();
+                }
+                // Ctrl+Alt+↑/↓: the previous or next match of the Results.
+                if ctrl
+                    && alt
+                    && !shift
+                    && (key == "ArrowUp" || key == "ArrowDown")
+                    && !self.results.tabs.is_empty()
+                {
+                    return self.results_update(results::ResultsMsg::Step(key == "ArrowDown"));
+                }
+                // The Results panel, clicked last: its keys.
+                if let Some(task) = self.results_key(&key, ctrl, shift, alt) {
+                    return task;
                 }
                 // The tree, clicked last: the arrows move in it, Enter opens.
                 if self.tree_focus && !ctrl && !alt && self.show_sidebar && self.panels.projects {
@@ -3658,7 +3806,7 @@ impl SimpleEditApp {
                 };
                 let sh = &self.config.shortcuts;
                 // Order matters: Ctrl+Shift+S must be tried before Ctrl+S.
-                let bindings: [(&ShortcutConfig, Message); 38] = [
+                let bindings: [(&ShortcutConfig, Message); 39] = [
                     (&sh.complete, Message::CompletionInvoke),
                     (&sh.parameter_info, Message::HintInvoke),
                     (&sh.toggle_git, Message::ToggleGit),
@@ -3702,6 +3850,7 @@ impl SimpleEditApp {
                         Message::OpenEverywhere(crate::everywhere::Tab::Symbols),
                     ),
                     (&sh.find_in_files, Message::OpenFindInFiles),
+                    (&sh.replace_in_files, Message::OpenReplaceInFiles),
                     (&sh.reopen_tab, Message::ReopenTab),
                 ];
                 let msg = bindings
@@ -4038,7 +4187,12 @@ impl SimpleEditApp {
                 // Innermost first: the list of completions, a pending
                 // rebind, a dialog, the Preferences window, the search card.
                 self.completion.snippet = None;
-                if self.overlay == ActiveOverlay::Everywhere
+                if self.overlay == ActiveOverlay::FindInFiles
+                    && (self.finder.menu.is_some() || self.finder.confirm_all)
+                {
+                    self.finder.menu = None;
+                    self.finder.confirm_all = false;
+                } else if self.overlay == ActiveOverlay::Everywhere
                     && (self.everywhere.abbreviating.is_some() || self.everywhere.filter_open)
                 {
                     self.everywhere.abbreviating = None;
@@ -6798,6 +6952,8 @@ mod git_file;
 mod lint;
 #[path = "app/project_ops.rs"]
 mod project_ops;
+#[path = "app/results.rs"]
+mod results;
 #[path = "app/split.rs"]
 mod split;
 #[path = "app/views.rs"]

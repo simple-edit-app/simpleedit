@@ -494,6 +494,7 @@ struct ProjectMenuLabels {
     terminal: String,
     reveal: String,
     find: String,
+    replace: String,
 }
 
 impl ProjectMenuLabels {
@@ -518,6 +519,7 @@ impl ProjectMenuLabels {
             terminal: t!("sidebar.open_terminal").to_string(),
             reveal: t!("sidebar.reveal").to_string(),
             find: t!("sidebar.find_here").to_string(),
+            replace: t!("sidebar.replace_here").to_string(),
             hide_ignored: if hide_ignored {
                 t!("sidebar.show_ignored").to_string()
             } else {
@@ -652,6 +654,10 @@ fn project_tree<'a>(
                     entries.push(item(
                         lbl.find.clone(),
                         Message::FindInFolder(menu_path.clone()),
+                    ));
+                    entries.push(item(
+                        lbl.replace.clone(),
+                        Message::ReplaceInFolder(menu_path.clone()),
                     ));
                     entries.push(item(lbl.refresh.clone(), Message::RefreshProjects));
                     entries.push(item(

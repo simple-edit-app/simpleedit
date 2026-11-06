@@ -20,6 +20,7 @@ mod definition;
 mod editor;
 mod everywhere;
 mod file_icons;
+mod find_replace;
 mod finder;
 mod floating;
 mod folding;

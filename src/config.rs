@@ -38,6 +38,7 @@ pub enum ShortcutTarget {
     BookmarkPanel,
     GotoFile,
     FindInFiles,
+    ReplaceInFiles,
     ReopenTab,
     Complete,
     ParameterInfo,
@@ -224,6 +225,7 @@ pub struct Shortcuts {
     pub bookmark_panel: ShortcutConfig,
     pub goto_file: ShortcutConfig,
     pub find_in_files: ShortcutConfig,
+    pub replace_in_files: ShortcutConfig,
     pub reopen_tab: ShortcutConfig,
     /// Opens the list of completions where the cursor is.
     pub complete: ShortcutConfig,
@@ -334,6 +336,7 @@ shortcut_slots! {
     BookmarkPanel => bookmark_panel,
     GotoFile => goto_file,
     FindInFiles => find_in_files,
+    ReplaceInFiles => replace_in_files,
     ReopenTab => reopen_tab,
     Complete => complete,
     ParameterInfo => parameter_info,
@@ -401,6 +404,7 @@ impl Default for Shortcuts {
             bookmark_panel: ShortcutConfig::shift("F11"),
             goto_file: ShortcutConfig::ctrl_shift("n"),
             find_in_files: ShortcutConfig::ctrl_shift("f"),
+            replace_in_files: ShortcutConfig::ctrl_shift("r"),
             reopen_tab: ShortcutConfig::ctrl_shift("t"),
             complete: default_complete(),
             parameter_info: ShortcutConfig::ctrl("p"),
@@ -526,6 +530,11 @@ pub struct Config {
     pub everywhere_git: bool,
     /// Abbreviations of actions, by action (search everywhere).
     pub action_abbreviations: std::collections::BTreeMap<String, Vec<String>>,
+    /// Searches and replacements made in files, latest first (Alt+↓).
+    /// Find in files: the files Git ignores one by one too.
+    pub find_ignored: bool,
+    pub find_history: Vec<String>,
+    pub replace_history: Vec<String>,
     pub lint_trigger: crate::lint::Trigger,
     pub lint_level: crate::lint::Level,
     /// Fixes are applied when a file is saved.
@@ -597,6 +606,9 @@ impl Default for Config {
             everywhere_text: true,
             everywhere_git: false,
             action_abbreviations: std::collections::BTreeMap::new(),
+            find_ignored: true,
+            find_history: Vec::new(),
+            replace_history: Vec::new(),
             lint_trigger: crate::lint::Trigger::default(),
             lint_level: crate::lint::Level::default(),
             lint_fix_on_save: false,

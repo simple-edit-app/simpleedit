@@ -62,28 +62,47 @@ fn glob(pattern: &str, name: &str) -> bool {
     pi == p.len()
 }
 
-/// The files of a folder: what Git knows of (tracked, or new and not
-/// ignored) in a repository, every file otherwise, heavy folders left out.
-pub fn list_files(root: &Path, exclude: &[String]) -> Vec<PathBuf> {
-    let from_git = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args([
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-        ])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success());
+/// The files of a folder, heavy folders left out: in a repository, what Git
+/// lists, plus with `ignored` the files it ignores one by one (a `.env`),
+/// never the folders it ignores as a whole (`node_modules`, `dist`); every
+/// file otherwise.
+pub fn list_files(root: &Path, exclude: &[String], ignored: bool) -> Vec<PathBuf> {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+    };
+    let from_git = git(&[
+        "ls-files",
+        "-z",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+    ]);
+    // `--directory`: a folder ignored as a whole is one entry, dropped below.
+    let ignored = ignored
+        .then(|| {
+            git(&[
+                "ls-files",
+                "-z",
+                "--others",
+                "--ignored",
+                "--exclude-standard",
+                "--directory",
+            ])
+        })
+        .flatten();
     let mut files: Vec<PathBuf> = match from_git {
         Some(output) => output
             .stdout
             .split(|b| *b == 0)
+            .chain(ignored.iter().flat_map(|o| o.stdout.split(|b| *b == 0)))
             .filter(|p| !p.is_empty())
             .map(|p| root.join(String::from_utf8_lossy(p).as_ref()))
             // A file deleted but not committed is still listed by Git.
@@ -108,6 +127,7 @@ pub fn list_files(root: &Path, exclude: &[String]) -> Vec<PathBuf> {
         });
     }
     files.sort();
+    files.dedup();
     files
 }
 
@@ -248,6 +268,82 @@ pub const MAX_HITS: usize = 2000;
 /// Files bigger than this are not looked into.
 const MAX_SIZE: u64 = 2 * 1024 * 1024;
 
+/// Every match of a search in `files`, with what each would be replaced by.
+/// The text of a file open in the editor is `open`'s (its unsaved changes
+/// count), else the file's; a big or binary file is left out.
+pub fn find_occurrences(
+    files: &[PathBuf],
+    open: &std::collections::HashMap<PathBuf, String>,
+    options: &crate::find_replace::Options,
+    replace: Option<&crate::find_replace::Replace>,
+) -> Result<Vec<(TextHit, Option<String>)>, String> {
+    if options.query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let re = crate::find_replace::compile(options)?;
+    let mut hits = Vec::new();
+    for path in files {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if let Some(mask) = &options.mask {
+            if !crate::find_replace::mask_matches(mask, &name) {
+                continue;
+            }
+        }
+        let read;
+        let text: &str = match open.get(path) {
+            Some(text) => text,
+            None => {
+                if std::fs::metadata(path).map_or(true, |m| m.len() > MAX_SIZE) {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(path) else {
+                    continue;
+                };
+                if bytes.iter().take(8000).any(|b| *b == 0) {
+                    continue;
+                }
+                read = String::from_utf8_lossy(&bytes).into_owned();
+                &read
+            }
+        };
+        let ext = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        for found in
+            crate::find_replace::find_in(text, &ext, &re, options.context, options.regex, replace)
+        {
+            let line_start = found.start - found.col;
+            let line_end = text[line_start..]
+                .find('\n')
+                .map_or(text.len(), |n| line_start + n);
+            let line = text[line_start..line_end].trim_end_matches('\r');
+            let trimmed = line.trim_start();
+            let cut = line.len() - trimmed.len();
+            let len = found.end.min(line_start + line.len()) - found.start;
+            let (preview, at) = excerpt(trimmed, found.col.saturating_sub(cut), len);
+            hits.push((
+                TextHit {
+                    path: path.clone(),
+                    line: found.line,
+                    col: found.col,
+                    len: found.end - found.start,
+                    preview,
+                    preview_at: at,
+                },
+                found.replacement,
+            ));
+            if hits.len() >= MAX_HITS {
+                return Ok(hits);
+            }
+        }
+    }
+    Ok(hits)
+}
+
 /// Every place `query` is in `files` (a regular expression if `regex`).
 pub fn search(
     files: &[PathBuf],
@@ -357,6 +453,38 @@ mod tests {
     }
 
     #[test]
+    fn the_files_git_ignores_are_listed_but_not_the_folders_it_ignores() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap();
+        };
+        git(&["init", "-q"]);
+        std::fs::create_dir_all(root.join("dist")).unwrap();
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        std::fs::write(root.join(".gitignore"), ".env\ndist/\n").unwrap();
+        std::fs::write(root.join("a.rs"), "").unwrap();
+        std::fs::write(root.join(".env"), "# NEON\n").unwrap();
+        std::fs::write(root.join("app/.env"), "").unwrap();
+        std::fs::write(root.join("dist/out.js"), "").unwrap();
+        let files: Vec<String> = list_files(root, &[], true)
+            .iter()
+            .map(|f| f.strip_prefix(root).unwrap().display().to_string())
+            .collect();
+        assert_eq!(files, [".env", ".gitignore", "a.rs", "app/.env"]);
+        let without: Vec<PathBuf> = list_files(root, &[], false);
+        assert_eq!(without, vec![root.join(".gitignore"), root.join("a.rs")]);
+        // Looked into like the others.
+        let hits = search(&list_files(root, &[], true), "neon", false, false).unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
     fn the_name_of_the_file_counts_most() {
         let paths: Vec<String> = [
             "src/components/app-sidebar.tsx",
@@ -395,13 +523,13 @@ mod tests {
         std::fs::write(p.join("node_modules/x/i.js"), "").unwrap();
         std::fs::write(p.join("debug.log"), "").unwrap();
         // Not a repository: walked.
-        let walked = list_files(p, &[]);
+        let walked = list_files(p, &[], true);
         assert_eq!(walked, vec![p.join("debug.log"), p.join("src/main.rs")]);
         assert_eq!(
-            list_files(p, &["*.log".into()]),
+            list_files(p, &["*.log".into()], true),
             vec![p.join("src/main.rs")]
         );
-        // A repository: what Git knows of, ignored files out.
+        // A repository: what Git knows of and ignored files, not ignored folders.
         let git = |args: &[&str]| {
             std::process::Command::new("git")
                 .arg("-C")
@@ -412,13 +540,13 @@ mod tests {
         };
         git(&["init", "-q"]);
         std::fs::write(p.join(".gitignore"), "*.log\nnode_modules/\n").unwrap();
-        let listed = list_files(p, &[]);
+        let listed = list_files(p, &[], true);
         assert!(listed.contains(&p.join("src/main.rs")) && listed.contains(&p.join(".gitignore")));
-        assert!(!listed.contains(&p.join("debug.log")));
+        assert!(listed.contains(&p.join("debug.log")));
         assert!(!listed.iter().any(|f| f.starts_with(p.join("node_modules"))));
         assert_eq!(
-            list_files(p, &["src/".into()]),
-            vec![p.join(".gitignore")],
+            list_files(p, &["src/".into()], true),
+            vec![p.join(".gitignore"), p.join("debug.log")],
             "a folder pattern leaves out what is in it"
         );
     }
@@ -476,8 +604,7 @@ mod tests {
         assert!(all.contains(&dir.path().join("node_modules/lib/index.js")));
         assert!(all.contains(&dir.path().join("a.ts")));
         assert!(!all.iter().any(|p| p.starts_with(dir.path().join(".git"))));
-        assert!(
-            !list_files(dir.path(), &[]).contains(&dir.path().join("node_modules/lib/index.js"))
-        );
+        assert!(!list_files(dir.path(), &[], true)
+            .contains(&dir.path().join("node_modules/lib/index.js")));
     }
 }

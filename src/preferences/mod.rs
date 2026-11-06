@@ -957,6 +957,11 @@ pub fn shortcuts_list(
             sc.find_in_files.display(),
         ),
         (
+            ShortcutTarget::ReplaceInFiles,
+            t!("shortcuts.replace_in_files").to_string(),
+            sc.replace_in_files.display(),
+        ),
+        (
             ShortcutTarget::Complete,
             t!("shortcuts.complete").to_string(),
             sc.complete.display(),

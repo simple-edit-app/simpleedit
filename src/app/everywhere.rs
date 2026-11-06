@@ -322,7 +322,7 @@ impl SimpleEditApp {
                             let files = if all {
                                 crate::finder::list_all_files(root)
                             } else {
-                                crate::finder::list_files(root, &exclude)
+                                crate::finder::list_files(root, &exclude, true)
                             };
                             files
                                 .into_iter()
@@ -1176,13 +1176,19 @@ impl SimpleEditApp {
                 _ => unreachable!("kept above"),
             })
             .collect();
-        self.finder.text = query;
-        self.finder.hits = hits;
-        self.finder.selected = 0;
-        self.finder.scope = None;
-        self.finder.error = None;
-        self.finder.searching = false;
-        self.overlay = ActiveOverlay::FindInFiles;
+        let occurrences: Vec<super::finder::Occurrence> = hits
+            .into_iter()
+            .map(|hit| super::finder::Occurrence {
+                hit,
+                replacement: None,
+                excluded: false,
+            })
+            .collect();
+        let results = super::finder::matches_text(occurrences.len());
+        let q = query.as_str();
+        let title = t!("results.everywhere", query = q, results = results).to_string();
+        self.results_add(title, None, occurrences);
+        self.overlay = ActiveOverlay::None;
         Task::none()
     }
 
@@ -1810,7 +1816,7 @@ mod tests {
     /// Opens the search on `tab` with the files of `dir` listed.
     fn open(app: &mut SimpleEditApp, dir: &Path, tab: Tab) {
         let _ = app.update(Message::OpenEverywhere(tab));
-        let files = crate::finder::list_files(dir, &[])
+        let files = crate::finder::list_files(dir, &[], true)
             .into_iter()
             .map(|f| {
                 let rel = f.strip_prefix(dir).unwrap().to_string_lossy().into_owned();
@@ -2077,9 +2083,9 @@ mod tests {
             2
         );
         let _ = app.update(Message::EverywhereExport);
-        assert_eq!(app.overlay, ActiveOverlay::FindInFiles);
-        assert_eq!(app.finder.hits.len(), 2);
-        assert_eq!(app.finder.text, "run");
+        assert_eq!(app.overlay, ActiveOverlay::None);
+        assert!(app.results.open);
+        assert_eq!(app.results.tabs[0].hits.len(), 2);
     }
 
     #[test]

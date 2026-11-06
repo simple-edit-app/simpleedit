@@ -1076,6 +1076,19 @@ impl SimpleEditApp {
                     Message::ToggleGit,
                 ),
             ]
+            .extend((!self.results.tabs.is_empty()).then(|| {
+                let open = self.results.open;
+                tool(
+                    text('\u{ea6d}')
+                        .font(iced_fonts::NERD_FONT)
+                        .size(15)
+                        .color(shown(open))
+                        .into(),
+                    open,
+                    t!("results.panel").to_string(),
+                    Message::Results(super::results::ResultsMsg::Hide),
+                )
+            }))
             .spacing(6),
         )
         .padding([8, 6])

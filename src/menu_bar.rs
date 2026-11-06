@@ -292,6 +292,12 @@ fn menu_items(
                     Message::OpenFindInFiles,
                 ),
                 item(
+                    t!("shortcuts.replace_in_files").to_string(),
+                    sc(&sh.replace_in_files),
+                    dark,
+                    Message::OpenReplaceInFiles,
+                ),
+                item(
                     t!("shortcuts.reopen_tab").to_string(),
                     sc(&sh.reopen_tab),
                     dark,
