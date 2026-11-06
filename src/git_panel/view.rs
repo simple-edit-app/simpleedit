@@ -100,38 +100,7 @@ impl Panel {
         ]
         .spacing(4)
         .align_y(Alignment::Center);
-        let tool_button = |label: String, msg: super::tools::ToolMsg, repo: bool| {
-            plain_button(
-                label,
-                (!repo || self.repo.is_some()).then_some(Message::Git(GitMsg::Tool(msg))),
-                false,
-                dark,
-            )
-        };
-        header = header.push(tool_button(
-            t!("git.repos").to_string(),
-            super::tools::ToolMsg::OpenRepos,
-            false,
-        ));
-        header = header.push(tool_button(
-            t!("git.remotes").to_string(),
-            super::tools::ToolMsg::OpenRemotes,
-            true,
-        ));
-        header = header.push(tool_button(
-            t!("git.patches").to_string(),
-            super::tools::ToolMsg::OpenPatch,
-            true,
-        ));
         if let Some(status) = &self.status {
-            header = header.push(plain_button(
-                t!("git.fetch").to_string(),
-                (!self.busy).then_some(Message::Git(GitMsg::RefAction(
-                    super::branches::RefAction::Fetch,
-                ))),
-                false,
-                dark,
-            ));
             header = header.push(
                 text(branch_label(&status.branch, status.ahead, status.behind))
                     .size(12)
@@ -190,6 +159,12 @@ impl Panel {
                     t!("git.init").to_string(),
                     (!self.busy).then_some(Message::Git(GitMsg::Init)),
                     true,
+                    dark,
+                ),
+                plain_button(
+                    t!("git.repos").to_string(),
+                    Some(Message::Git(GitMsg::Tool(super::tools::ToolMsg::OpenRepos))),
+                    false,
                     dark,
                 ),
             ]
@@ -318,6 +293,12 @@ impl Panel {
                         plain_button(
                             t!("git.commit_push").to_string(),
                             can_commit.then_some(Message::Git(GitMsg::Commit(true))),
+                            false,
+                            dark,
+                        ),
+                        plain_button(
+                            t!("git.patches").to_string(),
+                            Some(Message::Git(GitMsg::Tool(super::tools::ToolMsg::OpenPatch))),
                             false,
                             dark,
                         ),

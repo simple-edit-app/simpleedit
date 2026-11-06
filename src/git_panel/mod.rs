@@ -739,6 +739,10 @@ pub struct DiffTab {
 
 #[derive(Debug, Clone)]
 pub enum GitMsg {
+    /// The edge of the Branches tab's actions is dragged.
+    ActionsResizeStart,
+    ActionsResize(f32),
+    ActionsResizeEnd,
     /// Time to look again (the panel is open).
     Tick,
     /// A file was saved: look again at once.
@@ -1205,6 +1209,18 @@ impl Panel {
                         self.notice = Some((error, true));
                     }
                 }
+                Task::none()
+            }
+            GitMsg::ActionsResizeStart => {
+                self.branches.resize_start();
+                Task::none()
+            }
+            GitMsg::ActionsResize(x) => {
+                self.branches.resize_to(x);
+                Task::none()
+            }
+            GitMsg::ActionsResizeEnd => {
+                self.branches.resize_end();
                 Task::none()
             }
             GitMsg::SelectTab(tab) => {
