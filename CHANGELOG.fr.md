@@ -1,5 +1,13 @@
 # Journal des modifications
 
+## [1.15.0] - 2026-11-06
+
+### Ajouté
+- Onglets par projet : chaque projet a une couleur, en liseré sur ses onglets et en pastille dans l'arbre des projets et la liste des onglets. Avec des fichiers de plusieurs projets ouverts, les onglets d'un projet sont côte à côte derrière une étiquette à sa couleur. Un clic sur l'étiquette replie ou ouvre le groupe, la glisser déplace tout le groupe, et un clic droit change la couleur du projet. Un onglet lâché parmi ceux d'un autre projet revient dans son groupe.
+
+### Modifié
+- Dans un groupe, les onglets n'affichent le dossier que si deux de ses fichiers portent le même nom.
+
 ## [1.14.0] - 2026-11-06
 
 ### Ajouté

@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.15.0] - 2026-11-06
+
+### Added
+- Tabs by project: each project has a color, shown as a line on its tabs and as a dot in the project tree and the list of tabs. With files of several projects open, the tabs of a project sit side by side after a label in its color. A click on the label folds or opens the group, dragging it moves the whole group, and a right click changes the project's color. A tab dropped among those of another project goes back to its own group.
+
+### Changed
+- Inside a group, tabs only show the folder when two of its files have the same name.
+
 ## [1.14.0] - 2026-11-06
 
 ### Added
