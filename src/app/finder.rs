@@ -163,7 +163,7 @@ fn list_id() -> iced::widget::Id {
 }
 
 /// Where a file's text is: in the editor, in a tab behind it, on disk.
-enum Holder {
+pub(super) enum Holder {
     Editor,
     Tab,
     Disk,
@@ -566,7 +566,7 @@ impl SimpleEditApp {
 
     /// A file's text now (the editor's, a tab's, or the file's), and where
     /// it is.
-    fn file_text(&self, path: &Path) -> Option<(String, Holder)> {
+    pub(super) fn file_text(&self, path: &Path) -> Option<(String, Holder)> {
         if self.current_file.as_deref() == Some(path) {
             return Some((
                 crate::editor::buffer_text(&self.editor.content),
@@ -708,34 +708,11 @@ impl SimpleEditApp {
             if new == text {
                 continue;
             }
-            match holder {
-                Holder::Editor => {
-                    let (line, col) = self.editor.content.cursor_position();
-                    let line = line.min(new.split('\n').count().saturating_sub(1));
-                    let _ = self.apply_text_edit(new.clone(), line, col, None);
-                }
-                Holder::Tab => {
-                    self.bookmarks.remap(&path, &text, &new);
-                    if let Some(buffer) = self.file_cache.get_mut(&path) {
-                        if let Some(content) = buffer.content.as_mut() {
-                            crate::editor::replace_text(content, &text, &new);
-                        }
-                        buffer.dirty = true;
-                    }
-                    let (undo, redo) = self.undo_cache.entry(path.clone()).or_default();
-                    undo.push_back(Snapshot {
-                        text: text.clone(),
-                        cursor: (0, 0),
-                    });
-                    redo.clear();
-                }
-                Holder::Disk => {
-                    if std::fs::write(&path, &new).is_err() {
-                        continue;
-                    }
-                    self.bookmarks.remap(&path, &text, &new);
-                }
+            self.history_record(&path, &text);
+            if !self.put_text(&path, &holder, &text, &new) {
+                continue;
             }
+            self.history_record(&path, &new);
             count += kept.len();
             files += 1;
             written.push(Written {
@@ -748,6 +725,40 @@ impl SimpleEditApp {
             self.finder.undo = written;
         }
         (count, files)
+    }
+
+    /// A file's text becomes `new`, where it is held: undone with Ctrl+Z in
+    /// the editor and the tabs. Whether it worked.
+    pub(super) fn put_text(&mut self, path: &Path, holder: &Holder, text: &str, new: &str) -> bool {
+        match holder {
+            Holder::Editor => {
+                let (line, col) = self.editor.content.cursor_position();
+                let line = line.min(new.split('\n').count().saturating_sub(1));
+                let _ = self.apply_text_edit(new.to_string(), line, col, None);
+            }
+            Holder::Tab => {
+                self.bookmarks.remap(path, text, new);
+                if let Some(buffer) = self.file_cache.get_mut(path) {
+                    if let Some(content) = buffer.content.as_mut() {
+                        crate::editor::replace_text(content, text, new);
+                    }
+                    buffer.dirty = true;
+                }
+                let (undo, redo) = self.undo_cache.entry(path.to_path_buf()).or_default();
+                undo.push_back(Snapshot {
+                    text: text.to_string(),
+                    cursor: (0, 0),
+                });
+                redo.clear();
+            }
+            Holder::Disk => {
+                if std::fs::write(path, new).is_err() {
+                    return false;
+                }
+                self.bookmarks.remap(path, text, new);
+            }
+        }
+        true
     }
 
     /// Puts back what the last replacement wrote, in the files that have not
@@ -1066,6 +1077,16 @@ impl SimpleEditApp {
             f.pinned,
             t!("findrep.pin").to_string(),
             Message::FindPin,
+        ));
+        header = header.push(iced::widget::tooltip(
+            button(text("×").size(16).color(p.muted))
+                .padding([1, 8])
+                .on_press(Message::CloseOverlay)
+                .style(ghost(false)),
+            container(text(t!("history.close").to_string()).size(12))
+                .padding([4, 8])
+                .style(se_theme::tooltip(dark)),
+            iced::widget::tooltip::Position::Bottom,
         ));
 
         let find_field: Element<Message> = if f.multiline {

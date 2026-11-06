@@ -298,6 +298,18 @@ fn menu_items(
                     Message::OpenReplaceInFiles,
                 ),
                 item(
+                    t!("history.show").to_string(),
+                    None,
+                    dark,
+                    Message::History(crate::app::HistoryMsg::OpenCurrent),
+                ),
+                item(
+                    t!("history.put_label").to_string(),
+                    None,
+                    dark,
+                    Message::History(crate::app::HistoryMsg::AskLabel),
+                ),
+                item(
                     t!("shortcuts.reopen_tab").to_string(),
                     sc(&sh.reopen_tab),
                     dark,

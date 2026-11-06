@@ -226,8 +226,14 @@ impl SimpleEditApp {
                 self.close_path(p)
             })
             .collect();
+        let days = self.config.local_history_days;
         tasks.push(Task::perform(
             async move {
+                if days > 0 {
+                    if let Some(store) = crate::local_history::Store::global() {
+                        store.record_tree(&dir, crate::local_history::now());
+                    }
+                }
                 tokio::fs::remove_dir_all(&dir)
                     .await
                     .map(|()| dir.clone())

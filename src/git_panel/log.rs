@@ -74,6 +74,21 @@ pub enum LogAction {
     CompareSelected,
     /// An interactive rebase of the commits from this one on.
     RebaseFrom,
+    /// What is staged goes into this commit: its message stays (fixup), or
+    /// the new one is added to it (squash).
+    Fixup,
+    SquashInto,
+}
+
+/// What a filter of the log narrows by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterField {
+    Author,
+    Since,
+    Until,
+    Path,
+    FirstParent,
+    NoMerges,
 }
 
 #[derive(Default)]
@@ -113,6 +128,12 @@ pub struct State {
     /// What the commits are searched for, and in what.
     pub search: String,
     pub search_mode: SearchMode,
+    pub narrow: history::LogFilter,
+    pub filters_shown: bool,
+    /// Compared: the commits of `.1` that `.0` lacks.
+    pub compare: Option<(String, String)>,
+    /// The files of the commit ticked for an action on several.
+    pub ticked: HashSet<String>,
 }
 
 /// A commit to bring up, and the file whose diff to open.
@@ -143,6 +164,24 @@ pub struct Avail {
 }
 
 impl State {
+    pub fn set_filter_text(&mut self, field: FilterField, value: String) {
+        match field {
+            FilterField::Author => self.narrow.author = value,
+            FilterField::Since => self.narrow.since = value,
+            FilterField::Until => self.narrow.until = value,
+            FilterField::Path => self.narrow.path = value,
+            FilterField::FirstParent | FilterField::NoMerges => {}
+        }
+    }
+
+    pub fn set_filter_flag(&mut self, field: FilterField, on: bool) {
+        match field {
+            FilterField::FirstParent => self.narrow.first_parent = on,
+            FilterField::NoMerges => self.narrow.no_merges = on,
+            _ => {}
+        }
+    }
+
     pub fn selected_commits(&self) -> Vec<&Commit> {
         self.selected
             .iter()
@@ -159,7 +198,7 @@ impl State {
         }
         // A file's history skips commits: only what acts on single commits
         // is offered there.
-        if self.file.is_some() {
+        if self.file.is_some() || self.narrow.is_set() || self.narrow.lines.is_some() {
             return Avail {
                 revert: true,
                 cherry_pick: chosen.iter().all(|c| !self.head_set.contains(&c.sha)),
@@ -226,15 +265,17 @@ impl Panel {
         let limit = self.log.limit;
         let file = self.log.file.clone();
         let search = (self.log.search.trim().to_string(), self.log.search_mode);
+        let filter = self.log.narrow.clone();
         Task::perform(
             async move {
                 let (commits, head) = tokio::join!(
-                    history::log_matching(
+                    history::log_filtered(
                         &repo,
                         &rev,
                         limit,
                         file.as_deref(),
-                        Some((search.1, search.0.as_str()))
+                        Some((search.1, search.0.as_str())),
+                        &filter
                     ),
                     history::head_commits(&repo, 5000)
                 );
@@ -421,6 +462,7 @@ impl Panel {
         }
         self.log.files = result.unwrap_or_default();
         self.log.files_for = Some(sha.clone());
+        self.log.ticked.clear();
         // Asked for by a blame: the diff of that file opens in the editor.
         match self.log.reveal.take() {
             Some(reveal) if reveal.sha == sha => {
@@ -494,6 +536,25 @@ impl Panel {
             history::checkout(&repo, &branch).await?;
             Ok(String::new())
         })
+    }
+
+    /// The commits a branch has that the current one lacks, in the log.
+    pub(super) fn compare_branch(&mut self, name: String) -> Task<Message> {
+        let Some(current) = self.status.as_ref().map(|s| s.branch.clone()) else {
+            return Task::none();
+        };
+        self.tab = super::Tab::Log;
+        self.log.compare = Some((current.clone(), name.clone()));
+        self.show_log(&format!("{current}..{name}"))
+    }
+
+    /// The same two branches, the other way round.
+    pub(super) fn compare_swap(&mut self) -> Task<Message> {
+        let Some((base, other)) = self.log.compare.take() else {
+            return Task::none();
+        };
+        self.log.compare = Some((other.clone(), base.clone()));
+        self.show_log(&format!("{other}..{base}"))
     }
 
     /// The diff between a branch and the working tree, in the editor.
@@ -723,6 +784,17 @@ impl Panel {
                         Err(e) => Message::Git(GitMsg::Done(Err(e))),
                     },
                 )
+            }
+            LogAction::Fixup | LogAction::SquashInto => {
+                if !avail.rebase {
+                    return Task::none();
+                }
+                let sha = shas[0].clone();
+                let squash = action == LogAction::SquashInto;
+                self.act(move |repo| async move {
+                    git::tools::fixup(&repo, &sha, squash).await?;
+                    Ok(String::new())
+                })
             }
             LogAction::RebaseFrom => {
                 if !avail.rebase {

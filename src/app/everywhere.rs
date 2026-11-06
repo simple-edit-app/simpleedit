@@ -1537,6 +1537,16 @@ impl SimpleEditApp {
             export = export.on_press(Message::EverywhereExport);
         }
         header = header.push(export);
+        header = header.push(iced::widget::tooltip(
+            button(text("×").size(16).color(p.muted))
+                .padding([1, 8])
+                .on_press(Message::CloseOverlay)
+                .style(ghost(false)),
+            container(text(t!("history.close").to_string()).size(12))
+                .padding([4, 8])
+                .style(se_theme::tooltip(dark)),
+            iced::widget::tooltip::Position::Bottom,
+        ));
 
         let placeholder = placeholder_of(current);
         let field = text_input(&placeholder, &self.everywhere.query)

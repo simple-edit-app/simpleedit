@@ -9,6 +9,7 @@ pub mod diff;
 pub mod graph;
 pub mod history;
 pub mod marks;
+pub mod tools;
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -521,7 +522,7 @@ impl MergeMode {
         MergeMode::Squash,
     ];
 
-    fn flag(self) -> Option<&'static str> {
+    pub(crate) fn flag(self) -> Option<&'static str> {
         match self {
             MergeMode::Default => None,
             MergeMode::NoFastForward => Some("--no-ff"),
@@ -784,21 +785,31 @@ pub async fn commit_only(
     message: &str,
     amend: bool,
     path: &str,
+    options: &tools::CommitOptions,
 ) -> Result<(), String> {
     run(repo, &["add", "--", path]).await?;
+    let extra = options.args();
     let mut args = vec!["commit", "-F", "-"];
     if amend {
         args.push("--amend");
     }
+    args.extend(extra.iter().map(String::as_str));
     args.extend(["--", path]);
     run_with(repo, &args, Some(message), &[]).await.map(|_| ())
 }
 
-pub async fn commit(repo: &Path, message: &str, amend: bool) -> Result<(), String> {
+pub async fn commit(
+    repo: &Path,
+    message: &str,
+    amend: bool,
+    options: &tools::CommitOptions,
+) -> Result<(), String> {
+    let extra = options.args();
     let mut args = vec!["commit", "-F", "-"];
     if amend {
         args.push("--amend");
     }
+    args.extend(extra.iter().map(String::as_str));
     run_with(repo, &args, Some(message), &[]).await.map(|_| ())
 }
 
@@ -1292,9 +1303,15 @@ mod tests {
         assert_eq!(s.staged.len(), 1);
         assert_eq!(s.unstaged[0].kind, Kind::Untracked);
 
-        block(commit(repo.path(), "second\n\nbody", false)).unwrap();
+        block(commit(
+            repo.path(),
+            "second\n\nbody",
+            false,
+            &Default::default(),
+        ))
+        .unwrap();
         assert_eq!(block(last_message(repo.path())).unwrap(), "second\n\nbody");
-        block(commit(repo.path(), "amended", true)).unwrap();
+        block(commit(repo.path(), "amended", true, &Default::default())).unwrap();
         assert_eq!(block(last_message(repo.path())).unwrap(), "amended");
         let s = block(status(repo.path(), true)).unwrap();
         assert!(s.staged.is_empty());
@@ -1563,7 +1580,14 @@ mod tests {
         repo.write("b.txt", "two\n");
         repo.write("new.txt", "fresh\n");
         repo.git(&["add", "b.txt"]);
-        block(commit_only(repo.path(), "only a", false, "a.txt")).unwrap();
+        block(commit_only(
+            repo.path(),
+            "only a",
+            false,
+            "a.txt",
+            &Default::default(),
+        ))
+        .unwrap();
         let last = repo.git(&["show", "--name-only", "--format=%s", "HEAD"]);
         assert!(last.contains("only a") && last.contains("a.txt"));
         assert!(!last.contains("b.txt"));
@@ -1572,7 +1596,14 @@ mod tests {
         assert_eq!(status.staged.len(), 1);
         assert_eq!(status.staged[0].path, "b.txt");
         // A new file is added then committed alone.
-        block(commit_only(repo.path(), "only new", false, "new.txt")).unwrap();
+        block(commit_only(
+            repo.path(),
+            "only new",
+            false,
+            "new.txt",
+            &Default::default(),
+        ))
+        .unwrap();
         let last = repo.git(&["show", "--name-only", "--format=%s", "HEAD"]);
         assert!(last.contains("new.txt") && !last.contains("b.txt"));
     }

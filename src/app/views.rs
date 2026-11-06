@@ -177,6 +177,8 @@ impl SimpleEditApp {
             | ActiveOverlay::Shortcuts
             | ActiveOverlay::Conflicts
             | ActiveOverlay::Everywhere
+            | ActiveOverlay::LocalHistory(_)
+            | ActiveOverlay::HistoryLabel(_)
             | ActiveOverlay::ConfirmClose(_)
             | ActiveOverlay::ConfirmCloseMany(..)
             | ActiveOverlay::ConfirmQuit(_)

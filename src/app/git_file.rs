@@ -17,6 +17,10 @@ pub enum FileAction {
     CompareRef,
     CompareRevision,
     History,
+    /// The history of the lines selected (or of the cursor's).
+    HistorySelection,
+    /// The file comes back as a branch, a tag or a revision has it.
+    GetFromRevision,
     /// Adds the file to the `.gitignore` of its repository.
     Ignore,
 }
@@ -37,6 +41,8 @@ pub struct Pick {
     /// The file, relative to the repository.
     pub file: String,
     pub revisions: bool,
+    /// The choice brings the file back, rather than comparing with it.
+    pub get: bool,
     pub items: Vec<PickItem>,
     pub filter: String,
 }
@@ -69,7 +75,26 @@ fn ref_items(refs: &history::Refs) -> Vec<PickItem> {
     items
 }
 
+/// A commit, as something to pick.
+fn revision_item(c: crate::git::graph::Commit) -> PickItem {
+    PickItem {
+        detail: format!("{} · {}", &c.sha[..c.sha.len().min(8)], c.author),
+        label: c.subject,
+        rev: c.sha,
+    }
+}
+
 impl SimpleEditApp {
+    /// The lines the history of a selection is about, from 1: the selected
+    /// ones of the file in front, else the cursor's, else the first.
+    fn lines_of(&self, path: &Path) -> (usize, usize) {
+        if self.current_file.as_deref() != Some(path) {
+            return (1, 1);
+        }
+        let (first, last) = self.lines_to_edit(self.selection_span());
+        (first + 1, last + 1)
+    }
+
     /// The list that switches branch from the status bar: type to filter,
     /// Enter takes the first, and a name no branch has can be made.
     pub(super) fn branch_switch_overlay(&self, dark: bool, filter: &str) -> Element<'_, Message> {
@@ -226,6 +251,14 @@ impl SimpleEditApp {
                         FileAction::CompareRevision
                     ),
                     item(t!("git.file_history").to_string(), FileAction::History),
+                    item(
+                        t!("git.file_history_selection").to_string(),
+                        FileAction::HistorySelection
+                    ),
+                    item(
+                        t!("git.file_get_revision").to_string(),
+                        FileAction::GetFromRevision
+                    ),
                     item(t!("git.ignore_file").to_string(), FileAction::Ignore),
                 ]
                 .spacing(1),
@@ -296,7 +329,9 @@ impl SimpleEditApp {
         }
         container(
             column![
-                text(if pick.revisions {
+                text(if pick.get {
+                    t!("git.pick_get_title", file = pick.file.as_str()).to_string()
+                } else if pick.revisions {
                     t!("git.pick_revision_title", file = pick.file.as_str()).to_string()
                 } else {
                     t!("git.pick_ref_title", file = pick.file.as_str()).to_string()
@@ -398,6 +433,32 @@ impl SimpleEditApp {
                 self.git.log.shown = None;
                 Task::done(Message::Git(GitMsg::SelectTab(Tab::Log)))
             }
+            FileAction::HistorySelection => {
+                let (first, last) = self.lines_of(&path);
+                self.show_git_panel(root);
+                self.git.tab = Tab::Log;
+                self.git.log.file = None;
+                self.git.log.narrow.lines = Some((rel, first, last));
+                self.git.log.shown = None;
+                Task::done(Message::Git(GitMsg::SelectTab(Tab::Log)))
+            }
+            FileAction::GetFromRevision => Task::perform(
+                async move {
+                    let refs = history::refs(&root).await?;
+                    let mut items = ref_items(&refs);
+                    let commits = history::log(&root, "HEAD", 300, Some(&rel)).await?;
+                    items.extend(commits.into_iter().map(revision_item));
+                    Ok(Pick {
+                        repo: root,
+                        file: rel,
+                        revisions: false,
+                        get: true,
+                        items,
+                        filter: String::new(),
+                    })
+                },
+                Message::GitFilePick,
+            ),
             FileAction::Diff => Task::perform(
                 async move {
                     let status = crate::git::status(&root, true).await?;
@@ -422,6 +483,7 @@ impl SimpleEditApp {
                         repo: root,
                         file: rel,
                         revisions: false,
+                        get: false,
                         items: ref_items(&refs),
                         filter: String::new(),
                     })
@@ -431,18 +493,12 @@ impl SimpleEditApp {
             FileAction::CompareRevision => Task::perform(
                 async move {
                     let commits = history::log(&root, "HEAD", 300, Some(&rel)).await?;
-                    let items = commits
-                        .into_iter()
-                        .map(|c| PickItem {
-                            detail: format!("{} · {}", &c.sha[..c.sha.len().min(8)], c.author),
-                            label: c.subject,
-                            rev: c.sha,
-                        })
-                        .collect();
+                    let items = commits.into_iter().map(revision_item).collect();
                     Ok(Pick {
                         repo: root,
                         file: rel,
                         revisions: true,
+                        get: false,
                         items,
                         filter: String::new(),
                     })
@@ -499,13 +555,13 @@ impl SimpleEditApp {
         if rev.is_empty() {
             return Task::none();
         }
-        let (repo, file) = (pick.repo.clone(), pick.file.clone());
+        let (repo, file, get) = (pick.repo.clone(), pick.file.clone(), pick.get);
         self.overlay = ActiveOverlay::None;
         // Typed by hand: checked before git reads it (it could be an option).
         Task::perform(
             async move {
                 crate::git::verify_rev(&repo, &rev).await?;
-                Ok((repo, file, rev))
+                Ok((repo, file, rev, get))
             },
             Message::GitPickVerified,
         )
@@ -513,15 +569,24 @@ impl SimpleEditApp {
 
     pub(super) fn git_pick_verified(
         &mut self,
-        result: Result<(PathBuf, String, String), String>,
+        result: Result<(PathBuf, String, String, bool), String>,
     ) -> Task<Message> {
-        let (repo, file, rev) = match result {
+        let (repo, file, rev, get) = match result {
             Ok(found) => found,
             Err(e) => {
                 self.set_status(e, true);
                 return Task::none();
             }
         };
+        if get {
+            return Task::perform(
+                async move {
+                    crate::git::tools::get_from_revision(&repo, &rev, &file).await?;
+                    Ok(t!("git.file_got").to_string())
+                },
+                Message::GitFileDone,
+            );
+        }
         let short = rev.chars().take(8).collect::<String>();
         let title = format!("{file} ↔ {short}");
         self.open_diff_tab(DiffTab {
@@ -538,5 +603,133 @@ impl SimpleEditApp {
             }],
             start: 0,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app() -> SimpleEditApp {
+        let mut app = SimpleEditApp::blank(Config::default());
+        let _ = app.restore_session(crate::session::Session::default());
+        app
+    }
+
+    #[test]
+    fn a_file_in_the_back_has_its_first_line_for_the_history_of_a_selection() {
+        let app = app();
+        assert_eq!(app.lines_of(Path::new("/not/in/front")), (1, 1));
+    }
+
+    #[test]
+    fn a_blame_option_changes_and_hidden_commits_are_restored() {
+        let mut app = app();
+        let _ = app.update(Message::BlameOption(BlameOption::Blanks));
+        assert!(app.blame_options.ignore_blanks);
+        let _ = app.update(Message::BlameOption(BlameOption::MovesInFile));
+        let _ = app.update(Message::BlameOption(BlameOption::MovesAcross));
+        assert!(app.blame_options.moves_in_file && app.blame_options.moves_across);
+        app.blame_options.hidden.push("sha".into());
+        let _ = app.update(Message::BlameOption(BlameOption::ShowHidden));
+        assert!(app.blame_options.hidden.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_revision_picked_to_get_a_file_restores_it_instead_of_comparing() {
+        let repo = crate::git::testing::Repo::new();
+        std::fs::write(repo.path().join("f"), "old").unwrap();
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-q", "-m", "one"]);
+        let old = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        std::fs::write(repo.path().join("f"), "new").unwrap();
+        repo.git(&["commit", "-qam", "two"]);
+        let mut app = app();
+        let tabs = app.sidebar.files().len();
+        let _ = app.update(Message::GitPickVerified(Ok((
+            repo.path().to_path_buf(),
+            "f".into(),
+            old,
+            true,
+        ))));
+        assert_eq!(app.sidebar.files().len(), tabs, "no diff tab opens");
+    }
+
+    /// Draws the panel and two dialogs, to look at them without a screen:
+    /// `SNAPSHOT=/tmp/x cargo test git_look -- --ignored`.
+    #[test]
+    #[ignore]
+    fn git_look() {
+        use crate::git::tools::PushSpec;
+        use crate::git_panel::tools::{Dialog, PushDialog};
+        let Ok(out) = std::env::var("SNAPSHOT") else {
+            return;
+        };
+        let mut app = app();
+        app.git.open = true;
+        app.git.repo = Some(PathBuf::from("/repo"));
+        app.git.searched = true;
+        app.git.status = Some(crate::git::Status {
+            branch: "main".into(),
+            upstream: Some("origin/main".into()),
+            ahead: 2,
+            ..Default::default()
+        });
+        let commit = |sha: &str, subject: &str| crate::git::graph::Commit {
+            sha: sha.into(),
+            parents: Vec::new(),
+            author: "me".into(),
+            email: "me@x".into(),
+            time: 0,
+            subject: subject.into(),
+            refs: Vec::new(),
+        };
+        let shoot = |app: &SimpleEditApp, name: &str| {
+            let settings = iced::Settings {
+                default_font: se_theme::UI,
+                fonts: se_theme::font_files(),
+                ..Default::default()
+            };
+            let mut ui = iced_test::Simulator::with_size(settings, (1280.0, 800.0), app.view());
+            let shot = ui.snapshot(&se_theme::ink_dark()).unwrap();
+            let path = format!("{out}-{name}.png");
+            let _ = std::fs::remove_file(format!("{out}-{name}-wgpu.png"));
+            assert!(shot.matches_image(&path).unwrap());
+        };
+        shoot(&app, "commit");
+        app.git.dialog = Some(Dialog::Push(PushDialog {
+            remotes: vec!["origin".into(), "upstream".into()],
+            spec: PushSpec {
+                remote: "origin".into(),
+                source: "main".into(),
+                target: "main".into(),
+                ..PushSpec::default()
+            },
+            commits: vec![
+                commit("0123456789", "feat: a new thing"),
+                commit("abcdef0123", "fix: the old thing"),
+            ],
+            force_asked: false,
+        }));
+        shoot(&app, "push");
+        app.git.dialog = None;
+        app.git.tab = Tab::Log;
+        app.git.log.filters_shown = true;
+        let _ = app.update(Message::Git(GitMsg::LogLoaded(
+            "HEAD".into(),
+            Ok((
+                vec![commit("0123456789", "feat: a new thing")],
+                Default::default(),
+            )),
+        )));
+        app.git.log.shown = Some("HEAD".into());
+        let _ = app.update(Message::Git(GitMsg::LogLoaded(
+            "HEAD".into(),
+            Ok((
+                vec![commit("0123456789", "feat: a new thing")],
+                Default::default(),
+            )),
+        )));
+        shoot(&app, "log");
     }
 }

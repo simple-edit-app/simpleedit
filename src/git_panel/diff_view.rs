@@ -54,6 +54,8 @@ pub struct Nav {
     /// Changes of blanks left out; more or less context.
     pub toggle_blanks: Message,
     pub cycle_context: Message,
+    /// Those two are offered (Git reads the diff again for them).
+    pub reading_options: bool,
 }
 
 impl Nav {
@@ -75,6 +77,7 @@ impl Nav {
             stage_selection: Message::Git(GitMsg::StageSelection),
             toggle_blanks: Message::Git(GitMsg::ToggleBlanks),
             cycle_context: Message::Git(GitMsg::CycleContext),
+            reading_options: true,
         }
     }
 
@@ -97,6 +100,35 @@ impl Nav {
             stage_selection: Message::DiffTab(DiffNav::StageSelection),
             toggle_blanks: Message::DiffTab(DiffNav::ToggleBlanks),
             cycle_context: Message::DiffTab(DiffNav::CycleContext),
+            reading_options: true,
+        }
+    }
+
+    /// The diff of the local history: its arrows put a change back.
+    pub fn history() -> Nav {
+        use crate::app::DiffNav;
+        use crate::app::HistoryMsg;
+        let on = |nav: DiffNav| Message::History(HistoryMsg::Diff(nav));
+        Nav {
+            prev_change: on(DiffNav::PrevChange),
+            next_change: on(DiffNav::NextChange),
+            prev_file: on(DiffNav::PrevFile),
+            next_file: on(DiffNav::NextFile),
+            toggle_side: on(DiffNav::ToggleSide),
+            rollback: Some(|block| Message::History(HistoryMsg::Diff(DiffNav::Apply(block)))),
+            toggle_compare: None,
+            open_file: None,
+            pick: |p| Message::History(HistoryMsg::Diff(DiffNav::Pick(p))),
+            copy: on(DiffNav::CopyPicked),
+            select_all: on(DiffNav::PickAll),
+            scrolled: |top, height| {
+                Message::History(HistoryMsg::Diff(DiffNav::Scrolled(top, height)))
+            },
+            stage_block: |block| Message::History(HistoryMsg::Diff(DiffNav::Apply(block))),
+            stage_selection: on(DiffNav::CopyPicked),
+            toggle_blanks: on(DiffNav::ToggleBlanks),
+            cycle_context: on(DiffNav::CycleContext),
+            reading_options: false,
         }
     }
 }
@@ -955,6 +987,54 @@ pub fn view<'a>(viewer: &'a Viewer, nav: &Nav, dark: bool, empty: String) -> Ele
     } else {
         Space::new().into()
     };
+    // Blanks and context: only where Git reads the diff again for them.
+    let reading: Element<Message> = if nav.reading_options {
+        row![
+            iced::widget::tooltip(
+                tool_button(
+                    "␣",
+                    Some(nav.toggle_blanks.clone()),
+                    viewer.ignore_blanks,
+                    dark
+                ),
+                container(
+                    text(if viewer.ignore_blanks {
+                        t!("git.blanks_counted").to_string()
+                    } else {
+                        t!("git.blanks_ignored").to_string()
+                    })
+                    .size(12)
+                )
+                .padding([3, 8])
+                .style(se_theme::tooltip(dark)),
+                iced::widget::tooltip::Position::Bottom,
+            ),
+            iced::widget::tooltip(
+                tool_button(
+                    "⇕",
+                    Some(nav.cycle_context.clone()),
+                    viewer.context != 3,
+                    dark
+                ),
+                container(
+                    text(if viewer.context == u32::MAX {
+                        t!("git.context_all").to_string()
+                    } else {
+                        t!("git.context_n", n = viewer.context).to_string()
+                    })
+                    .size(12)
+                )
+                .padding([3, 8])
+                .style(se_theme::tooltip(dark)),
+                iced::widget::tooltip::Position::Bottom,
+            ),
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center)
+        .into()
+    } else {
+        Space::new().into()
+    };
     let toolbar = row![
         arrow("↑", &nav.prev_change, has_file),
         arrow("↓", &nav.next_change, has_file),
@@ -1007,44 +1087,7 @@ pub fn view<'a>(viewer: &'a Viewer, nav: &Nav, dark: bool, empty: String) -> Ele
             .style(se_theme::tooltip(dark)),
             iced::widget::tooltip::Position::Bottom,
         ),
-        iced::widget::tooltip(
-            tool_button(
-                "␣",
-                Some(nav.toggle_blanks.clone()),
-                viewer.ignore_blanks,
-                dark
-            ),
-            container(
-                text(if viewer.ignore_blanks {
-                    t!("git.blanks_counted").to_string()
-                } else {
-                    t!("git.blanks_ignored").to_string()
-                })
-                .size(12)
-            )
-            .padding([3, 8])
-            .style(se_theme::tooltip(dark)),
-            iced::widget::tooltip::Position::Bottom,
-        ),
-        iced::widget::tooltip(
-            tool_button(
-                "⇕",
-                Some(nav.cycle_context.clone()),
-                viewer.context != 3,
-                dark
-            ),
-            container(
-                text(if viewer.context == u32::MAX {
-                    t!("git.context_all").to_string()
-                } else {
-                    t!("git.context_n", n = viewer.context).to_string()
-                })
-                .size(12)
-            )
-            .padding([3, 8])
-            .style(se_theme::tooltip(dark)),
-            iced::widget::tooltip::Position::Bottom,
-        ),
+        reading,
     ]
     .spacing(4)
     .align_y(Alignment::Center);

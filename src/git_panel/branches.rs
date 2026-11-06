@@ -37,6 +37,7 @@ pub enum RefAction {
     CreateTag,
     Delete,
     Create,
+    Rename,
 }
 
 impl RefAction {
@@ -79,6 +80,7 @@ pub struct State {
 pub enum RefDialog {
     Branch,
     Tag,
+    Rename,
 }
 
 /// Width of the modes of a split button.
@@ -148,6 +150,9 @@ impl Panel {
                 None => false,
             },
             RefAction::Create => !branch_name(&self.branches.name).is_empty(),
+            RefAction::Rename => {
+                branch.is_some_and(|b| !b.remote) && !branch_name(&self.branches.name).is_empty()
+            }
         }
     }
 
@@ -238,6 +243,14 @@ impl Panel {
                     } else {
                         history::delete_branch(&repo, &b.name).await?;
                     }
+                    Ok(String::new())
+                })
+            }
+            (RefAction::Rename, Some(Ref::Branch(old)), _) => {
+                let new = branch_name(&self.branches.name);
+                self.branches.name.clear();
+                self.act(move |repo| async move {
+                    git::tools::rename_branch(&repo, &old, &new).await?;
                     Ok(String::new())
                 })
             }
@@ -476,6 +489,37 @@ impl Panel {
                     .style(),
                 )
         };
+        let act_msg_if = |label: String, msg: GitMsg, enabled: bool| {
+            button(text(label).size(12.5))
+                .padding([4, 12])
+                .width(Length::Fill)
+                .on_press_maybe(enabled.then_some(Message::Git(msg)))
+                .style(
+                    (se_theme::GhostButton {
+                        dark,
+                        active: false,
+                    })
+                    .style(),
+                )
+        };
+        let local_picked = self.picked_branch().is_some_and(|b| !b.remote);
+        let picked_name = match &self.branches.selected {
+            Some(Ref::Branch(n) | Ref::Tag(n)) => Some(n.clone()),
+            None => None,
+        };
+        let on_picked = |label: String, msg: fn(String) -> GitMsg| {
+            button(text(label).size(12.5))
+                .padding([4, 12])
+                .width(Length::Fill)
+                .on_press_maybe(picked_name.clone().map(|n| Message::Git(msg(n))))
+                .style(
+                    (se_theme::GhostButton {
+                        dark,
+                        active: false,
+                    })
+                    .style(),
+                )
+        };
         let confirming = |action: RefAction| self.branches.confirm == Some(action);
         let picked = match &self.branches.selected {
             Some(Ref::Branch(n) | Ref::Tag(n)) => n.clone(),
@@ -573,6 +617,18 @@ impl Panel {
             container(Space::new().height(1))
                 .width(Length::Fill)
                 .style(se_theme::rule(dark)),
+            on_picked(t!("git.compare_commits").to_string(), GitMsg::CompareBranch),
+            on_picked(t!("git.merge_options").to_string(), |n| {
+                GitMsg::Tool(super::tools::ToolMsg::OpenMerge(n))
+            }),
+            on_picked(t!("git.rebase_options").to_string(), |n| {
+                GitMsg::Tool(super::tools::ToolMsg::OpenRebase(n))
+            }),
+            act_msg_if(
+                t!("git.rename").to_string(),
+                GitMsg::RefDialog(Some(RefDialog::Rename)),
+                local_picked
+            ),
             act_msg(create_label, GitMsg::RefDialog(Some(RefDialog::Branch))),
             act_msg(tag_label, GitMsg::RefDialog(Some(RefDialog::Tag))),
             notice,
@@ -625,6 +681,16 @@ impl Panel {
                 .id(ref_dialog_field())
                 .into(),
             ),
+            RefDialog::Rename => (
+                t!("git.rename_title", name = from.as_str()).to_string(),
+                field(
+                    t!("git.new_branch_name").to_string(),
+                    &self.branches.name,
+                    GitMsg::RefName,
+                )
+                .id(ref_dialog_field())
+                .into(),
+            ),
             RefDialog::Tag => (
                 if from.is_empty() {
                     t!("git.new_tag_here").to_string()
@@ -651,6 +717,12 @@ impl Panel {
         let ok = match kind {
             RefDialog::Branch => RefAction::Create,
             RefDialog::Tag => RefAction::CreateTag,
+            RefDialog::Rename => RefAction::Rename,
+        };
+        let ok_label = if kind == RefDialog::Rename {
+            t!("git.rename").to_string()
+        } else {
+            t!("git.create").to_string()
         };
         let form = column![
             text(title)
@@ -659,7 +731,7 @@ impl Panel {
                 .color(p.text),
             fields,
             row![
-                button(text(t!("git.create").to_string()).size(12.5))
+                button(text(ok_label).size(12.5))
                     .padding([5, 14])
                     .on_press_maybe(self.can(ok).then_some(Message::Git(GitMsg::RefDialogOk)))
                     .style((se_theme::Primary { dark }).style()),

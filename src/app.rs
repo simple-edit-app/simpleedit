@@ -132,11 +132,26 @@ pub struct MarksState {
 }
 
 /// Which modal overlay (if any) is currently shown.
+/// What can be changed in how a blame is made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlameOption {
+    Blanks,
+    MovesInFile,
+    MovesAcross,
+    /// The commit of the line is left out.
+    HideLine,
+    ShowHidden,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ActiveOverlay {
     None,
     /// Search everywhere (Shift twice).
     Everywhere,
+    /// The revisions of a file or a folder.
+    LocalHistory(Box<local_history::HistoryView>),
+    /// A name for a moment of the history.
+    HistoryLabel(String),
     About,
     /// Every release.
     Changelog,
@@ -217,6 +232,7 @@ pub enum Message {
     /// A tab was dragged from a place to another.
     TabMoved(usize, usize),
     /// A group of tabs folded or opened; the color of a project.
+    History(local_history::HistoryMsg),
     TabGroupToggle(Option<PathBuf>),
     TabGroupClose(Option<PathBuf>),
     ProjectColor(PathBuf, usize),
@@ -439,6 +455,7 @@ pub enum Message {
         Result<(PathBuf, String, Vec<crate::git::history::BlameLine>), String>,
     ),
     CloseBlame,
+    BlameOption(BlameOption),
     BlameLineClicked(usize),
     /// Shows the file as it was before the commit of the line that was
     /// right-clicked in the blame column, with its own blame.
@@ -479,7 +496,7 @@ pub enum Message {
     GitPickFilter(String),
     GitPickChoose(String),
     /// The revision typed in the picker exists: (repository, file, revision).
-    GitPickVerified(Result<(PathBuf, String, String), String>),
+    GitPickVerified(Result<(PathBuf, String, String, bool), String>),
     // Bookmarks panel
     ToggleBookmarkPanel,
     BookmarkClick(bookmark_panel::Target),
@@ -717,6 +734,11 @@ pub struct SimpleEditApp {
     capturing: Option<ShortcutTarget>,
     everywhere: everywhere::Everywhere,
     results: results::Results,
+    /// The diff of the local history, and whether the compact list shows.
+    history_diff: crate::git_panel::Viewer,
+    history_compact: bool,
+    /// How the blame looks for who wrote a line.
+    blame_options: crate::git::history::BlameOptions,
     /// The groups of tabs that are folded.
     folded_tabs: BTreeSet<Option<PathBuf>>,
     open_menu: Option<TopMenu>,
@@ -936,6 +958,9 @@ impl SimpleEditApp {
             capturing: None,
             everywhere: everywhere::Everywhere::default(),
             results: results::Results::default(),
+            history_diff: Default::default(),
+            history_compact: false,
+            blame_options: Default::default(),
             folded_tabs: BTreeSet::new(),
             open_menu: None,
             recents_open: false,
@@ -1709,6 +1734,8 @@ impl SimpleEditApp {
                         )
                     }
                     ActiveOverlay::ProjectName(dialog) => self.view_name_overlay(dark, dialog),
+                    ActiveOverlay::HistoryLabel(name) => self.view_history_label(name, dark),
+                    ActiveOverlay::LocalHistory(view) => self.view_local_history(view, dark),
                     ActiveOverlay::ConfirmMove(source, dir) => confirm_card(
                         dark,
                         t!("projects.move_title").to_string(),
@@ -1769,6 +1796,7 @@ impl Message {
     fn is_background(&self) -> bool {
         match self {
             Message::Git(msg) => msg.is_background(),
+            Message::History(msg) => msg.is_background(),
             Message::BlameLoaded(..) | Message::MarksBase(..) => true,
             // What comes by itself (answers, timers) or from the pointer
             // merely passing over something: an open menu stays open.
@@ -1967,6 +1995,7 @@ impl SimpleEditApp {
                             .as_ref()
                             .is_some_and(|p| *p != loaded.path) => {}
                     Ok(loaded) => {
+                        self.history_record(&loaded.path, &loaded.text);
                         self.open_loaded(loaded);
                         self.apply_pending_jump();
                     }
@@ -1988,7 +2017,10 @@ impl SimpleEditApp {
             }
             Message::FileReloaded(result) => {
                 match result {
-                    Ok(loaded) => self.apply_reload(loaded),
+                    Ok(loaded) => {
+                        self.history_record(&loaded.path, &loaded.text);
+                        self.apply_reload(loaded);
+                    }
                     Err(e) => self.set_status(format!("{}: {}", t!("status.error"), e), true),
                 }
                 Task::none()
@@ -2056,6 +2088,7 @@ impl SimpleEditApp {
             Message::FileSaved(origin, result) => {
                 match result {
                     Ok((path, saved)) => {
+                        self.history_record(&path, &saved);
                         self.size_for = None;
                         // The tab the save started from may no longer be the
                         // active one (the dialog is asynchronous).
@@ -2152,6 +2185,7 @@ impl SimpleEditApp {
                 self.blame = None;
                 Task::none()
             }
+            Message::BlameOption(option) => self.blame_option(option),
             Message::BlameLineClicked(line) => self.blame_line_clicked(line),
             Message::BlamePrevious => {
                 let (Some(line), Some(blame)) = (self.gutter_line, &self.blame) else {
@@ -2166,11 +2200,13 @@ impl SimpleEditApp {
                 };
                 let (repo, relative) = (blame.repo.clone(), blame.relative.clone());
                 let sha = sha.clone();
+                let options = self.blame_options.clone();
                 Task::perform(
                     async move {
                         let rev = format!("{sha}^");
                         let lines =
-                            crate::git::history::blame_at(&repo, Some(&rev), &relative).await?;
+                            crate::git::history::blame_with(&repo, Some(&rev), &relative, &options)
+                                .await?;
                         let text = crate::git::history::file_at(&repo, &rev, &relative).await?;
                         let label = sha.chars().take(8).collect::<String>();
                         Ok((repo, relative, label, text, lines))
@@ -2250,6 +2286,8 @@ impl SimpleEditApp {
                     current_file: self.current_file.as_deref(),
                     ctrl: self.mod_ctrl,
                     shift: self.mod_shift,
+                    roots: &self.projects.roots,
+                    colors: &self.config.project_colors,
                 };
                 let task = self.git.toggle(&ctx);
                 if self.git.open {
@@ -2269,10 +2307,17 @@ impl SimpleEditApp {
                     }
                 }
                 self.remember_before_git(&msg);
+                if let crate::git_panel::GitMsg::Done(Ok(said)) = &msg {
+                    if said.starts_with("\u{2}") || said.starts_with("\u{5}") {
+                        self.history_label(t!("history.auto_commit").to_string(), true);
+                    }
+                }
                 let ctx = crate::git_panel::Ctx {
                     current_file: self.current_file.as_deref(),
                     ctrl: self.mod_ctrl,
                     shift: self.mod_shift,
+                    roots: &self.projects.roots,
+                    colors: &self.config.project_colors,
                 };
                 let refreshing = matches!(
                     msg,
@@ -2761,6 +2806,7 @@ impl SimpleEditApp {
                 }
                 Task::none()
             }
+            Message::History(msg) => self.history_update(msg),
             Message::TabGroupClose(project) => {
                 let targets = self.tabs_of(&project);
                 self.folded_tabs.remove(&project);
@@ -2945,7 +2991,7 @@ impl SimpleEditApp {
                 let action = match what {
                     GitShortcut::Commit => Task::none(),
                     GitShortcut::Push => {
-                        Task::done(Message::Git(crate::git_panel::GitMsg::PushCurrent))
+                        Task::done(Message::Git(crate::git_panel::GitMsg::OpenPush))
                     }
                     GitShortcut::Pull => {
                         Task::done(Message::Git(crate::git_panel::GitMsg::RefAction(
@@ -3055,7 +3101,8 @@ impl SimpleEditApp {
                 self.overlay = ActiveOverlay::None;
                 self.bookmarks.clear(&path);
                 let close = self.close_path(path.clone());
-                let delete = Task::perform(delete_file(path, from_git), Message::FileDeleted);
+                let days = self.config.local_history_days;
+                let delete = Task::perform(delete_file(path, from_git, days), Message::FileDeleted);
                 Task::batch([close, delete])
             }
             Message::FileDeleted(result) => {
@@ -3418,6 +3465,10 @@ impl SimpleEditApp {
                     Task::none()
                 };
                 let external = self.check_external_change();
+                self.history_tick();
+                if self.ticks == 5 {
+                    self.history_prune();
+                }
                 self.ticks = self.ticks.wrapping_add(1);
                 // The marks follow HEAD, which a commit made elsewhere moves.
                 let marks = if self.ticks.is_multiple_of(10) {
@@ -5321,6 +5372,7 @@ impl SimpleEditApp {
         let Some(path) = self.current_file.clone().filter(|p| !is_untitled(p)) else {
             return Task::none();
         };
+        let options = self.blame_options.clone();
         Task::perform(
             async move {
                 let root = crate::git::repo_root(&path)
@@ -5328,7 +5380,8 @@ impl SimpleEditApp {
                     .ok_or_else(|| t!("git.no_repo").to_string())?;
                 let relative =
                     relative_to(&root, &path).ok_or_else(|| t!("git.no_repo").to_string())?;
-                let lines = crate::git::history::blame(&root, &relative).await?;
+                let lines =
+                    crate::git::history::blame_with(&root, None, &relative, &options).await?;
                 Ok::<_, String>((path, (root, relative, lines)))
             },
             |result| match result {
@@ -5336,6 +5389,28 @@ impl SimpleEditApp {
                 Err(error) => Message::BlameLoaded(PathBuf::new(), Err(error)),
             },
         )
+    }
+
+    /// An option of the blame changed: it is made again.
+    fn blame_option(&mut self, option: BlameOption) -> Task<Message> {
+        let options = &mut self.blame_options;
+        match option {
+            BlameOption::Blanks => options.ignore_blanks = !options.ignore_blanks,
+            BlameOption::MovesInFile => options.moves_in_file = !options.moves_in_file,
+            BlameOption::MovesAcross => options.moves_across = !options.moves_across,
+            BlameOption::ShowHidden => options.hidden.clear(),
+            BlameOption::HideLine => {
+                let sha = self.gutter_line.and_then(|line| {
+                    let blame = self.blame.as_ref()?;
+                    blame.shas.get(line).cloned()
+                });
+                let Some(sha) = sha else {
+                    return Task::none();
+                };
+                self.blame_options.hidden.push(sha);
+            }
+        }
+        self.start_blame()
     }
 
     fn blame_loaded(
@@ -6768,6 +6843,30 @@ impl SimpleEditApp {
                 .is_some_and(|sha| !sha.chars().all(|c| c == '0'))
         });
         let lbl_previous = t!("git.blame_previous").to_string();
+        let lbl_history = t!("history.show").to_string();
+        let ticked = |on: bool, label: String| format!("{} {label}", if on { "✓" } else { "  " });
+        let blame_opts = &self.blame_options;
+        let mut blame_items = vec![
+            (
+                ticked(blame_opts.ignore_blanks, t!("git.blame_blanks").to_string()),
+                BlameOption::Blanks,
+            ),
+            (
+                ticked(blame_opts.moves_in_file, t!("git.blame_moves").to_string()),
+                BlameOption::MovesInFile,
+            ),
+            (
+                ticked(blame_opts.moves_across, t!("git.blame_across").to_string()),
+                BlameOption::MovesAcross,
+            ),
+            (t!("git.blame_hide").to_string(), BlameOption::HideLine),
+        ];
+        if !blame_opts.hidden.is_empty() {
+            blame_items.push((
+                t!("git.blame_show_hidden").to_string(),
+                BlameOption::ShowHidden,
+            ));
+        }
         let lbl_blame = t!("git.blame").to_string();
         let lbl_blame_close = t!("git.blame_close").to_string();
         let menu = crate::pointer_area::context_menu(editor_widget, move || {
@@ -6788,6 +6887,14 @@ impl SimpleEditApp {
                     } else {
                         disabled_item(lbl_previous.clone(), dark)
                     });
+                    for (label, option) in &blame_items {
+                        entries = entries.push(item(
+                            label.clone(),
+                            None,
+                            dark,
+                            Message::BlameOption(*option),
+                        ));
+                    }
                 }
                 return container(entries).style(crate::theme::card(dark)).into();
             }
@@ -6826,6 +6933,12 @@ impl SimpleEditApp {
                     Message::ContextPaste,
                 ),
                 item(lbl_delete.clone(), None, dark, Message::ContextDelete),
+                item(
+                    lbl_history.clone(),
+                    None,
+                    dark,
+                    Message::History(HistoryMsg::OpenCurrent),
+                ),
                 item(
                     lbl_select_all.clone(),
                     Some(sh_select_all.clone()),
@@ -6976,12 +7089,15 @@ mod completion;
 mod everywhere;
 pub(crate) use completion::Floating;
 pub(crate) use everywhere::Commit;
+pub(crate) use local_history::HistoryMsg;
 #[path = "app/finder.rs"]
 mod finder;
 #[path = "app/git_file.rs"]
 mod git_file;
 #[path = "app/lint.rs"]
 mod lint;
+#[path = "app/local_history.rs"]
+mod local_history;
 #[path = "app/project_ops.rs"]
 mod project_ops;
 #[path = "app/results.rs"]
@@ -7311,7 +7427,8 @@ pub(crate) async fn is_tracked(path: &Path) -> bool {
 
 /// Deletes a file from the disk and, if `from_git` and git tracks it, from
 /// the index too (`git rm`). `true`: it was removed from git as well.
-async fn delete_file(path: PathBuf, from_git: bool) -> Result<bool, String> {
+async fn delete_file(path: PathBuf, from_git: bool, days: u32) -> Result<bool, String> {
+    local_history::record_before_delete(&path, days);
     if from_git && is_tracked(&path).await {
         if let Some(root) = crate::git::repo_root(&path).await {
             if let Some(rel) = relative_to(&root, &path) {

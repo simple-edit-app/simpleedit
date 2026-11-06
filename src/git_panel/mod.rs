@@ -14,6 +14,7 @@ pub mod log_view;
 pub mod merge;
 pub mod stash;
 pub mod stash_view;
+pub mod tools;
 pub mod view;
 
 use std::path::{Path, PathBuf};
@@ -553,6 +554,17 @@ impl Viewer {
         self.scroll_to_change()
     }
 
+    /// Shows a diff made elsewhere (no Git to ask), beginning at its start.
+    pub fn show(&mut self, entry: Entry, diff: FileDiff) {
+        self.token += 1;
+        self.entries = vec![entry];
+        self.index = Some(0);
+        self.diff = Some(Ok(diff));
+        self.change = 0;
+        self.selection = None;
+        self.view_top.set(0.0);
+    }
+
     pub fn scroll_to_change(&self) -> Task<Message> {
         let y = match self.change_row() {
             Some(row) => self.row_top(row.saturating_sub(3)).max(0.0),
@@ -572,6 +584,11 @@ impl Viewer {
             self.change += 1;
             return self.scroll_to_change();
         }
+        // The last one of all: it is brought back into view (with a whole
+        // file shown, it may be far from where the eye is).
+        if self.index.is_some_and(|i| i + 1 >= self.entries.len()) {
+            return self.scroll_to_change();
+        }
         self.next_file(repo, Land::First)
     }
 
@@ -579,6 +596,9 @@ impl Viewer {
     pub fn prev_change(&mut self, repo: &Path) -> Task<Message> {
         if self.change > 0 {
             self.change -= 1;
+            return self.scroll_to_change();
+        }
+        if self.index == Some(0) {
             return self.scroll_to_change();
         }
         self.prev_file(repo, Land::Last)
@@ -616,6 +636,8 @@ pub struct Panel {
     /// The message box has the keyboard: the app's shortcuts stay out.
     pub typing: bool,
     pub amend: bool,
+    pub commit_options: git::tools::CommitOptions,
+    pub commit_options_shown: bool,
     /// The commit is of this file only (from its Git menu).
     pub only: Option<String>,
     pub busy: bool,
@@ -630,6 +652,10 @@ pub struct Panel {
     pinned: Option<Pinned>,
     /// What the last action said, and whether it failed.
     pub notice: Option<(String, bool)>,
+    /// The dialog open over the panel.
+    pub dialog: Option<tools::Dialog>,
+    /// The last push asked for, to do it again once caught up.
+    pub last_push: Option<git::tools::PushSpec>,
 }
 
 impl Default for Panel {
@@ -647,6 +673,8 @@ impl Default for Panel {
             message: text_editor::Content::new(),
             typing: false,
             amend: false,
+            commit_options: git::tools::CommitOptions::default(),
+            commit_options_shown: false,
             only: None,
             busy: false,
             branches: branches::State::default(),
@@ -655,6 +683,8 @@ impl Default for Panel {
             pending: None,
             pinned: None,
             notice: None,
+            dialog: None,
+            last_push: None,
         }
     }
 }
@@ -675,6 +705,8 @@ pub enum Pending {
 struct Pinned {
     dir: PathBuf,
     file: Option<PathBuf>,
+    /// Chosen among the projects: it stays whatever file is in front.
+    sticky: bool,
 }
 
 /// What the panel needs to know of the app.
@@ -682,6 +714,9 @@ pub struct Ctx<'a> {
     pub current_file: Option<&'a Path>,
     pub ctrl: bool,
     pub shift: bool,
+    /// The projects, and their colors.
+    pub roots: &'a [PathBuf],
+    pub colors: &'a std::collections::BTreeMap<String, usize>,
 }
 
 /// A conflicted file to settle by hand, in an editor tab.
@@ -746,7 +781,8 @@ pub enum GitMsg {
     /// Opens the file of the diff in the editor.
     OpenFile,
     /// Pushes the current branch (from its Git shortcut).
-    PushCurrent,
+    /// The push dialog, for the current branch.
+    OpenPush,
     /// Opens the modes behind the chevron of a split button, or closes them.
     OpenSplit(branches::Split, iced::Point),
     CloseSplit,
@@ -791,6 +827,21 @@ pub enum GitMsg {
     /// Back to the history of the whole branch.
     ClearLogFile,
     Commit(bool),
+    Tool(tools::ToolMsg),
+    CommitOptionsShown,
+    CommitSignoff(bool),
+    CommitNoVerify(bool),
+    CommitAuthor(String),
+    /// The commits a branch has that the current one lacks, or the other way.
+    CompareBranch(String),
+    CompareSwap,
+    CompareClear,
+    /// The filters of the log.
+    LogFiltersShown,
+    LogFilterText(log::FilterField, String),
+    LogFilterFlag(log::FilterField, bool),
+    LogFilterClear,
+    TickCommitFile(String, bool),
     Init,
     /// An action ended: what it said, or why it failed.
     Done(Result<String, String>),
@@ -867,7 +918,7 @@ impl GitMsg {
                 | GitMsg::CommitInfoLoaded(..)
                 | GitMsg::RewriteReady(..)
                 | GitMsg::Done(_)
-        )
+        ) || matches!(self, GitMsg::Tool(m) if m.is_background())
     }
 }
 
@@ -907,7 +958,7 @@ impl Panel {
         if self
             .pinned
             .as_ref()
-            .is_some_and(|p| p.file.as_deref() != ctx.current_file)
+            .is_some_and(|p| !p.sticky && p.file.as_deref() != ctx.current_file)
         {
             self.pinned = None;
         }
@@ -1024,8 +1075,22 @@ impl Panel {
         self.pinned = Some(Pinned {
             dir: root,
             file: current_file,
+            sticky: false,
         });
         self.open = true;
+    }
+
+    /// The repository shown stays until another is chosen.
+    pub(super) fn stick_to_repo(&mut self) {
+        if let Some(pinned) = &mut self.pinned {
+            pinned.sticky = true;
+        }
+    }
+
+    /// Back to the repository of the file in front.
+    pub(super) fn unpin(&mut self) {
+        self.pinned = None;
+        self.probed = None;
     }
 
     /// The second click of something that can't be undone: `true` when it is
@@ -1465,6 +1530,7 @@ impl Panel {
                 let message = text.trim_end().to_string();
                 let amend = self.amend;
                 let only = self.only.clone();
+                let options = self.commit_options.clone();
                 if message.trim().is_empty() {
                     self.notice = Some((t!("git.empty_message").to_string(), true));
                     return Task::none();
@@ -1482,8 +1548,10 @@ impl Panel {
                 }
                 self.act(move |repo| async move {
                     match &only {
-                        Some(path) => git::commit_only(&repo, &message, amend, path).await?,
-                        None => git::commit(&repo, &message, amend).await?,
+                        Some(path) => {
+                            git::commit_only(&repo, &message, amend, path, &options).await?
+                        }
+                        None => git::commit(&repo, &message, amend, &options).await?,
                     }
                     if and_push {
                         // The commit is made: a push that fails says so, and
@@ -1511,6 +1579,11 @@ impl Panel {
             GitMsg::RefDialog(kind) => {
                 self.typing = kind.is_some();
                 self.branches.dialog = kind;
+                if kind == Some(branches::RefDialog::Rename) {
+                    if let Some(branches::Ref::Branch(name)) = &self.branches.selected {
+                        self.branches.name = name.clone();
+                    }
+                }
                 if kind.is_some() {
                     return iced::widget::operation::focus(branches::ref_dialog_field());
                 }
@@ -1520,6 +1593,7 @@ impl Panel {
                 let action = match self.branches.dialog {
                     Some(branches::RefDialog::Branch) => branches::RefAction::Create,
                     Some(branches::RefDialog::Tag) => branches::RefAction::CreateTag,
+                    Some(branches::RefDialog::Rename) => branches::RefAction::Rename,
                     None => return Task::none(),
                 };
                 if !self.can(action) {
@@ -1610,29 +1684,68 @@ impl Panel {
             GitMsg::Noop => Task::none(),
             // (anything that isn't an opening already closed them)
             GitMsg::CloseSplit => Task::none(),
-            GitMsg::PushCurrent => {
-                let Some((branch, upstream)) = self
-                    .status
-                    .as_ref()
-                    .map(|s| (s.branch.clone(), s.upstream.clone()))
-                else {
-                    return Task::none();
-                };
-                if branch.starts_with('(') {
-                    self.notice = Some((t!("git.err_detached_push").to_string(), true));
-                    return Task::none();
-                }
-                self.act(move |repo| async move {
-                    git::history::push_branch(&repo, &branch, upstream.as_deref(), false).await?;
-                    Ok("\u{3}pushed".to_string())
-                })
-            }
+            GitMsg::OpenPush => self.tool_update(tools::ToolMsg::OpenPush(None), ctx),
             GitMsg::CancelOnly => {
                 self.only = None;
                 Task::none()
             }
+            GitMsg::Tool(msg) => self.tool_update(msg, ctx),
+            GitMsg::CommitOptionsShown => {
+                self.commit_options_shown = !self.commit_options_shown;
+                Task::none()
+            }
+            GitMsg::CommitSignoff(on) => {
+                self.commit_options.signoff = on;
+                Task::none()
+            }
+            GitMsg::CommitNoVerify(on) => {
+                self.commit_options.no_verify = on;
+                Task::none()
+            }
+            GitMsg::CommitAuthor(author) => {
+                self.typing = true;
+                self.commit_options.author = author;
+                Task::none()
+            }
+            GitMsg::CompareBranch(name) => self.compare_branch(name),
+            GitMsg::CompareSwap => self.compare_swap(),
+            GitMsg::CompareClear => {
+                self.log.compare = None;
+                self.show_log("HEAD")
+            }
+            GitMsg::LogFiltersShown => {
+                self.log.filters_shown = !self.log.filters_shown;
+                Task::none()
+            }
+            GitMsg::LogFilterText(field, value) => {
+                self.typing = true;
+                self.log.set_filter_text(field, value);
+                let rev = self.log.shown.clone().unwrap_or_else(|| "HEAD".into());
+                self.show_log(&rev)
+            }
+            GitMsg::LogFilterFlag(field, on) => {
+                self.log.set_filter_flag(field, on);
+                let rev = self.log.shown.clone().unwrap_or_else(|| "HEAD".into());
+                self.show_log(&rev)
+            }
+            GitMsg::LogFilterClear => {
+                let lines = self.log.narrow.lines.take();
+                self.log.narrow = Default::default();
+                self.log.narrow.lines = lines;
+                let rev = self.log.shown.clone().unwrap_or_else(|| "HEAD".into());
+                self.show_log(&rev)
+            }
+            GitMsg::TickCommitFile(path, on) => {
+                if on {
+                    self.log.ticked.insert(path);
+                } else {
+                    self.log.ticked.remove(&path);
+                }
+                Task::none()
+            }
             GitMsg::ClearLogFile => {
                 self.log.file = None;
+                self.log.narrow.lines = None;
                 let rev = self.log.shown.clone().unwrap_or_else(|| "HEAD".into());
                 self.show_log(&rev)
             }
@@ -1681,6 +1794,9 @@ impl Panel {
                                 self.only = None;
                                 self.message = text_editor::Content::new();
                                 self.amend = false;
+                                if git::tools::is_rejected(failed) {
+                                    self.push_refused();
+                                }
                                 self.notice = Some((
                                     t!("git.commit_push_failed", error = &failed[1..]).to_string(),
                                     true,
@@ -1715,6 +1831,12 @@ impl Panel {
                             "\u{3}pushed" => {
                                 self.notice = Some((t!("git.pushed").to_string(), false));
                             }
+                            "\u{b}patch" => {
+                                self.notice = Some((t!("git.patch_saved").to_string(), false));
+                            }
+                            "\u{c}applied" => {
+                                self.notice = Some((t!("git.patch_applied").to_string(), false));
+                            }
                             _ => self.notice = None,
                         }
                     }
@@ -1723,8 +1845,14 @@ impl Panel {
                         self.notice = Some((t!("git.conflicts_to_settle").to_string(), false));
                         opened = Some(Message::OpenConflicts);
                     }
-                    Err(error) => self.notice = Some((error, true)),
+                    Err(error) => {
+                        if git::tools::is_rejected(&error) {
+                            self.push_refused();
+                        }
+                        self.notice = Some((error, true));
+                    }
                 }
+                self.last_push = None;
                 // Look again at once, whatever the tab shows.
                 let more = match self.tab {
                     Tab::Commit => match self.repo.clone() {
@@ -2011,6 +2139,8 @@ mod tests {
             current_file: None,
             ctrl: false,
             shift: false,
+            roots: &[],
+            colors: test_colors(),
         };
         let _ = panel.update(GitMsg::SelectRef(Ref::Tag("v1".into())), &ctx);
         assert_eq!(panel.branches.confirm, None);
@@ -2018,11 +2148,19 @@ mod tests {
         assert_eq!(panel.branches.confirm, None, "a tag isn't pushed");
     }
 
+    fn test_colors() -> &'static std::collections::BTreeMap<String, usize> {
+        static COLORS: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        &COLORS
+    }
+
     fn ctx() -> Ctx<'static> {
         Ctx {
             current_file: None,
             ctrl: false,
             shift: false,
+            roots: &[],
+            colors: test_colors(),
         }
     }
 
@@ -2129,6 +2267,8 @@ mod tests {
             current_file: Some(&a),
             ctrl: false,
             shift: false,
+            roots: &[],
+            colors: test_colors(),
         };
         let _ = panel.refresh(&task_ctx);
         assert!(panel.pinned.is_some(), "same file in front: still pinned");
@@ -2137,6 +2277,8 @@ mod tests {
             current_file: Some(&b),
             ctrl: false,
             shift: false,
+            roots: &[],
+            colors: test_colors(),
         };
         let _ = panel.refresh(&other_ctx);
         assert!(panel.pinned.is_none(), "another file: the panel follows it");
@@ -2440,5 +2582,182 @@ mod tests {
         let _ = panel.update(GitMsg::RefDialog(Some(RefDialog::Branch)), &ctx());
         let _ = panel.update(GitMsg::RefDialog(None), &ctx());
         assert!(panel.branches.dialog.is_none() && !panel.typing);
+    }
+
+    fn branch(name: &str, remote: bool) -> git::history::Branch {
+        git::history::Branch {
+            name: name.into(),
+            sha: String::new(),
+            remote,
+            current: false,
+            upstream: None,
+            ahead: 0,
+            behind: 0,
+        }
+    }
+
+    fn with_refs() -> Panel {
+        let mut panel = Panel {
+            repo: Some(PathBuf::from("/nowhere")),
+            status: Some(Status {
+                branch: "main".into(),
+                upstream: Some("origin/main".into()),
+                ..Status::default()
+            }),
+            ..Panel::default()
+        };
+        panel.log.refs = Some(git::history::Refs {
+            branches: vec![branch("topic", false), branch("origin/x", true)],
+            tags: Vec::new(),
+        });
+        panel
+    }
+
+    #[test]
+    fn a_local_branch_can_be_renamed_with_its_name_ready() {
+        let mut panel = with_refs();
+        assert!(!panel.can(branches::RefAction::Rename));
+        panel.branches.selected = Some(branches::Ref::Branch("topic".into()));
+        let _ = panel.update(GitMsg::RefDialog(Some(branches::RefDialog::Rename)), &ctx());
+        assert_eq!(panel.branches.name, "topic");
+        assert!(panel.can(branches::RefAction::Rename));
+        // Not a remote branch.
+        panel.branches.selected = Some(branches::Ref::Branch("origin/x".into()));
+        assert!(!panel.can(branches::RefAction::Rename));
+    }
+
+    #[test]
+    fn a_branch_is_compared_with_the_current_one_both_ways() {
+        let mut panel = with_refs();
+        let _ = panel.update(GitMsg::CompareBranch("topic".into()), &ctx());
+        assert_eq!(panel.tab, Tab::Log);
+        assert_eq!(panel.log.shown.as_deref(), Some("main..topic"));
+        let _ = panel.update(GitMsg::CompareSwap, &ctx());
+        assert_eq!(panel.log.shown.as_deref(), Some("topic..main"));
+        let _ = panel.update(GitMsg::CompareClear, &ctx());
+        assert_eq!(panel.log.compare, None);
+        assert_eq!(panel.log.shown.as_deref(), Some("HEAD"));
+    }
+
+    #[test]
+    fn a_refused_push_asks_how_to_catch_up() {
+        let mut panel = with_refs();
+        panel.busy = true;
+        let refused = "! [rejected] main -> main (fetch first)".to_string();
+        let _ = panel.update(GitMsg::Done(Err(refused)), &ctx());
+        let Some(tools::Dialog::Rejected(spec)) = &panel.dialog else {
+            panic!("the dialog");
+        };
+        assert_eq!(
+            (spec.remote.as_str(), spec.target.as_str()),
+            ("origin", "main")
+        );
+        // Any other failure only says so.
+        let mut panel = with_refs();
+        let _ = panel.update(GitMsg::Done(Err("no network".into())), &ctx());
+        assert_eq!(panel.dialog, None);
+    }
+
+    #[test]
+    fn force_in_the_push_dialog_asks_twice() {
+        let mut panel = with_refs();
+        panel.dialog = Some(tools::Dialog::Push(tools::PushDialog {
+            remotes: vec!["origin".into()],
+            spec: git::tools::PushSpec {
+                remote: "origin".into(),
+                source: "main".into(),
+                target: "main".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        let force = || GitMsg::Tool(tools::ToolMsg::PushRun(true));
+        let _ = panel.update(force(), &ctx());
+        assert!(
+            matches!(&panel.dialog, Some(tools::Dialog::Push(d)) if d.force_asked),
+            "first click: only asked"
+        );
+        let _ = panel.update(force(), &ctx());
+        assert_eq!(panel.dialog, None);
+        assert!(panel.last_push.as_ref().is_some_and(|s| s.force));
+    }
+
+    #[test]
+    fn filters_leave_only_what_acts_on_single_commits() {
+        let mut panel = with_refs();
+        let commit = |sha: &str, parent: &str| git::graph::Commit {
+            sha: sha.into(),
+            parents: vec![parent.into()],
+            author: String::new(),
+            email: String::new(),
+            time: 0,
+            subject: String::new(),
+            refs: Vec::new(),
+        };
+        panel.log.commits = vec![commit("b", "a"), commit("a", "0")];
+        panel.log.head_set = ["a".to_string(), "b".to_string()].into();
+        panel.log.selected = vec![0];
+        assert!(panel.log.availability().drop);
+        let flag = GitMsg::LogFilterFlag(log::FilterField::NoMerges, true);
+        let _ = panel.update(flag, &ctx());
+        assert!(!panel.log.availability().drop, "the list skips commits");
+        let _ = panel.update(GitMsg::LogFilterClear, &ctx());
+        assert!(panel.log.availability().drop);
+    }
+
+    #[test]
+    fn a_repository_picked_among_the_projects_stays_until_given_up() {
+        let mut panel = Panel::default();
+        panel.show_repo(PathBuf::from("/a"), None);
+        panel.stick_to_repo();
+        let file = PathBuf::from("/b/file.rs");
+        let other = Ctx {
+            current_file: Some(&file),
+            ctrl: false,
+            shift: false,
+            roots: &[],
+            colors: test_colors(),
+        };
+        let _ = panel.refresh(&other);
+        assert_eq!(panel.repo, Some(PathBuf::from("/a")));
+        assert!(panel.pinned.is_some());
+        panel.unpin();
+        assert!(panel.pinned.is_none());
+    }
+
+    #[test]
+    fn files_of_a_commit_are_those_ticked_and_the_one_clicked_with_old_names() {
+        let mut panel = with_refs();
+        let change = |path: &str, from: Option<&str>| Change {
+            path: path.into(),
+            from: from.map(str::to_string),
+            kind: Kind::Modified,
+        };
+        panel.log.files = vec![
+            change("a", None),
+            change("b", Some("old-b")),
+            change("c", None),
+        ];
+        panel.log.files_for = Some("sha".into());
+        let _ = panel.update(GitMsg::TickCommitFile("c".into(), true), &ctx());
+        let msg = GitMsg::Tool(tools::ToolMsg::FileOf(tools::CommitFile::Extract, 1));
+        let _ = panel.update(msg, &ctx());
+        let Some(tools::Dialog::Extract { paths, sha, .. }) = &panel.dialog else {
+            panic!("the dialog");
+        };
+        assert_eq!(sha, "sha");
+        assert_eq!(paths, &["b", "old-b", "c"]);
+    }
+
+    #[test]
+    fn a_recent_message_goes_into_the_box() {
+        let mut panel = with_refs();
+        let list = Ok(vec!["one\n\nbody".to_string()]);
+        let _ = panel.update(GitMsg::Tool(tools::ToolMsg::MessagesLoaded(list)), &ctx());
+        assert!(matches!(panel.dialog, Some(tools::Dialog::Messages(_))));
+        let pick = tools::ToolMsg::UseMessage("one\n\nbody".into());
+        let _ = panel.update(GitMsg::Tool(pick), &ctx());
+        assert_eq!(panel.dialog, None);
+        assert_eq!(panel.message.text().trim_end(), "one\n\nbody");
     }
 }

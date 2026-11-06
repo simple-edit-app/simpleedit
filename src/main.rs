@@ -31,6 +31,7 @@ mod git_panel;
 mod history;
 mod i18n;
 mod lint;
+mod local_history;
 mod lsp;
 mod lsp_install;
 mod menu_bar;

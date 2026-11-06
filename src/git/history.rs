@@ -49,6 +49,59 @@ impl SearchMode {
     ];
 }
 
+/// What a list of commits is narrowed to, all at once.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogFilter {
+    pub author: String,
+    /// From and to dates, as git reads them (`2026-01-31`, `2 weeks ago`).
+    pub since: String,
+    pub until: String,
+    /// A folder or a file.
+    pub path: String,
+    pub first_parent: bool,
+    pub no_merges: bool,
+    /// The history of some lines of a file: `(file, first, last)`, from 1.
+    pub lines: Option<(String, usize, usize)>,
+}
+
+impl LogFilter {
+    /// Whether something narrows the list (the lines are shown apart).
+    pub fn is_set(&self) -> bool {
+        !self.author.trim().is_empty()
+            || !self.since.trim().is_empty()
+            || !self.until.trim().is_empty()
+            || !self.path.trim().is_empty()
+            || self.first_parent
+            || self.no_merges
+    }
+
+    fn args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        let mut text = |flag: &str, value: &str| {
+            if !value.trim().is_empty() {
+                args.push(format!("--{flag}={}", value.trim()));
+            }
+        };
+        text("author", &self.author);
+        text("since", &self.since);
+        text("until", &self.until);
+        if !self.author.trim().is_empty() {
+            args.push("-i".to_string());
+        }
+        if self.first_parent {
+            args.push("--first-parent".to_string());
+        }
+        if self.no_merges {
+            args.push("--no-merges".to_string());
+        }
+        if let Some((file, first, last)) = &self.lines {
+            args.push(format!("-L{first},{last}:{file}"));
+            args.push("--no-patch".to_string());
+        }
+        args
+    }
+}
+
 /// [`log`] restricted by a search `(what to look at, the text)`.
 pub async fn log_matching(
     repo: &Path,
@@ -56,6 +109,18 @@ pub async fn log_matching(
     limit: usize,
     path: Option<&str>,
     search: Option<(SearchMode, &str)>,
+) -> Result<Vec<Commit>, String> {
+    log_filtered(repo, rev, limit, path, search, &LogFilter::default()).await
+}
+
+/// [`log_matching`], narrowed by `filter` too.
+pub async fn log_filtered(
+    repo: &Path,
+    rev: &str,
+    limit: usize,
+    path: Option<&str>,
+    search: Option<(SearchMode, &str)>,
+    filter: &LogFilter,
 ) -> Result<Vec<Commit>, String> {
     let max = format!("--max-count={limit}");
     let mut args = vec![
@@ -95,11 +160,22 @@ pub async fn log_matching(
             }
         }
     }
+    let extra = filter.args();
+    args.extend(extra.iter().map(String::as_str));
+    let folder = filter.path.trim();
+    // `-L` names its own file: no path after it, and no `--follow`.
+    if filter.lines.is_some() {
+        args.retain(|a| *a != "--follow");
+        path = None;
+    }
     args.extend(["--end-of-options", rev, "--"]);
     args.extend(path);
+    if !folder.is_empty() && path.is_none() {
+        args.push(folder);
+    }
     let out = run(repo, &args).await?;
     let mut commits = parse_log(&out);
-    if path.is_some() {
+    if path.is_some() || !folder.is_empty() || filter.lines.is_some() {
         // `%P` names the real parents, which the filtered list mostly lacks:
         // each commit is drawn on top of the next one listed.
         let shas: Vec<String> = commits.iter().map(|c| c.sha.clone()).collect();
@@ -590,8 +666,39 @@ impl BlameLine {
     }
 }
 
+#[cfg(test)]
 pub async fn blame(repo: &Path, path: &str) -> Result<Vec<BlameLine>, String> {
     blame_at(repo, None, path).await
+}
+
+/// How a blame looks for who wrote a line.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlameOptions {
+    /// Changes of blanks don't count (`-w`).
+    pub ignore_blanks: bool,
+    /// Lines moved within the file keep their author (`-M`).
+    pub moves_in_file: bool,
+    /// Lines moved from another file too (`-C`).
+    pub moves_across: bool,
+    /// Commits left out, as if they had not been made (a reformatting).
+    pub hidden: Vec<String>,
+}
+
+impl BlameOptions {
+    fn args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if self.ignore_blanks {
+            args.push("-w".to_string());
+        }
+        if self.moves_in_file {
+            args.push("-M".to_string());
+        }
+        if self.moves_across {
+            args.push("-C".to_string());
+        }
+        args.extend(self.hidden.iter().map(|sha| format!("--ignore-rev={sha}")));
+        args
+    }
 }
 
 /// The text of a file as a commit had it.
@@ -600,12 +707,25 @@ pub async fn file_at(repo: &Path, rev: &str, path: &str) -> Result<String, Strin
 }
 
 /// Blame of a file as a commit had it (`None`: the file as it is now).
+#[cfg(test)]
 pub async fn blame_at(
     repo: &Path,
     rev: Option<&str>,
     path: &str,
 ) -> Result<Vec<BlameLine>, String> {
+    blame_with(repo, rev, path, &BlameOptions::default()).await
+}
+
+/// [`blame_at`] with options.
+pub async fn blame_with(
+    repo: &Path,
+    rev: Option<&str>,
+    path: &str,
+    options: &BlameOptions,
+) -> Result<Vec<BlameLine>, String> {
+    let extra = options.args();
     let mut args = vec!["blame", "--porcelain"];
+    args.extend(extra.iter().map(String::as_str));
     args.extend(rev);
     args.extend(["--", path]);
     let out = run(repo, &args).await?;
@@ -720,7 +840,7 @@ async fn rebase_with(
 
 /// [`rebase_with`] with any number of files for the `exec` lines to read, each
 /// named by the environment variable that holds its path.
-async fn rebase_todo(
+pub(super) async fn rebase_todo(
     repo: &Path,
     base: Option<&str>,
     todo: &str,
@@ -880,14 +1000,14 @@ pub async fn interactive_rebase(
 }
 
 /// The commits of `base..HEAD`, oldest first.
-async fn commits_after(repo: &Path, base: Option<&str>) -> Result<Vec<String>, String> {
+pub(super) async fn commits_after(repo: &Path, base: Option<&str>) -> Result<Vec<String>, String> {
     let range = base.map_or("HEAD".to_string(), |b| format!("{b}..HEAD"));
     let out = run(repo, &["rev-list", "--reverse", "--topo-order", &range]).await?;
     Ok(out.lines().map(str::to_string).collect())
 }
 
 /// The parent of a commit (`None` for a root commit).
-async fn parent_of(repo: &Path, sha: &str) -> Result<Option<String>, String> {
+pub(super) async fn parent_of(repo: &Path, sha: &str) -> Result<Option<String>, String> {
     let out = run(repo, &["rev-list", "--parents", "-n", "1", sha]).await?;
     Ok(out.split_whitespace().nth(1).map(str::to_string))
 }
@@ -977,7 +1097,7 @@ pub async fn reword(repo: &Path, sha: &str, message: &str) -> Result<(), String>
     rebase_with(repo, base.as_deref(), &todo, Some(&message_path)).await
 }
 
-async fn ensure_linear(repo: &Path, base: Option<&str>) -> Result<(), String> {
+pub(super) async fn ensure_linear(repo: &Path, base: Option<&str>) -> Result<(), String> {
     let linear = match base {
         Some(base) => is_linear(repo, base).await?,
         None => {
@@ -1886,5 +2006,126 @@ mod tests {
             block(file_at(repo.path(), "HEAD~1", "f.txt")).unwrap(),
             "one\ntwo\n"
         );
+    }
+
+    #[tokio::test]
+    async fn filters_narrow_the_list_all_at_once() {
+        let repo = Repo::new();
+        let commit = |name: &str, author: &str, message: &str| {
+            std::fs::create_dir_all(repo.path().join("src")).unwrap();
+            std::fs::write(repo.path().join(name), message).unwrap();
+            repo.git(&["add", "."]);
+            let who = format!("--author={author} <{author}@x>");
+            repo.git(&["commit", "-q", "-m", message, &who]);
+        };
+        commit("src/a", "ann", "one");
+        commit("b", "ann", "two");
+        commit("src/c", "bob", "three");
+        let list = |filter: LogFilter| {
+            let path = repo.path().to_path_buf();
+            async move {
+                log_filtered(&path, "HEAD", 50, None, None, &filter)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .map(|c| c.subject.clone())
+                    .collect::<Vec<_>>()
+            }
+        };
+        let by_ann = LogFilter {
+            author: "ANN".into(),
+            ..LogFilter::default()
+        };
+        assert_eq!(list(by_ann.clone()).await, ["two", "one"]);
+        let in_src = LogFilter {
+            path: "src".into(),
+            ..by_ann
+        };
+        assert_eq!(list(in_src).await, ["one"]);
+    }
+
+    #[tokio::test]
+    async fn merges_are_left_out_or_the_first_parent_followed() {
+        let repo = Repo::new();
+        let commit = |message: &str| {
+            std::fs::write(repo.path().join(message), message).unwrap();
+            repo.git(&["add", "."]);
+            repo.git(&["commit", "-q", "-m", message]);
+        };
+        commit("base");
+        repo.git(&["checkout", "-q", "-b", "topic"]);
+        commit("work");
+        repo.git(&["checkout", "-q", "main"]);
+        commit("main-work");
+        repo.git(&["merge", "-q", "--no-edit", "topic"]);
+        let list = |filter: LogFilter| {
+            let path = repo.path().to_path_buf();
+            async move {
+                log_filtered(&path, "HEAD", 50, None, None, &filter)
+                    .await
+                    .unwrap()
+                    .len()
+            }
+        };
+        assert_eq!(list(LogFilter::default()).await, 4);
+        let no_merges = LogFilter {
+            no_merges: true,
+            ..LogFilter::default()
+        };
+        assert_eq!(list(no_merges).await, 3);
+        let first = LogFilter {
+            first_parent: true,
+            ..LogFilter::default()
+        };
+        assert_eq!(list(first).await, 3);
+    }
+
+    #[tokio::test]
+    async fn the_history_of_some_lines() {
+        let repo = Repo::new();
+        let commit = |text: &str, message: &str| {
+            std::fs::write(repo.path().join("f"), text).unwrap();
+            repo.git(&["add", "."]);
+            repo.git(&["commit", "-q", "-m", message]);
+        };
+        commit("a\nb\nc\n", "start");
+        commit("a\nB\nc\n", "second line");
+        commit("A\nB\nc\n", "first line");
+        let filter = LogFilter {
+            lines: Some(("f".into(), 2, 2)),
+            ..LogFilter::default()
+        };
+        let found = log_filtered(repo.path(), "HEAD", 50, None, None, &filter)
+            .await
+            .unwrap();
+        let subjects: Vec<&str> = found.iter().map(|c| c.subject.as_str()).collect();
+        assert_eq!(subjects, ["second line", "start"]);
+    }
+
+    #[tokio::test]
+    async fn a_blame_ignores_blanks_and_hides_a_commit() {
+        let repo = Repo::new();
+        let commit = |text: &str, message: &str| {
+            std::fs::write(repo.path().join("f"), text).unwrap();
+            repo.git(&["add", "."]);
+            repo.git(&["commit", "-q", "-m", message]);
+            repo.git(&["rev-parse", "HEAD"]).trim().to_string()
+        };
+        let first = commit("code\n", "written");
+        let second = commit("  code\n", "indented");
+        let plain = blame(repo.path(), "f").await.unwrap();
+        assert_eq!(plain[0].sha, second);
+        let options = BlameOptions {
+            ignore_blanks: true,
+            ..BlameOptions::default()
+        };
+        let lines = blame_with(repo.path(), None, "f", &options).await.unwrap();
+        assert_eq!(lines[0].sha, first);
+        let options = BlameOptions {
+            hidden: vec![second],
+            ..BlameOptions::default()
+        };
+        let lines = blame_with(repo.path(), None, "f", &options).await.unwrap();
+        assert_eq!(lines[0].sha, first);
     }
 }

@@ -100,6 +100,29 @@ impl Panel {
         ]
         .spacing(4)
         .align_y(Alignment::Center);
+        let tool_button = |label: String, msg: super::tools::ToolMsg, repo: bool| {
+            plain_button(
+                label,
+                (!repo || self.repo.is_some()).then_some(Message::Git(GitMsg::Tool(msg))),
+                false,
+                dark,
+            )
+        };
+        header = header.push(tool_button(
+            t!("git.repos").to_string(),
+            super::tools::ToolMsg::OpenRepos,
+            false,
+        ));
+        header = header.push(tool_button(
+            t!("git.remotes").to_string(),
+            super::tools::ToolMsg::OpenRemotes,
+            true,
+        ));
+        header = header.push(tool_button(
+            t!("git.patches").to_string(),
+            super::tools::ToolMsg::OpenPatch,
+            true,
+        ));
         if let Some(status) = &self.status {
             header = header.push(plain_button(
                 t!("git.fetch").to_string(),
@@ -139,6 +162,12 @@ impl Panel {
             },
         };
 
+        let content: Element<Message> = match &self.dialog {
+            Some(dialog) => {
+                iced::widget::stack![content, self.tool_dialog_view(dialog, dark)].into()
+            }
+            None => content,
+        };
         column![
             crate::app::resize_edge(dark),
             container(header).padding([4, 10]),
@@ -265,6 +294,12 @@ impl Panel {
                             .on_toggle(|on| Message::Git(GitMsg::ToggleAmend(on))),
                         Space::new().width(Length::Fill),
                         plain_button(
+                            t!("git.commit_options").to_string(),
+                            Some(Message::Git(GitMsg::CommitOptionsShown)),
+                            self.commit_options_shown,
+                            dark,
+                        ),
+                        plain_button(
                             t!("git.undo_commit").to_string(),
                             (!self.busy).then_some(Message::Git(GitMsg::UndoCommit)),
                             false,
@@ -273,6 +308,7 @@ impl Panel {
                     ]
                     .align_y(Alignment::Center),
                     editor,
+                    self.commit_options_view(dark),
                     row![
                         filled_button(
                             t!("git.commit").to_string(),
@@ -306,6 +342,45 @@ impl Panel {
                 t!("git.select_file").to_string(),
             ),
         ]
+        .into()
+    }
+
+    /// Sign-off, hooks, author, last messages: out of the way until asked.
+    fn commit_options_view(&self, dark: bool) -> Element<'_, Message> {
+        if !self.commit_options_shown {
+            return Space::new().into();
+        }
+        column![
+            row![
+                checkbox(self.commit_options.signoff)
+                    .label(t!("git.signoff").to_string())
+                    .size(14)
+                    .text_size(12)
+                    .on_toggle(|on| Message::Git(GitMsg::CommitSignoff(on))),
+                checkbox(self.commit_options.no_verify)
+                    .label(t!("git.no_verify").to_string())
+                    .size(14)
+                    .text_size(12)
+                    .on_toggle(|on| Message::Git(GitMsg::CommitNoVerify(on))),
+                Space::new().width(Length::Fill),
+                plain_button(
+                    t!("git.recent_messages").to_string(),
+                    Some(Message::Git(GitMsg::Tool(
+                        super::tools::ToolMsg::OpenMessages
+                    ))),
+                    false,
+                    dark,
+                ),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+            iced::widget::text_input(&t!("git.author_placeholder"), &self.commit_options.author)
+                .on_input(|a| Message::Git(GitMsg::CommitAuthor(a)))
+                .size(12.5)
+                .padding([3, 8])
+                .style(se_theme::Field::new(dark).style()),
+        ]
+        .spacing(6)
         .into()
     }
 

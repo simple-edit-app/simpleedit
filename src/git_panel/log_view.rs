@@ -12,6 +12,7 @@ use iced::{Alignment, Color, Element, Length, Point, Rectangle, Theme};
 
 use super::log::{short, Action, Avail, Dialog, NameKind};
 use super::stash::format_time;
+use super::tools::{CommitFile, ToolMsg};
 use super::{GitMsg, Panel};
 use crate::app::Message;
 use crate::git::graph::{GraphRow, COLORS};
@@ -385,6 +386,9 @@ impl Panel {
         let diff = t!("git.diff_tree").to_string();
         let merge = t!("git.merge_into", name = branch.name.as_str()).to_string();
         let rebase = t!("git.rebase_onto", name = branch.name.as_str()).to_string();
+        let compare = t!("git.compare_commits").to_string();
+        let merge_more = t!("git.merge_options").to_string();
+        let rebase_more = t!("git.rebase_options").to_string();
         let name = branch.name.clone();
         let current = branch.current;
         crate::pointer_area::context_menu(target, move || {
@@ -420,6 +424,18 @@ impl Panel {
                         rebase.clone(),
                         (!current).then(|| GitMsg::RebaseOnto(name.clone())),
                     ),
+                    item(
+                        compare.clone(),
+                        (!current).then(|| GitMsg::CompareBranch(name.clone())),
+                    ),
+                    item(
+                        merge_more.clone(),
+                        (!current).then(|| GitMsg::Tool(ToolMsg::OpenMerge(name.clone()))),
+                    ),
+                    item(
+                        rebase_more.clone(),
+                        (!current).then(|| GitMsg::Tool(ToolMsg::OpenRebase(name.clone()))),
+                    ),
                 ]
                 .spacing(1)
                 .padding(6),
@@ -453,20 +469,97 @@ impl Panel {
                     .width(Length::Fixed(130.0))
                     .style(se_theme::Select { dark }.style())
                     .menu_style(se_theme::Select { dark }.menu_style()),
+                    button(text(t!("git.filters").to_string()).size(12).color(
+                        if log.narrow.is_set() {
+                            p.accent
+                        } else {
+                            p.text
+                        }
+                    ))
+                    .padding([3, 8])
+                    .on_press(Message::Git(GitMsg::LogFiltersShown))
+                    .style(
+                        (se_theme::GhostButton {
+                            dark,
+                            active: log.filters_shown,
+                        })
+                        .style(),
+                    ),
                 ]
                 .spacing(6)
                 .align_y(Alignment::Center),
             )
             .padding([4, 8]),
         );
+        list = list.push(self.log_filters(dark));
+        if let Some((base, other)) = &log.compare {
+            let (o, b) = (other.as_str(), base.as_str());
+            let label = t!("git.compare_banner", other = o, base = b);
+            let plain = |label: String, msg: GitMsg| {
+                button(text(label).size(12))
+                    .padding([0, 8])
+                    .on_press(Message::Git(msg))
+                    .style(
+                        (se_theme::GhostButton {
+                            dark,
+                            active: false,
+                        })
+                        .style(),
+                    )
+            };
+            list = list.push(
+                row![
+                    container(
+                        text(label.to_string())
+                            .size(12)
+                            .color(se_theme::accent_color(dark))
+                            .wrapping(iced::widget::text::Wrapping::None),
+                    )
+                    .width(Length::Fill)
+                    .clip(true),
+                    plain(t!("git.compare_swap").to_string(), GitMsg::CompareSwap),
+                    plain("×".to_string(), GitMsg::CompareClear),
+                ]
+                .align_y(Alignment::Center),
+            );
+        }
+        if let Some((file, first, last)) = &log.narrow.lines {
+            let lines = format!("{file}:{first}-{last}");
+            list = list.push(
+                row![
+                    container(
+                        text(t!("git.lines_history_of", lines = lines.as_str()).to_string())
+                            .size(12)
+                            .color(se_theme::accent_color(dark))
+                            .wrapping(iced::widget::text::Wrapping::None),
+                    )
+                    .width(Length::Fill)
+                    .clip(true),
+                    button(text("×").size(13))
+                        .padding([0, 8])
+                        .on_press(Message::Git(GitMsg::ClearLogFile))
+                        .style(
+                            (se_theme::GhostButton {
+                                dark,
+                                active: false,
+                            })
+                            .style(),
+                        ),
+                ]
+                .align_y(Alignment::Center),
+            );
+        }
         if let Some(file) = &log.file {
             list = list.push(
                 row![
-                    text(t!("git.file_history_of", file = file.as_str()).to_string())
-                        .size(12)
-                        .color(se_theme::accent_color(dark))
-                        .width(Length::Fill)
-                        .wrapping(iced::widget::text::Wrapping::None),
+                    container(
+                        text(t!("git.file_history_of", file = file.as_str()).to_string())
+                            .size(12)
+                            .color(se_theme::accent_color(dark))
+                            .wrapping(iced::widget::text::Wrapping::None),
+                    )
+                    .width(Length::Fill)
+                    .clip(true),
                     button(text("×").size(13))
                         .padding([0, 8])
                         .on_press(Message::Git(GitMsg::ClearLogFile))
@@ -598,6 +691,117 @@ impl Panel {
 
     /// The right-click menu of the selected commits: what can't be done with
     /// this selection is grayed out.
+    /// Author, dates, path, first parent, no merges: all at once.
+    fn log_filters(&self, dark: bool) -> Element<'_, Message> {
+        use super::log::FilterField as F;
+        let log = &self.log;
+        if !log.filters_shown {
+            return Space::new().into();
+        }
+        let field = |placeholder: String, value: &str, which: F| {
+            text_input(&placeholder, value)
+                .on_input(move |t| Message::Git(GitMsg::LogFilterText(which, t)))
+                .size(12)
+                .padding([3, 8])
+                .style(se_theme::Field::new(dark).style())
+        };
+        let flag = |label: String, on: bool, which: F| {
+            iced::widget::checkbox(on)
+                .label(label)
+                .size(13)
+                .text_size(12)
+                .on_toggle(move |v| Message::Git(GitMsg::LogFilterFlag(which, v)))
+        };
+        let f = &log.narrow;
+        container(
+            column![
+                row![
+                    field(t!("git.filter_author").to_string(), &f.author, F::Author),
+                    field(t!("git.filter_path").to_string(), &f.path, F::Path),
+                ]
+                .spacing(6),
+                row![
+                    field(t!("git.filter_since").to_string(), &f.since, F::Since),
+                    field(t!("git.filter_until").to_string(), &f.until, F::Until),
+                ]
+                .spacing(6),
+                row![
+                    flag(
+                        t!("git.filter_first_parent").to_string(),
+                        f.first_parent,
+                        F::FirstParent
+                    ),
+                    flag(
+                        t!("git.filter_no_merges").to_string(),
+                        f.no_merges,
+                        F::NoMerges
+                    ),
+                    Space::new().width(Length::Fill),
+                    button(text(t!("git.filter_clear").to_string()).size(12))
+                        .padding([2, 8])
+                        .on_press(Message::Git(GitMsg::LogFilterClear))
+                        .style(
+                            (se_theme::GhostButton {
+                                dark,
+                                active: false
+                            })
+                            .style()
+                        ),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+            ]
+            .spacing(4),
+        )
+        .padding([2, 8])
+        .into()
+    }
+
+    /// The right click on a file of a commit.
+    fn commit_file_menu<'a>(
+        &'a self,
+        target: Element<'a, Message>,
+        index: usize,
+        rewritable: bool,
+        dark: bool,
+    ) -> Element<'a, Message> {
+        let labels = [
+            (t!("git.file_get").to_string(), CommitFile::Get, true),
+            (t!("git.file_apply").to_string(), CommitFile::Apply, true),
+            (
+                t!("git.file_remove").to_string(),
+                CommitFile::Remove,
+                rewritable,
+            ),
+            (
+                t!("git.file_extract").to_string(),
+                CommitFile::Extract,
+                rewritable,
+            ),
+        ];
+        crate::pointer_area::context_menu(target, move || {
+            let mut menu = column![].spacing(1).padding(6);
+            for (label, action, enabled) in labels.iter().cloned() {
+                let msg = Message::Git(GitMsg::Tool(ToolMsg::FileOf(action, index)));
+                menu = menu.push(
+                    button(text(label).size(13))
+                        .padding([7, 10])
+                        .width(Length::Fixed(250.0))
+                        .on_press_maybe(enabled.then_some(msg))
+                        .style(
+                            (se_theme::MenuItem {
+                                dark,
+                                radius: se_theme::R_SM,
+                                highlighted: false,
+                            })
+                            .style(),
+                        ),
+                );
+            }
+            container(menu).style(se_theme::card(dark)).into()
+        })
+    }
+
     fn commit_menu<'a>(
         &'a self,
         target: Element<'a, Message>,
@@ -607,6 +811,9 @@ impl Panel {
         use super::log::LogAction;
         use crate::git::ResetMode;
         let item = |key: String, msg: GitMsg, enabled: bool| (key, msg, enabled);
+        let staged = self.status.as_ref().is_some_and(|s| !s.staged.is_empty());
+        let can_fix = avail.rebase && staged;
+        let sha_one = self.log.selected_commits().first().map(|c| c.sha.clone());
         let labels = vec![
             item(t!("git.copy_hash").to_string(), GitMsg::CopyHash, true),
             item(
@@ -638,6 +845,31 @@ impl Panel {
                 t!("git.log_rebase_from").to_string(),
                 GitMsg::LogAction(LogAction::RebaseFrom),
                 avail.rebase,
+            ),
+            item(
+                t!("git.fixup").to_string(),
+                GitMsg::LogAction(LogAction::Fixup),
+                can_fix,
+            ),
+            item(
+                t!("git.squash_into").to_string(),
+                GitMsg::LogAction(LogAction::SquashInto),
+                can_fix,
+            ),
+            item(
+                t!("git.push_up_to_here").to_string(),
+                GitMsg::Tool(ToolMsg::OpenPush(sha_one.clone())),
+                avail.one && avail.rebase,
+            ),
+            item(
+                t!("git.patch_copy").to_string(),
+                GitMsg::Tool(ToolMsg::PatchCommits(false)),
+                true,
+            ),
+            item(
+                t!("git.patch_save").to_string(),
+                GitMsg::Tool(ToolMsg::PatchCommits(true)),
+                true,
             ),
             item(
                 t!("git.log_branch_here").to_string(),
@@ -719,40 +951,54 @@ impl Panel {
             .into(),
             1 => {
                 let commit = chosen[0];
+                let avail = log.availability();
+                let rewritable = avail.drop && !commit.parents.is_empty();
                 let mut files = column![].spacing(1);
                 for (i, change) in log.files.iter().enumerate() {
                     let (dir, name) = match change.path.rsplit_once('/') {
                         Some((dir, name)) => (dir, name),
                         None => ("", change.path.as_str()),
                     };
+                    let line = button(
+                        row![
+                            text(change.kind.letter())
+                                .size(11)
+                                .font(se_theme::MONO)
+                                .color(super::view::kind_color(change.kind, dark))
+                                .width(12),
+                            crate::file_icons::file(std::path::Path::new(name), dark),
+                            text(name).size(12.5),
+                            text(dir)
+                                .size(11.5)
+                                .color(p.muted)
+                                .wrapping(iced::widget::text::Wrapping::None),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                    )
+                    .padding([3, 8])
+                    .width(Length::Fill)
+                    .on_press(Message::Git(GitMsg::CommitFileDiff(i)))
+                    .style(
+                        (se_theme::GhostButton {
+                            dark,
+                            active: false,
+                        })
+                        .style(),
+                    );
+                    let path = change.path.clone();
+                    let ticked = log.ticked.contains(&change.path);
                     files = files.push(
-                        button(
-                            row![
-                                text(change.kind.letter())
-                                    .size(11)
-                                    .font(se_theme::MONO)
-                                    .color(super::view::kind_color(change.kind, dark))
-                                    .width(12),
-                                crate::file_icons::file(std::path::Path::new(name), dark),
-                                text(name).size(12.5),
-                                text(dir)
-                                    .size(11.5)
-                                    .color(p.muted)
-                                    .wrapping(iced::widget::text::Wrapping::None),
-                            ]
-                            .spacing(8)
-                            .align_y(Alignment::Center),
-                        )
-                        .padding([3, 8])
-                        .width(Length::Fill)
-                        .on_press(Message::Git(GitMsg::CommitFileDiff(i)))
-                        .style(
-                            (se_theme::GhostButton {
-                                dark,
-                                active: false,
-                            })
-                            .style(),
-                        ),
+                        row![
+                            iced::widget::checkbox(ticked)
+                                .size(13)
+                                .on_toggle(move |on| {
+                                    Message::Git(GitMsg::TickCommitFile(path.clone(), on))
+                                }),
+                            self.commit_file_menu(line.into(), i, rewritable, dark),
+                        ]
+                        .spacing(4)
+                        .align_y(Alignment::Center),
                     );
                 }
                 let mut info = column![

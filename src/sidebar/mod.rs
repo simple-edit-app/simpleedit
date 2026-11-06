@@ -177,6 +177,7 @@ impl SidebarState {
         let lbl_delete = t!("sidebar.delete").to_string();
         let lbl_lint_fix = t!("menu.lint_fix").to_string();
         let lbl_show = t!("sidebar.show_in_tree").to_string();
+        let lbl_history = t!("history.show").to_string();
         let lbl_split_right = t!("sidebar.split_right").to_string();
         let lbl_split_down = t!("sidebar.split_down").to_string();
         let lbl_bookmark_add = t!("sidebar.bookmark_add").to_string();
@@ -256,6 +257,7 @@ impl SidebarState {
                 let lbl_delete = lbl_delete.clone();
                 let lbl_lint_fix = lbl_lint_fix.clone();
                 let lbl_show = lbl_show.clone();
+                let lbl_history = lbl_history.clone();
                 let in_project = projects.roots.iter().any(|r| path.starts_with(r));
                 let lbl_split_right = lbl_split_right.clone();
                 let lbl_split_down = lbl_split_down.clone();
@@ -306,6 +308,12 @@ impl SidebarState {
                             ctx_item(
                                 lbl_show.clone(),
                                 in_project.then(|| Message::ShowInProjects(bookmark_path.clone())),
+                            ),
+                            ctx_item(
+                                lbl_history.clone(),
+                                Some(Message::History(crate::app::HistoryMsg::Open(
+                                    bookmark_path.clone()
+                                ))),
                             ),
                             ctx_item(
                                 lbl_lint_fix.clone(),
@@ -508,6 +516,7 @@ struct ProjectMenuLabels {
     reveal: String,
     find: String,
     replace: String,
+    history: String,
 }
 
 impl ProjectMenuLabels {
@@ -533,6 +542,7 @@ impl ProjectMenuLabels {
             reveal: t!("sidebar.reveal").to_string(),
             find: t!("sidebar.find_here").to_string(),
             replace: t!("sidebar.replace_here").to_string(),
+            history: t!("history.show").to_string(),
             hide_ignored: if hide_ignored {
                 t!("sidebar.show_ignored").to_string()
             } else {
@@ -659,6 +669,10 @@ fn project_tree<'a>(
                         .into()
                 };
                 let mut entries: Vec<Element<'static, Message>> = Vec::new();
+                entries.push(item(
+                    lbl.history.clone(),
+                    Message::History(crate::app::HistoryMsg::Open(menu_path.clone())),
+                ));
                 if is_dir {
                     entries.push(item(
                         lbl.new_file.clone(),
