@@ -1,5 +1,10 @@
 # Journal des modifications
 
+## [1.16.1] - 2026-11-06
+
+### Corrigé
+- Dans la recherche partout, le bouton qui envoie les résultats au panneau Résultats le dit.
+
 ## [1.16.0] - 2026-11-06
 
 ### Ajouté

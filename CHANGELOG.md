@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.16.1] - 2026-11-06
+
+### Fixed
+- In search everywhere, the button that sends the results to the Results panel says so.
+
 ## [1.16.0] - 2026-11-06
 
 ### Added
