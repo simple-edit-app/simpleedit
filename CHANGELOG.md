@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.15.1] - 2026-11-06
+
+### Added
+- Right click on the label of a project in the tabs: Close all tabs of this project. Unsaved files are asked about first, and the label of the other files can close its tabs the same way.
+
 ## [1.15.0] - 2026-11-06
 
 ### Added

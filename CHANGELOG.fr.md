@@ -1,5 +1,10 @@
 # Journal des modifications
 
+## [1.15.1] - 2026-11-06
+
+### Ajouté
+- Clic droit sur l'étiquette d'un projet dans les onglets : Fermer tous les onglets de ce projet. Une confirmation est demandée pour les fichiers non enregistrés, et l'étiquette des autres fichiers ferme ses onglets de la même façon.
+
 ## [1.15.0] - 2026-11-06
 
 ### Ajouté
