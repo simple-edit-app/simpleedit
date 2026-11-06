@@ -675,7 +675,7 @@
   "everywhere.remove_abbreviation": "Retirer l'abréviation « %{abbreviation} »",
   "everywhere.non_project": "Inclure les éléments hors projet",
   "everywhere.filter": "Filtrer",
-  "everywhere.export": "Ouvrir dans Chercher dans les fichiers",
+  "everywhere.export": "Ouvrir dans Résultats",
   "everywhere.case": "Respecter la casse",
   "everywhere.words": "Mots entiers",
   "everywhere.regex": "Expression régulière",
