@@ -742,5 +742,7 @@
   "findrep.one_file": "1 fichier",
   "findrep.files": "%{n} fichiers",
   "findrep.multiline": "Plusieurs lignes (Ctrl+Alt+↑↓ parcourent les correspondances)",
-  "findrep.ignored": "Fichiers ignorés par Git"
+  "findrep.ignored": "Fichiers ignorés par Git",
+  "tabs.other_files": "Autres fichiers",
+  "tabs.project_color": "Couleur du projet"
 }

@@ -980,7 +980,7 @@ impl SimpleEditApp {
 
 /// The top edge of a bottom panel: a rule that can be dragged to resize it.
 /// The height of a tab, and of their bar.
-const TAB_HEIGHT: f32 = 34.0;
+pub(super) const TAB_HEIGHT: f32 = 34.0;
 
 pub(crate) fn resize_edge<'a>(dark: bool) -> Element<'a, Message> {
     iced::widget::mouse_area(
@@ -1103,12 +1103,25 @@ impl SimpleEditApp {
         use crate::sidebar::SidebarMessage;
         let p = se_theme::palette(dark);
         let files = self.sidebar.files();
-        let labels = unique_labels(files);
         let dirty = self.dirty_files();
-        let tabs: Vec<Element<Message>> = files
+        let groups = self.tab_groups();
+        // Told apart inside their group: its label says the project.
+        let mut labels = vec![String::new(); files.len()];
+        for group in &groups {
+            let names: Vec<PathBuf> = group.tabs.iter().map(|t| files[*t].clone()).collect();
+            for (t, name) in group.tabs.iter().zip(unique_labels(&names)) {
+                labels[*t] = name;
+            }
+        }
+        let slots = tab_groups::slots(&groups, &self.folded_tabs);
+        let tabs: Vec<Element<Message>> = slots
             .iter()
-            .zip(labels)
-            .map(|(path, name)| {
+            .map(|slot| {
+                let index = match slot {
+                    tab_groups::Slot::Label(g) => return self.tab_group_label(&groups[*g], dark),
+                    tab_groups::Slot::Tab(t) => *t,
+                };
+                let (path, name) = (&files[index], labels[index].clone());
                 let active = self.current_file.as_ref() == Some(path);
                 let preview = self.preview_tab.as_ref() == Some(path);
                 let mut label = row![
@@ -1216,10 +1229,11 @@ impl SimpleEditApp {
                 });
                 // The open tab has the editor's color, over the bar's bottom
                 // hairline: it joins the editor. A hairline splits the tabs.
+                let framed = container(with_menu)
+                    .height(Length::Fixed(TAB_HEIGHT))
+                    .style(se_theme::tab_frame(dark, active));
                 row![
-                    container(with_menu)
-                        .height(Length::Fixed(TAB_HEIGHT))
-                        .style(se_theme::tab_frame(dark, active)),
+                    self.with_project_line(framed.into(), path),
                     container(Space::new().width(1).height(Length::Fixed(TAB_HEIGHT)))
                         .style(se_theme::rule(dark)),
                 ]
@@ -1228,9 +1242,10 @@ impl SimpleEditApp {
             .collect();
         // The bar scrolls with the wheel and its tabs are dragged to reorder
         // them, all inside the widget so that it follows the pointer.
-        let active = files
-            .iter()
-            .position(|p| Some(p) == self.current_file.as_ref());
+        let active = slots.iter().position(|slot| {
+            matches!(slot, tab_groups::Slot::Tab(t)
+                if self.current_file.as_ref() == files.get(*t))
+        });
         let strip = crate::tab_strip::tab_strip(
             tabs,
             active,
@@ -1283,7 +1298,10 @@ impl SimpleEditApp {
                     .filter(|_| !is_untitled(path))
                     .map(short_dir)
                     .unwrap_or_default();
+                let color = tab_groups::project_of(&self.projects.roots, path)
+                    .map_or(iced::Color::TRANSPARENT, |r| self.project_color(r));
                 let mut line = row![
+                    container(Space::new().width(8).height(8)).style(se_theme::dot(color)),
                     crate::file_icons::file(path, dark),
                     text(name)
                         .size(13)

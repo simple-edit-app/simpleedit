@@ -392,6 +392,34 @@ pub fn badge(dark: bool) -> impl Fn(&Theme) -> container::Style {
 }
 
 /// A small filled circle (state dots), sized by the container.
+/// The label of a group of tabs: a pill tinted with the project's color.
+pub fn group_label(color: Color) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |_theme, status| {
+        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+        button::Style {
+            background: Some(Background::Color(Color {
+                a: if hovered { 0.30 } else { 0.18 },
+                ..color
+            })),
+            text_color: color,
+            border: iced::Border {
+                color: Color { a: 0.55, ..color },
+                width: 1.0,
+                radius: 0.0.into(),
+            },
+            ..button::Style::default()
+        }
+    }
+}
+
+/// A plain block of a color, square.
+pub fn dot_square(color: Color) -> impl Fn(&Theme) -> container::Style {
+    move |_theme: &Theme| container::Style {
+        background: Some(Background::Color(color)),
+        ..container::Style::default()
+    }
+}
+
 pub fn dot(color: Color) -> impl Fn(&Theme) -> container::Style {
     move |_theme: &Theme| container::Style {
         text_color: None,

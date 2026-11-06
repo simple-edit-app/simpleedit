@@ -531,6 +531,8 @@ pub struct Config {
     /// Abbreviations of actions, by action (search everywhere).
     pub action_abbreviations: std::collections::BTreeMap<String, Vec<String>>,
     /// Searches and replacements made in files, latest first (Alt+↓).
+    /// The color of each project, by its folder.
+    pub project_colors: std::collections::BTreeMap<String, usize>,
     /// Find in files: the files Git ignores one by one too.
     pub find_ignored: bool,
     pub find_history: Vec<String>,
@@ -606,6 +608,7 @@ impl Default for Config {
             everywhere_text: true,
             everywhere_git: false,
             action_abbreviations: std::collections::BTreeMap::new(),
+            project_colors: std::collections::BTreeMap::new(),
             find_ignored: true,
             find_history: Vec::new(),
             replace_history: Vec::new(),

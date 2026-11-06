@@ -2,7 +2,7 @@ use iced::{
     widget::{button, column, container, row, scrollable, text, text_editor, text_input, Space},
     Alignment, Element, Length, Task, Theme,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::history::{History, Snapshot};
 use std::path::{Path, PathBuf};
@@ -216,6 +216,9 @@ pub enum Message {
     ToggleSidebar,
     /// A tab was dragged from a place to another.
     TabMoved(usize, usize),
+    /// A group of tabs folded or opened; the color of a project.
+    TabGroupToggle(Option<PathBuf>),
+    ProjectColor(PathBuf, usize),
     /// A click on a file of the tree: it opens in the preview tab (a second
     /// click, at once, keeps it open).
     TreeOpenFile(PathBuf),
@@ -713,6 +716,8 @@ pub struct SimpleEditApp {
     capturing: Option<ShortcutTarget>,
     everywhere: everywhere::Everywhere,
     results: results::Results,
+    /// The groups of tabs that are folded.
+    folded_tabs: BTreeSet<Option<PathBuf>>,
     open_menu: Option<TopMenu>,
     /// The recent files submenu of the File menu is showing.
     recents_open: bool,
@@ -930,6 +935,7 @@ impl SimpleEditApp {
             capturing: None,
             everywhere: everywhere::Everywhere::default(),
             results: results::Results::default(),
+            folded_tabs: BTreeSet::new(),
             open_menu: None,
             recents_open: false,
             menu_bounds: HashMap::new(),
@@ -1462,6 +1468,7 @@ impl SimpleEditApp {
                     &self.dirty_files(),
                     &self.bookmarks.marked_paths(),
                     &self.projects,
+                    &self.config.project_colors,
                     &self.file_marks,
                     self.panels,
                     self.sidebar_width,
@@ -2744,7 +2751,19 @@ impl SimpleEditApp {
             Message::SplitFocus(id) => self.focus_pane(id),
             Message::SplitAction(id, action) => self.split_action(id, action),
             Message::TabMoved(from, to) => {
-                self.sidebar.move_tab(from, to);
+                self.tab_moved(from, to);
+                Task::none()
+            }
+            Message::TabGroupToggle(project) => {
+                if !self.folded_tabs.remove(&project) {
+                    self.folded_tabs.insert(project);
+                }
+                Task::none()
+            }
+            Message::ProjectColor(root, color) => {
+                let key = root.to_string_lossy().into_owned();
+                self.config.project_colors.insert(key, color);
+                self.config_dirty = true;
                 Task::none()
             }
             Message::TreeOpenFile(path) => self.tree_open(path),
@@ -2753,14 +2772,12 @@ impl SimpleEditApp {
                 Task::none()
             }
             Message::TabDoubleClick(index) => {
-                if self.preview_tab.is_some()
-                    && self.preview_tab.as_ref() == self.sidebar.files().get(index)
-                {
+                if self.preview_tab.is_some() && self.preview_tab == self.tab_at(index) {
                     self.preview_tab = None;
                 }
                 Task::none()
             }
-            Message::CloseTabAt(index) => match self.sidebar.files().get(index).cloned() {
+            Message::CloseTabAt(index) => match self.tab_at(index) {
                 Some(path) => self.request_close(path),
                 None => Task::none(),
             },
@@ -6171,6 +6188,7 @@ impl SimpleEditApp {
     fn save_projects(&mut self) {
         self.config.projects = self.projects.roots.clone();
         self.config.projects_open = self.projects.expanded.iter().cloned().collect();
+        self.assign_project_colors();
         self.config_dirty = true;
     }
 
@@ -6205,6 +6223,9 @@ impl SimpleEditApp {
 
     /// Puts a buffer in the editor and makes it the current tab.
     fn load_buffer(&mut self, path: PathBuf, buffer: CachedBuffer) {
+        // Its tab is shown: its group opens.
+        let project = tab_groups::project_of(&self.projects.roots, &path).cloned();
+        self.folded_tabs.remove(&project);
         let content = buffer.content.unwrap_or_default();
         let first_line = first_line_of(&content);
         self.editor = EditorState {
@@ -6956,6 +6977,8 @@ mod project_ops;
 mod results;
 #[path = "app/split.rs"]
 mod split;
+#[path = "app/tab_groups.rs"]
+mod tab_groups;
 #[path = "app/views.rs"]
 mod views;
 pub(crate) use views::resize_edge;

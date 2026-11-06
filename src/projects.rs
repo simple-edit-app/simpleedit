@@ -201,6 +201,30 @@ fn ignored_of(dir: &Path, entries: &[Entry]) -> std::collections::HashSet<PathBu
         .collect()
 }
 
+/// The colors of the projects: bright enough on a dark and a light bar.
+pub const COLORS: [(u8, u8, u8); 8] = [
+    (0x4c, 0x8d, 0xff),
+    (0xf0, 0x8a, 0x3c),
+    (0x3f, 0xb5, 0x6b),
+    (0xa3, 0x71, 0xf7),
+    (0xe8, 0x5d, 0x9e),
+    (0x2b, 0xb3, 0xb3),
+    (0xd9, 0xa4, 0x00),
+    (0xe5, 0x53, 0x4b),
+];
+
+/// The color of a project: the one it was given, its place otherwise.
+pub fn color_of(
+    colors: &std::collections::BTreeMap<String, usize>,
+    roots: &[PathBuf],
+    root: &Path,
+) -> iced::Color {
+    let stored = colors.get(root.to_string_lossy().as_ref()).copied();
+    let place = roots.iter().position(|r| r == root);
+    let (r, g, b) = COLORS[stored.or(place).unwrap_or(0) % COLORS.len()];
+    iced::Color::from_rgb8(r, g, b)
+}
+
 #[derive(Debug, Default)]
 pub struct Projects {
     /// What Git ignores is left out.

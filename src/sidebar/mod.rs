@@ -120,6 +120,11 @@ impl SidebarState {
         true
     }
 
+    /// The open files in a new order.
+    pub fn set_order(&mut self, files: Vec<PathBuf>) {
+        self.files = files;
+    }
+
     pub fn remove_path(&mut self, path: &std::path::Path) {
         self.files.retain(|p| p != path);
     }
@@ -158,6 +163,7 @@ impl SidebarState {
         dirty: &HashSet<PathBuf>,
         marked: &HashSet<PathBuf>,
         projects: &'a crate::projects::Projects,
+        colors: &std::collections::BTreeMap<String, usize>,
         marks: &crate::projects::Marks,
         panels: Panels,
         width: f32,
@@ -422,16 +428,23 @@ impl SidebarState {
                 .align_y(Alignment::Center),
             );
             content = content.push(if has_projects {
-                scrollable(project_tree(projects, marks, current_file, marked, dark))
-                    .id(tree_id())
-                    .on_scroll(|v| Message::TreeScrolled(v.absolute_offset().y, v.bounds().height))
-                    .style(theme::Scrollbar { dark }.style())
-                    .height(if both {
-                        Length::FillPortion(5)
-                    } else {
-                        Length::Fill
-                    })
-                    .into()
+                scrollable(project_tree(
+                    projects,
+                    colors,
+                    marks,
+                    current_file,
+                    marked,
+                    dark,
+                ))
+                .id(tree_id())
+                .on_scroll(|v| Message::TreeScrolled(v.absolute_offset().y, v.bounds().height))
+                .style(theme::Scrollbar { dark }.style())
+                .height(if both {
+                    Length::FillPortion(5)
+                } else {
+                    Length::Fill
+                })
+                .into()
             } else {
                 Element::from(
                     button(text(t!("sidebar.add_project").to_string()).size(12.5))
@@ -531,6 +544,7 @@ impl ProjectMenuLabels {
 
 fn project_tree<'a>(
     projects: &'a crate::projects::Projects,
+    colors: &std::collections::BTreeMap<String, usize>,
     marks: &crate::projects::Marks,
     current: &Option<PathBuf>,
     marked: &HashSet<PathBuf>,
@@ -586,6 +600,9 @@ fn project_tree<'a>(
                 label = label.push(error_dot(dark));
             }
             if line.root {
+                let color = crate::projects::color_of(colors, &projects.roots, &path);
+                label =
+                    label.push(container(Space::new().width(8).height(8)).style(theme::dot(color)));
                 label = label.push(
                     button(text("×").size(14).color(p.muted))
                         .padding([0, 5])
