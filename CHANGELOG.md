@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.17.0] - 2026-11-07
+
+### Added
+- On macOS, the menus (File, Edit, View, Help) are in the system menu bar, next to the application menu with About, Preferences and Quit.
+- In the Git panel, the actions of the Branches tab can be resized by dragging their left edge; the width is remembered.
+- In the View menu, Dark and Light are two entries, the current one checked.
+
+### Changed
+- In the Git panel, Remotes and Repositories moved to the Branches tab, Patches to the Commit tab; Fetch is no longer repeated in the header.
+- The popins of the Git tools close with a cross, and their secondary buttons are outlined like the rest of the app.
+- On macOS the window no longer has a title bar of its own.
+
 ## [1.16.1] - 2026-11-06
 
 ### Fixed

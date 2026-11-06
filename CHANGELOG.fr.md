@@ -1,5 +1,17 @@
 # Journal des modifications
 
+## [1.17.0] - 2026-11-07
+
+### Ajouté
+- Sur macOS, les menus (Fichier, Édition, Affichage, Aide) sont dans la barre de menus du système, à côté du menu de l'application avec À propos, Préférences et Quitter.
+- Dans le panneau Git, les actions de l'onglet Branches se redimensionnent en tirant leur bord gauche ; la largeur est retenue.
+- Dans le menu Affichage, Sombre et Clair sont deux entrées, la courante étant cochée.
+
+### Modifié
+- Dans le panneau Git, Remotes et Dépôts sont dans l'onglet Branches, Patchs dans l'onglet Commit ; Fetch n'est plus répété dans l'en-tête.
+- Les popins des outils Git se ferment avec une croix, et leurs boutons secondaires sont cerclés comme le reste de l'app.
+- Sur macOS, la fenêtre n'a plus de barre de titre à elle.
+
 ## [1.16.1] - 2026-11-06
 
 ### Corrigé
