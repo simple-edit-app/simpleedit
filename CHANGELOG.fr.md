@@ -1,5 +1,16 @@
 # Journal des modifications
 
+## [1.14.0] - 2026-11-06
+
+### Ajouté
+- Remplacer dans les fichiers, comme dans IntelliJ IDEA : Ctrl+Maj+R, ou le nouveau Remplacer dans ce dossier de l'arbre du projet. Avec une expression régulière, `$1` et `${nom}` donnent les groupes, et `\l \u \L \U \E` changent la casse ; Conserver la casse garde la casse de ce qui est remplacé. Chaque correspondance montre son remplacement avant toute écriture. Remplacer traite une correspondance, Tout remplacer les autres après confirmation ; les fichiers ouverts dans l'éditeur sont modifiés là (Ctrl+Z annule), les autres sur le disque (Annuler le remplacement).
+- Panneau Résultats, comme la fenêtre Find d'IntelliJ : Ctrl+Entrée y envoie les correspondances, en onglets épinglables, par fichier ou par dossier. Suppr exclut une correspondance, Inser la réinclut, Ctrl+X la retire, Alt+L et Alt+D remplacent, Ctrl+F5 relance la recherche, Ctrl+Alt+↑/↓ parcourent les correspondances, Alt+O les exporte.
+
+### Modifié
+- Chercher dans les fichiers a été refait : mots entiers, recherche sur plusieurs lignes, masque de fichiers (`*.js, !test*.js`), dans ou hors des commentaires et des chaînes, aperçu des lignes autour de chaque correspondance, épingle, recherches récentes (Alt+↓). La recherche porte sur le projet, un dossier avec ou sans ses sous-dossiers, ou les fichiers ouverts, récents, modifiés ou courant.
+- Chercher dans les fichiers et la recherche partout trouvent maintenant les fichiers que Git ignore un par un, comme un `.env`, mais pas les dossiers qu'il ignore entiers. Dans Chercher dans les fichiers, les fichiers ignorés par Git peuvent être désactivés.
+- La recherche partout envoie ses résultats au panneau Résultats.
+
 ## [1.13.0] - 2026-11-05
 
 ### Ajouté

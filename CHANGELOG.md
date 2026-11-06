@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.14.0] - 2026-11-06
+
+### Added
+- Replace in files, as in IntelliJ IDEA: Ctrl+Shift+R, or the new Replace in this folder of the project tree. With a regular expression, `$1` and `${name}` give the groups, and `\l \u \L \U \E` change the case; Preserve case keeps the case of what is replaced. Each match shows its replacement before anything is written. Replace does one match, Replace all the others after a confirmation; files open in the editor are changed there (Ctrl+Z undoes it), others on disk (Undo the replacement).
+- Results panel, like IntelliJ's Find tool window: Ctrl+Enter sends the matches to it, in tabs that can be pinned, by file or by folder. Delete leaves a match out, Insert takes it back, Ctrl+X removes it, Alt+L and Alt+D replace, Ctrl+F5 searches again, Ctrl+Alt+↑/↓ go through the matches, Alt+O exports them.
+
+### Changed
+- Find in files has been redone: whole words, a search on several lines, a file mask (`*.js, !test*.js`), in or except comments and string literals, a preview of the lines around each match, a pin, recent searches (Alt+↓). It looks in the project, a folder with or without its subfolders, or the open, recent, changed or current files.
+- Find in files and search everywhere now find the files Git ignores one by one, such as a `.env`, but not the folders it ignores as a whole. In Find in files, Git-ignored files can be turned off.
+- Search everywhere sends its results to the Results panel.
+
 ## [1.13.0] - 2026-11-05
 
 ### Added
