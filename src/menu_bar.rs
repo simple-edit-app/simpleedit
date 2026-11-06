@@ -75,18 +75,23 @@ pub fn view(config: &Config, open: Option<TopMenu>) -> Element<'static, Message>
         ..container::Style::default()
     });
 
-    let bar = row![
-        top_button(t!("menu.file").to_string(), TopMenu::File),
-        top_button(t!("menu.edit").to_string(), TopMenu::Edit),
-        top_button(t!("menu.view").to_string(), TopMenu::View),
-        top_button(t!("menu.help").to_string(), TopMenu::Help),
-        Space::new().width(Length::Fill),
-        theme_switch,
-    ]
-    .spacing(2)
-    .padding([0, 14])
-    .height(42)
-    .align_y(Alignment::Center);
+    // On macOS the menus live in the system menu bar (`native_menu`).
+    let titles = if cfg!(target_os = "macos") {
+        row![]
+    } else {
+        row![
+            top_button(t!("menu.file").to_string(), TopMenu::File),
+            top_button(t!("menu.edit").to_string(), TopMenu::Edit),
+            top_button(t!("menu.view").to_string(), TopMenu::View),
+            top_button(t!("menu.help").to_string(), TopMenu::Help),
+        ]
+        .spacing(2)
+    };
+    let bar = row![titles, Space::new().width(Length::Fill), theme_switch]
+        .spacing(2)
+        .padding([0, 14])
+        .height(42)
+        .align_y(Alignment::Center);
 
     container(bar)
         .width(Length::Fill)

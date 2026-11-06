@@ -744,6 +744,9 @@ pub struct SimpleEditApp {
     open_menu: Option<TopMenu>,
     /// The recent files submenu of the File menu is showing.
     recents_open: bool,
+    /// What the macOS menu bar was last built from.
+    #[cfg(all(target_os = "macos", not(test)))]
+    native_menu_state: String,
     /// Last known screen position of each menu button. Reused while a fresh
     /// query is in flight so switching menus doesn't flicker.
     menu_bounds: HashMap<TopMenu, iced::Rectangle>,
@@ -945,7 +948,7 @@ impl SimpleEditApp {
             tab_list: None,
             panels: crate::sidebar::Panels {
                 files: config.show_files_panel
-                    && !(config.show_projects_panel && !config.projects.is_empty()),
+                    && (!config.show_projects_panel || config.projects.is_empty()),
                 projects: config.show_projects_panel
                     && (!config.show_files_panel || !config.projects.is_empty()),
             },
@@ -964,6 +967,8 @@ impl SimpleEditApp {
             folded_tabs: BTreeSet::new(),
             open_menu: None,
             recents_open: false,
+            #[cfg(all(target_os = "macos", not(test)))]
+            native_menu_state: String::new(),
             menu_bounds: HashMap::new(),
             current_file: None,
             is_dirty: false,
@@ -1089,6 +1094,36 @@ impl SimpleEditApp {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.update_message(message);
+        // The tests run off the main thread, where the system menu is off limits.
+        #[cfg(all(target_os = "macos", not(test)))]
+        self.sync_native_menu();
+        task
+    }
+
+    /// Rebuilds the macOS menu bar when what it shows has changed.
+    #[cfg(all(target_os = "macos", not(test)))]
+    fn sync_native_menu(&mut self) {
+        let has_formatter = self
+            .editor
+            .language
+            .as_deref()
+            .map(crate::formatter::has_formatter)
+            .unwrap_or(false);
+        let state = crate::native_menu::State {
+            config: &self.config,
+            has_formatter,
+            lang_picker_enabled: self.language_picker_enabled(),
+            bookmarks: self.bookmark_state(),
+        };
+        let signature = state.signature();
+        if signature != self.native_menu_state {
+            crate::native_menu::install(&state);
+            self.native_menu_state = signature;
+        }
+    }
+
+    fn update_message(&mut self, message: Message) -> Task<Message> {
         // What the autosave and the preview have to look at again.
         let passive = message.is_background()
             || matches!(
@@ -1321,6 +1356,8 @@ impl SimpleEditApp {
                     .map(|_| Message::TerminalTick),
             );
         }
+        #[cfg(all(target_os = "macos", not(test)))]
+        subscriptions.push(crate::native_menu::subscription());
         iced::Subscription::batch(subscriptions)
     }
 

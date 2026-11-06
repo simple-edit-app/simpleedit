@@ -40,6 +40,10 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock", "s
 similar = "3.2.1"
 unicode-width = "0.2"
 
+# The system menu bar on macOS (File, Edit, View and Help up there).
+[target.'cfg(target_os = "macos")'.dependencies]
+muda = { version = "0.20", default-features = false }
+
 [dev-dependencies]
 # Checks that every file icon is a glyph of the bundled Nerd Font.
 ttf-parser = "0.25"
