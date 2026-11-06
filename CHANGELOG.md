@@ -1,5 +1,30 @@
 # Changelog
 
+## [1.16.0] - 2026-11-06
+
+### Added
+- Local history, as in IntelliJ IDEA: what files were, kept on this machine whatever Git knows, for 5 working days by default (Preferences > Git, Off to stop it). Show History from the editor, the tree or the list of files, for a file or a folder: revisions with a search in their content, the two files side by side with arrows to put one change back, or a compact view; Revert Selected and Later Changes, Create Patch, deleted files brought back. Labels by hand (Put Label) or by themselves at a commit.
+- Git, from IntelliJ IDEA:
+  - Rename a branch; compare a branch with the current one, in the log, both ways.
+  - Get a file from a branch or a revision; history of a selection.
+  - Commit options: Signed-off-by, skip the hooks, another author, recent messages.
+  - A push dialog: the commits that leave, the remote and the branch, tags; push up to a commit. A refused push offers to rebase or merge, then pushes again.
+  - Remotes: add, edit, remove.
+  - Log filters, all at once: author, dates, folder or file, first parent, no merges.
+  - Fixup and Squash Into from a commit; take files out of a commit, or extract them to a commit of their own; apply the changes of some files of a commit without committing.
+  - Blame: ignore blanks, detect moves, hide a commit.
+  - Patches: copy or save local changes and commits, apply from a file or the clipboard.
+  - Merge and rebase with options (`--no-commit`, `--onto`, `--update-refs` and others).
+  - Repositories: the state of every project, choose the one shown, fetch, pull or push them all.
+
+### Changed
+- Ctrl+Shift+K opens the push dialog.
+- Search everywhere and Find in files have a close button.
+
+### Fixed
+- In a diff, the arrows bring a lone change back into view.
+- Long lines no longer run under the buttons of the log and of the remotes.
+
 ## [1.15.1] - 2026-11-06
 
 ### Added

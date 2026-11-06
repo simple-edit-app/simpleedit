@@ -1,5 +1,30 @@
 # Journal des modifications
 
+## [1.16.0] - 2026-11-06
+
+### Ajouté
+- Historique local, comme dans IntelliJ IDEA : ce que les fichiers ont été, gardé sur cette machine quoi que sache Git, pendant 5 jours travaillés par défaut (Préférences > Git, Désactivé pour l'arrêter). Voir l'historique depuis l'éditeur, l'arbre ou la liste des fichiers, pour un fichier ou un dossier : révisions avec recherche dans leur contenu, les deux fichiers côte à côte avec des flèches pour rétablir un changement, ou vue compacte ; restauration d'une version, création de patch, fichiers supprimés récupérés. Labels à la main ou automatiques à chaque commit.
+- Git, d'après IntelliJ IDEA :
+  - Renommer une branche ; comparer une branche à la branche courante, dans le log, dans les deux sens.
+  - Récupérer un fichier d'une branche ou d'une révision ; historique d'une sélection.
+  - Options de commit : Signed-off-by, ignorer les hooks, autre auteur, messages récents.
+  - Boîte de push : les commits qui partent, le remote et la branche, les tags ; pousser jusqu'à un commit. Un push refusé propose de rebaser ou fusionner, puis repousse.
+  - Remotes : ajouter, modifier, supprimer.
+  - Filtres du log, tous à la fois : auteur, dates, dossier ou fichier, premier parent, sans fusions.
+  - Fixup et Squash Into depuis un commit ; retirer des fichiers d'un commit ou les extraire dans leur propre commit ; appliquer les changements de quelques fichiers d'un commit sans commiter.
+  - Blame : ignorer les espaces, détecter les déplacements, masquer un commit.
+  - Patchs : copier ou enregistrer les modifications locales et les commits, appliquer depuis un fichier ou le presse-papiers.
+  - Fusion et rebase avec options (`--no-commit`, `--onto`, `--update-refs` et d'autres).
+  - Dépôts : l'état de chaque projet, le choix de celui affiché, fetch, pull ou push sur tous.
+
+### Modifié
+- Ctrl+Maj+K ouvre la boîte de push.
+- La recherche partout et Chercher dans les fichiers ont un bouton de fermeture.
+
+### Corrigé
+- Dans un diff, les flèches ramènent à l'écran un changement isolé.
+- Les longues lignes ne passent plus sous les boutons du log et des remotes.
+
 ## [1.15.1] - 2026-11-06
 
 ### Ajouté
