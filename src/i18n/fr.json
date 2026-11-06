@@ -744,5 +744,7 @@
   "findrep.multiline": "Plusieurs lignes (Ctrl+Alt+↑↓ parcourent les correspondances)",
   "findrep.ignored": "Fichiers ignorés par Git",
   "tabs.other_files": "Autres fichiers",
-  "tabs.project_color": "Couleur du projet"
+  "tabs.project_color": "Couleur du projet",
+  "tabs.close_project": "Fermer tous les onglets de ce projet",
+  "tabs.close_other_files": "Fermer ces onglets"
 }

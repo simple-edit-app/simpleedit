@@ -135,6 +135,17 @@ impl SimpleEditApp {
         }
     }
 
+    /// The open files of a project (none: of no project).
+    pub(super) fn tabs_of(&self, project: &Option<PathBuf>) -> Vec<PathBuf> {
+        let files = self.sidebar.files();
+        self.tab_groups()
+            .into_iter()
+            .find(|g| g.project == *project)
+            .map_or_else(Vec::new, |g| {
+                g.tabs.iter().map(|t| files[*t].clone()).collect()
+            })
+    }
+
     pub(super) fn tab_moved(&mut self, from: usize, to: usize) {
         let groups = self.tab_groups();
         let slots = slots(&groups, &self.folded_tabs);
@@ -250,40 +261,58 @@ impl SimpleEditApp {
                 right: 6.0,
             })
             .center_y(height);
-        let Some(root) = group.project.clone() else {
-            return chip.into();
+        let project = group.project.clone();
+        let close_label = match project {
+            Some(_) => t!("tabs.close_project").to_string(),
+            None => t!("tabs.close_other_files").to_string(),
         };
         crate::pointer_area::context_menu(chip, move || {
-            let mut swatches = row![].spacing(4);
-            for (i, (r, g, b)) in COLORS.iter().enumerate() {
-                swatches = swatches.push(
-                    button(
-                        container(Space::new().width(14).height(14))
-                            .style(se_theme::dot(iced::Color::from_rgb8(*r, *g, *b))),
+            let close = button(text(close_label.clone()).size(13))
+                .padding([7, 10])
+                .width(Length::Fixed(250.0))
+                .on_press(Message::TabGroupClose(project.clone()))
+                .style(
+                    (se_theme::MenuItem {
+                        dark,
+                        radius: se_theme::R_SM,
+                        highlighted: false,
+                    })
+                    .style(),
+                );
+            let mut menu = column![close].spacing(6).padding(6);
+            if let Some(root) = &project {
+                let mut swatches = row![].spacing(4);
+                for (i, (r, g, b)) in COLORS.iter().enumerate() {
+                    swatches = swatches.push(
+                        button(
+                            container(Space::new().width(14).height(14))
+                                .style(se_theme::dot(iced::Color::from_rgb8(*r, *g, *b))),
+                        )
+                        .padding(3)
+                        .on_press(Message::ProjectColor(root.clone(), i))
+                        .style(
+                            (se_theme::GhostButton {
+                                dark,
+                                active: false,
+                            })
+                            .style(),
+                        ),
+                    );
+                }
+                menu = menu.push(
+                    container(
+                        column![
+                            text(t!("tabs.project_color").to_string())
+                                .size(12)
+                                .color(p.muted),
+                            swatches
+                        ]
+                        .spacing(6),
                     )
-                    .padding(3)
-                    .on_press(Message::ProjectColor(root.clone(), i))
-                    .style(
-                        (se_theme::GhostButton {
-                            dark,
-                            active: false,
-                        })
-                        .style(),
-                    ),
+                    .padding([2, 10]),
                 );
             }
-            container(
-                column![
-                    text(t!("tabs.project_color").to_string())
-                        .size(12)
-                        .color(p.muted),
-                    swatches
-                ]
-                .spacing(6)
-                .padding(8),
-            )
-            .style(se_theme::card(dark))
-            .into()
+            container(menu).style(se_theme::card(dark)).into()
         })
     }
 }
@@ -417,6 +446,53 @@ mod tests {
             stamp: None,
         })));
         assert!(!app.folded_tabs.contains(&root));
+    }
+
+    /// An app with `main.rs` open in two projects, `b`'s last and in front.
+    fn two_projects() -> (tempfile::TempDir, tempfile::TempDir, SimpleEditApp) {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mut app = SimpleEditApp::blank(Config::default());
+        let _ = app.restore_session(crate::session::Session::default());
+        for dir in [a.path(), b.path()] {
+            let _ = app.update(Message::ProjectPicked(Some(dir.to_path_buf())));
+            let path = dir.join("main.rs");
+            std::fs::write(&path, "").unwrap();
+            let _ = app.update(Message::TabRead(Ok(Loaded {
+                path,
+                text: String::new(),
+                format: TextFormat::default(),
+                stamp: None,
+            })));
+        }
+        (a, b, app)
+    }
+
+    #[test]
+    fn the_tabs_of_a_project_are_closed_and_only_those() {
+        let (a, b, mut app) = two_projects();
+        let (in_a, in_b) = (a.path().join("main.rs"), b.path().join("main.rs"));
+        let _ = app.update(Message::TabGroupClose(Some(b.path().to_path_buf())));
+        assert_eq!(app.overlay, ActiveOverlay::None);
+        assert!(!app.sidebar.files().contains(&in_b));
+        assert!(app.sidebar.files().contains(&in_a), "the other one stays");
+        // The files of no project are closed the same way.
+        let _ = app.update(Message::TabGroupClose(None));
+        assert!(app.sidebar.files().iter().all(|f| *f == in_a));
+    }
+
+    #[test]
+    fn unsaved_tabs_of_a_project_are_asked_about_first() {
+        let (_a, b, mut app) = two_projects();
+        let in_b = b.path().join("main.rs");
+        let _ = app.update(Message::EditorAction(text_editor::Action::Edit(
+            text_editor::Edit::Paste(std::sync::Arc::new("x".into())),
+        )));
+        let _ = app.update(Message::TabGroupClose(Some(b.path().to_path_buf())));
+        assert!(matches!(
+            app.overlay,
+            ActiveOverlay::ConfirmCloseMany(ref paths, 1) if paths == std::slice::from_ref(&in_b)
+        ));
+        assert!(app.sidebar.files().contains(&in_b), "nothing closed yet");
     }
 
     #[test]

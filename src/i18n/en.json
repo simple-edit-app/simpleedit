@@ -744,5 +744,7 @@
   "findrep.multiline": "Several lines (Ctrl+Alt+↑↓ go through the matches)",
   "findrep.ignored": "Git-ignored files",
   "tabs.other_files": "Other files",
-  "tabs.project_color": "Project color"
+  "tabs.project_color": "Project color",
+  "tabs.close_project": "Close all tabs of this project",
+  "tabs.close_other_files": "Close these tabs"
 }

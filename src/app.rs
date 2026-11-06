@@ -218,6 +218,7 @@ pub enum Message {
     TabMoved(usize, usize),
     /// A group of tabs folded or opened; the color of a project.
     TabGroupToggle(Option<PathBuf>),
+    TabGroupClose(Option<PathBuf>),
     ProjectColor(PathBuf, usize),
     /// A click on a file of the tree: it opens in the preview tab (a second
     /// click, at once, keeps it open).
@@ -2759,6 +2760,11 @@ impl SimpleEditApp {
                     self.folded_tabs.insert(project);
                 }
                 Task::none()
+            }
+            Message::TabGroupClose(project) => {
+                let targets = self.tabs_of(&project);
+                self.folded_tabs.remove(&project);
+                self.confirm_close_many(targets, Task::none())
             }
             Message::ProjectColor(root, color) => {
                 let key = root.to_string_lossy().into_owned();
@@ -5867,6 +5873,11 @@ impl SimpleEditApp {
             Some(path) if self.current_file.as_ref() != Some(&path) => self.activate(path),
             _ => Task::none(),
         };
+        self.confirm_close_many(targets, show)
+    }
+
+    /// Closes these tabs, after asking if some have unsaved changes.
+    fn confirm_close_many(&mut self, targets: Vec<PathBuf>, show: Task<Message>) -> Task<Message> {
         let modified = targets.iter().filter(|p| self.is_path_dirty(p)).count();
         if modified > 0 {
             self.overlay = ActiveOverlay::ConfirmCloseMany(targets, modified);
