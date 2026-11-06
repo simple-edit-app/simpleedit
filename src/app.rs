@@ -1057,6 +1057,7 @@ impl SimpleEditApp {
         let mut app = Self::blank(flags.config);
         app.git.pull_mode = app.config.git_pull_mode;
         app.git.merge_mode = app.config.git_merge_mode;
+        app.git.branches.actions_width = app.config.git_actions_width;
         app.session_lock = lock;
         app.session_owner = owner;
         if owner {
@@ -1325,6 +1326,19 @@ impl SimpleEditApp {
                 },
             ));
         }
+        if self.git.branches.resizing {
+            subscriptions.push(iced::event::listen_with(
+                |event, _status, _window| match event {
+                    iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => Some(
+                        Message::Git(crate::git_panel::GitMsg::ActionsResize(position.x)),
+                    ),
+                    iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                        iced::mouse::Button::Left,
+                    )) => Some(Message::Git(crate::git_panel::GitMsg::ActionsResizeEnd)),
+                    _ => None,
+                },
+            ));
+        }
         if self.panel_resizing {
             subscriptions.push(iced::event::listen_with(
                 |event, _status, _window| match event {
@@ -1555,7 +1569,13 @@ impl SimpleEditApp {
         }
         main_row = main_row.push(editor_panel);
 
-        let base: Element<Message> = container(column![title_bar, rule(dark), main_row])
+        // On macOS the menus are in the system bar: no title bar here.
+        let content: Element<Message> = if cfg!(target_os = "macos") {
+            main_row.into()
+        } else {
+            column![title_bar, rule(dark), main_row].into()
+        };
+        let base: Element<Message> = container(content)
             .width(Length::Fill)
             .height(Length::Fill)
             .style(se_theme::window(dark))
@@ -2342,6 +2362,10 @@ impl SimpleEditApp {
                     if !self.git.open && error != crate::git::CONFLICT {
                         self.set_status(error.clone(), true);
                     }
+                }
+                if matches!(&msg, crate::git_panel::GitMsg::ActionsResizeEnd) {
+                    self.config.git_actions_width = self.git.branches.actions_width;
+                    self.config_dirty = true;
                 }
                 self.remember_before_git(&msg);
                 if let crate::git_panel::GitMsg::Done(Ok(said)) = &msg {

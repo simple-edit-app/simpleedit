@@ -754,12 +754,21 @@ impl Panel {
     ) -> Element<'a, Message> {
         let p = se_theme::palette(dark);
         let ghost = move |active: bool| (se_theme::GhostButton { dark, active }).style();
+        // Every popin names itself and closes with a cross.
         let title = |label: String| -> Element<'a, Message> {
-            text(label)
-                .size(13.5)
-                .font(se_theme::UI_SEMIBOLD)
-                .color(p.text)
-                .into()
+            row![
+                text(label)
+                    .size(13.5)
+                    .font(se_theme::UI_SEMIBOLD)
+                    .color(p.text),
+                Space::new().width(Length::Fill),
+                button(text("×").size(16).color(p.muted))
+                    .padding([0, 7])
+                    .on_press(Message::Git(GitMsg::Tool(ToolMsg::Close)))
+                    .style(ghost(false)),
+            ]
+            .align_y(Alignment::Center)
+            .into()
         };
         let primary = |label: String, msg: Option<Message>| {
             button(text(label).size(12.5))
@@ -771,9 +780,8 @@ impl Panel {
             button(text(label).size(12.5))
                 .padding([5, 14])
                 .on_press_maybe(msg)
-                .style(ghost(false))
+                .style((se_theme::Outline { dark }).style())
         };
-        let cancel = || plain(t!("git.cancel").to_string(), Some(tool(ToolMsg::Close)));
         let field = |placeholder: String, value: &str| {
             text_input(&placeholder, value)
                 .size(13)
@@ -853,7 +861,6 @@ impl Panel {
                             can.then_some(tool(ToolMsg::PushRun(false)))
                         ),
                         plain(force_label, can.then_some(tool(ToolMsg::PushRun(true)))),
-                        cancel(),
                     ]
                     .spacing(8),
                 ]
@@ -874,7 +881,6 @@ impl Panel {
                         t!("git.rejected_merge").to_string(),
                         idle.then_some(tool(ToolMsg::Update(PullMode::Merge)))
                     ),
-                    cancel(),
                 ]
                 .spacing(8),
             ]
@@ -944,11 +950,7 @@ impl Panel {
                 };
                 let filled = !d.name.trim().is_empty() && !d.url.trim().is_empty();
                 form.push(
-                    row![
-                        primary(save, filled.then_some(tool(ToolMsg::RemoteSave))),
-                        plain(t!("git.close").to_string(), Some(tool(ToolMsg::Close))),
-                    ]
-                    .spacing(8),
+                    row![primary(save, filled.then_some(tool(ToolMsg::RemoteSave))),].spacing(8),
                 )
                 .into()
             }
@@ -982,7 +984,6 @@ impl Panel {
                     ),
                 ]
                 .spacing(8),
-                cancel(),
             ]
             .spacing(10)
             .into(),
@@ -1003,13 +1004,10 @@ impl Panel {
                     .on_toggle(|on| tool(ToolMsg::MergeFlagSet(MergeFlag::AllowUnrelated, on))),
                 field(t!("git.merge_message").to_string(), &o.message)
                     .on_input(|t| tool(ToolMsg::MergeMessage(t))),
-                row![
-                    primary(
-                        t!("git.merge").to_string(),
-                        idle.then_some(tool(ToolMsg::MergeRun))
-                    ),
-                    cancel(),
-                ]
+                row![primary(
+                    t!("git.merge").to_string(),
+                    idle.then_some(tool(ToolMsg::MergeRun))
+                ),]
                 .spacing(8),
             ]
             .spacing(10)
@@ -1028,13 +1026,10 @@ impl Panel {
                     .on_toggle(|on| tool(ToolMsg::RebaseFlagSet(RebaseFlag::UpdateRefs, on))),
                 flag(t!("git.rebase_autosquash").to_string(), o.autosquash)
                     .on_toggle(|on| tool(ToolMsg::RebaseFlagSet(RebaseFlag::Autosquash, on))),
-                row![
-                    primary(
-                        t!("git.rebase").to_string(),
-                        idle.then_some(tool(ToolMsg::RebaseRun))
-                    ),
-                    cancel(),
-                ]
+                row![primary(
+                    t!("git.rebase").to_string(),
+                    idle.then_some(tool(ToolMsg::RebaseRun))
+                ),]
                 .spacing(8),
             ]
             .spacing(10)
@@ -1060,7 +1055,6 @@ impl Panel {
                     scrollable(rows)
                         .style(se_theme::Scrollbar { dark }.style())
                         .height(Length::Fixed(150.0)),
-                    cancel(),
                 ]
                 .spacing(10)
                 .into()
@@ -1140,7 +1134,6 @@ impl Panel {
                             t!("git.repo_follow").to_string(),
                             Some(tool(ToolMsg::RepoFollow))
                         ),
-                        plain(t!("git.close").to_string(), Some(tool(ToolMsg::Close))),
                     ]
                     .spacing(6),
                 ]
@@ -1154,14 +1147,10 @@ impl Panel {
                     field(t!("git.extract_message").to_string(), message)
                         .on_input(|t| tool(ToolMsg::ExtractMessage(t)))
                         .on_submit(tool(ToolMsg::ExtractRun)),
-                    row![
-                        primary(
-                            t!("git.extract_run").to_string(),
-                            (idle && !message.trim().is_empty())
-                                .then_some(tool(ToolMsg::ExtractRun))
-                        ),
-                        cancel(),
-                    ]
+                    row![primary(
+                        t!("git.extract_run").to_string(),
+                        (idle && !message.trim().is_empty()).then_some(tool(ToolMsg::ExtractRun))
+                    ),]
                     .spacing(8),
                 ]
                 .spacing(10)

@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use iced::futures::{SinkExt, Stream};
-use muda::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
+use muda::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tokio::sync::mpsc;
 
 use crate::app::{HistoryMsg, Message};
@@ -61,7 +61,7 @@ pub fn subscription() -> iced::Subscription<Message> {
 
 fn events() -> impl Stream<Item = Message> {
     iced::stream::channel(32, async |mut output| {
-        let receiver = EVENTS.get().and_then(|r| r.lock().ok()?.take());
+        let receiver = channel().lock().ok().and_then(|mut r| r.take());
         let Some(mut receiver) = receiver else {
             return std::future::pending().await;
         };
@@ -74,15 +74,16 @@ fn events() -> impl Stream<Item = Message> {
     })
 }
 
-/// Hands the menu events to the subscription.
-fn listen() {
+/// The channel the menu events go through, made by whoever comes first: the
+/// subscription starts before the menu is installed.
+fn channel() -> &'static Mutex<Option<mpsc::UnboundedReceiver<MenuId>>> {
     EVENTS.get_or_init(|| {
         let (tx, rx) = mpsc::unbounded_channel();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
             let _ = tx.send(event.id);
         }));
         Mutex::new(Some(rx))
-    });
+    })
 }
 
 struct Builder {
@@ -107,7 +108,7 @@ fn separator(menu: &Submenu) {
 
 /// Installs the menu bar, replacing the previous one.
 pub fn install(state: &State) {
-    listen();
+    channel();
     let mut b = Builder {
         actions: HashMap::new(),
     };
@@ -283,12 +284,12 @@ fn view_menu(b: &mut Builder, state: &State) -> Submenu {
     b.on(&menu, t!("menu.view_split_close"), Message::CloseSplit);
     b.on(&menu, t!("git.title"), Message::ToggleGit);
     b.on(&menu, t!("terminal.title"), Message::ToggleTerminal);
-    let theme = if config.dark_mode {
-        t!("toolbar.light")
-    } else {
-        t!("toolbar.dark")
-    };
-    b.on(&menu, theme, Message::ThemeChanged(!config.dark_mode));
+    for (label, dark) in [(t!("toolbar.dark"), true), (t!("toolbar.light"), false)] {
+        let item = CheckMenuItem::new(label, true, config.dark_mode == dark, None);
+        b.actions
+            .insert(item.id().clone(), Message::ThemeChanged(dark));
+        let _ = menu.append(&item);
+    }
     let numbers = if config.show_line_numbers {
         t!("menu.view_line_numbers_hide")
     } else {

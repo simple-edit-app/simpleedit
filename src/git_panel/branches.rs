@@ -73,6 +73,34 @@ pub struct State {
     pub confirm: Option<RefAction>,
     /// The popin open to name a new branch or tag.
     pub dialog: Option<RefDialog>,
+    /// Width of the actions on the right (dragged by their left edge).
+    pub actions_width: f32,
+    /// The edge is being dragged; the width and pointer at the first move.
+    pub resizing: bool,
+    resize_from: Option<(f32, f32)>,
+}
+
+/// Bounds of the actions' width, and what it starts as.
+pub const ACTIONS_MIN: f32 = 200.0;
+pub const ACTIONS_MAX: f32 = 700.0;
+pub const ACTIONS_DEFAULT: f32 = 280.0;
+
+impl State {
+    /// The pointer went to `x`: dragging left makes the actions wider.
+    pub fn resize_to(&mut self, x: f32) {
+        let (x0, w0) = *self.resize_from.get_or_insert((x, self.actions_width));
+        self.actions_width = (w0 + x0 - x).clamp(ACTIONS_MIN, ACTIONS_MAX);
+    }
+
+    pub fn resize_start(&mut self) {
+        self.resizing = true;
+        self.resize_from = None;
+    }
+
+    pub fn resize_end(&mut self) {
+        self.resizing = false;
+        self.resize_from = None;
+    }
 }
 
 /// What the popin of the Branches tab creates.
@@ -631,17 +659,37 @@ impl Panel {
             ),
             act_msg(create_label, GitMsg::RefDialog(Some(RefDialog::Branch))),
             act_msg(tag_label, GitMsg::RefDialog(Some(RefDialog::Tag))),
+            container(Space::new().height(1))
+                .width(Length::Fill)
+                .style(se_theme::rule(dark)),
+            act_msg(
+                t!("git.remotes").to_string(),
+                GitMsg::Tool(super::tools::ToolMsg::OpenRemotes)
+            ),
+            act_msg(
+                t!("git.repos").to_string(),
+                GitMsg::Tool(super::tools::ToolMsg::OpenRepos)
+            ),
             notice,
         ]
         .spacing(4)
-        .width(Length::Fixed(280.0));
+        .width(Length::Fixed(self.branches.actions_width.max(ACTIONS_MIN)));
 
         let page: Element<Message> = row![
             scrollable(container(list).padding([2, 6]))
                 .style(se_theme::Scrollbar { dark }.style())
                 .width(Length::Fill)
                 .height(Length::Fill),
-            container(Space::new().width(1).height(Length::Fill)).style(se_theme::rule(dark)),
+            // The edge between the list and the actions: drag it to resize.
+            iced::widget::mouse_area(
+                container(
+                    container(Space::new().width(1).height(Length::Fill))
+                        .style(se_theme::rule(dark)),
+                )
+                .padding([0, 3]),
+            )
+            .on_press(Message::Git(GitMsg::ActionsResizeStart))
+            .interaction(iced::mouse::Interaction::ResizingHorizontally),
             scrollable(container(actions).padding([10, 12]))
                 .style(se_theme::Scrollbar { dark }.style())
                 .height(Length::Fill),
