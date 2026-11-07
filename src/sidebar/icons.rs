@@ -9,6 +9,8 @@ enum Shape {
     Folder,
     /// Two sheets, one behind the other.
     Files,
+    /// A database: a stack of discs.
+    Database,
 }
 
 struct Icon {
@@ -42,6 +44,32 @@ impl<Message> Program<Message> for Icon {
                     p.line_to(Point::new(1.5, 4.0));
                 });
                 frame.stroke(&outline, stroke);
+            }
+            Shape::Database => {
+                // The top disc, then the sides and the two bands below it.
+                let top = Path::new(|p| {
+                    p.move_to(Point::new(2.0, 4.0));
+                    p.line_to(Point::new(2.0, 12.0));
+                });
+                let right = Path::line(Point::new(14.0, 4.0), Point::new(14.0, 12.0));
+                frame.stroke(&top, stroke);
+                frame.stroke(&right, stroke);
+                for y in [4.0_f32, 8.0, 12.0] {
+                    frame.stroke(
+                        &Path::new(|p| {
+                            p.move_to(Point::new(2.0, y));
+                            p.quadratic_curve_to(Point::new(8.0, y + 3.0), Point::new(14.0, y));
+                        }),
+                        stroke,
+                    );
+                }
+                frame.stroke(
+                    &Path::new(|p| {
+                        p.move_to(Point::new(2.0, 4.0));
+                        p.quadratic_curve_to(Point::new(8.0, 1.0), Point::new(14.0, 4.0));
+                    }),
+                    stroke,
+                );
             }
             Shape::Files => {
                 // The sheet behind, then the one in front.
@@ -77,6 +105,10 @@ fn icon<'a, Message: 'a>(shape: Shape, color: Color) -> Element<'a, Message> {
 
 pub fn folder<'a, Message: 'a>(color: Color) -> Element<'a, Message> {
     icon(Shape::Folder, color)
+}
+
+pub fn database<'a, Message: 'a>(color: Color) -> Element<'a, Message> {
+    icon(Shape::Database, color)
 }
 
 pub fn files<'a, Message: 'a>(color: Color) -> Element<'a, Message> {

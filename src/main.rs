@@ -16,6 +16,7 @@ mod changelog;
 mod code_editor;
 mod completion;
 mod config;
+mod database;
 mod definition;
 mod editor;
 mod everywhere;

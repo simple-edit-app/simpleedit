@@ -195,6 +195,36 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// Largest `SHA256SUMS` or signature worth reading.
 const MAX_SUMS: usize = 64 * 1024;
 
+/// Downloads `asset` of the release `version` and checks it against the
+/// release's `SHA256SUMS`, itself checked against the signing key.
+pub async fn download_verified(
+    version: &str,
+    asset: &str,
+    max: usize,
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    if parse_version(version).is_none() {
+        return Err(t!("update.err_api").to_string());
+    }
+    let base = format!("https://github.com/{REPO}/releases/download/v{version}");
+    let client = client(timeout)?;
+
+    let sums = fetch_limited(&client, &format!("{base}/SHA256SUMS"), MAX_SUMS).await?;
+    let sig = fetch_limited(&client, &format!("{base}/SHA256SUMS.sig"), MAX_SUMS).await?;
+    if !verify_signature(&sums, &sig) {
+        return Err(t!("update.err_signature").to_string());
+    }
+    let sums = String::from_utf8_lossy(&sums).into_owned();
+    let expected =
+        expected_hash(&sums, asset).ok_or_else(|| t!("update.err_checksum").to_string())?;
+
+    let bytes = fetch_limited(&client, &format!("{base}/{asset}"), max).await?;
+    if sha256_hex(&bytes) != expected {
+        return Err(t!("update.err_checksum").to_string());
+    }
+    Ok(bytes)
+}
+
 /// Downloads the release asset into a fresh private directory and checks it
 /// against the release's `SHA256SUMS`. Returns the path of the verified file
 /// and the hash it was verified against (checked again at install time).
@@ -205,22 +235,8 @@ pub async fn download_update(version: String) -> Result<(PathBuf, String), Strin
     install_supported()?;
 
     let asset = asset_name(&version);
-    let base = format!("https://github.com/{REPO}/releases/download/v{version}");
-    let client = client(Duration::from_secs(300))?;
-
-    let sums = fetch_limited(&client, &format!("{base}/SHA256SUMS"), MAX_SUMS).await?;
-    let sig = fetch_limited(&client, &format!("{base}/SHA256SUMS.sig"), MAX_SUMS).await?;
-    if !verify_signature(&sums, &sig) {
-        return Err(t!("update.err_signature").to_string());
-    }
-    let sums = String::from_utf8_lossy(&sums).into_owned();
-    let expected =
-        expected_hash(&sums, &asset).ok_or_else(|| t!("update.err_checksum").to_string())?;
-
-    let bytes = fetch_limited(&client, &format!("{base}/{asset}"), MAX_DOWNLOAD).await?;
-    if sha256_hex(&bytes) != expected {
-        return Err(t!("update.err_checksum").to_string());
-    }
+    let bytes = download_verified(&version, &asset, MAX_DOWNLOAD, Duration::from_secs(300)).await?;
+    let expected = sha256_hex(&bytes);
 
     // A fresh 0700 directory: nobody else can pre-create or swap the file
     // between this write and the privileged install. It is kept only once

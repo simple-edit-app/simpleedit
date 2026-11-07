@@ -48,6 +48,10 @@ jobs:
           cd target/aarch64-apple-darwin/release
           tar czf simpleedit-${TAG}-aarch64-apple-darwin.tar.gz ${{ env.BINARY_NAME }}
           mv simpleedit-*.tar.gz ${{ github.workspace }}/
+      # The PostgreSQL driver of the Database panel, downloaded by the app on
+      # demand (src/database): named after the tag and the system.
+      - name: Package the database driver
+        run: cp target/aarch64-apple-darwin/release/simpleedit-db-postgres simpleedit-db-postgres-${TAG}-aarch64-apple-darwin
       - name: Build .app bundle
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
@@ -106,6 +110,7 @@ jobs:
           path: |
             simpleedit-*.tar.gz
             simpleedit-*-macos-aarch64.zip
+            simpleedit-db-postgres-*
 
   build-linux:
     name: Build Linux (x86_64)
@@ -128,6 +133,8 @@ jobs:
           cd target/release
           tar czf simpleedit-${TAG}-x86_64-linux.tar.gz ${{ env.BINARY_NAME }}
           mv simpleedit-*.tar.gz ${{ github.workspace }}/
+      - name: Package the database driver
+        run: cp target/release/simpleedit-db-postgres simpleedit-db-postgres-${TAG}-x86_64-linux
       - name: Build DEB
         run: |
           cargo install --locked --version 3.8.0 cargo-deb
@@ -150,6 +157,7 @@ jobs:
           name: simpleedit-linux
           path: |
             simpleedit-*.tar.gz
+            simpleedit-db-postgres-*
             *.deb
             *.AppImage
 
@@ -166,7 +174,7 @@ jobs:
           merge-multiple: true
       # The in-app updater and install.sh verify downloads against this file.
       - name: Generate checksums
-        run: sha256sum simpleedit-*.tar.gz simpleedit-*-macos-aarch64.zip *.deb *.AppImage > SHA256SUMS
+        run: sha256sum simpleedit-*.tar.gz simpleedit-*-macos-aarch64.zip simpleedit-db-postgres-* *.deb *.AppImage > SHA256SUMS
       # Ed25519 signature over SHA256SUMS; the app embeds the public key and
       # refuses an update whose checksums aren't signed by it.
       - name: Sign checksums
@@ -189,6 +197,7 @@ jobs:
           files: |
             simpleedit-*.tar.gz
             simpleedit-*-macos-aarch64.zip
+            simpleedit-db-postgres-*
             *.deb
             *.AppImage
             SHA256SUMS
