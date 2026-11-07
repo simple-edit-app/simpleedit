@@ -493,6 +493,7 @@ pub struct Config {
     /// Which panels the bar beside the sidebar has open.
     pub show_files_panel: bool,
     pub show_projects_panel: bool,
+    pub show_database_panel: bool,
     /// Width of the file list, in pixels (dragged by its right edge).
     pub sidebar_width: f32,
     /// How `pull` and `merge` are made in the Git panel.
@@ -595,6 +596,7 @@ impl Default for Config {
             show_sidebar: true,
             show_files_panel: true,
             show_projects_panel: false,
+            show_database_panel: false,
             sidebar_width: 208.0,
             git_pull_mode: crate::git::PullMode::default(),
             git_merge_mode: crate::git::MergeMode::default(),

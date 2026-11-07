@@ -543,6 +543,7 @@ mod behavior_tests {
         app.panels = crate::sidebar::Panels {
             files: true,
             projects: false,
+            database: false,
         };
         app.show_sidebar = false;
         let file = dir.path().join("src/main.rs");
@@ -2134,5 +2135,155 @@ mod look_tests {
         let mut ui = iced_test::Simulator::with_size(settings, (1280.0, 800.0), app.view());
         let shot = ui.snapshot(&theme).unwrap();
         assert!(shot.matches_image(&out).unwrap());
+    }
+
+    /// The Database panel with a table open, and every tab of its settings:
+    /// `SNAPSHOT=/tmp/db cargo test look_tests -- --ignored` writes
+    /// `/tmp/db-table-wgpu.png` and `/tmp/db-<tab>-wgpu.png`.
+    #[test]
+    #[ignore]
+    fn the_database_panel_is_drawn_to_pngs() {
+        use crate::database::protocol::{Column, Database, Schema, Table};
+        use crate::database::{
+            Choice, DbMsg, Dialog, DialogTab, Field, Flag, Kind, Page, SshAuth, SslMode, Tree,
+        };
+        let Ok(out) = std::env::var("SNAPSHOT") else {
+            return;
+        };
+        let config = Config {
+            dark_mode: std::env::var("LIGHT").is_err(),
+            ..Config::default()
+        };
+        let mut app = SimpleEditApp::blank(config);
+        let _ = app.restore_session(crate::session::Session::default());
+        let mut form = Dialog::new();
+        form.set(Field::Database, "shop".into());
+        form.set(Field::User, "dev".into());
+        let id = app.db.apply(&form).unwrap();
+        app.db.open.insert(id.to_string());
+        app.db.open.insert(format!("{id}/shop/public"));
+        app.db.trees.insert(
+            id,
+            Tree::Loaded(vec![Database {
+                name: "shop".into(),
+                current: true,
+                schemas: vec![
+                    Schema {
+                        name: "public".into(),
+                        tables: vec![
+                            Table {
+                                name: "customer_names".into(),
+                                kind: Kind::View,
+                            },
+                            Table {
+                                name: "customers".into(),
+                                kind: Kind::Table,
+                            },
+                        ],
+                    },
+                    Schema {
+                        name: "sales".into(),
+                        tables: vec![],
+                    },
+                ],
+            }]),
+        );
+        app.db.driver = crate::database::Driver::Missing;
+        let _ = app.update(Message::TogglePanel(crate::sidebar::Panel::Database));
+        let _ = app.update(Message::Db(DbMsg::OpenTable(
+            id,
+            "shop".into(),
+            "public".into(),
+            "customers".into(),
+        )));
+        let path = app.db_tabs.keys().next().unwrap().clone();
+        let columns = [
+            ("id", "integer"),
+            ("name", "text"),
+            ("email", "text"),
+            ("created", "timestamp with time zone"),
+            ("score", "numeric(8,2)"),
+            ("tags", "text[]"),
+        ];
+        let rows = (1..=60)
+            .map(|i| {
+                vec![
+                    Some(i.to_string()),
+                    Some(format!("Client {i}")),
+                    (i % 5 != 0).then(|| format!("c{i}@ex.fr")),
+                    Some("2026-11-07 20:30:14.562141+00".into()),
+                    Some(format!("{}.50", i * 3)),
+                    Some("{a,b}".into()),
+                ]
+            })
+            .collect();
+        let _ = app.update(Message::Db(DbMsg::Rows(
+            path,
+            Ok(Page {
+                columns: columns
+                    .iter()
+                    .map(|(n, k)| Column {
+                        name: n.to_string(),
+                        kind: k.to_string(),
+                    })
+                    .collect(),
+                rows,
+                has_more: true,
+                offset: 0,
+            }),
+        )));
+        let theme = if app.config.dark_mode {
+            se_theme::ink_dark()
+        } else {
+            se_theme::ink_light()
+        };
+        let settings = iced::Settings {
+            default_font: se_theme::UI,
+            fonts: se_theme::font_files(),
+            ..Default::default()
+        };
+        let shoot = |app: &SimpleEditApp, name: &str| {
+            let file = format!("{out}-{name}-wgpu.png");
+            let _ = std::fs::remove_file(&file);
+            let mut ui =
+                iced_test::Simulator::with_size(settings.clone(), (1280.0, 800.0), app.view());
+            assert!(ui.snapshot(&theme).unwrap().matches_image(&file).unwrap());
+        };
+        shoot(&app, "table");
+
+        // The settings, a tab after the other, with something in each.
+        let _ = app.update(Message::Db(DbMsg::OpenDialog(None)));
+        let _ = app.update(Message::Db(DbMsg::Text(Field::Name, "Shop (local)".into())));
+        let _ = app.update(Message::Db(DbMsg::Text(Field::User, "dev".into())));
+        let _ = app.update(Message::Db(DbMsg::Check(Flag::SshEnabled, true)));
+        let _ = app.update(Message::Db(DbMsg::Text(
+            Field::SshHost,
+            "bastion.example.com".into(),
+        )));
+        let _ = app.update(Message::Db(DbMsg::Choose(Choice::SshAuth(
+            SshAuth::KeyPair,
+        ))));
+        let _ = app.update(Message::Db(DbMsg::Choose(Choice::SslMode(
+            SslMode::VerifyFull,
+        ))));
+        let _ = app.update(Message::Db(DbMsg::Text(
+            Field::SslCa,
+            "/etc/ssl/ca.pem".into(),
+        )));
+        let _ = app.update(Message::Db(DbMsg::PropAdd));
+        let _ = app.update(Message::Db(DbMsg::PropKey(0, "application_name".into())));
+        let _ = app.update(Message::Db(DbMsg::PropValue(0, "simpleedit".into())));
+        let _ = app.update(Message::Db(DbMsg::Check(Flag::ReadOnly, true)));
+        for (tab, name) in [
+            (DialogTab::General, "general"),
+            (DialogTab::Options, "options"),
+            (DialogTab::SshSsl, "ssh"),
+            (DialogTab::Schemas, "schemas"),
+            (DialogTab::Advanced, "advanced"),
+            (DialogTab::Driver, "driver"),
+        ] {
+            let _ = app.update(Message::Db(DbMsg::Tab(tab)));
+            shoot(&app, name);
+        }
     }
 }

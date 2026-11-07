@@ -413,6 +413,8 @@ pub enum Message {
     SetMergeMode(crate::git::MergeMode),
     /// A Git shortcut: opens the panel and does it.
     GitShortcut(GitShortcut),
+    /// The Database panel and its tables.
+    Db(crate::database::DbMsg),
     SidebarResizeStart,
     SidebarResize(f32),
     SidebarResizeEnd,
@@ -723,6 +725,11 @@ pub struct SimpleEditApp {
     panels: crate::sidebar::Panels,
     /// Width of the file list, and whether its edge is being dragged.
     sidebar_width: f32,
+    /// The Database panel: connections, driver, form.
+    db: crate::database::State,
+    /// The tables open as tabs (`db://N/...`).
+    db_tabs: HashMap<PathBuf, crate::database::TableTab>,
+    db_counter: usize,
     sidebar_resizing: bool,
     /// The height of the bottom panels (Git, terminal, scratch files, bookmarks), and the drag that resizes it: where the
     /// pointer and the height were at its first move.
@@ -947,11 +954,17 @@ impl SimpleEditApp {
             tree_view: (0.0, 0.0),
             tab_list: None,
             panels: crate::sidebar::Panels {
-                files: config.show_files_panel
+                files: !config.show_database_panel
+                    && config.show_files_panel
                     && (!config.show_projects_panel || config.projects.is_empty()),
-                projects: config.show_projects_panel
+                projects: !config.show_database_panel
+                    && config.show_projects_panel
                     && (!config.show_files_panel || !config.projects.is_empty()),
+                database: config.show_database_panel,
             },
+            db: crate::database::State::load(),
+            db_tabs: HashMap::new(),
+            db_counter: 0,
             sidebar_width: config.sidebar_width.clamp(SIDEBAR_MIN, SIDEBAR_MAX),
             sidebar_resizing: false,
             panel_height: PANEL_HEIGHT,
@@ -1537,9 +1550,12 @@ impl SimpleEditApp {
         // and the editor is the handle that resizes the list.
         let mut main_row = row![].height(Length::Fill);
         main_row = main_row.push(self.activity_bar(dark)).push(vrule(dark));
-        if self.show_sidebar && (self.panels.files || self.panels.projects) {
-            main_row = main_row.push(
-                container(self.sidebar.view(
+        if self.show_sidebar && (self.panels.files || self.panels.projects || self.panels.database)
+        {
+            let panel: Element<Message> = if self.panels.database {
+                crate::database::view::sidebar(&self.db, dark)
+            } else {
+                self.sidebar.view(
                     dark,
                     &self.current_file,
                     &self.dirty_files(),
@@ -1549,9 +1565,9 @@ impl SimpleEditApp {
                     &self.file_marks,
                     self.panels,
                     self.sidebar_width,
-                ))
-                .width(Length::Fixed(self.sidebar_width)),
-            );
+                )
+            };
+            main_row = main_row.push(container(panel).width(Length::Fixed(self.sidebar_width)));
             // The edge between the list and the editor (a strip of the list
             // and the hairline): drag it to resize.
             main_row = main_row.push(
@@ -1708,6 +1724,18 @@ impl SimpleEditApp {
             with_dropdown
         };
 
+        // The form of a database connection.
+        let with_prefs: Element<Message> = match &self.db.dialog {
+            Some(form) => crate::floating::modal(
+                with_prefs,
+                crate::database::view::dialog(&self.db, form, dark),
+                None,
+                dark,
+                false,
+            ),
+            None => with_prefs,
+        };
+
         // A pop-up at the top announces conflicts, until they are gone.
         let with_prefs: Element<Message> = match self.conflict_toast(dark) {
             Some(toast) => iced::widget::stack![with_prefs, toast].into(),
@@ -1853,6 +1881,10 @@ impl Message {
     fn is_background(&self) -> bool {
         match self {
             Message::Git(msg) => msg.is_background(),
+            Message::Db(msg) => matches!(
+                msg,
+                crate::database::DbMsg::Scrolled(..) | crate::database::DbMsg::DriverProbed(_)
+            ),
             Message::History(msg) => msg.is_background(),
             Message::BlameLoaded(..) | Message::MarksBase(..) => true,
             // What comes by itself (answers, timers) or from the pointer
@@ -2809,11 +2841,13 @@ impl SimpleEditApp {
                 self.panels = crate::sidebar::Panels {
                     files: false,
                     projects: true,
+                    database: false,
                 };
                 self.show_sidebar = true;
                 self.config.show_sidebar = true;
                 self.config.show_files_panel = false;
                 self.config.show_projects_panel = true;
+                self.config.show_database_panel = false;
                 self.config_dirty = true;
                 // And scrolled to the file.
                 let index = self
@@ -3020,10 +3054,12 @@ impl SimpleEditApp {
                 let was_open = match panel {
                     crate::sidebar::Panel::Files => self.panels.files,
                     crate::sidebar::Panel::Projects => self.panels.projects,
+                    crate::sidebar::Panel::Database => self.panels.database,
                 };
                 self.panels = crate::sidebar::Panels {
                     files: panel == crate::sidebar::Panel::Files && !was_open,
                     projects: panel == crate::sidebar::Panel::Projects && !was_open,
+                    database: panel == crate::sidebar::Panel::Database && !was_open,
                 };
                 // A panel that is asked for shows the sidebar if it was hidden.
                 if !was_open {
@@ -3032,7 +3068,12 @@ impl SimpleEditApp {
                 }
                 self.config.show_files_panel = self.panels.files;
                 self.config.show_projects_panel = self.panels.projects;
+                self.config.show_database_panel = self.panels.database;
                 self.config_dirty = true;
+                // The first look at the panel finds out if the driver is there.
+                if self.panels.database && self.db.driver == crate::database::Driver::Unknown {
+                    return self.db_probe_driver();
+                }
                 Task::none()
             }
             Message::ToggleSidebar => {
@@ -3105,6 +3146,7 @@ impl SimpleEditApp {
                 self.config_dirty = true;
                 Task::none()
             }
+            Message::Db(msg) => self.db_message(msg),
             Message::SidebarResizeStart => {
                 self.sidebar_resizing = true;
                 Task::none()
@@ -6045,6 +6087,7 @@ impl SimpleEditApp {
         self.undo_cache.remove(&path);
         self.diff_tabs.remove(&path);
         self.merge_tabs.remove(&path);
+        self.db_tabs.remove(&path);
         self.sidebar.remove_path(&path);
         // An untitled file is gone for good once closed; a saved one keeps
         // its bookmarks for the next time it is opened.
@@ -6747,6 +6790,13 @@ impl SimpleEditApp {
         {
             return tab.view(dark);
         }
+        if let Some((path, tab)) = self
+            .current_file
+            .as_ref()
+            .and_then(|p| self.db_tabs.get(p).map(|tab| (p, tab)))
+        {
+            return crate::database::view::table(path, tab, dark);
+        }
         if let Some(tab) = self
             .current_file
             .as_ref()
@@ -7146,6 +7196,7 @@ use file_io::*;
 mod bookmark_panel;
 #[path = "app/completion.rs"]
 mod completion;
+mod database;
 #[path = "app/everywhere.rs"]
 mod everywhere;
 pub(crate) use completion::Floating;
@@ -7182,6 +7233,11 @@ pub fn display_name(path: &Path) -> String {
         let rest = path.to_str().unwrap_or("").trim_start_matches("diff://");
         let title = rest.split_once('/').map_or(rest, |(_, t)| t);
         format!("Δ {title}")
+    } else if is_db(path) {
+        // db://3/schema.table
+        let rest = path.to_str().unwrap_or("").trim_start_matches("db://");
+        let title = rest.split_once('/').map_or(rest, |(_, t)| t);
+        format!("▦ {title}")
     } else if is_merge(path) {
         // merge://3/dir/file.rs
         let rest = path.to_str().unwrap_or("").trim_start_matches("merge://");
@@ -7511,6 +7567,7 @@ pub fn is_untitled(path: &Path) -> bool {
                 || s.starts_with("diff://")
                 || s.starts_with("merge://")
                 || s.starts_with("rev://")
+                || s.starts_with("db://")
         })
         .unwrap_or(false)
 }
@@ -7538,7 +7595,12 @@ pub fn is_merge(path: &Path) -> bool {
 
 /// A tab that is not a file and is never saved or remembered.
 pub fn is_virtual(path: &Path) -> bool {
-    is_diff(path) || is_merge(path)
+    is_diff(path) || is_merge(path) || is_db(path)
+}
+
+/// A tab that shows a table of a database (`db://N/schema.table`).
+pub fn is_db(path: &Path) -> bool {
+    path.to_str().is_some_and(|s| s.starts_with("db://"))
 }
 
 /// Releases as a column: version and date, then each section and its changes.

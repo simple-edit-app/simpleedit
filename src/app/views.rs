@@ -1048,6 +1048,12 @@ impl SimpleEditApp {
                     t!("sidebar.projects").to_string(),
                     Message::TogglePanel(crate::sidebar::Panel::Projects),
                 ),
+                tool(
+                    crate::sidebar::icons::database(shown(self.panels.database)),
+                    self.panels.database,
+                    t!("sidebar.database").to_string(),
+                    Message::TogglePanel(crate::sidebar::Panel::Database),
+                ),
                 Space::new().height(Length::Fill),
                 tool(
                     text(">_")
