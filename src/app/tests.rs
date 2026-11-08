@@ -2727,6 +2727,73 @@ mod behavior_tests {
     }
 
     #[test]
+    fn a_file_is_read_mapped_and_imported_into_a_table() {
+        use crate::database::protocol::{ColumnDef, Structure};
+        use crate::database::DbMsg;
+        let (mut app, _) = db_app(true);
+        let id = app.db.connections[0].id;
+        let _ = app.update(Message::Db(DbMsg::ImportOpen(
+            id,
+            "shop".into(),
+            "public".into(),
+            "items".into(),
+        )));
+        let column = |name: &str, kind: &str, generated: bool| ColumnDef {
+            name: name.into(),
+            kind: kind.into(),
+            nullable: true,
+            default: None,
+            identity: String::new(),
+            generated,
+            comment: String::new(),
+        };
+        let structure = Structure {
+            columns: vec![
+                column("id", "integer", false),
+                column("label", "text", false),
+                column("total", "integer", true),
+            ],
+            ..Structure::default()
+        };
+        let _ = app.update(Message::Db(DbMsg::ImportStructure(Done::ok(structure))));
+        // A generated column cannot be filled.
+        assert_eq!(app.db.import.as_ref().unwrap().targets.len(), 2);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("rows.csv");
+        std::fs::write(&file, "ID;Label;other\n1;a;x\n2;b;y\n").unwrap();
+        let _ = app.update(Message::Db(DbMsg::ImportPicked(Some(file))));
+        let im = app.db.import.as_ref().unwrap();
+        assert_eq!(im.delimiter, ';');
+        assert_eq!(im.sample.names, vec!["ID", "Label", "other"]);
+        assert_eq!(
+            im.mapping,
+            vec![Some("id".to_string()), Some("label".to_string()), None]
+        );
+        // A column is filled by one field only.
+        let _ = app.update(Message::Db(DbMsg::ImportMap(2, Some("id".into()))));
+        let im = app.db.import.as_ref().unwrap();
+        assert_eq!(im.mapping[0], None);
+        assert_eq!(im.mapping[2].as_deref(), Some("id"));
+        // Without a header, the fields are numbered and go by place.
+        let _ = app.update(Message::Db(DbMsg::ImportHeader(false)));
+        let im = app.db.import.as_ref().unwrap();
+        assert_eq!(im.sample.names, vec!["1", "2", "3"]);
+        assert_eq!(im.sample.rows.len(), 3);
+        let _ = app.update(Message::Db(DbMsg::ImportHeader(true)));
+        // Going: one import at a time, and what comes back is said.
+        let _ = app.update(Message::Db(DbMsg::ImportRun));
+        assert!(app.db.import.as_ref().unwrap().running);
+        assert!(!app.db_escape(), "the window stays while it runs");
+        let _ = app.update(Message::Db(DbMsg::ImportDone(Done::err("bad value"))));
+        let im = app.db.import.as_ref().unwrap();
+        assert!(!im.running && im.error.as_deref() == Some("bad value"));
+        let _ = app.update(Message::Db(DbMsg::ImportRun));
+        let _ = app.update(Message::Db(DbMsg::ImportDone(Done::ok(2))));
+        assert_eq!(app.db.import.as_ref().unwrap().imported, Some(2));
+        assert!(app.db_escape() && app.db.import.is_none());
+    }
+
+    #[test]
     fn the_arrows_and_tab_move_the_focus_from_cell_to_cell() {
         let (mut app, path) = db_app(true);
         let key = |app: &mut SimpleEditApp, k: &str, shift: bool| {

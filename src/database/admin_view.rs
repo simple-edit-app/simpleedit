@@ -1028,3 +1028,188 @@ pub fn health<'a>(view: &'a super::HealthView, dark: bool) -> Element<'a, Messag
         .style(se_theme::card(dark))
         .into()
 }
+
+/// The window that puts the rows of a CSV or JSON file into a table: the
+/// file, how it is read, and the column each of its fields goes to.
+pub fn import<'a>(im: &'a super::Import, dark: bool) -> Element<'a, Message> {
+    use super::import::{delimiter_name, Format, DELIMITERS};
+    let p = se_theme::palette(dark);
+    let toggle = |label: String, active: bool, message: Message| {
+        button(text(label).size(12.5))
+            .padding([3, 10])
+            .on_press(message)
+            .style((se_theme::GhostButton { dark, active }).style())
+    };
+    let mut file_line = row![button(text(t!("db.import_choose").to_string()).size(12.5))
+        .padding([4, 14])
+        .on_press_maybe((!im.running).then_some(Message::Db(DbMsg::ImportPick)))
+        .style((se_theme::Outline { dark }).style())]
+    .spacing(10)
+    .align_y(Alignment::Center);
+    file_line = file_line.push(
+        text(
+            im.path
+                .as_ref()
+                .map(|f| f.display().to_string())
+                .unwrap_or_default(),
+        )
+        .size(12)
+        .color(p.muted),
+    );
+    let mut body = column![
+        head(
+            t!("db.import_title", table = im.table.as_str()).to_string(),
+            Message::Db(DbMsg::ImportClose),
+            dark
+        ),
+        file_line,
+    ]
+    .spacing(10)
+    .width(Length::Fixed(760.0));
+
+    if im.path.is_some() {
+        // How the file is read.
+        let mut options = row![
+            toggle(
+                "CSV".to_string(),
+                im.format == Format::Csv,
+                Message::Db(DbMsg::ImportFormat(Format::Csv))
+            ),
+            toggle(
+                "JSON".to_string(),
+                im.format == Format::Json,
+                Message::Db(DbMsg::ImportFormat(Format::Json))
+            ),
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center);
+        if im.format == Format::Csv {
+            options = options.push(Space::new().width(12));
+            for delimiter in DELIMITERS {
+                options = options.push(toggle(
+                    delimiter_name(delimiter),
+                    im.delimiter == delimiter,
+                    Message::Db(DbMsg::ImportDelimiter(delimiter)),
+                ));
+            }
+            options = options.push(Space::new().width(12)).push(
+                checkbox(im.header)
+                    .label(t!("db.import_header").to_string())
+                    .size(14)
+                    .text_size(12.5)
+                    .on_toggle(|on| Message::Db(DbMsg::ImportHeader(on))),
+            );
+        }
+        options = options.push(Space::new().width(12)).push(
+            checkbox(im.empty_null)
+                .label(t!("db.import_empty_null").to_string())
+                .size(14)
+                .text_size(12.5)
+                .on_toggle(|on| Message::Db(DbMsg::ImportEmptyNull(on))),
+        );
+        body = body.push(options);
+
+        // Where each field goes.
+        let skip = t!("db.import_skip").to_string();
+        let mut choices: Vec<String> = vec![skip.clone()];
+        choices.extend(im.targets.iter().map(|t| t.name.clone()));
+        let mut list = column![row![
+            text(t!("db.import_field").to_string())
+                .size(12)
+                .color(p.muted)
+                .width(Length::Fixed(170.0)),
+            text(t!("db.import_example").to_string())
+                .size(12)
+                .color(p.muted)
+                .width(Length::Fixed(230.0)),
+            text(t!("db.import_column").to_string())
+                .size(12)
+                .color(p.muted),
+        ]
+        .spacing(10)]
+        .spacing(4);
+        for (i, name) in im.sample.names.iter().enumerate() {
+            let example = im
+                .sample
+                .rows
+                .iter()
+                .take(2)
+                .filter_map(|r| r.get(i))
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(" · ");
+            let chosen = im
+                .mapping
+                .get(i)
+                .cloned()
+                .flatten()
+                .unwrap_or_else(|| skip.clone());
+            let skip_label = skip.clone();
+            list = list.push(
+                row![
+                    text(name.as_str())
+                        .size(12.5)
+                        .font(se_theme::UI_SEMIBOLD)
+                        .width(Length::Fixed(170.0))
+                        .wrapping(iced::widget::text::Wrapping::None),
+                    text(example)
+                        .size(12)
+                        .color(p.muted)
+                        .width(Length::Fixed(230.0))
+                        .wrapping(iced::widget::text::Wrapping::None),
+                    pick_list(choices.clone(), Some(chosen), move |c: String| {
+                        Message::Db(DbMsg::ImportMap(i, (c != skip_label).then_some(c)))
+                    })
+                    .text_size(12.5)
+                    .padding([3, 8])
+                    .style(se_theme::Select { dark }.style())
+                    .menu_style(se_theme::Select { dark }.menu_style()),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+            );
+        }
+        body = body.push(
+            scrollable(list)
+                .style(se_theme::Scrollbar { dark }.style())
+                .height(Length::Shrink),
+        );
+    }
+    if let Some(error) = &im.error {
+        body = body.push(
+            text(error.as_str())
+                .size(12.5)
+                .color(se_theme::error_color(dark)),
+        );
+    }
+    if let Some(n) = im.imported {
+        body = body.push(
+            text(t!("db.import_done", n = n).to_string())
+                .size(12.5)
+                .color(p.accent),
+        );
+    }
+    let ready = im.path.is_some() && im.mapping.iter().any(Option::is_some) && !im.running;
+    body = body.push(
+        row![
+            button(text(t!("db.import_run").to_string()).size(12.5))
+                .padding([5, 18])
+                .on_press_maybe(ready.then_some(Message::Db(DbMsg::ImportRun)))
+                .style((se_theme::Primary { dark }).style()),
+            text(if im.running {
+                t!("db.import_running").to_string()
+            } else {
+                String::new()
+            })
+            .size(12)
+            .color(p.muted),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),
+    );
+    container(body)
+        .max_height(620)
+        .padding(16)
+        .style(se_theme::card(dark))
+        .into()
+}

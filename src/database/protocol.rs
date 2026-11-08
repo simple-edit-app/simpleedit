@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped when a request or an answer changes; the app only uses a driver
 /// that answers `--protocol` with the same number.
-pub const PROTOCOL: u32 = 16;
+pub const PROTOCOL: u32 = 17;
 
 pub const DEFAULT_PORT: u16 = 5432;
 pub const DEFAULT_SSH_PORT: u16 = 22;
@@ -197,6 +197,38 @@ pub struct Request {
     /// For `export`: the file to write, and its format (`csv` or `json`).
     pub path: String,
     pub format: String,
+    /// For `import`: how the file is read and where its values go.
+    pub import: Option<ImportSpec>,
+}
+
+/// A file of rows to put into a table.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImportSpec {
+    /// `csv` or `json`.
+    pub format: String,
+    /// The character between the fields of a CSV.
+    pub delimiter: String,
+    /// The first line of a CSV holds the names of the columns.
+    pub header: bool,
+    /// How many columns each line of the CSV has.
+    pub file_columns: usize,
+    /// An empty value is NULL, not an empty text.
+    pub empty_null: bool,
+    pub mapping: Vec<ImportColumn>,
+}
+
+/// Where a value of the file goes.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImportColumn {
+    /// The place of the field in a line of CSV.
+    pub index: usize,
+    /// The key in an object of JSON.
+    pub key: String,
+    /// The column of the table, and its type (to convert the text).
+    pub column: String,
+    pub kind: String,
 }
 
 /// Most columns the driver gives for the completion; as many means there

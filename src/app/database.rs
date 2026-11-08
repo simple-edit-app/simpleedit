@@ -446,6 +446,10 @@ impl SimpleEditApp {
         if self.db.health.take().is_some() {
             return true;
         }
+        if self.db.import.as_ref().is_some_and(|i| !i.running) {
+            self.db.import = None;
+            return true;
+        }
         // A question waiting for a yes, or the table designer.
         if self.db.confirm.as_ref().is_some_and(|c| !c.running) {
             self.db.confirm = None;
@@ -953,7 +957,19 @@ impl SimpleEditApp {
             | DbMsg::HealthRun(_)
             | DbMsg::HealthRan(_)
             | DbMsg::HealthToConsole(_)
-            | DbMsg::HealthClose) => self.db_tools_message(msg),
+            | DbMsg::HealthClose
+            | DbMsg::ImportOpen(..)
+            | DbMsg::ImportStructure(_)
+            | DbMsg::ImportPick
+            | DbMsg::ImportPicked(_)
+            | DbMsg::ImportFormat(_)
+            | DbMsg::ImportDelimiter(_)
+            | DbMsg::ImportHeader(_)
+            | DbMsg::ImportEmptyNull(_)
+            | DbMsg::ImportMap(..)
+            | DbMsg::ImportRun
+            | DbMsg::ImportDone(_)
+            | DbMsg::ImportClose) => self.db_tools_message(msg),
             DbMsg::SearchText(path, text) => {
                 if let Some(tab) = self.db_tabs.get_mut(&path) {
                     tab.search_text = text;

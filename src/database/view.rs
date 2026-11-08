@@ -3103,6 +3103,19 @@ fn table_menu(
             )),
         ));
     }
+    if kind == Kind::Table {
+        items.push(menu_bar::item(
+            t!("db.import").to_string(),
+            None,
+            dark,
+            Message::Db(DbMsg::ImportOpen(
+                id,
+                database.clone(),
+                schema.clone(),
+                table.clone(),
+            )),
+        ));
+    }
     items.push(menu_bar::separator(dark));
     if kind == Kind::Table {
         items.push(menu_bar::item(

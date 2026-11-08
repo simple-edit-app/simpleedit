@@ -11,6 +11,7 @@ pub mod console;
 pub mod ddl;
 pub mod designer;
 pub mod grid;
+pub mod import;
 // The driver uses parts of it that the app does not.
 #[allow(dead_code)]
 pub mod protocol;
@@ -217,6 +218,21 @@ pub enum DbMsg {
     HealthRan(Done<Ran>),
     HealthToConsole(String),
     HealthClose,
+    /// The import window: open it for a table, the columns were read, choose
+    /// the file, the file was read, its options, where a field goes, go,
+    /// done, close.
+    ImportOpen(u64, String, String, String),
+    ImportStructure(Done<protocol::Structure>),
+    ImportPick,
+    ImportPicked(Option<PathBuf>),
+    ImportFormat(import::Format),
+    ImportDelimiter(char),
+    ImportHeader(bool),
+    ImportEmptyNull(bool),
+    ImportMap(usize, Option<String>),
+    ImportRun,
+    ImportDone(Done<u64>),
+    ImportClose,
     /// Lays out the selection, or all the queries.
     FormatSql,
     /// The SQL of the file being edited (its selection, or all of it) runs
@@ -252,6 +268,54 @@ pub enum DbMsg {
 
 /// A table: connection, database, schema, table.
 pub type TableKey = (u64, String, String, String);
+
+/// The window that puts the rows of a file into a table.
+#[derive(Debug, Clone)]
+pub struct Import {
+    pub conn: u64,
+    pub database: String,
+    pub schema: String,
+    pub table: String,
+    /// The columns a file can fill (not the generated ones).
+    pub targets: Vec<import::Target>,
+    pub path: Option<PathBuf>,
+    pub format: import::Format,
+    pub delimiter: char,
+    pub header: bool,
+    pub empty_null: bool,
+    /// What was read of the file, to cut it again when an option changes.
+    pub text: String,
+    pub sample: import::Sample,
+    /// For each field of the file, the column it goes to.
+    pub mapping: Vec<Option<String>>,
+    pub running: bool,
+    pub error: Option<String>,
+    pub imported: Option<u64>,
+}
+
+impl Import {
+    /// Reads what the file holds again, with the options as they are now,
+    /// and says where each field goes.
+    pub fn reread(&mut self) {
+        if self.text.is_empty() {
+            self.sample = import::Sample::default();
+            self.mapping.clear();
+            return;
+        }
+        self.sample = match self.format {
+            import::Format::Csv => import::csv_sample(&self.text, self.delimiter, self.header),
+            import::Format::Json => match import::json_sample(&self.text) {
+                Ok(sample) => sample,
+                Err(error) => {
+                    self.error = Some(error);
+                    import::Sample::default()
+                }
+            },
+        };
+        let named = self.header || self.format == import::Format::Json;
+        self.mapping = import::auto_map(&self.sample.names, named, &self.targets);
+    }
+}
 
 /// What the health window of a database shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -891,7 +955,7 @@ fn wait_limit(request: &protocol::Request) -> Option<Duration> {
     // What reads or changes data waits as long as the connection allows (the
     // server stops it), the rest does not wait for long.
     match request.op.as_str() {
-        "query" | "rows" | "apply" | "export" => match request.target.query_timeout {
+        "query" | "rows" | "apply" | "export" | "import" => match request.target.query_timeout {
             0 => None,
             seconds => Some(Duration::from_secs(seconds) + CALL_TIMEOUT),
         },
@@ -1194,6 +1258,21 @@ pub async fn table_columns(params: Params) -> Done<protocol::Catalog> {
                 .unwrap_or_default(),
         })
     })
+}
+
+/// Puts the rows of a CSV or JSON file into a table, all or none; how many.
+pub async fn import_file(
+    params: Params,
+    table: TableRef,
+    path: String,
+    spec: protocol::ImportSpec,
+) -> Done<u64> {
+    let mut request = table_request(&params, "import", &table);
+    request.path = path;
+    request.import = Some(spec);
+    call_with(params.browse.clone(), params.driver.clone(), request)
+        .await
+        .map(|answer| Ok(answer["imported"].as_u64().unwrap_or(0)))
 }
 
 /// How a database is doing: sizes, what waits to be cleaned, unused indexes.
@@ -1949,6 +2028,7 @@ pub struct State {
     pub designer: Option<designer::Designer>,
     /// The health of a database, on show.
     pub health: Option<HealthView>,
+    pub import: Option<Import>,
     pub confirm: Option<Confirm>,
     /// What each table is made of, read when a table of the tree opens.
     pub structures: HashMap<TableKey, protocol::Structure>,
@@ -2004,6 +2084,7 @@ impl State {
             foreign_keys: HashMap::new(),
             designer: None,
             health: None,
+            import: None,
             confirm: None,
             structures: HashMap::new(),
             tree_filter: String::new(),
@@ -3510,6 +3591,76 @@ mod tests {
                 && f.ref_table == "customers"
                 && !f.columns.is_empty()
                 && f.columns.len() == f.ref_columns.len()));
+            // A file into a table, all or none.
+            let dir = tempfile::tempdir().unwrap();
+            let csv = dir.path().join("in.csv");
+            std::fs::write(&csv, "n;label\n7;\"a;b\"\n8;\n").unwrap();
+            let made = run_statements(
+                params.clone(),
+                vec![
+                    "DROP TABLE IF EXISTS live_import".into(),
+                    "CREATE TABLE live_import (id int primary key, label text)".into(),
+                ],
+            )
+            .await;
+            assert!(made.result.unwrap().failed.is_none());
+            let items = tref("public", "live_import");
+            let spec = |kind: &str| protocol::ImportSpec {
+                format: "csv".into(),
+                delimiter: ";".into(),
+                header: true,
+                file_columns: 2,
+                empty_null: true,
+                mapping: vec![
+                    protocol::ImportColumn {
+                        index: 0,
+                        column: "id".into(),
+                        kind: kind.into(),
+                        ..Default::default()
+                    },
+                    protocol::ImportColumn {
+                        index: 1,
+                        column: "label".into(),
+                        kind: "text".into(),
+                        ..Default::default()
+                    },
+                ],
+            };
+            let done = import_file(
+                params.clone(),
+                items.clone(),
+                csv.to_string_lossy().to_string(),
+                spec("integer"),
+            )
+            .await;
+            assert_eq!(done.result.unwrap(), 2);
+            // A value that is not of the type: nothing is imported.
+            std::fs::write(&csv, "n;label\n9;ok\nten;bad\n").unwrap();
+            let failed = import_file(
+                params.clone(),
+                items.clone(),
+                csv.to_string_lossy().to_string(),
+                spec("integer"),
+            )
+            .await;
+            assert!(failed.result.is_err());
+            let kept = rows(
+                params.clone(),
+                items.clone(),
+                Query {
+                    limit: 100,
+                    ..Query::default()
+                },
+            )
+            .await
+            .result
+            .unwrap();
+            assert_eq!(kept.rows.len(), 2);
+            assert_eq!(kept.rows[0][1].as_deref(), Some("a;b"));
+            assert_eq!(kept.rows[1][1], None);
+            let dropped =
+                run_statements(params.clone(), vec!["DROP TABLE live_import".into()]).await;
+            assert!(dropped.result.unwrap().failed.is_none());
             // The health: sizes, dead rows, and an index nobody reads.
             let state = health(params.clone(), "shop".into()).await;
             assert!(state.executed.iter().all(|e| e.internal));

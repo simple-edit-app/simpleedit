@@ -196,6 +196,13 @@ fn run(input: &str, slot: &mut Option<(String, Session)>, serving: bool) -> Resu
             limit(client, &request.target)?;
             apply(client, &request)
         }
+        "import" => {
+            if request.target.read_only {
+                return Err("this data source is read-only".to_string());
+            }
+            limit(client, &request.target)?;
+            import(client, &request)
+        }
         "query" => {
             limit(client, &request.target)?;
             let mut answer = guarded(client, &request.target, |c| query(c, &request))?;
@@ -1766,6 +1773,140 @@ fn columns(client: &mut Client, request: &Request) -> Result<Value, String> {
         })
         .collect();
     Ok(json!({ "columns": list, "foreign_keys": foreign_keys }))
+}
+
+/// Puts the rows of a file into a table, all or none. A CSV goes through a
+/// temporary table of texts (`COPY` reads it as it is), then each value is
+/// converted to the type of its column; a JSON array of objects is read by the
+/// server. What is not mapped is left to the column's default.
+fn import(client: &mut Client, request: &Request) -> Result<Value, String> {
+    use std::io::Read;
+    let spec = request
+        .import
+        .as_ref()
+        .ok_or_else(|| "nothing to import".to_string())?;
+    if spec.mapping.is_empty() {
+        return Err("no column to fill".to_string());
+    }
+    let target = format!(
+        "{}.{}",
+        protocol::quote_ident(&request.schema),
+        protocol::quote_ident(&request.table)
+    );
+    let columns: Vec<String> = spec
+        .mapping
+        .iter()
+        .map(|m| protocol::quote_ident(&m.column))
+        .collect();
+    let mut file =
+        std::fs::File::open(&request.path).map_err(|e| format!("{}: {e}", request.path))?;
+    let mut transaction = client.transaction().map_err(clean)?;
+    let started = Instant::now();
+    let insert = if spec.format == "json" {
+        let mut text = String::new();
+        file.read_to_string(&mut text).map_err(|e| e.to_string())?;
+        let values: Vec<String> = spec
+            .mapping
+            .iter()
+            .map(|m| {
+                let json = matches!(m.kind.as_str(), "json" | "jsonb");
+                format!(
+                    "(e.j {} {})::{}",
+                    if json { "->" } else { "->>" },
+                    protocol::quote_literal(&m.key),
+                    m.kind
+                )
+            })
+            .collect();
+        let sql = format!(
+            "INSERT INTO {target} ({}) SELECT {} FROM jsonb_array_elements($1::text::jsonb) AS e(j)",
+            columns.join(", "),
+            values.join(", ")
+        );
+        match transaction.execute(&sql, &[&text]) {
+            Ok(n) => {
+                record(&sql, started, Some(n), None);
+                n
+            }
+            Err(e) => {
+                let message = clean(e);
+                record(&sql, started, None, Some(message.clone()));
+                return Err(message);
+            }
+        }
+    } else {
+        let width = spec.file_columns.max(1);
+        let names: Vec<String> = (0..width).map(|i| format!("c{i}")).collect();
+        let create = format!(
+            "CREATE TEMP TABLE _se_import ({}) ON COMMIT DROP",
+            names
+                .iter()
+                .map(|n| format!("{n} text"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        transaction.batch_execute(&create).map_err(clean)?;
+        record_internal(&create, started, None, None);
+        let delimiter = spec.delimiter.chars().next().unwrap_or(',');
+        let copy = format!(
+            "COPY _se_import FROM STDIN WITH (FORMAT csv, DELIMITER {}, HEADER {})",
+            protocol::quote_literal(&delimiter.to_string()),
+            if spec.header { "true" } else { "false" }
+        );
+        let started = Instant::now();
+        let loaded = (|| -> Result<u64, String> {
+            let mut writer = transaction.copy_in(copy.as_str()).map_err(clean)?;
+            std::io::copy(&mut file, &mut writer).map_err(|e| clean_copy(&e))?;
+            writer.finish().map_err(clean)
+        })();
+        match &loaded {
+            Ok(n) => record(&copy, started, Some(*n), None),
+            Err(e) => record(&copy, started, None, Some(e.clone())),
+        }
+        loaded?;
+        let values: Vec<String> = spec
+            .mapping
+            .iter()
+            .map(|m| {
+                let name = format!("c{}", m.index);
+                if spec.empty_null {
+                    format!("NULLIF({name}, '')::{}", m.kind)
+                } else {
+                    format!("{name}::{}", m.kind)
+                }
+            })
+            .collect();
+        let sql = format!(
+            "INSERT INTO {target} ({}) SELECT {} FROM _se_import",
+            columns.join(", "),
+            values.join(", ")
+        );
+        let started = Instant::now();
+        match transaction.execute(&sql, &[]) {
+            Ok(n) => {
+                record(&sql, started, Some(n), None);
+                n
+            }
+            Err(e) => {
+                let message = clean(e);
+                record(&sql, started, None, Some(message.clone()));
+                return Err(message);
+            }
+        }
+    };
+    transaction.commit().map_err(clean)?;
+    Ok(json!({ "imported": insert }))
+}
+
+/// The text of an error met while copying a file in.
+fn clean_copy(error: &std::io::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = std::error::Error::source(error);
+    while let Some(inner) = source {
+        message = inner.to_string();
+        source = inner.source();
+    }
+    message
 }
 
 /// How the database is doing: the size of its tables and indexes, what waits
