@@ -1,6 +1,6 @@
 [package]
 name = "simpleedit"
-version = "1.17.0"
+version = "1.18.0"
 edition = "2021"
 rust-version = "1.90"
 description = "A fast, stable, cross-platform text editor"
@@ -53,6 +53,11 @@ rustls-native-certs = "0.8.5"
 # The system menu bar on macOS (File, Edit, View and Help up there).
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = { version = "0.20", default-features = false }
+# Passwords of the data sources live in the system keychain.
+keyring = { version = "3", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["sync-secret-service", "crypto-rust", "vendored"] }
 
 [dev-dependencies]
 # Checks that every file icon is a glyph of the bundled Nerd Font.

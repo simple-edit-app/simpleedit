@@ -22,6 +22,7 @@ pub struct PointerArea<'a, Message> {
     /// button under it still gets its press).
     early: bool,
     on_press_abs: Option<At<'a, Message>>,
+    on_right_press: Option<Message>,
 }
 
 pub fn pointer_area<'a, Message>(
@@ -35,6 +36,7 @@ pub fn pointer_area<'a, Message>(
         quiet: false,
         early: false,
         on_press_abs: None,
+        on_right_press: None,
     }
 }
 
@@ -64,6 +66,12 @@ impl<'a, Message: Clone> PointerArea<'a, Message> {
                     here.is_some(),
                 ) {
                     shell.publish(at(p));
+                }
+            }
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
+                // Not captured: a context menu under it still opens.
+                if let (Some(message), Some(_)) = (self.on_right_press.as_ref(), here) {
+                    shell.publish(message.clone());
                 }
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
@@ -115,6 +123,12 @@ impl<'a, Message> PointerArea<'a, Message> {
     /// A left press, with the pointer's place in the window.
     pub fn on_press_in_window(mut self, f: impl Fn(Point) -> Message + 'a) -> Self {
         self.on_press_abs = Some(Box::new(f));
+        self
+    }
+
+    /// A right press, which this area only hears of.
+    pub fn on_right_press(mut self, message: Message) -> Self {
+        self.on_right_press = Some(message);
         self
     }
 

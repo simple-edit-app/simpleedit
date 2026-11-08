@@ -15,6 +15,7 @@
 #[path = "../../src/database/protocol.rs"]
 mod protocol;
 
+use std::cell::RefCell;
 use std::io::Read;
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -34,7 +35,8 @@ use serde_json::{json, Value};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 use protocol::{
-    Auth, Column, Database, Kind, Request, Schema, Scope, SshAuth, SslMode, Table, Target, PROTOCOL,
+    Auth, Change, ChangeKind, Column, Database, Executed, Kind, QueryResult, Request, Schema,
+    Scope, SshAuth, SslMode, Table, Target, MAX_RESULT_ROWS, PROTOCOL,
 };
 
 fn main() {
@@ -47,14 +49,64 @@ fn main() {
         Ok(_) => run(&input),
         Err(e) => Err(e.to_string()),
     };
+    // What was run goes back with the answer, whether it went well or not.
+    let executed = LOG.with(|log| std::mem::take(&mut *log.borrow_mut()));
     let line = match answer {
         Ok(mut value) => {
             value["ok"] = json!(true);
+            value["executed"] = json!(executed);
             value
         }
-        Err(error) => json!({ "ok": false, "error": error }),
+        Err(error) => json!({ "ok": false, "error": error, "executed": executed }),
     };
     println!("{line}");
+}
+
+thread_local! {
+    /// The commands run so far, for the log of the app.
+    static LOG: RefCell<Vec<Executed>> = const { RefCell::new(Vec::new()) };
+}
+
+fn record(sql: &str, started: Instant, rows: Option<u64>, error: Option<String>) {
+    log(sql, started, rows, error, false);
+}
+
+/// A command the driver runs for its own needs.
+fn record_internal(sql: &str, started: Instant, rows: Option<u64>, error: Option<String>) {
+    log(sql, started, rows, error, true);
+}
+
+fn log(sql: &str, started: Instant, rows: Option<u64>, error: Option<String>, internal: bool) {
+    // On one line, as the log shows it.
+    let sql = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    LOG.with(|log| {
+        log.borrow_mut().push(Executed {
+            sql,
+            ms: started.elapsed().as_millis() as u64,
+            rows,
+            error,
+            internal,
+        })
+    });
+}
+
+/// Runs a query of the driver's own, and logs it.
+fn internal_query(
+    client: &mut Client,
+    sql: &str,
+    params: &[&(dyn postgres::types::ToSql + Sync)],
+) -> Result<Vec<postgres::Row>, postgres::Error> {
+    let started = Instant::now();
+    match client.query(sql, params) {
+        Ok(rows) => {
+            record_internal(sql, started, Some(rows.len() as u64), None);
+            Ok(rows)
+        }
+        Err(e) => {
+            record_internal(sql, started, None, Some(e.to_string()));
+            Err(e)
+        }
+    }
 }
 
 fn run(input: &str) -> Result<Value, String> {
@@ -63,25 +115,61 @@ fn run(input: &str) -> Result<Value, String> {
     match request.op.as_str() {
         "test" => {
             let mut session = session;
-            let row = session
-                .client
-                .query_one("SELECT version()", &[])
-                .map_err(clean)?;
+            let started = Instant::now();
+            let row = match session.client.query_one("SELECT version()", &[]) {
+                Ok(row) => row,
+                Err(e) => {
+                    let message = clean(e);
+                    record("SELECT version()", started, None, Some(message.clone()));
+                    return Err(message);
+                }
+            };
+            record("SELECT version()", started, Some(1), None);
             Ok(json!({ "version": row.get::<_, String>(0) }))
         }
         "tree" => tree(session, &request),
         "rows" => {
             let mut session = session;
-            rows(
-                &mut session.client,
-                &request.schema,
-                &request.table,
-                request.limit.max(1),
-                request.offset,
-            )
+            limit(&mut session.client, &request.target)?;
+            rows(&mut session.client, &request)
+        }
+        "apply" => {
+            let mut session = session;
+            limit(&mut session.client, &request.target)?;
+            apply(&mut session.client, &request)
+        }
+        "query" => {
+            let mut session = session;
+            limit(&mut session.client, &request.target)?;
+            query(&mut session.client, &request)
+        }
+        "columns" => {
+            let mut session = session;
+            columns(&mut session.client, &request)
+        }
+        "structure" => {
+            let mut session = session;
+            structure(&mut session.client, &request)
         }
         other => Err(format!("unknown operation: {other}")),
     }
+}
+
+/// The longest a statement may run, and the server watching that the client
+/// is still there: when the app gives up on a query (the user cancelled it),
+/// the driver is gone and the server stops the query within a second
+/// (PostgreSQL 14 and later; older servers ignore the setting).
+fn limit(client: &mut Client, target: &Target) -> Result<(), String> {
+    if target.query_timeout > 0 {
+        client
+            .batch_execute(&format!(
+                "SET statement_timeout = {}",
+                target.query_timeout.saturating_mul(1000)
+            ))
+            .map_err(clean)?;
+    }
+    let _ = client.batch_execute("SET client_connection_check_interval = 1000");
+    Ok(())
 }
 
 // -------------------------------------------------------------- connection
@@ -119,9 +207,16 @@ impl Session {
         let mut client = connect(&mut config, target)?;
         // The session is set up the way the connection asks.
         if target.read_only {
+            let started = Instant::now();
             client
                 .batch_execute("SET default_transaction_read_only = on")
                 .map_err(clean)?;
+            record_internal(
+                "SET default_transaction_read_only = on",
+                started,
+                None,
+                None,
+            );
         }
         if !target.time_zone.trim().is_empty() {
             client
@@ -132,9 +227,11 @@ impl Session {
                 .map_err(clean)?;
         }
         if !target.startup_script.trim().is_empty() {
+            let started = Instant::now();
             client
                 .batch_execute(&target.startup_script)
                 .map_err(|e| format!("startup script: {}", clean(e)))?;
+            record_internal(&target.startup_script, started, None, None);
         }
         Ok(Session {
             client,
@@ -642,30 +739,25 @@ fn selected(
 fn tree(mut session: Session, request: &Request) -> Result<Value, String> {
     let scope: &Scope = &request.scope;
     let filters = Filters::parse(&scope.object_filter)?;
-    let current: String = session
-        .client
-        .query_one("SELECT current_database()", &[])
-        .map_err(clean)?
+    let current: String = internal_query(&mut session.client, "SELECT current_database()", &[])
+        .map_err(clean)?[0]
         .get(0);
-    let current_schema: Option<String> = session
-        .client
-        .query_one("SELECT current_schema()", &[])
-        .map_err(clean)?
-        .get(0);
+    let current_schema: Option<String> =
+        internal_query(&mut session.client, "SELECT current_schema()", &[]).map_err(clean)?[0]
+            .get(0);
     let all: Vec<String> = if scope.single_database {
         vec![current.clone()]
     } else {
-        session
-            .client
-            .query(
-                "SELECT datname FROM pg_database \
-                 WHERE datallowconn AND (NOT datistemplate OR $1) ORDER BY datname",
-                &[&scope.template_databases],
-            )
-            .map_err(clean)?
-            .iter()
-            .map(|r| r.get::<_, String>(0))
-            .collect()
+        internal_query(
+            &mut session.client,
+            "SELECT datname FROM pg_database \
+             WHERE datallowconn AND (NOT datistemplate OR $1) ORDER BY datname",
+            &[&scope.template_databases],
+        )
+        .map_err(clean)?
+        .iter()
+        .map(|r| r.get::<_, String>(0))
+        .collect()
     };
     let mut databases = Vec::new();
     for (name, wanted) in selected(&scope.pattern, &current, &all) {
@@ -703,23 +795,64 @@ fn schemas_of(
 ) -> Result<Vec<Schema>, String> {
     let system = "nspname IN ('pg_catalog', 'information_schema') \
                   OR nspname LIKE 'pg\\_toast%' OR nspname LIKE 'pg\\_temp%'";
-    let schemas = client
-        .query(
-            &format!(
-                "SELECT nspname FROM pg_namespace WHERE ($1 OR NOT ({system})) ORDER BY nspname"
-            ),
-            &[&scope.system_schemas],
+    let schemas = internal_query(
+        client,
+        &format!("SELECT nspname FROM pg_namespace WHERE ($1 OR NOT ({system})) ORDER BY nspname"),
+        &[&scope.system_schemas],
+    )
+    .map_err(clean)?;
+    let tables = internal_query(
+        client,
+        "SELECT n.nspname, c.relname, c.relkind::text \
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') \
+         ORDER BY n.nspname, c.relname",
+        &[],
+    )
+    .map_err(clean)?;
+    let extension = |alias: &str, class: &str| {
+        format!(
+            "NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = {alias}.oid \
+             AND d.classid = '{class}'::regclass AND d.deptype = 'e')"
         )
-        .map_err(clean)?;
-    let tables = client
-        .query(
-            "SELECT n.nspname, c.relname, c.relkind::text \
-             FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') \
-             ORDER BY n.nspname, c.relname",
-            &[],
-        )
-        .map_err(clean)?;
+    };
+    let routines = internal_query(
+        client,
+        &format!(
+            "SELECT n.nspname::text, p.proname::text, pg_get_function_identity_arguments(p.oid), \
+                    p.prokind::text \
+             FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+             WHERE p.prokind IN ('f', 'p') AND {} ORDER BY n.nspname, p.proname, 3",
+            extension("p", "pg_proc")
+        ),
+        &[],
+    )
+    .map_err(clean)?;
+    // The sequences that a column owns (serial, identity) are part of it.
+    let sequences = internal_query(
+        client,
+        "SELECT n.nspname::text, c.relname::text \
+         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE c.relkind = 'S' AND NOT EXISTS (SELECT 1 FROM pg_depend d \
+               WHERE d.objid = c.oid AND d.classid = 'pg_class'::regclass \
+                 AND d.deptype IN ('a', 'i')) \
+         ORDER BY n.nspname, c.relname",
+        &[],
+    )
+    .map_err(clean)?;
+    let types = internal_query(
+        client,
+        &format!(
+            "SELECT n.nspname::text, t.typname::text \
+             FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace \
+             WHERE (t.typtype IN ('e', 'd') OR (t.typtype = 'c' AND EXISTS \
+                    (SELECT 1 FROM pg_class c WHERE c.oid = t.typrelid AND c.relkind = 'c'))) \
+               AND {} ORDER BY n.nspname, t.typname",
+            extension("t", "pg_type")
+        ),
+        &[],
+    )
+    .map_err(clean)?;
     Ok(schemas
         .iter()
         .map(|r| r.get::<_, String>(0))
@@ -741,7 +874,27 @@ fn schemas_of(
                         .then_some(Table { name: table, kind })
                 })
                 .collect();
-            Schema { name, tables: mine }
+            let in_schema = |rows: &[postgres::Row]| -> Vec<String> {
+                rows.iter()
+                    .filter(|r| r.get::<_, String>(0) == name)
+                    .map(|r| r.get::<_, String>(1))
+                    .collect()
+            };
+            Schema {
+                tables: mine,
+                routines: routines
+                    .iter()
+                    .filter(|r| r.get::<_, String>(0) == name)
+                    .map(|r| protocol::Routine {
+                        name: r.get(1),
+                        args: r.get(2),
+                        procedure: r.get::<_, String>(3) == "p",
+                    })
+                    .collect(),
+                sequences: in_schema(&sequences),
+                types: in_schema(&types),
+                name,
+            }
         })
         .collect())
 }
@@ -751,43 +904,132 @@ fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-fn rows(
-    client: &mut Client,
-    schema: &str,
-    table: &str,
-    limit: u64,
-    offset: u64,
-) -> Result<Value, String> {
-    let columns = client
-        .query(
-            "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod) \
+/// What a table is made of: its columns, its primary key, and whether
+/// rows can be changed in it.
+struct Shape {
+    columns: Vec<Column>,
+    primary_key: Vec<String>,
+    /// An ordinary or partitioned table (not a view).
+    is_table: bool,
+}
+
+fn shape(client: &mut Client, schema: &str, table: &str) -> Result<Shape, String> {
+    let found = internal_query(
+        client,
+        "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod), NOT a.attnotnull, \
+                    c.relkind::text, \
+                    COALESCE(a.attnum = ANY (i.indkey::int2[]), false) \
              FROM pg_attribute a \
              JOIN pg_class c ON c.oid = a.attrelid \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
+             LEFT JOIN pg_index i ON i.indrelid = c.oid AND i.indisprimary \
              WHERE n.nspname = $1 AND c.relname = $2 \
                AND a.attnum > 0 AND NOT a.attisdropped \
              ORDER BY a.attnum",
-            &[&schema, &table],
-        )
-        .map_err(clean)?;
-    if columns.is_empty() {
+        &[&schema, &table],
+    )
+    .map_err(clean)?;
+    if found.is_empty() {
         return Err(format!("{schema}.{table}: no such table"));
     }
-    let names: Vec<String> = columns.iter().map(|c| c.get::<_, String>(0)).collect();
-    let select: Vec<String> = names
+    let mut columns = Vec::new();
+    let mut primary_key = Vec::new();
+    for row in &found {
+        let name: String = row.get(0);
+        if row.get::<_, bool>(4) {
+            primary_key.push(name.clone());
+        }
+        columns.push(Column {
+            name,
+            kind: row.get(1),
+            nullable: row.get(2),
+        });
+    }
+    let relkind: String = found[0].get(3);
+    Ok(Shape {
+        columns,
+        primary_key,
+        is_table: matches!(relkind.as_str(), "r" | "p"),
+    })
+}
+
+/// ` WHERE (…)` and ` ORDER BY …` for a request; the parts are known columns
+/// and the user's own condition, on its own lines so that a comment in it
+/// can't swallow what follows.
+fn clauses(request: &Request, names: &[&str]) -> Result<String, String> {
+    let mut sql = String::new();
+    if !request.filter.trim().is_empty() {
+        sql.push_str(&format!(" WHERE (\n{}\n)", request.filter.trim()));
+    }
+    if !request.order.is_empty() {
+        let mut parts = Vec::new();
+        for sort in &request.order {
+            if !names.contains(&sort.column.as_str()) {
+                return Err(format!("no column {}", sort.column));
+            }
+            parts.push(format!(
+                "{} {}",
+                quote(&sort.column),
+                if sort.desc { "DESC" } else { "ASC" }
+            ));
+        }
+        sql.push_str(&format!(" ORDER BY {}", parts.join(", ")));
+    }
+    Ok(sql)
+}
+
+fn rows(client: &mut Client, request: &Request) -> Result<Value, String> {
+    // The rows of a query, not of a table.
+    if !request.sql.trim().is_empty() {
+        return result_rows(client, request);
+    }
+    let (schema, table) = (request.schema.as_str(), request.table.as_str());
+    let limit = request.limit.max(1);
+    let shape = shape(client, schema, table)?;
+    let names: Vec<&str> = shape.columns.iter().map(|c| c.name.as_str()).collect();
+    let mut select: Vec<String> = names
         .iter()
         .map(|n| format!("{}::text", quote(n)))
         .collect();
+    // Without a primary key, a row is found again by its place.
+    let keyless = shape.is_table && shape.primary_key.is_empty();
+    if keyless {
+        select.push("ctid::text".to_string());
+    }
     // One more than asked, to know whether there is a next page.
     let sql = format!(
-        "SELECT {} FROM {}.{} LIMIT {} OFFSET {}",
+        "SELECT {} FROM {}.{}{} LIMIT {} OFFSET {}",
         select.join(", "),
         quote(schema),
         quote(table),
+        clauses(request, &names)?,
         limit + 1,
-        offset
+        request.offset
     );
-    let fetched = client.query(&sql, &[]).map_err(clean)?;
+    // What the log shows is the plain query, without the casts to text.
+    let shown = format!(
+        "SELECT * FROM {}.{}{} LIMIT {} OFFSET {}",
+        quote(schema),
+        quote(table),
+        clauses(request, &names)?,
+        limit,
+        request.offset
+    );
+    let started = Instant::now();
+    let fetched = match client.query(&sql, &[]) {
+        Ok(rows) => rows,
+        Err(e) => {
+            let message = clean(e);
+            record(&shown, started, None, Some(message.clone()));
+            return Err(message);
+        }
+    };
+    record(
+        &shown,
+        started,
+        Some(fetched.len().min(limit as usize) as u64),
+        None,
+    );
     let has_more = fetched.len() as u64 > limit;
     let data: Vec<Value> = fetched
         .iter()
@@ -803,14 +1045,521 @@ fn rows(
             )
         })
         .collect();
-    let columns: Vec<Column> = columns
+    let ctids: Vec<String> = if keyless {
+        fetched
+            .iter()
+            .take(limit as usize)
+            .map(|row| row.get::<_, String>(names.len()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let editable = shape.is_table && !request.target.read_only;
+    Ok(json!({
+        "columns": shape.columns,
+        "rows": data,
+        "has_more": has_more,
+        "primary_key": shape.primary_key,
+        "ctids": ctids,
+        "editable": editable,
+    }))
+}
+
+/// The rows of a query, sorted, filtered and paged by wrapping it:
+/// `SELECT * FROM (query) AS "q" …`. When all its columns are columns of one
+/// table, with the names they have there, and its primary key is among them,
+/// the rows can be changed.
+fn result_rows(client: &mut Client, request: &Request) -> Result<Value, String> {
+    let sql = request.sql.trim().trim_end_matches(';').trim().to_string();
+    if !protocol::wrappable(&sql) {
+        return Err("this query cannot be paged".to_string());
+    }
+    let limit = request.limit.max(1);
+    // What the query is made of, without running it.
+    let statement = client.prepare(&sql).map_err(clean)?;
+    let columns: Vec<Column> = statement
+        .columns()
         .iter()
         .map(|c| Column {
-            name: c.get::<_, String>(0),
-            kind: c.get::<_, String>(1),
+            name: c.name().to_string(),
+            kind: c.type_().name().to_string(),
+            nullable: true,
         })
         .collect();
-    Ok(json!({ "columns": columns, "rows": data, "has_more": has_more }))
+    let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+    let wrapped = format!(
+        "SELECT * FROM (\n{sql}\n) AS \"q\"{} LIMIT {} OFFSET {}",
+        clauses(request, &names)?,
+        limit + 1,
+        request.offset
+    );
+    let started = Instant::now();
+    let fetched = match client.simple_query(&wrapped) {
+        Ok(messages) => messages,
+        Err(e) => {
+            let message = clean(e);
+            record(&wrapped, started, None, Some(message.clone()));
+            return Err(message);
+        }
+    };
+    let mut data: Vec<Value> = Vec::new();
+    for message in fetched {
+        if let postgres::SimpleQueryMessage::Row(row) = message {
+            data.push(Value::Array(
+                (0..row.len())
+                    .map(|i| match row.get(i) {
+                        Some(text) => Value::String(text.to_string()),
+                        None => Value::Null,
+                    })
+                    .collect(),
+            ));
+        }
+    }
+    let has_more = data.len() as u64 > limit;
+    data.truncate(limit as usize);
+    record(&wrapped, started, Some(data.len() as u64), None);
+
+    let (primary_key, editable, source) = if request.target.read_only {
+        (Vec::new(), false, None)
+    } else {
+        source_of(client, statement.columns()).unwrap_or_default()
+    };
+    Ok(json!({
+        "columns": columns,
+        "rows": data,
+        "has_more": has_more,
+        "primary_key": primary_key,
+        "editable": editable,
+        "source": source,
+    }))
+}
+
+/// The table all the columns of a query come from, if there is one, they keep
+/// their names, and its primary key is among them: then its primary key, and
+/// `true` for editable.
+fn source_of(
+    client: &mut Client,
+    columns: &[postgres::Column],
+) -> Option<(Vec<String>, bool, Option<protocol::Source>)> {
+    let oid = columns.first()?.table_oid().filter(|oid| *oid != 0)?;
+    if columns.iter().any(|c| c.table_oid() != Some(oid)) {
+        return None;
+    }
+    let found = internal_query(
+        client,
+        "SELECT n.nspname, c.relname, c.relkind::text FROM pg_class c \
+         JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = $1",
+        &[&oid],
+    )
+    .ok()?;
+    let row = found.first()?;
+    let (schema, table, kind): (String, String, String) = (row.get(0), row.get(1), row.get(2));
+    if !matches!(kind.as_str(), "r" | "p") {
+        return None;
+    }
+    // Each column has to be the one of the table it seems to be.
+    let attributes = internal_query(
+        client,
+        "SELECT attnum, attname::text FROM pg_attribute WHERE attrelid = $1 AND attnum > 0",
+        &[&oid],
+    )
+    .ok()?;
+    for column in columns {
+        let id = column.column_id()?;
+        let real = attributes
+            .iter()
+            .find(|a| a.get::<_, i16>(0) == id)
+            .map(|a| a.get::<_, String>(1))?;
+        if real != column.name() {
+            return None;
+        }
+    }
+    let shape = shape(client, &schema, &table).ok()?;
+    let present = |name: &String| columns.iter().any(|c| c.name() == name);
+    if shape.primary_key.is_empty() || !shape.primary_key.iter().all(present) {
+        return None;
+    }
+    Some((
+        shape.primary_key,
+        true,
+        Some(protocol::Source { schema, table }),
+    ))
+}
+
+/// The SQL of a change: a statement and its text parameters. A value is cast
+/// from text to the type of its column, so any type can be given as text.
+fn statement(
+    change: &Change,
+    schema: &str,
+    table: &str,
+    shape: &Shape,
+) -> Result<(String, Vec<Option<String>>), String> {
+    let kind_of = |name: &str| -> Result<&str, String> {
+        shape
+            .columns
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.kind.as_str())
+            .ok_or_else(|| format!("no column {name}"))
+    };
+    let mut params: Vec<Option<String>> = Vec::new();
+    let target = format!("{}.{}", quote(schema), quote(table));
+    // A new row: the columns that were given, the others keep their default.
+    if change.kind == ChangeKind::Insert {
+        let mut columns = Vec::new();
+        let mut values = Vec::new();
+        for (column, value) in &change.set {
+            let kind = kind_of(column)?;
+            columns.push(quote(column));
+            match value {
+                Some(text) => {
+                    params.push(Some(text.clone()));
+                    values.push(format!("(${}::text)::{kind}", params.len()));
+                }
+                None => values.push("NULL".to_string()),
+            }
+        }
+        let sql = if columns.is_empty() {
+            format!("INSERT INTO {target} DEFAULT VALUES")
+        } else {
+            format!(
+                "INSERT INTO {target} ({}) VALUES ({})",
+                columns.join(", "),
+                values.join(", ")
+            )
+        };
+        return Ok((sql, params));
+    }
+    let mut sets = Vec::new();
+    for (column, value) in &change.set {
+        match value {
+            Some(text) => {
+                params.push(Some(text.clone()));
+                let n = params.len();
+                sets.push(format!(
+                    "{} = (${n}::text)::{}",
+                    quote(column),
+                    kind_of(column)?
+                ));
+            }
+            None => {
+                kind_of(column)?;
+                sets.push(format!("{} = NULL", quote(column)));
+            }
+        }
+    }
+    let mut conditions = Vec::new();
+    if shape.primary_key.is_empty() {
+        // No primary key: the row's place, and all it was read with.
+        if change.key.len() != 1 || change.key[0].0 != "ctid" {
+            return Err("the row cannot be found: it has no place to be found by".to_string());
+        }
+        params.push(Some(change.key[0].1.clone()));
+        conditions.push(format!("ctid = (${}::text)::tid", params.len()));
+        for (column, value) in &change.original {
+            kind_of(column)?;
+            match value {
+                Some(text) => {
+                    params.push(Some(text.clone()));
+                    conditions.push(format!(
+                        "{}::text IS NOT DISTINCT FROM ${}::text",
+                        quote(column),
+                        params.len()
+                    ));
+                }
+                None => conditions.push(format!("{} IS NULL", quote(column))),
+            }
+        }
+    } else {
+        // The key must be the table's primary key, whole.
+        let mut key_columns: Vec<&str> = change.key.iter().map(|(c, _)| c.as_str()).collect();
+        key_columns.sort_unstable();
+        let mut expected: Vec<&str> = shape.primary_key.iter().map(String::as_str).collect();
+        expected.sort_unstable();
+        if key_columns != expected {
+            return Err("the row cannot be found: the table has no usable primary key".to_string());
+        }
+        for (column, value) in &change.key {
+            params.push(Some(value.clone()));
+            conditions.push(format!(
+                "{} = (${}::text)::{}",
+                quote(column),
+                params.len(),
+                kind_of(column)?
+            ));
+        }
+    }
+    let sql = match change.kind {
+        ChangeKind::Insert => return Err("a new row has no key".to_string()),
+        ChangeKind::Update => {
+            if sets.is_empty() {
+                return Err("nothing to change".to_string());
+            }
+            format!(
+                "UPDATE {target} SET {} WHERE {}",
+                sets.join(", "),
+                conditions.join(" AND ")
+            )
+        }
+        ChangeKind::Delete => format!("DELETE FROM {target} WHERE {}", conditions.join(" AND ")),
+    };
+    Ok((sql, params))
+}
+
+/// Applies the changes of the request in one transaction: if one fails, or
+/// does not touch exactly one row, none is made.
+fn apply(client: &mut Client, request: &Request) -> Result<Value, String> {
+    let (schema, table) = (request.schema.as_str(), request.table.as_str());
+    let shape = shape(client, schema, table)?;
+    if !shape.is_table {
+        return Err("only the rows of a table can be changed".to_string());
+    }
+    let mut transaction = client.transaction().map_err(clean)?;
+    let mut done = 0u64;
+    for (i, change) in request.changes.iter().enumerate() {
+        let (sql, params) = statement(change, schema, table, &shape)?;
+        let refs: Vec<&(dyn postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|p| p as &(dyn postgres::types::ToSql + Sync))
+            .collect();
+        let shown = protocol::display_change(change, schema, table);
+        let started = Instant::now();
+        let touched = match transaction.execute(&sql, &refs) {
+            Ok(touched) => touched,
+            Err(e) => {
+                let message = clean(e);
+                record(&shown, started, None, Some(message.clone()));
+                return Err(format!("change {}: {message}", i + 1));
+            }
+        };
+        record(&shown, started, Some(touched), None);
+        if touched != 1 {
+            return Err(format!(
+                "change {}: {touched} rows touched instead of 1 (the row was changed or removed by someone else)",
+                i + 1
+            ));
+        }
+        done += touched;
+    }
+    transaction.commit().map_err(clean)?;
+    Ok(json!({ "applied": done }))
+}
+
+/// What a table is made of: its columns with their types, defaults and
+/// comments, its constraints and its indexes, for the table designer.
+fn structure(client: &mut Client, request: &Request) -> Result<Value, String> {
+    let name = format!("{}.{}", quote(&request.schema), quote(&request.table));
+    let columns = internal_query(
+        client,
+        "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod), NOT a.attnotnull, \
+                pg_get_expr(d.adbin, d.adrelid), a.attidentity::text, a.attgenerated::text, \
+                col_description(a.attrelid, a.attnum) \
+         FROM pg_attribute a \
+         LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
+         WHERE a.attrelid = $1::text::regclass AND a.attnum > 0 AND NOT a.attisdropped \
+         ORDER BY a.attnum",
+        &[&name],
+    )
+    .map_err(clean)?;
+    let constraints = internal_query(
+        client,
+        "SELECT conname::text, contype::text, pg_get_constraintdef(oid) \
+         FROM pg_constraint WHERE conrelid = $1::text::regclass ORDER BY contype, conname",
+        &[&name],
+    )
+    .map_err(clean)?;
+    let indexes = internal_query(
+        client,
+        "SELECT ic.relname::text, pg_get_indexdef(i.indexrelid), i.indisunique \
+         FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid \
+         WHERE i.indrelid = $1::text::regclass \
+           AND NOT EXISTS (SELECT 1 FROM pg_constraint c WHERE c.conindid = i.indexrelid) \
+         ORDER BY ic.relname",
+        &[&name],
+    )
+    .map_err(clean)?;
+    let comment = internal_query(
+        client,
+        "SELECT obj_description($1::text::regclass, 'pg_class')",
+        &[&name],
+    )
+    .map_err(clean)?
+    .first()
+    .and_then(|r| r.get::<_, Option<String>>(0))
+    .unwrap_or_default();
+    let referenced_by = internal_query(
+        client,
+        "SELECT c.conname::text, n.nspname::text, r.relname::text, pg_get_constraintdef(c.oid) \
+         FROM pg_constraint c JOIN pg_class r ON r.oid = c.conrelid \
+         JOIN pg_namespace n ON n.oid = r.relnamespace \
+         WHERE c.contype = 'f' AND c.confrelid = $1::text::regclass \
+         ORDER BY n.nspname, r.relname, c.conname",
+        &[&name],
+    )
+    .map_err(clean)?;
+    let structure = protocol::Structure {
+        referenced_by: referenced_by
+            .iter()
+            .map(|r| protocol::Reference {
+                name: r.get(0),
+                schema: r.get(1),
+                table: r.get(2),
+                definition: r.get(3),
+            })
+            .collect(),
+        columns: columns
+            .iter()
+            .map(|r| protocol::ColumnDef {
+                name: r.get(0),
+                kind: r.get(1),
+                nullable: r.get(2),
+                default: r.get(3),
+                identity: r.get(4),
+                generated: !r.get::<_, String>(5).is_empty(),
+                comment: r.get::<_, Option<String>>(6).unwrap_or_default(),
+            })
+            .collect(),
+        constraints: constraints
+            .iter()
+            .map(|r| protocol::ConstraintDef {
+                name: r.get(0),
+                kind: match r.get::<_, String>(1).as_str() {
+                    "p" => protocol::ConstraintKind::Primary,
+                    "u" => protocol::ConstraintKind::Unique,
+                    "f" => protocol::ConstraintKind::Foreign,
+                    "c" => protocol::ConstraintKind::Check,
+                    _ => protocol::ConstraintKind::Other,
+                },
+                definition: r.get(2),
+            })
+            .collect(),
+        indexes: indexes
+            .iter()
+            .map(|r| protocol::IndexDef {
+                name: r.get(0),
+                definition: r.get(1),
+                unique: r.get(2),
+            })
+            .collect(),
+        comment,
+    };
+    Ok(json!({ "structure": structure }))
+}
+
+/// Every column of every table and view of the database, for the completion
+/// (at most a few tens of thousands).
+fn columns(client: &mut Client, request: &Request) -> Result<Value, String> {
+    let rows = internal_query(
+        client,
+        "SELECT n.nspname::text, c.relname::text, a.attname::text, \
+                format_type(a.atttypid, a.atttypmod) \
+         FROM pg_attribute a \
+         JOIN pg_class c ON c.oid = a.attrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE a.attnum > 0 AND NOT a.attisdropped AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
+           AND ($1 OR (n.nspname NOT IN ('pg_catalog', 'information_schema') \
+                       AND n.nspname NOT LIKE 'pg\\_toast%' AND n.nspname NOT LIKE 'pg\\_temp%')) \
+         ORDER BY n.nspname, c.relname, a.attnum LIMIT 30000",
+        &[&request.scope.system_schemas],
+    )
+    .map_err(clean)?;
+    let list: Vec<protocol::TableColumn> = rows
+        .iter()
+        .map(|r| protocol::TableColumn {
+            schema: r.get(0),
+            table: r.get(1),
+            name: r.get(2),
+            kind: r.get(3),
+        })
+        .collect();
+    Ok(json!({ "columns": list }))
+}
+
+/// Runs the statements one after the other, in one session: the rows they
+/// give (up to a limit), or how many rows they touched. Stops at the first
+/// that fails and says which.
+fn query(client: &mut Client, request: &Request) -> Result<Value, String> {
+    let mut results: Vec<QueryResult> = Vec::new();
+    let mut failed: Option<Value> = None;
+    for (index, sql) in request.statements.iter().enumerate() {
+        // What the statement gives, without running it: a reading statement
+        // is left to the tab that pages it.
+        if let Ok(statement) = client.prepare(sql) {
+            if !statement.columns().is_empty() && protocol::wrappable(sql) {
+                results.push(QueryResult {
+                    sql: sql.clone(),
+                    ms: 0,
+                    has_rows: true,
+                    columns: statement
+                        .columns()
+                        .iter()
+                        .map(|c| c.name().to_string())
+                        .collect(),
+                    rows: Vec::new(),
+                    affected: 0,
+                    truncated: false,
+                    deferred: true,
+                });
+                continue;
+            }
+        }
+        let started = Instant::now();
+        let messages = match client.simple_query(sql) {
+            Ok(messages) => messages,
+            Err(e) => {
+                let message = clean(e);
+                record(sql, started, None, Some(message.clone()));
+                failed = Some(json!({ "index": index, "error": message }));
+                break;
+            }
+        };
+        let mut result = QueryResult {
+            sql: sql.clone(),
+            ms: started.elapsed().as_millis() as u64,
+            has_rows: false,
+            columns: Vec::new(),
+            rows: Vec::new(),
+            affected: 0,
+            truncated: false,
+            deferred: false,
+        };
+        let mut seen = 0usize;
+        for message in messages {
+            match message {
+                postgres::SimpleQueryMessage::RowDescription(columns) => {
+                    result.has_rows = true;
+                    result.columns = columns.iter().map(|c| c.name().to_string()).collect();
+                }
+                postgres::SimpleQueryMessage::Row(row) => {
+                    result.has_rows = true;
+                    if result.columns.is_empty() {
+                        result.columns =
+                            row.columns().iter().map(|c| c.name().to_string()).collect();
+                    }
+                    seen += 1;
+                    if result.rows.len() < MAX_RESULT_ROWS {
+                        result.rows.push(
+                            (0..row.len())
+                                .map(|i| row.get(i).map(str::to_string))
+                                .collect(),
+                        );
+                    } else {
+                        result.truncated = true;
+                    }
+                }
+                postgres::SimpleQueryMessage::CommandComplete(n) => result.affected = n,
+                _ => {}
+            }
+        }
+        let count = if result.has_rows {
+            seen as u64
+        } else {
+            result.affected
+        };
+        record(sql, started, Some(count), None);
+        results.push(result);
+    }
+    Ok(json!({ "results": results, "failed": failed }))
 }
 
 #[cfg(test)]

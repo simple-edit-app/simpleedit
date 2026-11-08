@@ -27,10 +27,16 @@ pub struct Group {
 
 /// The files by project: the groups as they first appear, each with its
 /// files in their order.
+#[cfg(test)]
 pub fn groups(files: &[PathBuf], roots: &[PathBuf]) -> Vec<Group> {
+    groups_by(files, |path| project_of(roots, path).cloned())
+}
+
+/// The same, with what groups a file given by `key`.
+pub fn groups_by(files: &[PathBuf], key: impl Fn(&Path) -> Option<PathBuf>) -> Vec<Group> {
     let mut groups: Vec<Group> = Vec::new();
     for (i, path) in files.iter().enumerate() {
-        let project = project_of(roots, path).cloned();
+        let project = key(path);
         match groups.iter_mut().find(|g| g.project == project) {
             Some(group) => group.tabs.push(i),
             None => groups.push(Group {
@@ -120,7 +126,32 @@ pub fn reorder(groups: &[Group], slots: &[Slot], from: usize, to: usize) -> Vec<
 
 impl SimpleEditApp {
     pub(super) fn tab_groups(&self) -> Vec<Group> {
-        groups(self.sidebar.files(), &self.projects.roots)
+        groups_by(self.sidebar.files(), |path| self.tab_key(path))
+    }
+
+    /// What a tab is grouped under: its project, or for the table of a
+    /// database, that database.
+    pub(super) fn tab_key(&self, path: &Path) -> Option<PathBuf> {
+        match self.db_tabs.get(path) {
+            Some(tab) => Some(crate::database::source_root(tab.conn)),
+            None => project_of(&self.projects.roots, path).cloned(),
+        }
+    }
+
+    /// A data source takes a color no other group has, and keeps it.
+    pub(super) fn assign_db_color(&mut self, conn: u64) {
+        let key = crate::database::source_root(conn)
+            .to_string_lossy()
+            .into_owned();
+        if self.config.project_colors.contains_key(&key) {
+            return;
+        }
+        let taken: Vec<usize> = self.config.project_colors.values().copied().collect();
+        let free = (0..COLORS.len())
+            .find(|c| !taken.contains(c))
+            .unwrap_or(conn as usize % COLORS.len());
+        self.config.project_colors.insert(key, free);
+        self.config_dirty = true;
     }
 
     pub(super) fn tab_slots(&self) -> Vec<Slot> {
@@ -195,10 +226,10 @@ impl SimpleEditApp {
         tab: Element<'a, Message>,
         path: &Path,
     ) -> Element<'a, Message> {
-        let Some(root) = project_of(&self.projects.roots, path) else {
+        let Some(root) = self.tab_key(path) else {
             return tab;
         };
-        let color = self.project_color(root);
+        let color = self.project_color(&root);
         stack![
             tab,
             container(Space::new().height(LINE))
@@ -213,10 +244,17 @@ impl SimpleEditApp {
         let p = se_theme::palette(dark);
         let folded = self.folded_tabs.contains(&group.project);
         let name = match &group.project {
-            Some(root) => root
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+            Some(root) => match crate::database::source_id(root) {
+                Some(id) => self
+                    .db
+                    .connection(id)
+                    .map(crate::database::Connection::label)
+                    .unwrap_or_default(),
+                None => root
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            },
             None => t!("tabs.other_files").to_string(),
         };
         let color = group
@@ -262,7 +300,10 @@ impl SimpleEditApp {
             })
             .center_y(height);
         let project = group.project.clone();
-        let close_label = match project {
+        let close_label = match &project {
+            Some(root) if crate::database::source_id(root).is_some() => {
+                t!("db.close_group").to_string()
+            }
             Some(_) => t!("tabs.close_project").to_string(),
             None => t!("tabs.close_other_files").to_string(),
         };

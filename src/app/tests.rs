@@ -24,6 +24,7 @@ mod short_dir_tests {
 #[cfg(test)]
 mod behavior_tests {
     use super::*;
+    use crate::database::Done;
     use text_editor::{Action, Edit};
 
     fn app() -> SimpleEditApp {
@@ -2089,6 +2090,1223 @@ mod behavior_tests {
         assert_eq!(app.current_file, before);
         assert!(app.status_message.contains("no such path"));
     }
+
+    // ---- the Database panel's tables
+
+    /// An app with a table open in a tab and a page of it that can be edited.
+    fn db_app(editable: bool) -> (SimpleEditApp, PathBuf) {
+        use crate::database::protocol::Column;
+        use crate::database::{DbMsg, Dialog, Field, Page};
+        let mut app = app();
+        // The connections are read from a file the other tests write too.
+        app.db.connections.clear();
+        let mut form = Dialog::new();
+        form.set(Field::User, "dev".into());
+        form.set(Field::Password, "secret".into());
+        let id = app.db.apply(&form).unwrap();
+        let _ = app.update(Message::Db(DbMsg::OpenTable(
+            id,
+            "shop".into(),
+            "public".into(),
+            "items".into(),
+        )));
+        let path = app.db_tabs.keys().next().unwrap().clone();
+        let column = |name: &str, kind: &str, nullable: bool| Column {
+            name: name.into(),
+            kind: kind.into(),
+            nullable,
+        };
+        let page = Page {
+            columns: vec![
+                column("id", "integer", false),
+                column("label", "text", true),
+                column("due", "date", true),
+            ],
+            rows: (1..=3)
+                .map(|i| vec![Some(i.to_string()), Some(format!("row {i}")), None])
+                .collect(),
+            has_more: false,
+            primary_key: vec!["id".into()],
+            ctids: Vec::new(),
+            editable,
+            source: None,
+            offset: 0,
+        };
+        let _ = app.update(Message::Db(DbMsg::Rows(path.clone(), Done::ok(page))));
+        (app, path)
+    }
+
+    #[test]
+    fn a_cell_is_typed_in_then_waits_for_the_commit() {
+        use crate::database::DbMsg;
+        let (mut app, path) = db_app(true);
+        let _ = app.update(Message::Db(DbMsg::Edit(path.clone(), 1, 1)));
+        let tab = &app.db_tabs[&path];
+        assert_eq!(tab.editing.as_ref().map(|e| e.text.as_str()), Some("row 2"));
+        let _ = app.update(Message::Db(DbMsg::EditInput(
+            path.clone(),
+            "renamed".into(),
+        )));
+        let _ = app.update(Message::Db(DbMsg::EditCommit(path.clone())));
+        let tab = &app.db_tabs[&path];
+        assert!(tab.editing.is_none());
+        assert!(tab.pending.is_edited(1, 1));
+        assert_eq!(tab.pending.count(), 1);
+        // The page itself is not touched until the database says so.
+        assert_eq!(
+            tab.page.as_ref().unwrap().rows[1][1].as_deref(),
+            Some("row 2")
+        );
+        let _ = app.update(Message::Db(DbMsg::Commit(path.clone())));
+        assert!(app.db_tabs[&path].committing);
+        // It went well: the page is read again, clean.
+        let _ = app.update(Message::Db(DbMsg::Committed(path.clone(), Done::ok(1))));
+        let tab = &app.db_tabs[&path];
+        assert!(tab.pending.is_empty() && !tab.committing);
+    }
+
+    #[test]
+    fn a_failed_commit_keeps_the_changes_and_says_why() {
+        use crate::database::DbMsg;
+        let (mut app, path) = db_app(true);
+        let _ = app.update(Message::Db(DbMsg::DeleteRow(path.clone(), 0)));
+        let _ = app.update(Message::Db(DbMsg::Commit(path.clone())));
+        let _ = app.update(Message::Db(DbMsg::Committed(
+            path.clone(),
+            Done::err("change 1: violates a foreign key"),
+        )));
+        let tab = &app.db_tabs[&path];
+        assert!(!tab.committing);
+        assert!(tab.pending.is_deleted(0));
+        assert_eq!(
+            tab.notice.as_deref(),
+            Some("change 1: violates a foreign key")
+        );
+        // Reverting takes everything back.
+        let _ = app.update(Message::Db(DbMsg::RevertAll(path.clone())));
+        let tab = &app.db_tabs[&path];
+        assert!(tab.pending.is_empty() && tab.notice.is_none());
+    }
+
+    #[test]
+    fn a_page_cannot_be_left_while_changes_wait() {
+        use crate::database::DbMsg;
+        let (mut app, path) = db_app(true);
+        let _ = app.update(Message::Db(DbMsg::DeleteRow(path.clone(), 2)));
+        for message in [
+            DbMsg::Sort(path.clone(), 1),
+            DbMsg::Turn(path.clone(), 1),
+            DbMsg::Refresh(path.clone()),
+            DbMsg::PageSize(path.clone(), 100),
+            DbMsg::ClearFilter(path.clone()),
+        ] {
+            let _ = app.update(Message::Db(message));
+            let tab = &app.db_tabs[&path];
+            assert!(tab.pending.is_deleted(2));
+            assert!(tab.notice.is_some());
+            assert!(tab.order.is_empty() && tab.page_size == 500);
+        }
+        // With nothing pending, a sort goes through.
+        let _ = app.update(Message::Db(DbMsg::RevertAll(path.clone())));
+        let _ = app.update(Message::Db(DbMsg::Sort(path.clone(), 1)));
+        assert_eq!(app.db_tabs[&path].order, vec![("label".to_string(), false)]);
+    }
+
+    #[test]
+    fn the_page_size_and_the_filter_are_applied_and_remembered() {
+        use crate::database::DbMsg;
+        let (mut app, path) = db_app(true);
+        let _ = app.update(Message::Db(DbMsg::PageSize(path.clone(), 100)));
+        assert_eq!(app.db_tabs[&path].page_size, 100);
+        assert_eq!(app.db.page_size, 100);
+        // The tables opened next start with it.
+        let _ = app.update(Message::Db(DbMsg::OpenTable(
+            1,
+            "shop".into(),
+            "public".into(),
+            "other".into(),
+        )));
+        assert!(app
+            .db_tabs
+            .values()
+            .any(|t| t.table == "other" && t.page_size == 100));
+        let _ = app.update(Message::Db(DbMsg::Filter(path.clone(), "  id > 1 ".into())));
+        // Typed, not yet applied.
+        assert_eq!(app.db_tabs[&path].filter, "");
+        let _ = app.update(Message::Db(DbMsg::ApplyFilter(path.clone())));
+        assert_eq!(app.db_tabs[&path].filter, "id > 1");
+        let _ = app.update(Message::Db(DbMsg::ClearFilter(path.clone())));
+        assert!(app.db_tabs[&path].filter.is_empty() && app.db_tabs[&path].filter_text.is_empty());
+    }
+
+    #[test]
+    fn escape_gives_up_the_cell_and_the_date_being_picked() {
+        use crate::database::DbMsg;
+        let (mut app, path) = db_app(true);
+        let _ = app.update(Message::Db(DbMsg::Edit(path.clone(), 0, 1)));
+        assert!(app.db_tabs[&path].editing.is_some());
+        let _ = app.update(Message::EscapePressed);
+        assert!(app.db_tabs[&path].editing.is_none());
+        let _ = app.update(Message::Db(DbMsg::OpenPicker(path.clone(), 0, 2)));
+        assert!(app.db_tabs[&path].picker.is_some());
+        let _ = app.update(Message::EscapePressed);
+        assert!(app.db_tabs[&path].picker.is_none());
+        assert!(app.db_tabs[&path].pending.is_empty());
+    }
+
+    #[test]
+    fn a_date_is_picked_then_becomes_an_edit_and_null_too() {
+        use crate::database::grid::TimePart;
+        use crate::database::DbMsg;
+        let (mut app, path) = db_app(true);
+        // Not a date column: no picker.
+        let _ = app.update(Message::Db(DbMsg::OpenPicker(path.clone(), 0, 1)));
+        assert!(app.db_tabs[&path].picker.is_none());
+        let _ = app.update(Message::Db(DbMsg::OpenPicker(path.clone(), 0, 2)));
+        let _ = app.update(Message::Db(DbMsg::PickerShift(path.clone(), 1)));
+        let _ = app.update(Message::Db(DbMsg::PickerDay(path.clone(), 15)));
+        // A date has no time to type: this is ignored in the value.
+        let _ = app.update(Message::Db(DbMsg::PickerTime(
+            path.clone(),
+            TimePart::Hour,
+            "07".into(),
+        )));
+        let _ = app.update(Message::Db(DbMsg::PickerApply(path.clone())));
+        let tab = &app.db_tabs[&path];
+        assert!(tab.picker.is_none());
+        let value = tab.pending.value(tab.page.as_ref().unwrap(), 0, 2);
+        assert!(value.is_some_and(|v| v.len() == 10 && v.ends_with("-15")));
+        // NULL, on a column that takes it and one that does not.
+        let _ = app.update(Message::Db(DbMsg::SetNull(path.clone(), 1, 1)));
+        assert!(app.db_tabs[&path].pending.is_edited(1, 1));
+        let _ = app.update(Message::Db(DbMsg::SetNull(path.clone(), 1, 0)));
+        assert!(!app.db_tabs[&path].pending.is_edited(1, 0));
+        assert!(app.db_tabs[&path].notice.is_some());
+    }
+
+    #[test]
+    fn a_click_gives_the_focus_to_a_cell_and_moves_it() {
+        use crate::database::DbMsg;
+        let (mut app, path) = db_app(true);
+        assert_eq!(app.db_tabs[&path].selected, None);
+        let _ = app.update(Message::Db(DbMsg::Select(path.clone(), 1, 2)));
+        assert_eq!(app.db_tabs[&path].selected, Some((1, 2)));
+        let _ = app.update(Message::Db(DbMsg::Select(path.clone(), 0, 0)));
+        assert_eq!(app.db_tabs[&path].selected, Some((0, 0)));
+        // Double click types in it, and the focus follows.
+        let _ = app.update(Message::Db(DbMsg::Edit(path.clone(), 2, 1)));
+        assert_eq!(app.db_tabs[&path].selected, Some((2, 1)));
+        // A click on another cell keeps what was typed and leaves the cell.
+        let _ = app.update(Message::Db(DbMsg::EditInput(path.clone(), "typed".into())));
+        let _ = app.update(Message::Db(DbMsg::Select(path.clone(), 0, 1)));
+        let tab = &app.db_tabs[&path];
+        assert!(tab.editing.is_none() && tab.pending.is_edited(2, 1));
+        // The focus is not kept when the page changes.
+        let _ = app.update(Message::Db(DbMsg::RevertAll(path.clone())));
+        assert_eq!(app.db_tabs[&path].selected, Some((0, 1)));
+    }
+
+    #[test]
+    fn the_console_opens_and_takes_the_place_of_the_other_bottom_panels() {
+        use crate::database::DbMsg;
+        let (mut app, _) = db_app(true);
+        assert!(!app.db.console.open);
+        let _ = app.update(Message::Db(DbMsg::ToggleConsole));
+        assert!(app.db.console.open);
+        // The connection to run on is the first one.
+        assert_eq!(
+            app.db.console.connection,
+            app.db.connections.first().map(|c| c.id)
+        );
+        let _ = app.update(Message::ToggleScratch);
+        assert!(app.scratch.open && !app.db.console.open);
+        let _ = app.update(Message::Db(DbMsg::ToggleConsole));
+        assert!(app.db.console.open && !app.scratch.open);
+        let _ = app.update(Message::Db(DbMsg::ToggleConsole));
+        assert!(!app.db.console.open);
+    }
+
+    #[test]
+    fn what_the_driver_ran_goes_to_the_log_and_the_end_is_shown() {
+        use crate::database::{DbMsg, Executed};
+        let (mut app, path) = db_app(true);
+        let executed = vec![
+            Executed {
+                sql: "SELECT * FROM \"public\".\"items\" LIMIT 500 OFFSET 0".into(),
+                ms: 3,
+                rows: Some(3),
+                error: None,
+                internal: false,
+            },
+            Executed {
+                sql: "DELETE FROM t WHERE id = '1'".into(),
+                ms: 1,
+                rows: None,
+                error: Some("violates a foreign key".into()),
+                internal: false,
+            },
+        ];
+        let page = app.db_tabs[&path].page.clone().unwrap();
+        let done = Done {
+            result: Ok(page),
+            executed: executed.clone(),
+        };
+        let _ = app.update(Message::Db(DbMsg::Rows(path.clone(), done)));
+        let log = &app.db.console.log;
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].sql, executed[0].sql);
+        assert_eq!(log[1].error.as_deref(), Some("violates a foreign key"));
+        assert_eq!(log[0].connection, "localhost");
+        // Clearing empties it.
+        let _ = app.update(Message::Db(DbMsg::ClearLog));
+        assert!(app.db.console.log.is_empty());
+    }
+
+    #[test]
+    fn a_select_opens_a_tab_and_the_rest_says_what_it_did() {
+        use crate::database::{DbMsg, Executed, QueryResult, Ran};
+        let (mut app, _) = db_app(true);
+        let conn = app.db.connections[0].id;
+        let select = QueryResult {
+            sql: "SELECT a, b FROM t".into(),
+            ms: 2,
+            has_rows: true,
+            columns: vec!["a".into(), "b".into()],
+            rows: vec![vec![Some("1".into()), None]],
+            affected: 1,
+            truncated: false,
+            deferred: false,
+        };
+        let update = QueryResult {
+            sql: "UPDATE t SET b = 'x'".into(),
+            ms: 1,
+            has_rows: false,
+            columns: vec![],
+            rows: vec![],
+            affected: 3,
+            truncated: false,
+            deferred: false,
+        };
+        let executed = vec![
+            Executed {
+                sql: select.sql.clone(),
+                ms: 2,
+                rows: Some(1),
+                error: None,
+                internal: false,
+            },
+            Executed {
+                sql: update.sql.clone(),
+                ms: 1,
+                rows: Some(3),
+                error: None,
+                internal: false,
+            },
+        ];
+        let tabs_before = app.db_tabs.len();
+        let _ = app.update(Message::Db(DbMsg::Ran(
+            conn,
+            Done {
+                result: Ok(Ran {
+                    results: vec![select, update],
+                    failed: None,
+                }),
+                executed,
+            },
+        )));
+        // One tab, for the select, that cannot be edited and knows its query.
+        assert_eq!(app.db_tabs.len(), tabs_before + 1);
+        let tab = app.db_tabs.values().find(|t| t.query.is_some()).unwrap();
+        assert_eq!(tab.query.as_deref(), Some("SELECT a, b FROM t"));
+        assert!(!tab.editable());
+        assert_eq!(tab.page.as_ref().unwrap().rows.len(), 1);
+        // Both are in the log; the last run went well.
+        assert_eq!(app.db.console.log.len(), 2);
+        assert_eq!(app.db.console.last.as_ref().map(|l| l.0), Some(true));
+        assert!(!app.db.console.running);
+    }
+
+    #[test]
+    fn a_failed_query_shows_the_log_and_says_which_statement() {
+        use crate::database::console::ConsoleTab;
+        use crate::database::{DbMsg, Executed, Ran};
+        let (mut app, _) = db_app(true);
+        let conn = app.db.connections[0].id;
+        app.db.console.tab = ConsoleTab::Queries;
+        let _ = app.update(Message::Db(DbMsg::Ran(
+            conn,
+            Done {
+                result: Ok(Ran {
+                    results: vec![],
+                    failed: Some((1, "syntax error".into())),
+                }),
+                executed: vec![Executed {
+                    sql: "SELEKT 1".into(),
+                    ms: 0,
+                    rows: None,
+                    error: Some("syntax error".into()),
+                    internal: false,
+                }],
+            },
+        )));
+        let (ok, message) = app.db.console.last.clone().unwrap();
+        assert!(!ok && message.contains('2') && message.contains("syntax error"));
+        assert_eq!(app.db.console.tab, ConsoleTab::Log);
+        assert_eq!(app.db.console.log.len(), 1);
+        // No tab came of it.
+        assert!(app.db_tabs.values().all(|t| t.query.is_none()));
+    }
+
+    #[test]
+    fn running_without_a_connection_or_a_query_says_so() {
+        use crate::database::DbMsg;
+        let mut app = app();
+        app.db.connections.clear();
+        let _ = app.update(Message::Db(DbMsg::Run(true)));
+        assert_eq!(app.db.console.last.as_ref().map(|l| l.0), Some(false));
+        assert!(!app.db.console.running);
+        let (mut app, _) = db_app(true);
+        app.db.console.editor = iced::widget::text_editor::Content::with_text("  \n ");
+        let _ = app.update(Message::Db(DbMsg::Run(false)));
+        assert_eq!(app.db.console.last.as_ref().map(|l| l.0), Some(false));
+        assert!(!app.db.console.running);
+        // With something written, it runs.
+        app.db.console.editor = iced::widget::text_editor::Content::with_text("SELECT 1");
+        let _ = app.update(Message::Db(DbMsg::Run(false)));
+        assert!(app.db.console.running);
+    }
+
+    #[test]
+    fn the_arrows_and_tab_move_the_focus_from_cell_to_cell() {
+        let (mut app, path) = db_app(true);
+        let key = |app: &mut SimpleEditApp, k: &str, shift: bool| {
+            app.db_key(k, false, shift, false).is_some()
+        };
+        // From nowhere, the first move starts at the first cell.
+        assert!(key(&mut app, "ArrowDown", false));
+        assert_eq!(app.db_tabs[&path].selected, Some((1, 0)));
+        assert!(key(&mut app, "ArrowRight", false));
+        assert!(key(&mut app, "ArrowRight", false));
+        assert_eq!(app.db_tabs[&path].selected, Some((1, 2)));
+        // The edge holds.
+        assert!(key(&mut app, "ArrowRight", false));
+        assert_eq!(app.db_tabs[&path].selected, Some((1, 2)));
+        // Tab goes on to the next row, Shift+Tab back.
+        assert!(key(&mut app, "Tab", false));
+        assert_eq!(app.db_tabs[&path].selected, Some((2, 0)));
+        assert!(key(&mut app, "Tab", true));
+        assert_eq!(app.db_tabs[&path].selected, Some((1, 2)));
+        assert!(key(&mut app, "Home", false));
+        assert_eq!(app.db_tabs[&path].selected, Some((1, 0)));
+        assert!(key(&mut app, "ArrowUp", false));
+        assert!(key(&mut app, "ArrowUp", false));
+        assert_eq!(app.db_tabs[&path].selected, Some((0, 0)));
+        // F2 types in the cell, Alt+Delete marks the row.
+        assert!(key(&mut app, "F2", false));
+        assert!(app.db_tabs[&path].editing.is_some());
+        // While typing, the keys are the field's.
+        assert!(!key(&mut app, "ArrowRight", false));
+        let _ = app.update(Message::EscapePressed);
+        assert!(app.db_key("Delete", false, false, true).is_some());
+        assert!(app.db_tabs[&path].pending.is_deleted(0));
+        // A key that means nothing here goes on to the rest of the app.
+        assert!(!key(&mut app, "z", false));
+    }
+
+    #[test]
+    fn the_tabs_of_a_database_are_grouped_under_it() {
+        use crate::database::DbMsg;
+        let (mut app, path) = db_app(true);
+        let conn = app.db.connections[0].id;
+        let file = PathBuf::from("/tmp/some_file.txt");
+        app.sidebar.add_file(file.clone());
+        let groups = app.tab_groups();
+        assert_eq!(groups.len(), 2);
+        let db_root = crate::database::source_root(conn);
+        assert_eq!(app.tab_key(&path), Some(db_root.clone()));
+        assert!(groups.iter().any(|g| g.project.as_ref() == Some(&db_root)));
+        // A second table of the same database joins the group.
+        let _ = app.update(Message::Db(DbMsg::OpenTable(
+            conn,
+            "shop".into(),
+            "public".into(),
+            "other".into(),
+        )));
+        let groups = app.tab_groups();
+        let mine = groups
+            .iter()
+            .find(|g| g.project.as_ref() == Some(&db_root))
+            .unwrap();
+        assert_eq!(mine.tabs.len(), 2);
+        // It has a color of its own.
+        assert!(app
+            .config
+            .project_colors
+            .contains_key(&db_root.to_string_lossy().into_owned()));
+    }
+
+    #[test]
+    fn a_reading_query_opens_a_paged_tab_and_one_from_a_table_can_be_edited() {
+        use crate::database::protocol::Source;
+        use crate::database::{DbMsg, Executed, QueryResult, Ran};
+        let (mut app, _) = db_app(true);
+        let conn = app.db.connections[0].id;
+        let select = QueryResult {
+            sql: "SELECT id, label FROM items".into(),
+            ms: 0,
+            has_rows: true,
+            columns: vec!["id".into(), "label".into()],
+            rows: vec![],
+            affected: 0,
+            truncated: false,
+            deferred: true,
+        };
+        let _ = app.update(Message::Db(DbMsg::Ran(
+            conn,
+            Done {
+                result: Ok(Ran {
+                    results: vec![select],
+                    failed: None,
+                }),
+                executed: Vec::<Executed>::new(),
+            },
+        )));
+        let path = app
+            .db_tabs
+            .iter()
+            .find(|(_, t)| t.query.is_some())
+            .map(|(p, _)| p.clone())
+            .unwrap();
+        let tab = &app.db_tabs[&path];
+        assert!(tab.paged && tab.loading);
+        // Its page asks for the query, sorted and filtered like a table.
+        let q = tab.query(0);
+        assert_eq!(q.sql.as_deref(), Some("SELECT id, label FROM items"));
+        assert!(!tab.is_static_result());
+        // The page that comes tells where the rows are from: they can be edited there.
+        let mut page = app
+            .db_tabs
+            .values()
+            .find(|t| t.table == "items")
+            .unwrap()
+            .page
+            .clone()
+            .unwrap();
+        page.source = Some(Source {
+            schema: "public".into(),
+            table: "items".into(),
+        });
+        let _ = app.update(Message::Db(DbMsg::Rows(path.clone(), Done::ok(page))));
+        let tab = &app.db_tabs[&path];
+        assert!(tab.editable());
+        assert_eq!(tab.table_ref().table, "items");
+        assert!(tab.title.starts_with(&t!("db.result").to_string()));
+        // A sort by two columns, stacked with Alt.
+        app.mod_alt = true;
+        let _ = app.update(Message::Db(DbMsg::Sort(path.clone(), 1)));
+        let _ = app.update(Message::Db(DbMsg::Sort(path.clone(), 2)));
+        assert_eq!(app.db_tabs[&path].order.len(), 2);
+    }
+
+    #[test]
+    fn typing_in_the_queries_proposes_tables_then_columns_and_accepts() {
+        use crate::database::protocol::{Database, Kind, Schema, Table, TableColumn};
+        use crate::database::{DbMsg, Tree};
+        use iced::widget::text_editor::{Action, Edit, Motion};
+        let (mut app, _) = db_app(true);
+        let conn = app.db.connections[0].id;
+        app.db.console.connection = Some(conn);
+        app.db.trees.insert(
+            conn,
+            Tree::Loaded(vec![Database {
+                name: "shop".into(),
+                current: true,
+                schemas: vec![Schema {
+                    name: "public".into(),
+                    tables: vec![Table {
+                        name: "items".into(),
+                        kind: Kind::Table,
+                    }],
+                    ..Default::default()
+                }],
+            }]),
+        );
+        let column = |name: &str, kind: &str| TableColumn {
+            schema: "public".into(),
+            table: "items".into(),
+            name: name.into(),
+            kind: kind.into(),
+        };
+        app.db
+            .columns
+            .insert(conn, vec![column("id", "integer"), column("label", "text")]);
+        app.db.console.editor = iced::widget::text_editor::Content::with_text("SELECT * FROM it");
+        app.db
+            .console
+            .editor
+            .perform(Action::Move(Motion::DocumentEnd));
+        // A character typed after FROM: the table comes first.
+        let _ = app.update(Message::Db(DbMsg::Sql(Action::Edit(Edit::Insert('e')))));
+        let completion = app.db.console.completion.as_ref().expect("proposals");
+        assert_eq!(completion.suggestions.items[0].label, "items");
+        assert_eq!(completion.typed, 3);
+        // With one proposal, moving wraps onto itself.
+        let _ = app.update(Message::Db(DbMsg::CompleteMove(-1)));
+        assert_eq!(app.db.console.completion.as_ref().unwrap().selected, 0);
+        // Accepted: what was typed gives way to the table.
+        let _ = app.update(Message::Db(DbMsg::CompleteAccept));
+        assert_eq!(
+            app.db.console.editor.text().trim_end(),
+            "SELECT * FROM items"
+        );
+        assert!(app.db.console.completion.is_none());
+        // Then the columns of the table, after a dot and an alias.
+        app.db.console.editor =
+            iced::widget::text_editor::Content::with_text("SELECT i.la FROM items i");
+        for _ in 0..4 {
+            app.db.console.editor.perform(Action::Move(Motion::Right));
+        }
+        // The caret is after "SELE"; go to the end of "i.la".
+        app.db.console.editor.perform(Action::Move(Motion::Home));
+        for _ in 0..11 {
+            app.db.console.editor.perform(Action::Move(Motion::Right));
+        }
+        let _ = app.update(Message::Db(DbMsg::Sql(Action::Edit(Edit::Backspace))));
+        let _ = app.update(Message::Db(DbMsg::Sql(Action::Edit(Edit::Insert('a')))));
+        let completion = app.db.console.completion.as_ref().expect("columns");
+        assert_eq!(completion.suggestions.items[0].label, "label");
+        // Moving the caret closes the list.
+        let _ = app.update(Message::Db(DbMsg::Sql(Action::Move(Motion::Left))));
+        assert!(app.db.console.completion.is_none());
+        // Ctrl+Space asks for it with nothing typed.
+        app.db.console.editor = iced::widget::text_editor::Content::with_text("SELECT ");
+        app.db
+            .console
+            .editor
+            .perform(Action::Move(Motion::DocumentEnd));
+        let _ = app.update(Message::Db(DbMsg::Complete));
+        assert!(app.db.console.completion.is_some());
+    }
+
+    #[test]
+    fn a_row_is_added_filled_in_and_waits_for_the_commit() {
+        use crate::database::grid::Cell;
+        use crate::database::DbMsg;
+        let (mut app, path) = db_app(true);
+        let _ = app.update(Message::Db(DbMsg::AddRow(path.clone())));
+        let tab = &app.db_tabs[&path];
+        // It comes after the three rows, and the first column that is not the
+        // key is typed in.
+        assert_eq!(tab.pending.inserts.len(), 1);
+        assert_eq!(tab.selected, Some((3, 1)));
+        assert_eq!(tab.editing.as_ref().map(|e| (e.row, e.col)), Some((3, 1)));
+        let _ = app.update(Message::Db(DbMsg::EditInput(path.clone(), "fresh".into())));
+        let _ = app.update(Message::Db(DbMsg::EditCommit(path.clone())));
+        let tab = &app.db_tabs[&path];
+        let page = tab.page.as_ref().unwrap();
+        assert_eq!(tab.pending.cell(page, 3, 1), Cell::Value("fresh"));
+        assert_eq!(tab.pending.cell(page, 3, 0), Cell::Default);
+        // A second one, then NULL in a cell of it and a date by the picker.
+        let _ = app.update(Message::Db(DbMsg::AddRow(path.clone())));
+        let _ = app.update(Message::Db(DbMsg::SetNull(path.clone(), 4, 1)));
+        let _ = app.update(Message::Db(DbMsg::OpenPicker(path.clone(), 4, 2)));
+        let _ = app.update(Message::Db(DbMsg::PickerDay(path.clone(), 9)));
+        let _ = app.update(Message::Db(DbMsg::PickerApply(path.clone())));
+        let tab = &app.db_tabs[&path];
+        let page = tab.page.as_ref().unwrap();
+        assert_eq!(tab.pending.cell(page, 4, 1), Cell::Null);
+        assert!(tab
+            .pending
+            .value(page, 4, 2)
+            .is_some_and(|d| d.ends_with("-09")));
+        assert_eq!(tab.pending.count(), 2);
+        // The commit sends both, as inserts.
+        let changes = tab.pending.changes(page);
+        assert_eq!(changes.len(), 2);
+        assert!(changes
+            .iter()
+            .all(|c| c.kind == crate::database::protocol::ChangeKind::Insert));
+        let _ = app.update(Message::Db(DbMsg::Commit(path.clone())));
+        assert!(app.db_tabs[&path].committing);
+        // A page cannot be left meanwhile.
+        let _ = app.update(Message::Db(DbMsg::Committed(
+            path.clone(),
+            Done::err("change 2: null value in column violates not-null"),
+        )));
+        let tab = &app.db_tabs[&path];
+        assert_eq!(tab.pending.inserts.len(), 2);
+        assert!(tab.notice.is_some());
+        let _ = app.update(Message::Db(DbMsg::Turn(path.clone(), 1)));
+        assert_eq!(app.db_tabs[&path].offset(), 0);
+    }
+
+    #[test]
+    fn a_new_row_can_be_removed_and_reverted_and_walked_to_with_the_keys() {
+        use crate::database::DbMsg;
+        let (mut app, path) = db_app(true);
+        let _ = app.update(Message::Db(DbMsg::AddRow(path.clone())));
+        let _ = app.update(Message::EscapePressed);
+        // The keys go down onto the new row.
+        for _ in 0..3 {
+            assert!(app.db_key("ArrowDown", false, false, false).is_some());
+        }
+        assert_eq!(app.db_tabs[&path].selected.map(|s| s.0), Some(3));
+        assert!(app.db_key("ArrowDown", false, false, false).is_some());
+        assert_eq!(app.db_tabs[&path].selected.map(|s| s.0), Some(3));
+        // Alt+Delete takes the new row out: nothing waits.
+        assert!(app.db_key("Delete", false, false, true).is_some());
+        assert!(app.db_tabs[&path].pending.is_empty());
+        // With a table that cannot be edited, no row is added.
+        let (mut app, path) = db_app(false);
+        let _ = app.update(Message::Db(DbMsg::AddRow(path.clone())));
+        assert!(app.db_tabs[&path].pending.is_empty());
+    }
+
+    #[test]
+    fn an_entry_of_the_log_is_selected_and_copied_with_the_keys_or_the_menu() {
+        use crate::database::console::ConsoleTab;
+        use crate::database::{DbMsg, Executed, LogCopy};
+        let mut app = app();
+        app.db.console.log.clear();
+        app.db.console.push(
+            "shop",
+            &[
+                Executed {
+                    sql: "SELECT 1".into(),
+                    ms: 1,
+                    rows: Some(1),
+                    error: None,
+                    internal: false,
+                },
+                Executed {
+                    sql: "DELETE FROM t".into(),
+                    ms: 2,
+                    rows: None,
+                    error: Some("boom".into()),
+                    internal: false,
+                },
+            ],
+        );
+        app.db.console.open = true;
+        app.db.console.tab = ConsoleTab::Log;
+        // Nothing selected: the copy key is not the log's.
+        assert!(app.db_key("c", true, false, false).is_none());
+        let _ = app.update(Message::Db(DbMsg::SelectLog(1)));
+        assert_eq!(app.db.console.selected_log, Some(1));
+        // Cmd/Ctrl+C now copies it; so does the menu, for each part.
+        assert!(app.db_key("c", true, false, false).is_some());
+        for what in [LogCopy::Sql, LogCopy::Error, LogCopy::Entry] {
+            let _ = app.update(Message::Db(DbMsg::CopyLog(1, what)));
+        }
+        // On the queries, the key is the editor's.
+        app.db.console.tab = ConsoleTab::Queries;
+        assert!(app.db_key("c", true, false, false).is_none());
+        // Clearing forgets the selection.
+        let _ = app.update(Message::Db(DbMsg::ClearLog));
+        assert_eq!(app.db.console.selected_log, None);
+    }
+
+    /// What a successful operation on a table gave.
+    fn altered(
+        what: crate::database::AlterKind,
+        conn: u64,
+        result: Result<(), String>,
+    ) -> crate::database::Altered {
+        use crate::database::Ran;
+        let done = match result {
+            Ok(()) => Done::ok(Ran {
+                results: vec![],
+                failed: None,
+            }),
+            Err(e) => Done::ok(Ran {
+                results: vec![],
+                failed: Some((0, e)),
+            }),
+        };
+        crate::database::Altered {
+            what,
+            conn,
+            database: "shop".into(),
+            schema: "public".into(),
+            table: "items".into(),
+            done,
+        }
+    }
+
+    #[test]
+    fn a_drop_asks_first_then_closes_the_tabs_of_the_table_and_says_when_it_fails() {
+        use crate::database::{AlterKind, ConfirmAction, DbMsg, Kind};
+        let (mut app, path) = db_app(true);
+        let conn = app.db.connections[0].id;
+        let _ = app.update(Message::Db(DbMsg::AskDrop(
+            conn,
+            "shop".into(),
+            "public".into(),
+            "items".into(),
+            Kind::Table,
+        )));
+        let confirm = app.db.confirm.as_ref().unwrap();
+        assert_eq!(confirm.action, ConfirmAction::Drop);
+        assert_eq!(confirm.statement(), "DROP TABLE \"public\".\"items\"");
+        // Nothing is run before the yes; a view is dropped as a view.
+        assert!(!confirm.running);
+        let _ = app.update(Message::Db(DbMsg::ConfirmCascade(true)));
+        assert!(app
+            .db
+            .confirm
+            .as_ref()
+            .unwrap()
+            .statement()
+            .ends_with("CASCADE"));
+        let _ = app.update(Message::Db(DbMsg::ConfirmRun));
+        assert!(app.db.confirm.as_ref().unwrap().running);
+        // A refusal of the database stays on the question.
+        let _ = app.update(Message::Db(DbMsg::Altered(Box::new(altered(
+            AlterKind::Drop,
+            conn,
+            Err("cannot drop: other objects depend on it".into()),
+        )))));
+        let confirm = app.db.confirm.as_ref().unwrap();
+        assert!(!confirm.running);
+        assert_eq!(
+            confirm.error.as_deref(),
+            Some("cannot drop: other objects depend on it")
+        );
+        assert!(app.db_tabs.contains_key(&path));
+        // It went: the question goes, and so do the tabs of the table.
+        let _ = app.update(Message::Db(DbMsg::ConfirmRun));
+        let _ = app.update(Message::Db(DbMsg::Altered(Box::new(altered(
+            AlterKind::Drop,
+            conn,
+            Ok(()),
+        )))));
+        assert!(app.db.confirm.is_none());
+        assert!(!app.db_tabs.contains_key(&path));
+        let view = Kind::View;
+        let _ = app.update(Message::Db(DbMsg::AskDrop(
+            conn,
+            "shop".into(),
+            "public".into(),
+            "v".into(),
+            view,
+        )));
+        assert!(app
+            .db
+            .confirm
+            .as_ref()
+            .unwrap()
+            .statement()
+            .starts_with("DROP VIEW"));
+        // Escape gives the question up.
+        let _ = app.update(Message::EscapePressed);
+        assert!(app.db.confirm.is_none());
+    }
+
+    #[test]
+    fn deleting_all_the_rows_asks_first_and_keeps_the_tabs_which_read_again() {
+        use crate::database::{AlterKind, DbMsg};
+        let (mut app, path) = db_app(true);
+        let conn = app.db.connections[0].id;
+        let _ = app.update(Message::Db(DbMsg::AskEmpty(
+            conn,
+            "shop".into(),
+            "public".into(),
+            "items".into(),
+        )));
+        assert_eq!(
+            app.db.confirm.as_ref().unwrap().statement(),
+            "DELETE FROM \"public\".\"items\""
+        );
+        let _ = app.update(Message::Db(DbMsg::ConfirmRun));
+        let _ = app.update(Message::Db(DbMsg::Altered(Box::new(altered(
+            AlterKind::Empty,
+            conn,
+            Ok(()),
+        )))));
+        assert!(app.db.confirm.is_none());
+        // The table is still there, being read again.
+        assert!(app.db_tabs[&path].loading);
+    }
+
+    #[test]
+    fn a_data_source_is_deleted_on_the_second_click() {
+        use crate::database::DbMsg;
+        let (mut app, _path) = db_app(true);
+        let id = app.db.connections[0].id;
+        let _ = app.update(Message::Db(DbMsg::OpenDialog(Some(id))));
+        let _ = app.update(Message::Db(DbMsg::Delete));
+        assert!(app.db.connection(id).is_some());
+        assert!(app.db.dialog.as_ref().unwrap().confirm_delete);
+        let _ = app.update(Message::Db(DbMsg::Delete));
+        assert!(app.db.connection(id).is_none());
+        assert!(app.db.dialog.is_none());
+    }
+
+    fn orders_structure() -> crate::database::protocol::Structure {
+        use crate::database::protocol::{
+            ColumnDef, ConstraintDef, ConstraintKind, Reference, Structure,
+        };
+        let column = |name: &str, kind: &str| ColumnDef {
+            name: name.into(),
+            kind: kind.into(),
+            nullable: true,
+            default: None,
+            identity: String::new(),
+            generated: false,
+            comment: String::new(),
+        };
+        Structure {
+            columns: vec![column("id", "integer"), column("label", "text")],
+            constraints: vec![ConstraintDef {
+                name: "items_pkey".into(),
+                kind: ConstraintKind::Primary,
+                definition: "PRIMARY KEY (id)".into(),
+            }],
+            referenced_by: vec![Reference {
+                name: "lines_item_fkey".into(),
+                schema: "public".into(),
+                table: "lines".into(),
+                definition: "FOREIGN KEY (item_id) REFERENCES items(id)".into(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_table_of_the_tree_opens_to_its_structure_and_shows_its_ddl() {
+        use crate::database::{DbMsg, Done};
+        let (mut app, path) = db_app(true);
+        let conn = app.db.connections[0].id;
+        let key = (
+            conn,
+            "shop".to_string(),
+            "public".to_string(),
+            "items".to_string(),
+        );
+        // Opening the node reads the structure; it is kept.
+        let _ = app.update(Message::Db(DbMsg::ToggleTable(
+            conn,
+            "shop".into(),
+            "public".into(),
+            "items".into(),
+        )));
+        assert!(app.db.open.contains(&format!("{conn}/shop/public/items")));
+        let _ = app.update(Message::Db(DbMsg::StructureRead(
+            key.clone(),
+            false,
+            Done::ok(orders_structure()),
+        )));
+        assert!(app.db.structures.contains_key(&key));
+        // The tab of the table learns it too, for the links of its rows.
+        assert!(app.db_tabs[&path].structure.is_some());
+        // The DDL comes from what is kept.
+        let _ = app.update(Message::Db(DbMsg::ShowDdl(
+            conn,
+            "shop".into(),
+            "public".into(),
+            "items".into(),
+        )));
+        let text = app.db.text.as_ref().unwrap();
+        assert_eq!(text.title, "items");
+        assert!(text.text.starts_with("CREATE TABLE \"public\".\"items\" ("));
+        assert!(text
+            .text
+            .contains("CONSTRAINT \"items_pkey\" PRIMARY KEY (id)"));
+        let _ = app.update(Message::Db(DbMsg::TextClose));
+        assert!(app.db.text.is_none());
+        // Folding it again.
+        let _ = app.update(Message::Db(DbMsg::ToggleTable(
+            conn,
+            "shop".into(),
+            "public".into(),
+            "items".into(),
+        )));
+        assert!(!app.db.open.contains(&format!("{conn}/shop/public/items")));
+        // A reload forgets what the tables were made of.
+        let _ = app.update(Message::Db(DbMsg::Reload(conn)));
+        assert!(app.db.structures.is_empty());
+        // The filter of the tree is kept as it is typed.
+        let _ = app.update(Message::Db(DbMsg::TreeFilter("it".into())));
+        assert_eq!(app.db.tree_filter, "it");
+    }
+
+    #[test]
+    fn a_value_is_shown_whole_and_json_is_indented() {
+        use crate::database::DbMsg;
+        let (mut app, path) = db_app(true);
+        let _ = app.update(Message::Db(DbMsg::ViewValue(path.clone(), 0, 1)));
+        let view = app.db.text.as_ref().unwrap();
+        assert_eq!(view.title, "label");
+        assert_eq!(
+            view.text,
+            app.db_tabs[&path].page.as_ref().unwrap().rows[0][1]
+                .clone()
+                .unwrap()
+        );
+        let _ = app.update(Message::Db(DbMsg::TextClose));
+        let tab = app.db_tabs.get_mut(&path).unwrap();
+        let page = tab.page.clone().unwrap();
+        tab.pending
+            .edits
+            .insert((0, 1), Some("{\"a\":1}".to_string()));
+        let _ = page;
+        let _ = app.update(Message::Db(DbMsg::ViewValue(path, 0, 1)));
+        assert_eq!(app.db.text.as_ref().unwrap().text, "{\n  \"a\": 1\n}");
+    }
+
+    #[test]
+    fn a_column_is_dragged_to_a_width_that_a_new_page_keeps() {
+        use crate::database::DbMsg;
+        let (mut app, path) = db_app(true);
+        let before = app.db_tabs[&path].widths[1];
+        let _ = app.update(Message::Db(DbMsg::ResizeStart(path.clone(), 1)));
+        // The first move is where the pointer was; the next ones are the drag.
+        let _ = app.update(Message::Db(DbMsg::ResizeMove(300.0)));
+        let _ = app.update(Message::Db(DbMsg::ResizeMove(350.0)));
+        assert!((app.db_tabs[&path].widths[1] - (before + 50.0)).abs() < 0.01);
+        let _ = app.update(Message::Db(DbMsg::ResizeMove(-5000.0)));
+        assert_eq!(app.db_tabs[&path].widths[1], 40.0);
+        let _ = app.update(Message::Db(DbMsg::ResizeEnd));
+        assert!(app.db.resizing.is_none());
+        // Another page of the table keeps it.
+        let tab = app.db_tabs.get_mut(&path).unwrap();
+        let page = tab.page.clone().unwrap();
+        tab.set_page(page);
+        assert_eq!(tab.widths[1], 40.0);
+    }
+
+    #[test]
+    fn the_rows_a_row_is_linked_to_open_with_a_condition() {
+        use crate::database::DbMsg;
+        let (mut app, path) = db_app(true);
+        let conn = app.db.connections[0].id;
+        // Another table, a condition on it.
+        let _ = app.update(Message::Db(DbMsg::OpenRelated(
+            conn,
+            "shop".into(),
+            "public".into(),
+            "lines".into(),
+            "\"item_id\" = '7'".into(),
+        )));
+        let opened = app
+            .db_tabs
+            .iter()
+            .find(|(_, t)| t.table == "lines")
+            .map(|(_, t)| t)
+            .unwrap();
+        assert_eq!(opened.filter, "\"item_id\" = '7'");
+        assert_eq!(opened.filter_text, "\"item_id\" = '7'");
+        // The table that is already open gets the condition.
+        let _ = app.update(Message::Db(DbMsg::OpenRelated(
+            conn,
+            "shop".into(),
+            "public".into(),
+            "items".into(),
+            "\"id\" = '3'".into(),
+        )));
+        assert_eq!(app.db_tabs[&path].filter, "\"id\" = '3'");
+        assert_eq!(app.db_tabs.len(), 2);
+    }
+
+    #[test]
+    fn a_schema_is_named_then_created_or_refused() {
+        use crate::database::{AlterKind, Altered, DbMsg, Done, Ran};
+        let (mut app, _path) = db_app(true);
+        let conn = app.db.connections[0].id;
+        let _ = app.update(Message::Db(DbMsg::NewSchema(conn, "shop".into())));
+        // Nothing is run without a name.
+        let _ = app.update(Message::Db(DbMsg::SchemaCreate));
+        assert!(!app.db.new_schema.as_ref().unwrap().running);
+        let _ = app.update(Message::Db(DbMsg::SchemaName("sales".into())));
+        let _ = app.update(Message::Db(DbMsg::SchemaCreate));
+        assert!(app.db.new_schema.as_ref().unwrap().running);
+        let altered = |done| {
+            Message::Db(DbMsg::Altered(Box::new(Altered {
+                what: AlterKind::Schema,
+                conn,
+                database: "shop".into(),
+                schema: "sales".into(),
+                table: String::new(),
+                done,
+            })))
+        };
+        let _ = app.update(altered(Done::failed("already exists".to_string())));
+        let n = app.db.new_schema.as_ref().unwrap();
+        assert!(!n.running);
+        assert_eq!(n.error.as_deref(), Some("already exists"));
+        let _ = app.update(Message::Db(DbMsg::SchemaCreate));
+        let _ = app.update(altered(Done::ok(Ran {
+            results: vec![],
+            failed: None,
+        })));
+        assert!(app.db.new_schema.is_none());
+    }
+
+    #[test]
+    fn a_new_table_starts_with_an_id_and_is_made_by_the_designer() {
+        use crate::database::{DbMsg, DesignerMsg};
+        let (mut app, _path) = db_app(true);
+        let conn = app.db.connections[0].id;
+        let _ = app.update(Message::Db(DbMsg::NewTable(
+            conn,
+            "shop".into(),
+            "sales".into(),
+        )));
+        let d = app.db.designer.as_ref().unwrap();
+        assert!(d.creating);
+        assert_eq!(d.schema_to, "sales");
+        // It needs a name first.
+        assert!(d.problem().is_some());
+        let _ = app.update(Message::Db(DbMsg::Designer(DesignerMsg::TableName(
+            "orders".into(),
+        ))));
+        let d = app.db.designer.as_ref().unwrap();
+        assert_eq!(d.problem(), None);
+        assert!(d.statements()[0].starts_with("CREATE TABLE \"sales\".\"orders\""));
+        let _ = app.update(Message::Db(DbMsg::Designer(DesignerMsg::Apply)));
+        assert_eq!(
+            app.db.designer.as_ref().unwrap().load,
+            crate::database::designer::Load::Running
+        );
+    }
+
+    #[test]
+    fn a_running_query_is_stopped() {
+        use crate::database::DbMsg;
+        let (mut app, _path) = db_app(true);
+        app.db.console.running = true;
+        let _ = app.update(Message::Db(DbMsg::Cancel));
+        assert!(!app.db.console.running);
+        assert_eq!(app.db.console.last.as_ref().map(|l| l.0), Some(false));
+    }
+
+    #[test]
+    fn the_designer_opens_loads_is_edited_and_applied_in_one_transaction() {
+        use crate::database::designer::{DesignerTab, Load};
+        use crate::database::protocol::{ColumnDef, ConstraintDef, ConstraintKind, Structure};
+        use crate::database::{AlterKind, ColField, DbMsg, DesignerMsg};
+        let (mut app, path) = db_app(true);
+        let conn = app.db.connections[0].id;
+        let _ = app.update(Message::Db(DbMsg::OpenDesigner(
+            conn,
+            "shop".into(),
+            "public".into(),
+            "items".into(),
+        )));
+        assert_eq!(app.db.designer.as_ref().unwrap().load, Load::Loading);
+        let column = |name: &str, kind: &str| ColumnDef {
+            name: name.into(),
+            kind: kind.into(),
+            nullable: true,
+            default: None,
+            identity: String::new(),
+            generated: false,
+            comment: String::new(),
+        };
+        let structure = Structure {
+            columns: vec![column("id", "integer"), column("label", "text")],
+            constraints: vec![ConstraintDef {
+                name: "items_pkey".into(),
+                kind: ConstraintKind::Primary,
+                definition: "PRIMARY KEY (id)".into(),
+            }],
+            indexes: vec![],
+            comment: String::new(),
+            ..Default::default()
+        };
+        let _ = app.update(Message::Db(DbMsg::Designer(DesignerMsg::Loaded(Done::ok(
+            structure,
+        )))));
+        assert_eq!(app.db.designer.as_ref().unwrap().load, Load::Ready);
+        // Nothing changed: nothing to apply.
+        let _ = app.update(Message::Db(DbMsg::Designer(DesignerMsg::Apply)));
+        assert_eq!(app.db.designer.as_ref().unwrap().load, Load::Ready);
+        // Edits: a rename, a new column, a dropped one, a new table name.
+        let say = |app: &mut SimpleEditApp, m: DesignerMsg| {
+            let _ = app.update(Message::Db(DbMsg::Designer(m)));
+        };
+        say(
+            &mut app,
+            DesignerMsg::Col(1, ColField::Name, "title".into()),
+        );
+        say(&mut app, DesignerMsg::ColAdd);
+        say(&mut app, DesignerMsg::Col(2, ColField::Name, "note".into()));
+        say(&mut app, DesignerMsg::ColDrop(0, true));
+        say(&mut app, DesignerMsg::ColDrop(0, false));
+        say(&mut app, DesignerMsg::TableName("things".into()));
+        say(&mut app, DesignerMsg::Tab(DesignerTab::Sql));
+        let d = app.db.designer.as_ref().unwrap();
+        assert_eq!(d.tab, DesignerTab::Sql);
+        assert_eq!(d.statements().len(), 3);
+        assert_eq!(d.problem(), None);
+        // A column that is new is removed, not marked.
+        say(&mut app, DesignerMsg::ColAdd);
+        assert_eq!(app.db.designer.as_ref().unwrap().columns.len(), 4);
+        say(&mut app, DesignerMsg::ColDrop(3, true));
+        assert_eq!(app.db.designer.as_ref().unwrap().columns.len(), 3);
+        // A problem stops the apply.
+        say(&mut app, DesignerMsg::Col(1, ColField::Name, String::new()));
+        say(&mut app, DesignerMsg::Apply);
+        assert_eq!(app.db.designer.as_ref().unwrap().load, Load::Ready);
+        say(
+            &mut app,
+            DesignerMsg::Col(1, ColField::Name, "title".into()),
+        );
+        // Applied: it runs, and a refusal stays on the designer with its reason.
+        say(&mut app, DesignerMsg::Apply);
+        assert_eq!(app.db.designer.as_ref().unwrap().load, Load::Running);
+        let _ = app.update(Message::Db(DbMsg::Altered(Box::new(altered(
+            AlterKind::Modify(Some("things".into())),
+            conn,
+            Err("column \"note\" already exists".into()),
+        )))));
+        let d = app.db.designer.as_ref().unwrap();
+        assert_eq!(d.load, Load::Ready);
+        assert_eq!(d.error.as_deref(), Some("column \"note\" already exists"));
+        assert!(app.db_tabs.contains_key(&path));
+        // Then it goes: the designer closes, the tabs of the renamed table too.
+        say(&mut app, DesignerMsg::Apply);
+        let _ = app.update(Message::Db(DbMsg::Altered(Box::new(altered(
+            AlterKind::Modify(Some("things".into())),
+            conn,
+            Ok(()),
+        )))));
+        assert!(app.db.designer.is_none());
+        assert!(!app.db_tabs.contains_key(&path));
+        // Escape closes a designer that is not running.
+        let _ = app.update(Message::Db(DbMsg::OpenDesigner(
+            conn,
+            "shop".into(),
+            "public".into(),
+            "items".into(),
+        )));
+        let _ = app.update(Message::EscapePressed);
+        assert!(app.db.designer.is_none());
+    }
+
+    #[test]
+    fn a_table_that_cannot_be_edited_refuses_everything() {
+        use crate::database::DbMsg;
+        let (mut app, path) = db_app(false);
+        let _ = app.update(Message::Db(DbMsg::Edit(path.clone(), 0, 1)));
+        let _ = app.update(Message::Db(DbMsg::DeleteRow(path.clone(), 0)));
+        let _ = app.update(Message::Db(DbMsg::SetNull(path.clone(), 0, 1)));
+        let _ = app.update(Message::Db(DbMsg::OpenPicker(path.clone(), 0, 2)));
+        let tab = &app.db_tabs[&path];
+        assert!(tab.editing.is_none() && tab.picker.is_none() && tab.pending.is_empty());
+    }
+
+    #[test]
+    fn a_deleted_row_cannot_be_typed_in() {
+        use crate::database::DbMsg;
+        let (mut app, path) = db_app(true);
+        let _ = app.update(Message::Db(DbMsg::DeleteRow(path.clone(), 1)));
+        let _ = app.update(Message::Db(DbMsg::Edit(path.clone(), 1, 1)));
+        assert!(app.db_tabs[&path].editing.is_none());
+        let _ = app.update(Message::Db(DbMsg::RevertRow(path.clone(), 1)));
+        let _ = app.update(Message::Db(DbMsg::Edit(path.clone(), 1, 1)));
+        assert!(app.db_tabs[&path].editing.is_some());
+    }
 }
 
 /// Draws the window to a PNG, to look at the design without a screen:
@@ -2096,6 +3314,7 @@ mod behavior_tests {
 #[cfg(test)]
 mod look_tests {
     use super::*;
+    use crate::database::Done;
 
     #[test]
     #[ignore]
@@ -2180,10 +3399,12 @@ mod look_tests {
                                 kind: Kind::Table,
                             },
                         ],
+                        ..Default::default()
                     },
                     Schema {
                         name: "sales".into(),
                         tables: vec![],
+                        ..Default::default()
                     },
                 ],
             }]),
@@ -2218,20 +3439,43 @@ mod look_tests {
             })
             .collect();
         let _ = app.update(Message::Db(DbMsg::Rows(
-            path,
-            Ok(Page {
+            path.clone(),
+            Done::ok(Page {
                 columns: columns
                     .iter()
-                    .map(|(n, k)| Column {
+                    .enumerate()
+                    .map(|(i, (n, k))| Column {
                         name: n.to_string(),
                         kind: k.to_string(),
+                        nullable: i != 0,
                     })
                     .collect(),
                 rows,
                 has_more: true,
+                primary_key: vec!["id".into()],
+                ctids: Vec::new(),
+                editable: true,
+                source: None,
                 offset: 0,
             }),
         )));
+        // Something waits for Commit: an edit, a NULL, a deleted row, a sort.
+        if let Some(tab) = app.db_tabs.get_mut(&path) {
+            let page = tab.page.clone().unwrap();
+            tab.pending
+                .set(&page, 1, 1, Some("Client 2 (renamed)".into()));
+            tab.pending.set(&page, 2, 2, None);
+            tab.pending.delete(&page, 4);
+            tab.order = vec![("score".into(), true)];
+            tab.filter = "score > 3".into();
+            tab.filter_text = "score > 3".into();
+            tab.notice = Some("change 1: invalid input syntax for type date".into());
+            // Two rows added, one of them filled in.
+            let first = tab.pending.add_row(&page);
+            tab.pending.set(&page, first, 1, Some("Client 61".into()));
+            tab.pending.set(&page, first, 2, None);
+            tab.pending.add_row(&page);
+        }
         let theme = if app.config.dark_mode {
             se_theme::ink_dark()
         } else {
@@ -2244,12 +3488,291 @@ mod look_tests {
         };
         let shoot = |app: &SimpleEditApp, name: &str| {
             let file = format!("{out}-{name}-wgpu.png");
-            let _ = std::fs::remove_file(&file);
+            // The renderer adds its own suffix to the name.
+            let _ = std::fs::remove_file(format!("{out}-{name}-wgpu-wgpu.png"));
             let mut ui =
                 iced_test::Simulator::with_size(settings.clone(), (1280.0, 800.0), app.view());
             assert!(ui.snapshot(&theme).unwrap().matches_image(&file).unwrap());
         };
+        if let Some(tab) = app.db_tabs.get_mut(&path) {
+            tab.selected = Some((3, 1));
+        }
         shoot(&app, "table");
+        if let Some(tab) = app.db_tabs.get_mut(&path) {
+            tab.picker = Some(crate::database::grid::Picker::new(
+                1,
+                3,
+                crate::database::grid::PickKind::DateTime,
+                Some("2026-11-07 20:30:14"),
+            ));
+        }
+        shoot(&app, "picker");
+        if let Some(tab) = app.db_tabs.get_mut(&path) {
+            tab.picker = None;
+        }
+
+        // The console: the log of what was run, then the queries.
+        let _ = app.update(Message::Db(DbMsg::ToggleConsole));
+        app.db.console.push(
+            "shop@localhost",
+            &[
+                crate::database::Executed {
+                    sql: "SELECT * FROM \"public\".\"customers\" ORDER BY \"score\" DESC LIMIT 500 OFFSET 0".into(),
+                    ms: 4,
+                    rows: Some(500),
+                    error: None,
+                    internal: false,
+                },
+                crate::database::Executed {
+                    sql: "UPDATE \"public\".\"customers\" SET \"name\" = 'Client 2 (renamed)' WHERE \"id\" = '2'".into(),
+                    ms: 1,
+                    rows: Some(1),
+                    error: None,
+                    internal: false,
+                },
+                crate::database::Executed {
+                    sql: "DELETE FROM \"public\".\"customers\" WHERE \"id\" = '5'".into(),
+                    ms: 2,
+                    rows: None,
+                    error: Some("update or delete on table \"customers\" violates foreign key constraint".into()),
+                    internal: false,
+                },
+            ],
+        );
+        app.db.console.tab = crate::database::console::ConsoleTab::Log;
+        app.db.console.selected_log = Some(1);
+        shoot(&app, "log");
+        app.db.console.tab = crate::database::console::ConsoleTab::Queries;
+        app.db.console.editor = iced::widget::text_editor::Content::with_text(
+            "SELECT id, name, email\nFROM customers\nWHERE score > 10\nORDER BY score DESC;\n\nUPDATE customers SET email = NULL WHERE id = 5;",
+        );
+        // The caret in the second statement: that one is framed.
+        for _ in 0..5 {
+            app.db
+                .console
+                .editor
+                .perform(iced::widget::text_editor::Action::Move(
+                    iced::widget::text_editor::Motion::Down,
+                ));
+        }
+        app.db.console.last = Some((true, "2 statements run in 5 ms.".into()));
+        app.db.driver = crate::database::Driver::Ready;
+        shoot(&app, "queries");
+        // The proposals under the word being typed.
+        {
+            use crate::database::completion::{Item, ItemKind, Suggestions};
+            let item = |label: &str, detail: &str, kind: ItemKind| Item {
+                label: label.into(),
+                insert: label.into(),
+                detail: detail.into(),
+                kind,
+            };
+            app.db.console.editor = iced::widget::text_editor::Content::with_text(
+                "SELECT id, name, email\nFROM customers c\nWHERE c.na",
+            );
+            app.db.console.completion = Some(crate::database::console::Completion {
+                suggestions: Suggestions {
+                    start: 0,
+                    items: vec![
+                        item("name", "customers · text", ItemKind::Column),
+                        item("created", "customers · timestamp", ItemKind::Column),
+                        item("NATURAL", "", ItemKind::Keyword),
+                        item("customer_names", "public", ItemKind::View),
+                        item("count", "", ItemKind::Function),
+                    ],
+                },
+                selected: 0,
+                line: 2,
+                column: 8,
+                typed: 2,
+            });
+        }
+        shoot(&app, "completion");
+        app.db.console.completion = None;
+        // The table designer, and the question before a drop.
+        {
+            use crate::database::designer::Designer;
+            use crate::database::protocol::{
+                ColumnDef, ConstraintDef, ConstraintKind, IndexDef, Structure,
+            };
+            let column =
+                |name: &str, kind: &str, nullable: bool, default: Option<&str>| ColumnDef {
+                    name: name.into(),
+                    kind: kind.into(),
+                    nullable,
+                    default: default.map(String::from),
+                    identity: String::new(),
+                    generated: false,
+                    comment: String::new(),
+                };
+            let mut d = Designer::new(1, "shop".into(), "public".into(), "customers".into());
+            d.load(Structure {
+                columns: vec![
+                    column(
+                        "id",
+                        "integer",
+                        false,
+                        Some("nextval('customers_id_seq'::regclass)"),
+                    ),
+                    column("name", "text", false, None),
+                    column("email", "text", true, None),
+                    column("score", "numeric(8,2)", true, Some("0")),
+                ],
+                constraints: vec![
+                    ConstraintDef {
+                        name: "customers_pkey".into(),
+                        kind: ConstraintKind::Primary,
+                        definition: "PRIMARY KEY (id)".into(),
+                    },
+                    ConstraintDef {
+                        name: "customers_score_check".into(),
+                        kind: ConstraintKind::Check,
+                        definition: "CHECK ((score >= (0)::numeric))".into(),
+                    },
+                ],
+                indexes: vec![IndexDef {
+                    name: "customers_email_idx".into(),
+                    definition:
+                        "CREATE INDEX customers_email_idx ON public.customers USING btree (email)"
+                            .into(),
+                    unique: false,
+                }],
+                comment: String::new(),
+                ..Default::default()
+            });
+            d.columns[2].name = "mail".into();
+            d.columns[3].dropped = true;
+            d.add_column();
+            let n = d.columns.last_mut().unwrap();
+            n.name = "created".into();
+            n.kind = "timestamptz".into();
+            n.default = "now()".into();
+            d.add_constraint(ConstraintKind::Foreign);
+            let f = d.constraints.last_mut().unwrap();
+            f.columns = "id".into();
+            f.reference = "public.accounts".into();
+            f.on_delete = "CASCADE".into();
+            d.constraints[1].dropped = true;
+            app.db.designer = Some(d);
+        }
+        shoot(&app, "designer-columns");
+        if let Some(d) = app.db.designer.as_mut() {
+            d.tab = crate::database::designer::DesignerTab::Constraints;
+        }
+        shoot(&app, "designer-constraints");
+        if let Some(d) = app.db.designer.as_mut() {
+            d.tab = crate::database::designer::DesignerTab::Sql;
+        }
+        shoot(&app, "designer-sql");
+        app.db.designer = None;
+        app.db.confirm = Some(crate::database::Confirm {
+            conn: 1,
+            database: "shop".into(),
+            schema: "public".into(),
+            table: "customers".into(),
+            kind: crate::database::Kind::Table,
+            action: crate::database::ConfirmAction::Drop,
+            cascade: false,
+            running: false,
+            error: Some("cannot drop table customers because other objects depend on it".into()),
+        });
+        shoot(&app, "confirm");
+        app.db.confirm = None;
+
+        // The tree with a table opened to its structure, the folders of the
+        // schema, the filter; the DDL; a new table; a new schema.
+        {
+            use crate::database::protocol::{ColumnDef, ConstraintDef, ConstraintKind, IndexDef};
+            let col = |name: &str, kind: &str, nullable: bool| ColumnDef {
+                name: name.into(),
+                kind: kind.into(),
+                nullable,
+                default: None,
+                identity: String::new(),
+                generated: false,
+                comment: String::new(),
+            };
+            let structure = crate::database::protocol::Structure {
+                columns: vec![
+                    col("id", "integer", false),
+                    col("name", "text", false),
+                    col("account_id", "integer", true),
+                ],
+                constraints: vec![
+                    ConstraintDef {
+                        name: "customers_pkey".into(),
+                        kind: ConstraintKind::Primary,
+                        definition: "PRIMARY KEY (id)".into(),
+                    },
+                    ConstraintDef {
+                        name: "customers_account_fkey".into(),
+                        kind: ConstraintKind::Foreign,
+                        definition: "FOREIGN KEY (account_id) REFERENCES accounts(id)".into(),
+                    },
+                ],
+                indexes: vec![IndexDef {
+                    name: "customers_name_idx".into(),
+                    definition:
+                        "CREATE UNIQUE INDEX customers_name_idx ON public.customers USING btree (name)"
+                            .into(),
+                    unique: true,
+                }],
+                ..Default::default()
+            };
+            let key = (
+                id,
+                "shop".to_string(),
+                "public".to_string(),
+                "customers".to_string(),
+            );
+            app.db.structures.insert(key.clone(), structure.clone());
+            app.db.open.insert(format!("{id}/shop/public/customers"));
+            app.db.open.insert(format!("{id}/shop/public/#routines"));
+            if let Some(crate::database::Tree::Loaded(databases)) = app.db.trees.get_mut(&id) {
+                let public = &mut databases[0].schemas[0];
+                public.routines = vec![crate::database::protocol::Routine {
+                    name: "total_due".into(),
+                    args: "customer integer".into(),
+                    procedure: false,
+                }];
+                public.sequences = vec!["invoice_numbers".into()];
+                public.types = vec!["mood".into()];
+            }
+            shoot(&app, "tree-structure");
+            let _ = app.update(Message::Db(DbMsg::TreeFilter("custo".into())));
+            shoot(&app, "tree-filter");
+            let _ = app.update(Message::Db(DbMsg::TreeFilter(String::new())));
+            app.db.text = Some(crate::database::TextView {
+                title: "customers".into(),
+                text: crate::database::ddl::table_ddl("public", "customers", &structure),
+            });
+            shoot(&app, "ddl");
+            app.db.text = None;
+            app.db.designer = Some(crate::database::designer::Designer::for_new_table(
+                id,
+                "shop".into(),
+                "public".into(),
+            ));
+            if let Some(d) = app.db.designer.as_mut() {
+                d.name = "orders".into();
+                d.add_column();
+                let c = d.columns.last_mut().unwrap();
+                c.name = "total".into();
+                c.kind = "numeric(10,2)".into();
+                c.nullable = false;
+            }
+            shoot(&app, "designer-new");
+            app.db.designer = None;
+            app.db.new_schema = Some(crate::database::NewSchema {
+                conn: id,
+                database: "shop".into(),
+                name: "sales".into(),
+                running: false,
+                error: None,
+            });
+            shoot(&app, "new-schema");
+            app.db.new_schema = None;
+        }
 
         // The settings, a tab after the other, with something in each.
         let _ = app.update(Message::Db(DbMsg::OpenDialog(None)));
