@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.19.0] - 2026-11-08
+
+### Added
+- The console keeps its session: a transaction begun in one run, a temporary table or a `SET` is still there in the next. An open transaction is shown, with Commit and Rollback buttons, and the rows of a query are read in that same session.
+- The console runs in the database of your choice (a list next to the connection), and its result tabs stay in it.
+- Explain and Explain analyze (reading statements only) in the console.
+- All the rows of a table or a query, with its filter and sort, can be exported as CSV or JSON from the grid, streamed by the server.
+
+### Changed
+- The pages of a table follow its primary key (its row place without one), so a row is never on two pages or on none.
+
+### Fixed
+- Sorting on a number, a date or any column that is not text sorted it as text (10 before 2).
+- Changes made in the table designer are one transaction: a failure leaves the table as it was.
+- A result tab that wrote (`INSERT … RETURNING`, a plan) is no longer run again by Refresh.
+- A read-only data source now refuses what could write or lift the protection, in the console and in the `WHERE` field.
+- With an SSH tunnel, the tree of several databases works with a fixed local port, and `verify-full` checks the certificate against the server's name.
+- A statement the server cannot prepare in an open transaction says its own error.
+
 ## [1.18.0] - 2026-11-08
 
 ### Added

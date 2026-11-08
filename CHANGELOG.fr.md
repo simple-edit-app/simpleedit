@@ -1,5 +1,24 @@
 # Journal des modifications
 
+## [1.19.0] - 2026-11-08
+
+### Ajouté
+- La console garde sa session : une transaction commencée dans une exécution, une table temporaire ou un `SET` sont encore là à la suivante. Une transaction ouverte est signalée, avec des boutons Valider et Annuler, et les lignes d'une requête sont lues dans cette même session.
+- La console s'exécute dans la base de votre choix (une liste près de la connexion), et ses onglets de résultat y restent.
+- Plan et Plan mesuré (requêtes de lecture seulement) dans la console.
+- Toutes les lignes d'une table ou d'une requête, avec son filtre et son tri, s'exportent en CSV ou JSON depuis la grille, lues en flux depuis le serveur.
+
+### Modifié
+- Les pages d'une table suivent sa clé primaire (la place de la ligne sans clé) : une ligne n'est jamais sur deux pages ni sur aucune.
+
+### Corrigé
+- Trier sur un nombre, une date ou toute colonne qui n'est pas du texte la triait comme du texte (10 avant 2).
+- Les changements de l'éditeur de table forment une transaction : un échec laisse la table comme elle était.
+- Un onglet de résultat qui a écrit (`INSERT … RETURNING`, un plan) n'est plus rejoué par Actualiser.
+- Une source en lecture seule refuse maintenant ce qui pourrait écrire ou lever la protection, dans la console et dans le champ `WHERE`.
+- Avec un tunnel SSH, l'arbre de plusieurs bases fonctionne avec un port local fixé, et `verify-full` vérifie le certificat contre le nom du serveur.
+- Une requête que le serveur ne peut pas préparer dans une transaction ouverte donne sa propre erreur.
+
 ## [1.18.0] - 2026-11-08
 
 ### Ajouté
