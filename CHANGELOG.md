@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.21.0] - 2026-11-08
+
+### Added
+- The "driver not installed" message in the tree of a data source is a link: a click opens the settings of the source, where the driver is downloaded.
+
 ## [1.20.0] - 2026-11-08
 
 ### Added

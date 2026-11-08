@@ -1,5 +1,10 @@
 # Journal des modifications
 
+## [1.21.0] - 2026-11-08
+
+### Ajouté
+- Le message « driver non installé » dans l'arbre d'une source de données est cliquable : un clic ouvre les réglages de la source, où le driver se télécharge.
+
 ## [1.20.0] - 2026-11-08
 
 ### Ajouté
