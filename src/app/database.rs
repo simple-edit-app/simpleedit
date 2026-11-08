@@ -443,6 +443,9 @@ impl SimpleEditApp {
             self.db.new_schema = None;
             return true;
         }
+        if self.db.health.take().is_some() {
+            return true;
+        }
         // A question waiting for a yes, or the table designer.
         if self.db.confirm.as_ref().is_some_and(|c| !c.running) {
             self.db.confirm = None;
@@ -944,6 +947,13 @@ impl SimpleEditApp {
                 }
                 Task::none()
             }
+            msg @ (DbMsg::OpenHealth(..)
+            | DbMsg::HealthLoaded(_)
+            | DbMsg::HealthTab(_)
+            | DbMsg::HealthRun(_)
+            | DbMsg::HealthRan(_)
+            | DbMsg::HealthToConsole(_)
+            | DbMsg::HealthClose) => self.db_tools_message(msg),
             DbMsg::SearchText(path, text) => {
                 if let Some(tab) = self.db_tabs.get_mut(&path) {
                     tab.search_text = text;

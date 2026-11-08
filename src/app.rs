@@ -1766,6 +1766,16 @@ impl SimpleEditApp {
             ),
             None => with_prefs,
         };
+        let with_prefs: Element<Message> = match &self.db.health {
+            Some(health) => crate::floating::modal(
+                with_prefs,
+                crate::database::admin_view::health(health, dark),
+                None,
+                dark,
+                false,
+            ),
+            None => with_prefs,
+        };
         let with_prefs: Element<Message> = match &self.db.confirm {
             Some(confirm) => crate::floating::modal(
                 with_prefs,
@@ -7275,6 +7285,7 @@ mod bookmark_panel;
 #[path = "app/completion.rs"]
 mod completion;
 mod database;
+mod db_tools;
 mod db_tree;
 #[path = "app/everywhere.rs"]
 mod everywhere;

@@ -208,6 +208,15 @@ pub enum DbMsg {
     SwitchConsole(usize),
     CloseConsole(usize),
     LogFilter(String),
+    /// The health window of a database: open, read, tab, clean a table,
+    /// the answer, send a statement to the console, close.
+    OpenHealth(u64, String),
+    HealthLoaded(Done<protocol::Health>),
+    HealthTab(HealthTab),
+    HealthRun(String),
+    HealthRan(Done<Ran>),
+    HealthToConsole(String),
+    HealthClose,
     /// Lays out the selection, or all the queries.
     FormatSql,
     /// The SQL of the file being edited (its selection, or all of it) runs
@@ -243,6 +252,25 @@ pub enum DbMsg {
 
 /// A table: connection, database, schema, table.
 pub type TableKey = (u64, String, String, String);
+
+/// What the health window of a database shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthTab {
+    Tables,
+    Indexes,
+}
+
+#[derive(Debug, Clone)]
+pub struct HealthView {
+    pub conn: u64,
+    pub database: String,
+    pub data: Option<protocol::Health>,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub tab: HealthTab,
+    /// The statement being run (a `VACUUM`, an `ANALYZE`).
+    pub running: Option<String>,
+}
 
 /// A text shown whole, to read and copy: a long value, a DDL.
 #[derive(Debug, Clone)]
@@ -1168,6 +1196,15 @@ pub async fn table_columns(params: Params) -> Done<protocol::Catalog> {
     })
 }
 
+/// How a database is doing: sizes, what waits to be cleaned, unused indexes.
+pub async fn health(params: Params, database: String) -> Done<protocol::Health> {
+    let mut request = params.request("health");
+    request.database = database;
+    call_with(params.browse.clone(), params.driver.clone(), request)
+        .await
+        .map(|answer| serde_json::from_value(answer["health"].clone()).map_err(|e| e.to_string()))
+}
+
 /// The columns of a table that take their values from a list.
 pub async fn table_choices(params: Params, table: TableRef) -> Done<Vec<protocol::Choices>> {
     let request = table_request(&params, "choices", &table);
@@ -1910,6 +1947,8 @@ pub struct State {
     pub foreign_keys: HashMap<u64, Vec<protocol::ForeignKey>>,
     /// The table being modified, and a drop or deletion waiting for a yes.
     pub designer: Option<designer::Designer>,
+    /// The health of a database, on show.
+    pub health: Option<HealthView>,
     pub confirm: Option<Confirm>,
     /// What each table is made of, read when a table of the tree opens.
     pub structures: HashMap<TableKey, protocol::Structure>,
@@ -1964,6 +2003,7 @@ impl State {
             columns: HashMap::new(),
             foreign_keys: HashMap::new(),
             designer: None,
+            health: None,
             confirm: None,
             structures: HashMap::new(),
             tree_filter: String::new(),
@@ -3470,6 +3510,14 @@ mod tests {
                 && f.ref_table == "customers"
                 && !f.columns.is_empty()
                 && f.columns.len() == f.ref_columns.len()));
+            // The health: sizes, dead rows, and an index nobody reads.
+            let state = health(params.clone(), "shop".into()).await;
+            assert!(state.executed.iter().all(|e| e.internal));
+            let state = state.result.unwrap();
+            assert!(state.database_size > 0);
+            let customers = state.tables.iter().find(|t| t.name == "customers").unwrap();
+            assert!(customers.total_size >= customers.table_size && customers.rows > 0);
+            assert!(state.indexes.iter().any(|i| i.name == "customers_pkey" && i.primary));
             // The columns that take their values from a list.
             let listed = table_choices(params.clone(), tref("public", "items")).await;
             assert!(listed.executed.iter().all(|e| e.internal));

@@ -813,3 +813,218 @@ pub fn new_schema<'a>(n: &'a super::NewSchema, dark: bool) -> Element<'a, Messag
         .style(se_theme::card(dark))
         .into()
 }
+
+/// How a database is doing: its tables with their sizes and what waits to be
+/// cleaned, and its indexes with how much they are read.
+pub fn health<'a>(view: &'a super::HealthView, dark: bool) -> Element<'a, Message> {
+    use super::protocol::human_size;
+    use super::HealthTab;
+    let p = se_theme::palette(dark);
+    let cell = |label: String, width: f32| text(label).size(12).width(Length::Fixed(width));
+    let muted = |label: String, width: f32| {
+        text(label)
+            .size(12)
+            .color(p.muted)
+            .width(Length::Fixed(width))
+    };
+    let mut head_line =
+        row![
+            text(t!("db.health_title", name = view.database.as_str()).to_string())
+                .size(13.5)
+                .font(se_theme::UI_SEMIBOLD),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center);
+    if let Some(data) = &view.data {
+        head_line = head_line.push(
+            text(human_size(data.database_size))
+                .size(12.5)
+                .color(p.muted),
+        );
+    }
+    head_line = head_line
+        .push(Space::new().width(Length::Fill))
+        .push(
+            button(text("⟳").size(13))
+                .padding([2, 9])
+                .on_press_maybe(
+                    (!view.loading && view.running.is_none())
+                        .then(|| Message::Db(DbMsg::OpenHealth(view.conn, view.database.clone()))),
+                )
+                .style((se_theme::Outline { dark }).style()),
+        )
+        .push(
+            button(text("×").size(16).color(p.muted))
+                .padding([0, 7])
+                .on_press(Message::Db(DbMsg::HealthClose))
+                .style(ghost(dark)),
+        );
+    let tabs = row![
+        button(text(t!("db.health_tables").to_string()).size(12.5))
+            .padding([3, 12])
+            .on_press(Message::Db(DbMsg::HealthTab(HealthTab::Tables)))
+            .style(
+                (se_theme::GhostButton {
+                    dark,
+                    active: view.tab == HealthTab::Tables,
+                })
+                .style(),
+            ),
+        button(text(t!("db.health_indexes").to_string()).size(12.5))
+            .padding([3, 12])
+            .on_press(Message::Db(DbMsg::HealthTab(HealthTab::Indexes)))
+            .style(
+                (se_theme::GhostButton {
+                    dark,
+                    active: view.tab == HealthTab::Indexes,
+                })
+                .style(),
+            ),
+    ]
+    .spacing(4);
+    let mut list = column![].spacing(2);
+    match (&view.data, view.tab) {
+        (None, _) => {
+            list = list.push(
+                text(if view.loading {
+                    t!("db.loading").to_string()
+                } else {
+                    String::new()
+                })
+                .size(12.5)
+                .color(p.muted),
+            );
+        }
+        (Some(data), HealthTab::Tables) => {
+            list = list.push(
+                row![
+                    muted(t!("db.health_table").to_string(), 190.0),
+                    muted(t!("db.health_rows").to_string(), 80.0),
+                    muted(t!("db.health_size").to_string(), 80.0),
+                    muted(t!("db.health_idx_size").to_string(), 80.0),
+                    muted(t!("db.health_dead").to_string(), 70.0),
+                    muted(t!("db.health_vacuum").to_string(), 120.0),
+                    muted(t!("db.health_analyze").to_string(), 120.0),
+                ]
+                .spacing(8),
+            );
+            for t in &data.tables {
+                let qualified = format!(
+                    "{}.{}",
+                    super::protocol::quote_ident(&t.schema),
+                    super::protocol::quote_ident(&t.name)
+                );
+                // Many dead rows for the size of the table: worth a clean-up.
+                let dirty = t.dead_rows > 1000 && t.dead_rows * 5 > t.rows.max(1);
+                let run = |verb: &str| {
+                    (view.running.is_none())
+                        .then(|| Message::Db(DbMsg::HealthRun(format!("{verb} {qualified}"))))
+                };
+                list = list.push(
+                    row![
+                        cell(format!("{}.{}", t.schema, t.name), 190.0),
+                        cell(t.rows.to_string(), 80.0),
+                        cell(human_size(t.total_size), 80.0),
+                        cell(human_size(t.indexes_size), 80.0),
+                        text(t.dead_rows.to_string())
+                            .size(12)
+                            .width(Length::Fixed(70.0))
+                            .color(if dirty {
+                                se_theme::error_color(dark)
+                            } else {
+                                p.text
+                            }),
+                        muted(t.last_vacuum.clone(), 120.0),
+                        muted(t.last_analyze.clone(), 120.0),
+                        button(text("VACUUM").size(11.5))
+                            .padding([1, 8])
+                            .on_press_maybe(run("VACUUM"))
+                            .style((se_theme::Outline { dark }).style()),
+                        button(text("ANALYZE").size(11.5))
+                            .padding([1, 8])
+                            .on_press_maybe(run("ANALYZE"))
+                            .style((se_theme::Outline { dark }).style()),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                );
+            }
+        }
+        (Some(data), HealthTab::Indexes) => {
+            list = list.push(
+                row![
+                    muted(t!("db.health_index").to_string(), 220.0),
+                    muted(t!("db.health_table").to_string(), 170.0),
+                    muted(t!("db.health_size").to_string(), 80.0),
+                    muted(t!("db.health_scans").to_string(), 80.0),
+                ]
+                .spacing(8),
+            );
+            for i in &data.indexes {
+                let unused = i.unused();
+                let mut line = row![
+                    text(i.name.as_str())
+                        .size(12)
+                        .width(Length::Fixed(220.0))
+                        .color(if unused {
+                            se_theme::error_color(dark)
+                        } else {
+                            p.text
+                        }),
+                    cell(format!("{}.{}", i.schema, i.table), 170.0),
+                    cell(human_size(i.size), 80.0),
+                    cell(i.scans.to_string(), 80.0),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center);
+                if unused {
+                    line = line
+                        .push(
+                            text(t!("db.health_unused").to_string())
+                                .size(11.5)
+                                .color(se_theme::error_color(dark)),
+                        )
+                        .push(
+                            button(text(t!("db.health_drop_in_console").to_string()).size(11.5))
+                                .padding([1, 8])
+                                .on_press(Message::Db(DbMsg::HealthToConsole(format!(
+                                    "DROP INDEX {}.{};",
+                                    super::protocol::quote_ident(&i.schema),
+                                    super::protocol::quote_ident(&i.name)
+                                ))))
+                                .style((se_theme::Outline { dark }).style()),
+                        );
+                }
+                list = list.push(line);
+            }
+        }
+    }
+    let mut body = column![
+        head_line,
+        tabs,
+        scrollable(list)
+            .style(se_theme::Scrollbar { dark }.style())
+            .direction(scrollable::Direction::Both {
+                vertical: scrollable::Scrollbar::default(),
+                horizontal: scrollable::Scrollbar::default(),
+            })
+            .width(Length::Fill)
+            .height(Length::Fixed(380.0)),
+    ]
+    .spacing(10)
+    .width(Length::Fixed(900.0));
+    if let Some(running) = &view.running {
+        body = body.push(text(running.as_str()).size(12).color(p.muted));
+    }
+    if let Some(error) = &view.error {
+        body = body.push(
+            text(error.as_str())
+                .size(12.5)
+                .color(se_theme::error_color(dark)),
+        );
+    }
+    container(body)
+        .padding(16)
+        .style(se_theme::card(dark))
+        .into()
+}

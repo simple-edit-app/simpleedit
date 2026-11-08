@@ -206,6 +206,7 @@ fn run(input: &str, slot: &mut Option<(String, Session)>, serving: bool) -> Resu
         }
         "columns" => columns(client, &request),
         "choices" => choices(client, &request),
+        "health" => health(client, &request),
         "structure" => structure(client, &request),
         "definition" => definition(client, &request),
         "cancel" => {
@@ -1765,6 +1766,81 @@ fn columns(client: &mut Client, request: &Request) -> Result<Value, String> {
         })
         .collect();
     Ok(json!({ "columns": list, "foreign_keys": foreign_keys }))
+}
+
+/// How the database is doing: the size of its tables and indexes, what waits
+/// to be cleaned, and the indexes nobody reads.
+fn health(client: &mut Client, request: &Request) -> Result<Value, String> {
+    let user_schemas = "($1 OR (n.nspname NOT IN ('pg_catalog', 'information_schema') \
+                         AND n.nspname NOT LIKE 'pg\\_toast%' AND n.nspname NOT LIKE 'pg\\_temp%'))";
+    let size = internal_query(client, "SELECT pg_database_size(current_database())", &[])
+        .map_err(clean)?;
+    let database_size: i64 = size.first().map_or(0, |r| r.get(0));
+    let tables = internal_query(
+        client,
+        &format!(
+            "SELECT n.nspname::text, c.relname::text, GREATEST(c.reltuples, 0)::bigint, \
+                    pg_table_size(c.oid), pg_indexes_size(c.oid), pg_total_relation_size(c.oid), \
+                    COALESCE(s.n_dead_tup, 0)::bigint, \
+                    COALESCE(to_char(GREATEST(s.last_vacuum, s.last_autovacuum), 'YYYY-MM-DD HH24:MI'), ''), \
+                    COALESCE(to_char(GREATEST(s.last_analyze, s.last_autoanalyze), 'YYYY-MM-DD HH24:MI'), '') \
+             FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             LEFT JOIN pg_stat_all_tables s ON s.relid = c.oid \
+             WHERE c.relkind IN ('r', 'p', 'm') AND {user_schemas} \
+             ORDER BY pg_total_relation_size(c.oid) DESC, n.nspname, c.relname \
+             LIMIT 500"
+        ),
+        &[&request.scope.system_schemas],
+    )
+    .map_err(clean)?;
+    let indexes = internal_query(
+        client,
+        &format!(
+            "SELECT n.nspname::text, t.relname::text, i.relname::text, pg_relation_size(i.oid), \
+                    COALESCE(s.idx_scan, 0)::bigint, x.indisunique, x.indisprimary \
+             FROM pg_index x \
+             JOIN pg_class i ON i.oid = x.indexrelid \
+             JOIN pg_class t ON t.oid = x.indrelid \
+             JOIN pg_namespace n ON n.oid = t.relnamespace \
+             LEFT JOIN pg_stat_all_indexes s ON s.indexrelid = i.oid \
+             WHERE {user_schemas} \
+             ORDER BY pg_relation_size(i.oid) DESC, n.nspname, i.relname \
+             LIMIT 500"
+        ),
+        &[&request.scope.system_schemas],
+    )
+    .map_err(clean)?;
+    let health = protocol::Health {
+        database_size,
+        tables: tables
+            .iter()
+            .map(|r| protocol::TableHealth {
+                schema: r.get(0),
+                name: r.get(1),
+                rows: r.get(2),
+                table_size: r.get(3),
+                indexes_size: r.get(4),
+                total_size: r.get(5),
+                dead_rows: r.get(6),
+                last_vacuum: r.get(7),
+                last_analyze: r.get(8),
+            })
+            .collect(),
+        indexes: indexes
+            .iter()
+            .map(|r| protocol::IndexHealth {
+                schema: r.get(0),
+                table: r.get(1),
+                name: r.get(2),
+                size: r.get(3),
+                scans: r.get(4),
+                unique: r.get(5),
+                primary: r.get(6),
+            })
+            .collect(),
+    };
+    Ok(json!({ "health": health }))
 }
 
 /// The columns of a table that take their values from a list: the labels of

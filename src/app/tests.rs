@@ -2669,6 +2669,64 @@ mod behavior_tests {
     }
 
     #[test]
+    fn the_health_of_a_database_is_read_and_cleaned_from_its_window() {
+        use crate::database::protocol::{Health, IndexHealth};
+        use crate::database::{DbMsg, HealthTab};
+        let (mut app, _) = db_app(true);
+        let id = app.db.connections[0].id;
+        let _ = app.update(Message::Db(DbMsg::OpenHealth(id, "shop".into())));
+        let view = app.db.health.as_ref().expect("the window opens");
+        assert!(view.loading && view.data.is_none());
+        let data = Health {
+            database_size: 1 << 20,
+            tables: Vec::new(),
+            indexes: vec![IndexHealth {
+                schema: "public".into(),
+                table: "items".into(),
+                name: "items_label_idx".into(),
+                size: 8192,
+                scans: 0,
+                unique: false,
+                primary: false,
+            }],
+        };
+        let _ = app.update(Message::Db(DbMsg::HealthLoaded(Done::ok(data))));
+        let view = app.db.health.as_ref().unwrap();
+        assert!(!view.loading && view.data.is_some() && view.error.is_none());
+        let _ = app.update(Message::Db(DbMsg::HealthTab(HealthTab::Indexes)));
+        assert_eq!(app.db.health.as_ref().unwrap().tab, HealthTab::Indexes);
+        // A clean-up runs one at a time.
+        let _ = app.update(Message::Db(DbMsg::HealthRun(
+            "VACUUM \"public\".\"items\"".into(),
+        )));
+        assert!(app.db.health.as_ref().unwrap().running.is_some());
+        let _ = app.update(Message::Db(DbMsg::HealthRun(
+            "ANALYZE \"public\".\"items\"".into(),
+        )));
+        assert_eq!(
+            app.db.health.as_ref().unwrap().running.as_deref(),
+            Some("VACUUM \"public\".\"items\"")
+        );
+        // A failure is said in the window.
+        let _ = app.update(Message::Db(DbMsg::HealthRan(Done::err(
+            "permission denied",
+        ))));
+        let view = app.db.health.as_ref().unwrap();
+        assert!(view.running.is_none());
+        assert_eq!(view.error.as_deref(), Some("permission denied"));
+        // A statement for the console goes there, and the window closes.
+        app.db.console.editor = iced::widget::text_editor::Content::new();
+        let _ = app.update(Message::Db(DbMsg::HealthToConsole(
+            "DROP INDEX \"public\".\"items_label_idx\";".into(),
+        )));
+        assert!(app.db.health.is_none() && app.db.console.open);
+        assert!(app.db.console.editor.text().contains("DROP INDEX"));
+        // Escape closes the window.
+        let _ = app.update(Message::Db(DbMsg::OpenHealth(id, "shop".into())));
+        assert!(app.db_escape() && app.db.health.is_none());
+    }
+
+    #[test]
     fn the_arrows_and_tab_move_the_focus_from_cell_to_cell() {
         let (mut app, path) = db_app(true);
         let key = |app: &mut SimpleEditApp, k: &str, shift: bool| {

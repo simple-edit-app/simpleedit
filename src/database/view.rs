@@ -520,7 +520,13 @@ fn schema_menu(
             t!("db.new_schema").to_string(),
             None,
             dark,
-            Message::Db(DbMsg::NewSchema(conn, database)),
+            Message::Db(DbMsg::NewSchema(conn, database.clone())),
+        ),
+        menu_bar::item(
+            t!("db.health").to_string(),
+            None,
+            dark,
+            Message::Db(DbMsg::OpenHealth(conn, database)),
         ),
     ];
     container(column(items).spacing(1).padding(6).width(230))
@@ -531,12 +537,20 @@ fn schema_menu(
 /// What a right click on a database offers.
 fn database_menu(conn: u64, database: String, dark: bool) -> Element<'static, Message> {
     container(
-        column![menu_bar::item(
-            t!("db.new_schema").to_string(),
-            None,
-            dark,
-            Message::Db(DbMsg::NewSchema(conn, database)),
-        )]
+        column![
+            menu_bar::item(
+                t!("db.new_schema").to_string(),
+                None,
+                dark,
+                Message::Db(DbMsg::NewSchema(conn, database.clone())),
+            ),
+            menu_bar::item(
+                t!("db.health").to_string(),
+                None,
+                dark,
+                Message::Db(DbMsg::OpenHealth(conn, database)),
+            )
+        ]
         .padding(6)
         .width(230),
     )

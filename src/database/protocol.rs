@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped when a request or an answer changes; the app only uses a driver
 /// that answers `--protocol` with the same number.
-pub const PROTOCOL: u32 = 15;
+pub const PROTOCOL: u32 = 16;
 
 pub const DEFAULT_PORT: u16 = 5432;
 pub const DEFAULT_SSH_PORT: u16 = 22;
@@ -242,6 +242,69 @@ pub struct Choices {
 
 /// Most values of a foreign key that are listed.
 pub const MAX_CHOICES: usize = 200;
+
+/// How a table of the database is doing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TableHealth {
+    pub schema: String,
+    pub name: String,
+    /// The server's estimate of the rows.
+    pub rows: i64,
+    /// Bytes: the table alone, its indexes, and all of it with what is kept
+    /// aside (TOAST).
+    pub table_size: i64,
+    pub indexes_size: i64,
+    pub total_size: i64,
+    /// Rows that were deleted or replaced and not yet cleaned.
+    pub dead_rows: i64,
+    /// `YYYY-MM-DD HH:MM`, empty when it never happened.
+    pub last_vacuum: String,
+    pub last_analyze: String,
+}
+
+/// An index, and how much it is used.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IndexHealth {
+    pub schema: String,
+    pub table: String,
+    pub name: String,
+    pub size: i64,
+    /// How many times the server read through it since the statistics began.
+    pub scans: i64,
+    pub unique: bool,
+    pub primary: bool,
+}
+
+impl IndexHealth {
+    /// Never used, and not one that keeps the data right (a key or a unique
+    /// index does that without being read).
+    pub fn unused(&self) -> bool {
+        self.scans == 0 && !self.unique && !self.primary
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Health {
+    pub database_size: i64,
+    pub tables: Vec<TableHealth>,
+    pub indexes: Vec<IndexHealth>,
+}
+
+/// A size in bytes, as a person reads it.
+pub fn human_size(bytes: i64) -> String {
+    let mut value = bytes.max(0) as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < 4 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    let units = ["B", "KB", "MB", "GB", "TB"];
+    if unit == 0 {
+        format!("{} B", bytes.max(0))
+    } else {
+        format!("{value:.1} {}", units[unit])
+    }
+}
 
 /// What the completion knows of a database besides its tree.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1318,5 +1381,31 @@ mod tests {
             search_condition(&["a", "b c"], " Foo ").as_deref(),
             Some("\"a\"::text ILIKE '%Foo%' OR \"b c\"::text ILIKE '%Foo%'")
         );
+    }
+
+    #[test]
+    fn a_size_is_read_in_the_unit_that_fits() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(1023), "1023 B");
+        assert_eq!(human_size(1536), "1.5 KB");
+        assert_eq!(human_size(5 * 1024 * 1024), "5.0 MB");
+        assert_eq!(human_size(-4), "0 B");
+    }
+
+    #[test]
+    fn an_index_that_keeps_the_data_right_is_never_unused() {
+        let index = |scans, unique, primary| IndexHealth {
+            schema: "public".into(),
+            table: "t".into(),
+            name: "i".into(),
+            size: 8192,
+            scans,
+            unique,
+            primary,
+        };
+        assert!(index(0, false, false).unused());
+        assert!(!index(3, false, false).unused());
+        assert!(!index(0, true, false).unused());
+        assert!(!index(0, false, true).unused());
     }
 }
