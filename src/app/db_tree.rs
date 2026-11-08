@@ -275,7 +275,16 @@ impl SimpleEditApp {
                 self.db.text = None;
                 Task::none()
             }
+            DbMsg::ShowLinks(view) => {
+                self.db.links = Some(*view);
+                Task::none()
+            }
+            DbMsg::CloseLinks => {
+                self.db.links = None;
+                Task::none()
+            }
             DbMsg::OpenRelated(conn, database, schema, table, filter) => {
+                self.db.links = None;
                 self.db_open_table_with(conn, database, schema, table, Some(filter))
             }
             DbMsg::ResizeStart(path, col) => {

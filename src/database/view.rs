@@ -1910,30 +1910,17 @@ fn cell_menu(
     }
     if !related.links.is_empty() && !new_row {
         items.push(menu_bar::separator(dark));
-        for link in &related.links {
-            let name = if link.schema == "public" || link.schema == related.schema {
-                link.table.clone()
-            } else {
-                format!("{}.{}", link.schema, link.table)
-            };
-            let label = format!(
-                "{} {name}  ({})",
-                if link.outgoing { "→" } else { "←" },
-                link.label.replace('"', "")
-            );
-            items.push(menu_bar::item(
-                label,
-                None,
-                dark,
-                Message::Db(DbMsg::OpenRelated(
-                    related.conn,
-                    related.database.clone(),
-                    link.schema.clone(),
-                    link.table.clone(),
-                    link.filter.clone(),
-                )),
-            ));
-        }
+        items.push(menu_bar::item(
+            t!("db.links", n = related.links.len()).to_string(),
+            None,
+            dark,
+            Message::Db(DbMsg::ShowLinks(Box::new(super::LinksView {
+                conn: related.conn,
+                database: related.database.clone(),
+                schema: related.schema.clone(),
+                links: related.links.clone(),
+            }))),
+        ));
     }
     if editable && (has_value || nullable || !new_row) {
         items.push(menu_bar::separator(dark));

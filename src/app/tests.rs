@@ -2900,6 +2900,40 @@ mod behavior_tests {
     }
 
     #[test]
+    fn the_linked_rows_of_a_row_are_listed_in_a_window_that_closes_when_one_is_opened() {
+        use crate::database::ddl::Link;
+        use crate::database::{DbMsg, LinksView};
+        let (mut app, _) = db_app(true);
+        let id = app.db.connections[0].id;
+        let view = LinksView {
+            conn: id,
+            database: "shop".into(),
+            schema: "public".into(),
+            links: vec![Link {
+                outgoing: false,
+                schema: "public".into(),
+                table: "orders".into(),
+                filter: "\"customer_id\" = '1'".into(),
+                label: "\"customer_id\" = '1'".into(),
+            }],
+        };
+        let _ = app.update(Message::Db(DbMsg::ShowLinks(Box::new(view.clone()))));
+        assert_eq!(app.db.links.as_ref().map(|v| v.links.len()), Some(1));
+        // Escape closes it.
+        assert!(app.db_escape() && app.db.links.is_none());
+        // Opening one of the tables closes it too.
+        let _ = app.update(Message::Db(DbMsg::ShowLinks(Box::new(view))));
+        let _ = app.update(Message::Db(DbMsg::OpenRelated(
+            id,
+            "shop".into(),
+            "public".into(),
+            "orders".into(),
+            "\"customer_id\" = '1'".into(),
+        )));
+        assert!(app.db.links.is_none());
+    }
+
+    #[test]
     fn the_arrows_and_tab_move_the_focus_from_cell_to_cell() {
         let (mut app, path) = db_app(true);
         let key = |app: &mut SimpleEditApp, k: &str, shift: bool| {

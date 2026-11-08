@@ -436,7 +436,7 @@ impl SimpleEditApp {
 
     /// Escape gives up what is being typed or picked in the table in front.
     pub(super) fn db_escape(&mut self) -> bool {
-        if self.db.text.take().is_some() {
+        if self.db.text.take().is_some() || self.db.links.take().is_some() {
             return true;
         }
         if self.db.new_schema.as_ref().is_some_and(|n| !n.running) {
@@ -1451,6 +1451,8 @@ impl SimpleEditApp {
             | DbMsg::TextCopy
             | DbMsg::CopyCell(..)
             | DbMsg::CopySelection(..)
+            | DbMsg::ShowLinks(_)
+            | DbMsg::CloseLinks
             | DbMsg::TextClose
             | DbMsg::OpenRelated(..)
             | DbMsg::ResizeStart(..)

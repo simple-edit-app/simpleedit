@@ -1494,3 +1494,75 @@ pub fn backup<'a>(b: &'a super::Backup, production: bool, dark: bool) -> Element
         .style(se_theme::card(dark))
         .into()
 }
+
+/// The rows a row is linked to: the tables it points to, and the tables that
+/// point to it, each a click away.
+pub fn links<'a>(view: &'a super::LinksView, dark: bool) -> Element<'a, Message> {
+    let p = se_theme::palette(dark);
+    let mut body = column![head(
+        t!("db.links_title").to_string(),
+        Message::Db(DbMsg::CloseLinks),
+        dark
+    )]
+    .spacing(8)
+    .width(Length::Fixed(460.0));
+    for (outgoing, title, hint) in [
+        (
+            true,
+            t!("db.links_out").to_string(),
+            t!("db.links_out_hint").to_string(),
+        ),
+        (
+            false,
+            t!("db.links_in").to_string(),
+            t!("db.links_in_hint").to_string(),
+        ),
+    ] {
+        let group: Vec<&super::ddl::Link> = view
+            .links
+            .iter()
+            .filter(|l| l.outgoing == outgoing)
+            .collect();
+        if group.is_empty() {
+            continue;
+        }
+        body = body.push(text(title).size(12.5).font(se_theme::UI_SEMIBOLD));
+        body = body.push(text(hint).size(11.5).color(p.muted));
+        for link in group {
+            let name = if link.schema == "public" || link.schema == view.schema {
+                link.table.clone()
+            } else {
+                format!("{}.{}", link.schema, link.table)
+            };
+            body = body.push(
+                button(
+                    row![
+                        text(name).size(12.5).width(Length::Fixed(190.0)),
+                        text(super::ddl::short_label(&link.label))
+                            .size(12)
+                            .color(p.muted)
+                            .font(se_theme::MONO)
+                            .wrapping(iced::widget::text::Wrapping::None),
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                )
+                .padding([4, 8])
+                .width(Length::Fill)
+                .on_press(Message::Db(DbMsg::OpenRelated(
+                    view.conn,
+                    view.database.clone(),
+                    link.schema.clone(),
+                    link.table.clone(),
+                    link.filter.clone(),
+                )))
+                .style(ghost(dark)),
+            );
+        }
+    }
+    container(scrollable(body).style(se_theme::Scrollbar { dark }.style()))
+        .max_height(520)
+        .padding(16)
+        .style(se_theme::card(dark))
+        .into()
+}

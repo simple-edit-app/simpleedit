@@ -192,6 +192,9 @@ pub enum DbMsg {
     CopyCell(PathBuf, usize, usize),
     /// The block of selected cells, or the cell, in a format.
     CopySelection(PathBuf, grid::CopyFormat),
+    /// The rows a row is linked to, in a window; closed.
+    ShowLinks(Box<LinksView>),
+    CloseLinks,
     /// Opens a table with a condition on it (the rows another one points
     /// to, or the rows that point to this one).
     OpenRelated(u64, String, String, String, String),
@@ -352,6 +355,16 @@ pub struct HealthView {
     pub tab: HealthTab,
     /// The statement being run (a `VACUUM`, an `ANALYZE`).
     pub running: Option<String>,
+}
+
+/// The rows a row is linked to, on show in a window.
+#[derive(Debug, Clone)]
+pub struct LinksView {
+    pub conn: u64,
+    pub database: String,
+    /// The schema of the table: tables of it are shown without it.
+    pub schema: String,
+    pub links: Vec<ddl::Link>,
 }
 
 /// A text shown whole, to read and copy: a long value, a DDL.
@@ -2243,6 +2256,7 @@ pub struct State {
     pub tree_filter: String,
     /// A text shown whole, and the question to make a schema.
     pub text: Option<TextView>,
+    pub links: Option<LinksView>,
     pub new_schema: Option<NewSchema>,
     pub resizing: Option<Resizing>,
     /// The sessions that stay, one per data source the console ran on.
@@ -2298,6 +2312,7 @@ impl State {
             structures: HashMap::new(),
             tree_filter: String::new(),
             text: None,
+            links: None,
             new_schema: None,
             resizing: None,
             live: HashMap::new(),

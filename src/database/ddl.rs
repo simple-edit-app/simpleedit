@@ -236,6 +236,18 @@ pub struct Link {
     pub label: String,
 }
 
+/// The condition of a link as a person reads it: no quotes, and a long value
+/// cut short.
+pub fn short_label(label: &str) -> String {
+    let plain = label.replace(['"', '\''], "");
+    if plain.chars().count() <= 32 {
+        return plain;
+    }
+    let mut cut: String = plain.chars().take(31).collect();
+    cut.push('…');
+    cut
+}
+
 /// `schema.table` or `table`, without quotes.
 fn qualified(text: &str) -> (Option<String>, String) {
     let mut parts: Vec<String> = Vec::new();
@@ -577,5 +589,14 @@ mod tests {
         // No identity, nothing to restart.
         s.columns[0].identity.clear();
         assert!(restart_sequences("s", "t", &s).is_empty());
+    }
+
+    #[test]
+    fn a_link_is_read_without_quotes_and_with_a_short_value() {
+        assert_eq!(short_label("\"id\" = 'abc'"), "id = abc");
+        let long = "\"id\" = 'toCPK5nBIAyCSc7kIwKcC8GZiTwe5jJI'";
+        let short = short_label(long);
+        assert_eq!(short.chars().count(), 32);
+        assert!(short.starts_with("id = toCPK5nBIAyCSc7kIwKcC8GZ") && short.ends_with('…'));
     }
 }

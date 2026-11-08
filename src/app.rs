@@ -1766,6 +1766,16 @@ impl SimpleEditApp {
             ),
             None => with_prefs,
         };
+        let with_prefs: Element<Message> = match &self.db.links {
+            Some(links) => crate::floating::modal(
+                with_prefs,
+                crate::database::admin_view::links(links, dark),
+                Some(Message::Db(crate::database::DbMsg::CloseLinks)),
+                dark,
+                false,
+            ),
+            None => with_prefs,
+        };
         let with_prefs: Element<Message> = match &self.db.backup {
             Some(backup) => crate::floating::modal(
                 with_prefs,
