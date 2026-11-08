@@ -1206,7 +1206,6 @@ impl SimpleEditApp {
             | DbMsg::StructureRead(..)
             | DbMsg::ShowDefinition(..)
             | DbMsg::ShowFunction(..)
-            | DbMsg::Stopped(..)
             | DbMsg::Definition(..)
             | DbMsg::ShowDdl(..)
             | DbMsg::TreeFilter(_)
