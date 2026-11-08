@@ -2566,6 +2566,27 @@ fn queries_view<'a>(state: &'a State, dark: bool) -> Element<'a, Message> {
         }
         None => editor.into(),
     };
+    // The word the server blamed, underlined in red (the same metrics).
+    let editor: Element<Message> = match c.error_mark {
+        Some(mark) => iced::widget::stack![
+            editor,
+            container(
+                container(Space::new().height(2))
+                    .width(Length::Fixed(mark.len as f32 * 7.8))
+                    .style(move |_: &iced::Theme| container::Style {
+                        background: Some(iced::Background::Color(se_theme::error_color(dark))),
+                        ..container::Style::default()
+                    })
+            )
+            .padding(iced::Padding {
+                top: 8.0 + (mark.line as f32 + 1.0) * 16.9 - 1.0,
+                left: 12.0 + mark.column as f32 * 7.8,
+                ..iced::Padding::ZERO
+            })
+        ]
+        .into(),
+        None => editor,
+    };
     // The list hangs under the word being typed (the editor's text metrics:
     // a character of the monospace font, and its line height).
     let editor: Element<Message> = match &c.completion {

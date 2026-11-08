@@ -1149,6 +1149,8 @@ pub async fn table_columns(params: Params) -> Done<Vec<protocol::TableColumn>> {
 pub struct Ran {
     pub results: Vec<QueryResult>,
     pub failed: Option<(usize, String)>,
+    /// Where the failed statement went wrong: a character, from 1.
+    pub position: Option<usize>,
     /// A transaction is open on the session when the statements ended.
     pub in_transaction: bool,
 }
@@ -1265,9 +1267,11 @@ pub async fn run_with(
                     f["error"].as_str().unwrap_or("").to_string(),
                 )
             });
+            let position = answer["failed"]["position"].as_u64().map(|p| p as usize);
             Ok(Ran {
                 results,
                 failed,
+                position,
                 in_transaction: answer["in_transaction"].as_bool().unwrap_or(false),
             })
         })

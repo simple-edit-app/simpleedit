@@ -86,8 +86,20 @@ pub struct Console {
     /// one is in `editor`, not in its entry here.
     pub docs: Vec<Doc>,
     pub active: usize,
+    /// The statements of the run that is going, to find the one that failed.
+    pub running_sql: Vec<String>,
+    /// The word of the queries the server blamed, to underline.
+    pub error_mark: Option<ErrorMark>,
     /// The number the next console is given.
     pub next_doc: usize,
+}
+
+/// A place of the queries: a line, a column and a length, in characters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ErrorMark {
+    pub line: usize,
+    pub column: usize,
+    pub len: usize,
 }
 
 /// A console, as its tab says.
@@ -137,6 +149,35 @@ pub fn format_sql(sql: &str) -> String {
 }
 
 impl Console {
+    /// Marks the word the server blamed in a statement of the queries:
+    /// `position` counts characters of the statement, from 1.
+    pub fn mark_error(&mut self, statement: &str, position: usize) {
+        self.error_mark = None;
+        let text = self.editor.text();
+        let Some(start) = text.find(statement) else {
+            return;
+        };
+        let at = start
+            + statement
+                .char_indices()
+                .nth(position.saturating_sub(1))
+                .map_or(statement.len(), |(i, _)| i);
+        let before = &text[..at];
+        let line = before.matches('\n').count();
+        let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+        let column = text[line_start..at].chars().count();
+        let rest = &text[at..];
+        let word = rest
+            .chars()
+            .take_while(|ch| ch.is_alphanumeric() || *ch == '_' || *ch == '.')
+            .count();
+        self.error_mark = Some(ErrorMark {
+            line,
+            column,
+            len: word.max(1),
+        });
+    }
+
     /// Opens another console and goes to it.
     pub fn new_doc(&mut self) {
         let title = t!("db.console_title", n = self.next_doc).to_string();
@@ -272,6 +313,8 @@ impl Console {
                 content: text_editor::Content::new(),
             }],
             active: 0,
+            running_sql: Vec::new(),
+            error_mark: None,
             next_doc: 2,
         }
     }
@@ -778,6 +821,25 @@ mod tests {
         assert_eq!(console.editor.text().trim(), "c");
         console.switch_doc(0);
         assert_eq!(console.editor.text().trim(), "b");
+    }
+
+    #[test]
+    fn the_word_the_server_blamed_is_marked() {
+        let mut console = Console::load();
+        console.editor = text_editor::Content::with_text("SELECT 1;\nSELECT nme FROM t");
+        // Character 8 of the second statement: `nme`.
+        console.mark_error("SELECT nme FROM t", 8);
+        assert_eq!(
+            console.error_mark,
+            Some(ErrorMark {
+                line: 1,
+                column: 7,
+                len: 3
+            })
+        );
+        // A statement that is not there leaves nothing marked.
+        console.mark_error("SELECT other", 3);
+        assert_eq!(console.error_mark, None);
     }
 
     #[test]

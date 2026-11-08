@@ -756,6 +756,15 @@ fn pgpass_lookup(text: &str, host: &str, port: u16, database: &str, user: &str) 
 
 // -------------------------------------------------------------------- tree
 
+/// Where in the statement the server found the error, counted in characters
+/// from 1 (a syntax error, an unknown column).
+fn position_of(error: &postgres::Error) -> Option<u32> {
+    match error.as_db_error()?.position()? {
+        postgres::error::ErrorPosition::Original(at) => Some(*at),
+        postgres::error::ErrorPosition::Internal { .. } => None,
+    }
+}
+
 /// The text of an error, without the driver's wrapping noise.
 fn clean(error: postgres::Error) -> String {
     match error.as_db_error() {
@@ -1754,9 +1763,11 @@ fn query(client: &mut Client, request: &Request) -> Result<Value, String> {
             match client.prepare(sql) {
                 Ok(statement) => Some(statement),
                 Err(e) => {
+                    let position = position_of(&e);
                     let message = clean(e);
                     record(sql, started, None, Some(message.clone()));
-                    failed = Some(json!({ "index": index, "error": message }));
+                    failed =
+                        Some(json!({ "index": index, "error": message, "position": position }));
                     break;
                 }
             }
@@ -1784,9 +1795,10 @@ fn query(client: &mut Client, request: &Request) -> Result<Value, String> {
         let messages = match client.simple_query(sql) {
             Ok(messages) => messages,
             Err(e) => {
+                let position = position_of(&e);
                 let message = clean(e);
                 record(sql, started, None, Some(message.clone()));
-                failed = Some(json!({ "index": index, "error": message }));
+                failed = Some(json!({ "index": index, "error": message, "position": position }));
                 break;
             }
         };

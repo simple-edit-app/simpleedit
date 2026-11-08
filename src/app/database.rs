@@ -226,6 +226,8 @@ impl SimpleEditApp {
         };
         self.db.console.running = true;
         self.db.console.last = None;
+        self.db.console.error_mark = None;
+        self.db.console.running_sql = statements.clone();
         let live = self.db.live_of(conn);
         let database = self.db.console.database.clone();
         let (task, handle) = Task::perform(
@@ -1244,6 +1246,10 @@ impl SimpleEditApp {
                     &action,
                     Action::Edit(Edit::Insert(_) | Edit::Backspace | Edit::Delete | Edit::Paste(_))
                 );
+                if matches!(&action, Action::Edit(_)) {
+                    // The places of the error are no longer where they were.
+                    self.db.console.error_mark = None;
+                }
                 self.db.console.editor.perform(action);
                 if typed {
                     self.db_complete(false);
@@ -1394,6 +1400,11 @@ impl SimpleEditApp {
                         // the rest says what it did in the log.
                         for result in ran.results.iter().filter(|r| r.has_rows).take(10) {
                             tasks.push(self.db_open_result(conn, result));
+                        }
+                        if let (Some((index, _)), Some(position)) = (&ran.failed, ran.position) {
+                            if let Some(sql) = self.db.console.running_sql.get(*index).cloned() {
+                                self.db.console.mark_error(&sql, position);
+                            }
                         }
                         if ran.failed.is_some() {
                             self.db.console.tab = database::console::ConsoleTab::Log;

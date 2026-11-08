@@ -2411,6 +2411,7 @@ mod behavior_tests {
                     in_transaction: false,
                     results: vec![select, update],
                     failed: None,
+                    position: None,
                 }),
                 executed,
             },
@@ -2449,6 +2450,7 @@ mod behavior_tests {
                     in_transaction: false,
                     results: vec![insert],
                     failed: None,
+                    position: None,
                 }),
                 executed: Vec::<Executed>::new(),
             },
@@ -2479,6 +2481,7 @@ mod behavior_tests {
                     in_transaction: true,
                     results: vec![],
                     failed: None,
+                    position: None,
                 }),
                 executed: vec![],
             },
@@ -2512,6 +2515,7 @@ mod behavior_tests {
                     in_transaction: false,
                     results: vec![],
                     failed: Some((1, "syntax error".into())),
+                    position: None,
                 }),
                 executed: vec![Executed {
                     sql: "SELEKT 1".into(),
@@ -2674,6 +2678,7 @@ mod behavior_tests {
                     in_transaction: false,
                     results: vec![select],
                     failed: None,
+                    position: None,
                 }),
                 executed: Vec::<Executed>::new(),
             },
@@ -2925,11 +2930,13 @@ mod behavior_tests {
                 in_transaction: false,
                 results: vec![],
                 failed: None,
+                position: None,
             }),
             Err(e) => Done::ok(Ran {
                 in_transaction: false,
                 results: vec![],
                 failed: Some((0, e)),
+                position: None,
             }),
         };
         crate::database::Altered {
@@ -3248,6 +3255,7 @@ mod behavior_tests {
             in_transaction: false,
             results: vec![],
             failed: None,
+            position: None,
         })));
         assert!(app.db.new_schema.is_none());
     }
