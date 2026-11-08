@@ -2637,9 +2637,37 @@ fn queries_view<'a>(state: &'a State, dark: bool) -> Element<'a, Message> {
             .into()
         }
     };
-    column![editor, container(status).padding([4, 14])]
-        .height(Length::Fill)
-        .into()
+    // One tab for each console.
+    let mut tabs = row![].spacing(2).align_y(Alignment::Center);
+    for (at, doc) in c.docs.iter().enumerate() {
+        let mut tab = row![button(text(doc.title.as_str()).size(12))
+            .padding([2, 8])
+            .on_press(Message::Db(DbMsg::SwitchConsole(at)))
+            .style(ghost(dark, at == c.active))]
+        .align_y(Alignment::Center);
+        if c.docs.len() > 1 {
+            tab = tab.push(
+                button(text("×").size(12))
+                    .padding([0, 4])
+                    .on_press(Message::Db(DbMsg::CloseConsole(at)))
+                    .style(ghost(dark, false)),
+            );
+        }
+        tabs = tabs.push(tab);
+    }
+    tabs = tabs.push(
+        button(text("+").size(13))
+            .padding([0, 8])
+            .on_press(Message::Db(DbMsg::NewConsole))
+            .style(ghost(dark, false)),
+    );
+    column![
+        container(tabs).padding([2, 10]),
+        editor,
+        container(status).padding([4, 14])
+    ]
+    .height(Length::Fill)
+    .into()
 }
 
 /// The proposals of the completion, the chosen one marked.

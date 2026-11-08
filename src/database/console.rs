@@ -81,6 +81,19 @@ pub struct Console {
     pub guard: Option<Guard>,
     /// What is typed to find an entry of the log.
     pub log_filter: String,
+    /// The consoles: the first is the one whose queries are kept for the next
+    /// time, the others last until the app is closed. The text of the active
+    /// one is in `editor`, not in its entry here.
+    pub docs: Vec<Doc>,
+    pub active: usize,
+    /// The number the next console is given.
+    pub next_doc: usize,
+}
+
+/// A console, as its tab says.
+pub struct Doc {
+    pub title: String,
+    pub content: text_editor::Content,
 }
 
 /// What waits for a confirmation, and why.
@@ -124,6 +137,60 @@ pub fn format_sql(sql: &str) -> String {
 }
 
 impl Console {
+    /// Opens another console and goes to it.
+    pub fn new_doc(&mut self) {
+        let title = t!("db.console_title", n = self.next_doc).to_string();
+        self.next_doc += 1;
+        self.docs.push(Doc {
+            title,
+            content: text_editor::Content::new(),
+        });
+        let last = self.docs.len() - 1;
+        self.switch_doc(last);
+    }
+
+    /// Goes to a console: what is written stays where it was.
+    pub fn switch_doc(&mut self, to: usize) {
+        if to >= self.docs.len() || to == self.active {
+            return;
+        }
+        self.completion = None;
+        let current = std::mem::take(&mut self.editor);
+        self.docs[self.active].content = current;
+        self.editor = std::mem::take(&mut self.docs[to].content);
+        self.active = to;
+    }
+
+    /// Closes a console; the first one stays, empty, when it is the last.
+    pub fn close_doc(&mut self, at: usize) {
+        if at >= self.docs.len() {
+            return;
+        }
+        self.completion = None;
+        if self.docs.len() == 1 {
+            self.editor = text_editor::Content::new();
+            return;
+        }
+        // Its text goes with it; the one next to it takes the editor.
+        if at == self.active {
+            let next = if at + 1 < self.docs.len() {
+                at + 1
+            } else {
+                at - 1
+            };
+            let current = std::mem::take(&mut self.editor);
+            self.docs[self.active].content = current;
+            self.editor = std::mem::take(&mut self.docs[next].content);
+            self.docs.remove(at);
+            self.active = if next > at { next - 1 } else { next };
+        } else {
+            self.docs.remove(at);
+            if at < self.active {
+                self.active -= 1;
+            }
+        }
+    }
+
     /// Lays out the selection, or all the queries when nothing is selected.
     pub fn format(&mut self) {
         use text_editor::{Action, Edit};
@@ -200,6 +267,12 @@ impl Console {
             selected_log: None,
             guard: None,
             log_filter: String::new(),
+            docs: vec![Doc {
+                title: t!("db.console_title", n = 1).to_string(),
+                content: text_editor::Content::new(),
+            }],
+            active: 0,
+            next_doc: 2,
         }
     }
 
@@ -209,7 +282,11 @@ impl Console {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let text = self.editor.text();
+        let text = if self.active == 0 {
+            self.editor.text()
+        } else {
+            self.docs[0].content.text()
+        };
         let _ = crate::fsutil::write_atomic(&path, text.as_bytes(), true);
     }
 
@@ -664,6 +741,43 @@ mod tests {
         // Only `se` is selected: it is laid out, the rest is left alone.
         console.format();
         assert!(console.editor.text().ends_with("select 2"));
+    }
+
+    #[test]
+    fn consoles_keep_their_own_text() {
+        let mut console = Console::load();
+        console.editor = text_editor::Content::with_text("SELECT 1");
+        console.new_doc();
+        assert_eq!((console.docs.len(), console.active), (2, 1));
+        assert_eq!(console.editor.text().trim(), "");
+        console.editor = text_editor::Content::with_text("SELECT 2");
+        console.switch_doc(0);
+        assert_eq!(console.editor.text().trim(), "SELECT 1");
+        console.switch_doc(1);
+        assert_eq!(console.editor.text().trim(), "SELECT 2");
+        // Closing the active one goes to its neighbour, text intact.
+        console.close_doc(1);
+        assert_eq!((console.docs.len(), console.active), (1, 0));
+        assert_eq!(console.editor.text().trim(), "SELECT 1");
+        // The last one is emptied, not removed.
+        console.close_doc(0);
+        assert_eq!(console.docs.len(), 1);
+        assert_eq!(console.editor.text(), "");
+    }
+
+    #[test]
+    fn closing_a_console_before_the_active_one_keeps_the_active_one() {
+        let mut console = Console::load();
+        console.editor = text_editor::Content::with_text("a");
+        console.new_doc();
+        console.editor = text_editor::Content::with_text("b");
+        console.new_doc();
+        console.editor = text_editor::Content::with_text("c");
+        console.close_doc(0);
+        assert_eq!(console.active, 1);
+        assert_eq!(console.editor.text().trim(), "c");
+        console.switch_doc(0);
+        assert_eq!(console.editor.text().trim(), "b");
     }
 
     #[test]

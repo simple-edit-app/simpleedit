@@ -1299,6 +1299,19 @@ impl SimpleEditApp {
                 }
                 _ => Task::none(),
             },
+            DbMsg::NewConsole => {
+                self.db.console.new_doc();
+                Task::none()
+            }
+            DbMsg::SwitchConsole(at) => {
+                self.db.console.switch_doc(at);
+                Task::none()
+            }
+            DbMsg::CloseConsole(at) => {
+                self.db.console.close_doc(at);
+                self.db.console.save();
+                Task::none()
+            }
             DbMsg::FormatSql => {
                 self.db.console.format();
                 self.db.console.completion = None;

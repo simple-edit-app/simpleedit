@@ -188,6 +188,10 @@ pub enum DbMsg {
     /// The risky statements that wait are run, or given up.
     /// What is typed to find an entry of the log; an entry goes back into
     /// the queries.
+    /// The consoles: a new one, go to one, close one.
+    NewConsole,
+    SwitchConsole(usize),
+    CloseConsole(usize),
     LogFilter(String),
     /// Lays out the selection, or all the queries.
     FormatSql,
