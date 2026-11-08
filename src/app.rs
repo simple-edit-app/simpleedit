@@ -1766,6 +1766,22 @@ impl SimpleEditApp {
             ),
             None => with_prefs,
         };
+        let with_prefs: Element<Message> = match &self.db.backup {
+            Some(backup) => crate::floating::modal(
+                with_prefs,
+                crate::database::admin_view::backup(
+                    backup,
+                    self.db
+                        .connection(backup.conn)
+                        .is_some_and(|c| c.production),
+                    dark,
+                ),
+                None,
+                dark,
+                false,
+            ),
+            None => with_prefs,
+        };
         let with_prefs: Element<Message> = match &self.db.copy_table {
             Some(copy) => crate::floating::modal(
                 with_prefs,

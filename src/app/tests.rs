@@ -2848,6 +2848,58 @@ mod behavior_tests {
     }
 
     #[test]
+    fn a_backup_and_a_restore_are_asked_for_in_one_window() {
+        use crate::database::{BackupFlag, DbMsg};
+        let (mut app, _) = db_app(true);
+        let id = app.db.connections[0].id;
+        let _ = app.update(Message::Db(DbMsg::BackupOpen(
+            id,
+            "shop".into(),
+            "public".into(),
+            "items".into(),
+            false,
+        )));
+        let b = app.db.backup.as_ref().expect("the window opens");
+        assert!(!b.restore && b.spec.format == "custom" && b.spec.no_owner);
+        // Nothing goes before a file is chosen.
+        let _ = app.update(Message::Db(DbMsg::BackupRun));
+        assert!(!app.db.backup.as_ref().unwrap().running);
+        // Structure only and data only exclude each other.
+        let _ = app.update(Message::Db(DbMsg::BackupFlag(BackupFlag::SchemaOnly, true)));
+        let _ = app.update(Message::Db(DbMsg::BackupFlag(BackupFlag::DataOnly, true)));
+        let spec = &app.db.backup.as_ref().unwrap().spec;
+        assert!(spec.data_only && !spec.schema_only);
+        let _ = app.update(Message::Db(DbMsg::BackupFlag(BackupFlag::Plain, true)));
+        assert_eq!(app.db.backup.as_ref().unwrap().spec.format, "plain");
+        let _ = app.update(Message::Db(DbMsg::BackupPicked(Some("/tmp/x.sql".into()))));
+        let _ = app.update(Message::Db(DbMsg::BackupRun));
+        assert!(app.db.backup.as_ref().unwrap().running);
+        assert!(!app.db_escape(), "the window stays while it works");
+        let _ = app.update(Message::Db(DbMsg::BackupDone(Done::err(
+            "pg_dump was not found",
+        ))));
+        let b = app.db.backup.as_ref().unwrap();
+        assert!(!b.running && b.error.as_deref() == Some("pg_dump was not found"));
+        let _ = app.update(Message::Db(DbMsg::BackupRun));
+        let _ = app.update(Message::Db(DbMsg::BackupDone(Done::ok("4.2 KB".into()))));
+        assert_eq!(
+            app.db.backup.as_ref().unwrap().done.as_deref(),
+            Some("4.2 KB")
+        );
+        assert!(app.db_escape() && app.db.backup.is_none());
+        // A restore reads its backup in one transaction by default.
+        let _ = app.update(Message::Db(DbMsg::BackupOpen(
+            id,
+            "shop".into(),
+            String::new(),
+            String::new(),
+            true,
+        )));
+        let b = app.db.backup.as_ref().unwrap();
+        assert!(b.restore && b.spec.single_transaction && !b.spec.clean);
+    }
+
+    #[test]
     fn the_arrows_and_tab_move_the_focus_from_cell_to_cell() {
         let (mut app, path) = db_app(true);
         let key = |app: &mut SimpleEditApp, k: &str, shift: bool| {

@@ -450,6 +450,10 @@ impl SimpleEditApp {
             self.db.import = None;
             return true;
         }
+        if self.db.backup.as_ref().is_some_and(|b| !b.running) {
+            self.db.backup = None;
+            return true;
+        }
         if self.db.copy_table.as_ref().is_some_and(|c| !c.running) {
             self.db.copy_table = None;
             return true;
@@ -980,7 +984,14 @@ impl SimpleEditApp {
             | DbMsg::CopyData(_)
             | DbMsg::CopyRun
             | DbMsg::CopyDone(_)
-            | DbMsg::CopyClose) => self.db_tools_message(msg),
+            | DbMsg::CopyClose
+            | DbMsg::BackupOpen(..)
+            | DbMsg::BackupFlag(..)
+            | DbMsg::BackupPick
+            | DbMsg::BackupPicked(_)
+            | DbMsg::BackupRun
+            | DbMsg::BackupDone(_)
+            | DbMsg::BackupClose) => self.db_tools_message(msg),
             DbMsg::SearchText(path, text) => {
                 if let Some(tab) = self.db_tabs.get_mut(&path) {
                     tab.search_text = text;

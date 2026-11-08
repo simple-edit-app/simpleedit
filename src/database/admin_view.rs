@@ -1254,17 +1254,10 @@ pub fn copy_table<'a>(
         && !copy.name.trim().is_empty()
         && !copy.schema.trim().is_empty()
         && !copy.running;
+    let (table, source) = (copy.from.3.as_str(), source_name.as_str());
+    let title = t!("db.copy_title", table = table, source = source).to_string();
     let mut body = column![
-        head(
-            t!(
-                "db.copy_title",
-                table = copy.from.3.as_str(),
-                source = source_name.as_str()
-            )
-            .to_string(),
-            Message::Db(DbMsg::CopyClose),
-            dark
-        ),
+        head(title, Message::Db(DbMsg::CopyClose), dark),
         row![
             text(t!("db.copy_to").to_string())
                 .size(12.5)
@@ -1337,6 +1330,156 @@ pub fn copy_table<'a>(
                 .style((se_theme::Primary { dark }).style()),
             text(if copy.running {
                 t!("db.copy_running").to_string()
+            } else {
+                String::new()
+            })
+            .size(12)
+            .color(p.muted),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),
+    );
+    container(body)
+        .padding(16)
+        .style(se_theme::card(dark))
+        .into()
+}
+
+/// The window that backs a database up (or a schema, or a table), or puts a
+/// backup back.
+pub fn backup<'a>(b: &'a super::Backup, production: bool, dark: bool) -> Element<'a, Message> {
+    use super::BackupFlag;
+    let p = se_theme::palette(dark);
+    let flag = |label: String, on: bool, which: BackupFlag| {
+        checkbox(on)
+            .label(label)
+            .size(14)
+            .text_size(12.5)
+            .on_toggle(move |v| Message::Db(DbMsg::BackupFlag(which, v)))
+    };
+    let scope = if !b.table.is_empty() {
+        format!("{}.{}", b.schema, b.table)
+    } else if !b.schema.is_empty() {
+        b.schema.clone()
+    } else {
+        b.database.clone()
+    };
+    let title = if b.restore {
+        t!("db.restore_title", database = b.database.as_str()).to_string()
+    } else {
+        t!("db.backup_title", scope = scope.as_str()).to_string()
+    };
+    let mut options = column![].spacing(6);
+    if !b.restore {
+        options = options.push(flag(
+            t!("db.backup_plain").to_string(),
+            b.spec.format == "plain",
+            BackupFlag::Plain,
+        ));
+    }
+    options = options
+        .push(flag(
+            t!("db.backup_schema_only").to_string(),
+            b.spec.schema_only,
+            BackupFlag::SchemaOnly,
+        ))
+        .push(flag(
+            t!("db.backup_data_only").to_string(),
+            b.spec.data_only,
+            BackupFlag::DataOnly,
+        ))
+        .push(flag(
+            t!("db.backup_no_owner").to_string(),
+            b.spec.no_owner,
+            BackupFlag::NoOwner,
+        ))
+        .push(flag(
+            t!("db.backup_no_privileges").to_string(),
+            b.spec.no_privileges,
+            BackupFlag::NoPrivileges,
+        ));
+    if b.restore {
+        options = options
+            .push(flag(
+                t!("db.restore_clean").to_string(),
+                b.spec.clean,
+                BackupFlag::Clean,
+            ))
+            .push(flag(
+                t!("db.restore_single").to_string(),
+                b.spec.single_transaction,
+                BackupFlag::SingleTransaction,
+            ));
+    }
+    let mut body = column![
+        head(title, Message::Db(DbMsg::BackupClose), dark),
+        row![
+            button(text(t!("db.import_choose").to_string()).size(12.5))
+                .padding([4, 14])
+                .on_press_maybe((!b.running).then_some(Message::Db(DbMsg::BackupPick)))
+                .style((se_theme::Outline { dark }).style()),
+            text(
+                b.path
+                    .as_ref()
+                    .map(|f| f.display().to_string())
+                    .unwrap_or_default()
+            )
+            .size(12)
+            .color(p.muted),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+        options,
+    ]
+    .spacing(12)
+    .width(Length::Fixed(560.0));
+    // What a restore can do to what is there.
+    if b.restore && (b.spec.clean || production) {
+        body = body.push(
+            text(if b.spec.clean {
+                t!("db.restore_warning_clean").to_string()
+            } else {
+                t!("db.restore_warning_production").to_string()
+            })
+            .size(12.5)
+            .color(se_theme::error_color(dark)),
+        );
+    }
+    if let Some(error) = &b.error {
+        body = body.push(
+            text(error.as_str())
+                .size(12.5)
+                .color(se_theme::error_color(dark)),
+        );
+    }
+    if let Some(said) = &b.done {
+        body = body.push(
+            text(if b.restore {
+                t!("db.restore_done", kind = said.as_str()).to_string()
+            } else {
+                t!("db.backup_done", size = said.as_str()).to_string()
+            })
+            .size(12.5)
+            .color(p.accent),
+        );
+    }
+    body = body.push(
+        row![
+            button(
+                text(if b.restore {
+                    t!("db.restore_run").to_string()
+                } else {
+                    t!("db.backup_run").to_string()
+                })
+                .size(12.5)
+            )
+            .padding([5, 18])
+            .on_press_maybe(
+                (b.path.is_some() && !b.running).then_some(Message::Db(DbMsg::BackupRun))
+            )
+            .style((se_theme::Primary { dark }).style()),
+            text(if b.running {
+                t!("db.backup_running").to_string()
             } else {
                 String::new()
             })

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped when a request or an answer changes; the app only uses a driver
 /// that answers `--protocol` with the same number.
-pub const PROTOCOL: u32 = 17;
+pub const PROTOCOL: u32 = 18;
 
 pub const DEFAULT_PORT: u16 = 5432;
 pub const DEFAULT_SSH_PORT: u16 = 22;
@@ -199,6 +199,25 @@ pub struct Request {
     pub format: String,
     /// For `import`: how the file is read and where its values go.
     pub import: Option<ImportSpec>,
+    /// For `dump` and `restore`: what the tool is asked for.
+    pub tool: Option<ToolSpec>,
+}
+
+/// What `pg_dump`, `pg_restore` and `psql` are asked for.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolSpec {
+    /// For a dump: `custom` (restored with `pg_restore`, compressed) or
+    /// `plain` (SQL).
+    pub format: String,
+    pub schema_only: bool,
+    pub data_only: bool,
+    pub no_owner: bool,
+    pub no_privileges: bool,
+    /// For a restore: drop what is there first (`--clean --if-exists`).
+    pub clean: bool,
+    /// For a restore of SQL or of a custom file: all or none.
+    pub single_transaction: bool,
 }
 
 /// A file of rows to put into a table.

@@ -165,6 +165,7 @@ fn run(input: &str, slot: &mut Option<(String, Session)>, serving: bool) -> Resu
         }
     }
     let session = &mut slot.as_mut().expect("just opened").1;
+    let tunnel_port = session.tunnel_port;
     let client = &mut session.client;
     match request.op.as_str() {
         "test" => {
@@ -195,6 +196,13 @@ fn run(input: &str, slot: &mut Option<(String, Session)>, serving: bool) -> Resu
             }
             limit(client, &request.target)?;
             apply(client, &request)
+        }
+        "dump" => dump(&request, tunnel_port),
+        "restore" => {
+            if request.target.read_only {
+                return Err("this data source is read-only".to_string());
+            }
+            restore(&request, tunnel_port)
         }
         "import" => {
             if request.target.read_only {
@@ -1907,6 +1915,287 @@ fn clean_copy(error: &std::io::Error) -> String {
         source = inner.source();
     }
     message
+}
+
+/// The directories where the PostgreSQL tools may be, besides the `PATH`.
+fn tool_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    for fixed in [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/Applications/Postgres.app/Contents/Versions/latest/bin",
+    ] {
+        dirs.push(PathBuf::from(fixed));
+    }
+    // Homebrew keeps one directory per version, and Debian too.
+    for (parent, prefix) in [
+        ("/opt/homebrew/opt", "postgresql@"),
+        ("/usr/local/opt", "postgresql@"),
+        ("/usr/lib/postgresql", ""),
+    ] {
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with(prefix) {
+                    dirs.push(entry.path().join("bin"));
+                }
+            }
+        }
+    }
+    dirs
+}
+
+/// The newest of the installed copies of a tool: one older than the server
+/// refuses to work with it.
+fn find_tool(name: &str) -> Result<(PathBuf, String), String> {
+    let mut best: Option<(Vec<u32>, PathBuf, String)> = None;
+    for dir in tool_dirs() {
+        let path = dir.join(name);
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(output) = Command::new(&path).arg("--version").output() else {
+            continue;
+        };
+        let said = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let number: Vec<u32> = said
+            .split_whitespace()
+            .last()
+            .unwrap_or("")
+            .split(|c: char| !c.is_ascii_digit())
+            .filter_map(|n| n.parse().ok())
+            .collect();
+        if best.as_ref().is_none_or(|(b, _, _)| number > *b) {
+            best = Some((number, path, said));
+        }
+    }
+    best.map(|(_, path, said)| (path, said)).ok_or_else(|| {
+        format!(
+            "{name} was not found: install the PostgreSQL client tools (for example `brew install libpq`)"
+        )
+    })
+}
+
+/// What a tool needs to reach the server, in its environment (the password
+/// never goes on a command line).
+fn tool_environment(
+    target: &Target,
+    database: &str,
+    tunnel_port: Option<u16>,
+) -> Vec<(String, String)> {
+    let mut env = vec![
+        ("PGHOST".to_string(), target.host.clone()),
+        ("PGPORT".to_string(), target.port.to_string()),
+        (
+            "PGDATABASE".to_string(),
+            if database.is_empty() {
+                target.database.clone()
+            } else {
+                database.to_string()
+            },
+        ),
+        ("PGCONNECT_TIMEOUT".to_string(), "20".to_string()),
+    ];
+    if !target.user.is_empty() {
+        env.push(("PGUSER".to_string(), target.user.clone()));
+    }
+    // The tunnel: the address to knock at changes, the name that the
+    // certificate is checked against does not.
+    if let Some(port) = tunnel_port {
+        env.push(("PGHOSTADDR".to_string(), "127.0.0.1".to_string()));
+        env.push(("PGPORT".to_string(), port.to_string()));
+    }
+    if target.auth == Auth::UserPassword && !target.password.is_empty() {
+        env.push(("PGPASSWORD".to_string(), target.password.clone()));
+    }
+    let mode = match target.ssl.mode {
+        SslMode::Disable => "disable",
+        SslMode::Prefer => "prefer",
+        SslMode::Require => "require",
+        SslMode::VerifyCa => "verify-ca",
+        SslMode::VerifyFull => "verify-full",
+    };
+    env.push(("PGSSLMODE".to_string(), mode.to_string()));
+    for (key, value) in [
+        ("PGSSLROOTCERT", &target.ssl.ca_file),
+        ("PGSSLCERT", &target.ssl.client_cert),
+        ("PGSSLKEY", &target.ssl.client_key),
+    ] {
+        if !value.is_empty() {
+            env.push((key.to_string(), value.clone()));
+        }
+    }
+    env
+}
+
+/// What a tool said that matters: its lines of complaint, or else its last
+/// lines (the first ones are progress, and a `Command was:` is the SQL it ran).
+fn said_of(said: &str) -> String {
+    let complaints: Vec<&str> = said
+        .lines()
+        .filter(|l| {
+            let l = l.to_lowercase();
+            l.contains("error") || l.contains("fatal") || l.contains("could not")
+        })
+        .take(4)
+        .collect();
+    if !complaints.is_empty() {
+        return complaints.join("\n");
+    }
+    let lines: Vec<&str> = said.lines().collect();
+    lines[lines.len().saturating_sub(8)..].join("\n")
+}
+
+/// Runs a tool and says how it ended: its last lines of complaint when it
+/// failed.
+fn run_tool(program: &Path, args: &[String], env: &[(String, String)]) -> Result<String, String> {
+    let shown = format!(
+        "{} {}",
+        program
+            .file_name()
+            .map_or_else(String::new, |n| n.to_string_lossy().to_string()),
+        args.join(" ")
+    );
+    let started = Instant::now();
+    let output = Command::new(program)
+        .args(args)
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("{}: {e}", program.display()))?;
+    let said = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let tail = said_of(&said);
+    if output.status.success() {
+        record(&shown, started, None, None);
+        Ok(tail)
+    } else {
+        record(&shown, started, None, Some(tail.clone()));
+        Err(if tail.is_empty() {
+            format!("{} failed", program.display())
+        } else {
+            tail
+        })
+    }
+}
+
+/// Writes a copy of the database (or of a schema, or of a table) to a file.
+fn dump(request: &Request, tunnel_port: Option<u16>) -> Result<Value, String> {
+    let spec = request.tool.clone().unwrap_or_default();
+    if request.path.is_empty() {
+        return Err("no file to write".to_string());
+    }
+    let (program, version) = find_tool("pg_dump")?;
+    let mut args: Vec<String> = vec![
+        "--no-password".into(),
+        "--file".into(),
+        request.path.clone(),
+        if spec.format == "plain" {
+            "--format=plain"
+        } else {
+            "--format=custom"
+        }
+        .into(),
+    ];
+    for (on, flag) in [
+        (spec.schema_only, "--schema-only"),
+        (spec.data_only, "--data-only"),
+        (spec.no_owner, "--no-owner"),
+        (spec.no_privileges, "--no-privileges"),
+        (spec.clean && spec.format == "plain", "--clean"),
+    ] {
+        if on {
+            args.push(flag.into());
+        }
+    }
+    if !request.table.is_empty() {
+        args.push("--table".into());
+        args.push(format!(
+            "{}.{}",
+            protocol::quote_ident(&request.schema),
+            protocol::quote_ident(&request.table)
+        ));
+    } else if !request.schema.is_empty() {
+        args.push("--schema".into());
+        args.push(protocol::quote_ident(&request.schema));
+    }
+    let env = tool_environment(&request.target, &request.database, tunnel_port);
+    let said = run_tool(&program, &args, &env)?;
+    let size = std::fs::metadata(&request.path).map_or(0, |m| m.len());
+    Ok(json!({ "path": request.path, "tool": version, "size": size, "said": said }))
+}
+
+/// How a backup file is made: `pg_restore` reads the custom and tar formats,
+/// `psql` the SQL ones.
+fn backup_kind(path: &str) -> Result<&'static str, String> {
+    let mut file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+    let mut head = [0u8; 512];
+    let read = file.read(&mut head).map_err(|e| e.to_string())?;
+    if head[..read.min(5)] == *b"PGDMP" {
+        Ok("custom")
+    } else if read >= 262 && &head[257..262] == b"ustar" {
+        Ok("tar")
+    } else {
+        Ok("sql")
+    }
+}
+
+/// Puts a backup back into the database.
+fn restore(request: &Request, tunnel_port: Option<u16>) -> Result<Value, String> {
+    let spec = request.tool.clone().unwrap_or_default();
+    if request.path.is_empty() {
+        return Err("no file to read".to_string());
+    }
+    let kind = backup_kind(&request.path)?;
+    let env = tool_environment(&request.target, &request.database, tunnel_port);
+    let (program, version, args) = if kind == "sql" {
+        let (program, version) = find_tool("psql")?;
+        let mut args: Vec<String> = vec![
+            "--no-password".into(),
+            "--quiet".into(),
+            "-v".into(),
+            "ON_ERROR_STOP=1".into(),
+        ];
+        if spec.single_transaction {
+            args.push("--single-transaction".into());
+        }
+        args.push("--file".into());
+        args.push(request.path.clone());
+        (program, version, args)
+    } else {
+        let (program, version) = find_tool("pg_restore")?;
+        let mut args: Vec<String> = vec![
+            "--no-password".into(),
+            "--dbname".into(),
+            if request.database.is_empty() {
+                request.target.database.clone()
+            } else {
+                request.database.clone()
+            },
+            "--exit-on-error".into(),
+        ];
+        for (on, flag) in [
+            (spec.schema_only, "--schema-only"),
+            (spec.data_only, "--data-only"),
+            (spec.no_owner, "--no-owner"),
+            (spec.no_privileges, "--no-privileges"),
+            (spec.clean, "--clean"),
+            (spec.clean, "--if-exists"),
+            (spec.single_transaction, "--single-transaction"),
+        ] {
+            if on {
+                args.push(flag.into());
+            }
+        }
+        args.push(request.path.clone());
+        (program, version, args)
+    };
+    let said = run_tool(&program, &args, &env)?;
+    Ok(json!({ "path": request.path, "tool": version, "kind": kind, "said": said }))
 }
 
 /// How the database is doing: the size of its tables and indexes, what waits

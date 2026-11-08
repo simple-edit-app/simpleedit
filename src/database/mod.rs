@@ -242,6 +242,15 @@ pub enum DbMsg {
     CopyRun,
     CopyDone(Box<Copied>),
     CopyClose,
+    /// The backup window: open it (for a database, a schema or a table; to
+    /// restore or not), an option, the file, go, done, close.
+    BackupOpen(u64, String, String, String, bool),
+    BackupFlag(BackupFlag, bool),
+    BackupPick,
+    BackupPicked(Option<PathBuf>),
+    BackupRun,
+    BackupDone(Done<String>),
+    BackupClose,
     /// Lays out the selection, or all the queries.
     FormatSql,
     /// The SQL of the file being edited (its selection, or all of it) runs
@@ -971,10 +980,12 @@ fn wait_limit(request: &protocol::Request) -> Option<Duration> {
     // What reads or changes data waits as long as the connection allows (the
     // server stops it), the rest does not wait for long.
     match request.op.as_str() {
-        "query" | "rows" | "apply" | "export" | "import" => match request.target.query_timeout {
-            0 => None,
-            seconds => Some(Duration::from_secs(seconds) + CALL_TIMEOUT),
-        },
+        "query" | "rows" | "apply" | "export" | "import" | "dump" | "restore" => {
+            match request.target.query_timeout {
+                0 => None,
+                seconds => Some(Duration::from_secs(seconds) + CALL_TIMEOUT),
+            }
+        }
         _ => Some(CALL_TIMEOUT),
     }
 }
@@ -1276,6 +1287,48 @@ pub async fn table_columns(params: Params) -> Done<protocol::Catalog> {
     })
 }
 
+/// Writes a backup of the database, a schema or a table (with `pg_dump`): how
+/// big the file is, as a person reads it.
+pub async fn backup(
+    params: Params,
+    database: String,
+    schema: String,
+    table: String,
+    path: String,
+    spec: protocol::ToolSpec,
+) -> Done<String> {
+    let mut request = params.request("dump");
+    request.database = database;
+    request.schema = schema;
+    request.table = table;
+    request.path = path;
+    request.tool = Some(spec);
+    call_with(None, params.driver.clone(), request)
+        .await
+        .map(|answer| {
+            Ok(protocol::human_size(
+                answer["size"].as_u64().unwrap_or(0) as i64
+            ))
+        })
+}
+
+/// Puts a backup file into a database (with `pg_restore`, or `psql` for SQL):
+/// the kind of file it was.
+pub async fn restore_backup(
+    params: Params,
+    database: String,
+    path: String,
+    spec: protocol::ToolSpec,
+) -> Done<String> {
+    let mut request = params.request("restore");
+    request.database = database;
+    request.path = path;
+    request.tool = Some(spec);
+    call_with(None, params.driver.clone(), request)
+        .await
+        .map(|answer| Ok(answer["kind"].as_str().unwrap_or_default().to_string()))
+}
+
 /// What a copy of a table did, with what each of the two sources was asked.
 #[derive(Debug, Clone)]
 pub struct Copied {
@@ -1363,6 +1416,36 @@ pub async fn copy_table(
         source_log,
         dest_log,
     }
+}
+
+/// The options of a backup or a restore.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupFlag {
+    /// A SQL file, not the compressed format of `pg_restore`.
+    Plain,
+    SchemaOnly,
+    DataOnly,
+    NoOwner,
+    NoPrivileges,
+    Clean,
+    SingleTransaction,
+}
+
+/// The window that backs a database up, or puts a backup back.
+#[derive(Debug, Clone)]
+pub struct Backup {
+    pub conn: u64,
+    pub database: String,
+    /// What is backed up: all the database, a schema, or a table.
+    pub schema: String,
+    pub table: String,
+    pub restore: bool,
+    pub spec: protocol::ToolSpec,
+    pub path: Option<PathBuf>,
+    pub running: bool,
+    pub error: Option<String>,
+    /// What it said when it went well.
+    pub done: Option<String>,
 }
 
 /// The window that copies a table to another data source.
@@ -2152,6 +2235,7 @@ pub struct State {
     pub health: Option<HealthView>,
     pub import: Option<Import>,
     pub copy_table: Option<CopyTable>,
+    pub backup: Option<Backup>,
     pub confirm: Option<Confirm>,
     /// What each table is made of, read when a table of the tree opens.
     pub structures: HashMap<TableKey, protocol::Structure>,
@@ -2209,6 +2293,7 @@ impl State {
             health: None,
             import: None,
             copy_table: None,
+            backup: None,
             confirm: None,
             structures: HashMap::new(),
             tree_filter: String::new(),

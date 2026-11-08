@@ -514,7 +514,7 @@ fn schema_menu(
             t!("db.new_table").to_string(),
             None,
             dark,
-            Message::Db(DbMsg::NewTable(conn, database.clone(), schema)),
+            Message::Db(DbMsg::NewTable(conn, database.clone(), schema.clone())),
         ),
         menu_bar::item(
             t!("db.new_schema").to_string(),
@@ -526,7 +526,31 @@ fn schema_menu(
             t!("db.health").to_string(),
             None,
             dark,
-            Message::Db(DbMsg::OpenHealth(conn, database)),
+            Message::Db(DbMsg::OpenHealth(conn, database.clone())),
+        ),
+        menu_bar::item(
+            t!("db.backup").to_string(),
+            None,
+            dark,
+            Message::Db(DbMsg::BackupOpen(
+                conn,
+                database.clone(),
+                schema.clone(),
+                String::new(),
+                false,
+            )),
+        ),
+        menu_bar::item(
+            t!("db.restore").to_string(),
+            None,
+            dark,
+            Message::Db(DbMsg::BackupOpen(
+                conn,
+                database,
+                String::new(),
+                String::new(),
+                true,
+            )),
         ),
     ];
     container(column(items).spacing(1).padding(6).width(230))
@@ -548,7 +572,31 @@ fn database_menu(conn: u64, database: String, dark: bool) -> Element<'static, Me
                 t!("db.health").to_string(),
                 None,
                 dark,
-                Message::Db(DbMsg::OpenHealth(conn, database)),
+                Message::Db(DbMsg::OpenHealth(conn, database.clone())),
+            ),
+            menu_bar::item(
+                t!("db.backup").to_string(),
+                None,
+                dark,
+                Message::Db(DbMsg::BackupOpen(
+                    conn,
+                    database.clone(),
+                    String::new(),
+                    String::new(),
+                    false,
+                )),
+            ),
+            menu_bar::item(
+                t!("db.restore").to_string(),
+                None,
+                dark,
+                Message::Db(DbMsg::BackupOpen(
+                    conn,
+                    database,
+                    String::new(),
+                    String::new(),
+                    true,
+                )),
             )
         ]
         .padding(6)
@@ -3113,6 +3161,20 @@ fn table_menu(
                 database.clone(),
                 schema.clone(),
                 table.clone(),
+            )),
+        ));
+    }
+    if kind == Kind::Table {
+        items.push(menu_bar::item(
+            t!("db.backup").to_string(),
+            None,
+            dark,
+            Message::Db(DbMsg::BackupOpen(
+                id,
+                database.clone(),
+                schema.clone(),
+                table.clone(),
+                false,
             )),
         ));
     }

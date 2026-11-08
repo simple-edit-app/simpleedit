@@ -4,7 +4,9 @@ use iced::Task;
 
 use super::{Message, SimpleEditApp};
 use crate::database::import::{self, Format};
-use crate::database::{self, CopyField, CopyTable, DbMsg, HealthTab, HealthView, Import, TableRef};
+use crate::database::{
+    self, Backup, BackupFlag, CopyField, CopyTable, DbMsg, HealthTab, HealthView, Import, TableRef,
+};
 
 impl SimpleEditApp {
     pub(super) fn db_tools_message(&mut self, msg: DbMsg) -> Task<Message> {
@@ -424,6 +426,152 @@ impl SimpleEditApp {
             DbMsg::CopyClose => {
                 if self.db.copy_table.as_ref().is_some_and(|c| !c.running) {
                     self.db.copy_table = None;
+                }
+                Task::none()
+            }
+            DbMsg::BackupOpen(conn, database, schema, table, restore) => {
+                self.db.backup = Some(Backup {
+                    conn,
+                    database,
+                    schema,
+                    table,
+                    restore,
+                    spec: database::protocol::ToolSpec {
+                        format: "custom".into(),
+                        no_owner: true,
+                        no_privileges: true,
+                        single_transaction: restore,
+                        ..Default::default()
+                    },
+                    path: None,
+                    running: false,
+                    error: None,
+                    done: None,
+                });
+                Task::none()
+            }
+            DbMsg::BackupFlag(flag, on) => {
+                if let Some(b) = self.db.backup.as_mut().filter(|b| !b.running) {
+                    match flag {
+                        BackupFlag::Plain => {
+                            b.spec.format = if on { "plain" } else { "custom" }.to_string()
+                        }
+                        BackupFlag::SchemaOnly => {
+                            b.spec.schema_only = on;
+                            b.spec.data_only &= !on;
+                        }
+                        BackupFlag::DataOnly => {
+                            b.spec.data_only = on;
+                            b.spec.schema_only &= !on;
+                        }
+                        BackupFlag::NoOwner => b.spec.no_owner = on,
+                        BackupFlag::NoPrivileges => b.spec.no_privileges = on,
+                        BackupFlag::Clean => b.spec.clean = on,
+                        BackupFlag::SingleTransaction => b.spec.single_transaction = on,
+                    }
+                    b.error = None;
+                    b.done = None;
+                }
+                Task::none()
+            }
+            DbMsg::BackupPick => {
+                let Some(b) = self.db.backup.as_ref().filter(|b| !b.running) else {
+                    return Task::none();
+                };
+                let restore = b.restore;
+                let name = [&b.database, &b.schema, &b.table]
+                    .into_iter()
+                    .filter(|p| !p.is_empty())
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(".");
+                let ext = if b.spec.format == "plain" {
+                    "sql"
+                } else {
+                    "dump"
+                };
+                Task::perform(
+                    async move {
+                        if restore {
+                            rfd::AsyncFileDialog::new()
+                                .pick_file()
+                                .await
+                                .map(|f| f.path().to_path_buf())
+                        } else {
+                            rfd::AsyncFileDialog::new()
+                                .set_file_name(format!("{name}.{ext}"))
+                                .save_file()
+                                .await
+                                .map(|f| f.path().to_path_buf())
+                        }
+                    },
+                    |path| Message::Db(DbMsg::BackupPicked(path)),
+                )
+            }
+            DbMsg::BackupPicked(path) => {
+                if let (Some(path), Some(b)) = (path, self.db.backup.as_mut()) {
+                    b.path = Some(path);
+                    b.error = None;
+                    b.done = None;
+                }
+                Task::none()
+            }
+            DbMsg::BackupRun => {
+                let Some(b) = self.db.backup.as_ref().filter(|b| !b.running) else {
+                    return Task::none();
+                };
+                let Some(path) = b.path.clone() else {
+                    return Task::none();
+                };
+                let (conn, restore) = (b.conn, b.restore);
+                let (database, schema, table) =
+                    (b.database.clone(), b.schema.clone(), b.table.clone());
+                let spec = b.spec.clone();
+                let Some(params) = self.db_params(conn, false) else {
+                    return self.db_ask_password(conn);
+                };
+                if let Some(b) = self.db.backup.as_mut() {
+                    b.running = true;
+                    b.error = None;
+                    b.done = None;
+                }
+                let path = path.to_string_lossy().to_string();
+                if restore {
+                    Task::perform(
+                        database::restore_backup(params, database, path, spec),
+                        |done| Message::Db(DbMsg::BackupDone(done)),
+                    )
+                } else {
+                    Task::perform(
+                        database::backup(params, database, schema, table, path, spec),
+                        |done| Message::Db(DbMsg::BackupDone(done)),
+                    )
+                }
+            }
+            DbMsg::BackupDone(done) => {
+                let Some(conn) = self.db.backup.as_ref().map(|b| b.conn) else {
+                    return Task::none();
+                };
+                let log = self.db_log(conn, &done.executed);
+                let restored = self.db.backup.as_ref().is_some_and(|b| b.restore);
+                if let Some(b) = self.db.backup.as_mut() {
+                    b.running = false;
+                    match done.result {
+                        Ok(said) => b.done = Some(said),
+                        Err(error) => b.error = Some(error),
+                    }
+                }
+                // What a restore made is in the tree.
+                let ok = self.db.backup.as_ref().is_some_and(|b| b.done.is_some());
+                if restored && ok {
+                    Task::batch([log, self.db_message(DbMsg::Reload(conn))])
+                } else {
+                    log
+                }
+            }
+            DbMsg::BackupClose => {
+                if self.db.backup.as_ref().is_some_and(|b| !b.running) {
+                    self.db.backup = None;
                 }
                 Task::none()
             }
