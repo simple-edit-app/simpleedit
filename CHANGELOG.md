@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.20.0] - 2026-11-08
+
+### Added
+- The tables and the tree are read through a session that stays open: the connection, TLS and the SSH tunnel are paid once, not for every page.
+- The DDL of a table covers partitioned tables and their partitions, unlogged tables and triggers; a view or a materialized view shows its SQL from the tree menu, and a function or a procedure shows its SQL when clicked.
+- Stop asks the server to cancel the statement, so it also stops on servers before PostgreSQL 14.
+- The completion knows up to 100,000 columns, those of the schemas in use first, and says when it is partial.
+
+### Fixed
+- A text with several commands (the DDL of a table with its indexes, for instance) runs again in the console; it was refused in 1.19.0.
+
 ## [1.19.0] - 2026-11-08
 
 ### Added

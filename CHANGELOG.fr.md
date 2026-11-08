@@ -1,5 +1,16 @@
 # Journal des modifications
 
+## [1.20.0] - 2026-11-08
+
+### Ajouté
+- Les tables et l'arbre sont lus par une session qui reste ouverte : la connexion, le TLS et le tunnel SSH ne sont payés qu'une fois, plus à chaque page.
+- Le DDL d'une table couvre les tables partitionnées et leurs partitions, les tables non journalisées et les triggers ; une vue ou une vue matérialisée montre son SQL depuis le menu de l'arbre, et une fonction ou une procédure montre son SQL au clic.
+- Arrêter demande au serveur d'annuler la requête : elle s'arrête aussi sur les serveurs antérieurs à PostgreSQL 14.
+- La complétion connaît jusqu'à 100 000 colonnes, celles des schémas utilisés d'abord, et dit quand elle est partielle.
+
+### Corrigé
+- Un texte à plusieurs commandes (le DDL d'une table avec ses index, par exemple) s'exécute de nouveau dans la console ; il était refusé en 1.19.0.
+
 ## [1.19.0] - 2026-11-08
 
 ### Ajouté
