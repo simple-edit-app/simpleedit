@@ -186,6 +186,10 @@ pub enum DbMsg {
     /// Stops the query that runs.
     Cancel,
     /// The risky statements that wait are run, or given up.
+    /// What is typed to find an entry of the log; an entry goes back into
+    /// the queries.
+    LogFilter(String),
+    LogReuse(usize),
     GuardRun,
     GuardCancel,
     ClearLog,

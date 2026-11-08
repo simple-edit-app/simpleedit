@@ -925,6 +925,8 @@
   "db.guard_writes": "This is a production source: confirm the change.",
   "db.guard_run": "Run anyway",
   "db.guard_cancel": "Cancel",
+  "db.log_search": "Search the history…",
+  "db.log_reuse": "Put in the editor",
   "db.opt_single": "Single database mode",
   "db.opt_single_hint": "Shows only the database named in the connection, not the other ones of the server.",
   "db.opt_time_zone": "Time zone",

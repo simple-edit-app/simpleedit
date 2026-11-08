@@ -2306,6 +2306,13 @@ pub fn console<'a>(state: &'a State, dark: bool) -> Element<'a, Message> {
         }
         ConsoleTab::Log => {
             header = header.push(
+                text_input(&t!("db.log_search"), &c.log_filter)
+                    .on_input(|text| Message::Db(DbMsg::LogFilter(text)))
+                    .size(12.5)
+                    .padding([3, 8])
+                    .width(220),
+            );
+            header = header.push(
                 checkbox(c.show_internal)
                     .label(t!("db.log_internal").to_string())
                     .size(14)
@@ -2361,6 +2368,7 @@ fn log_view<'a>(state: &'a State, dark: bool) -> Element<'a, Message> {
         .iter()
         .enumerate()
         .filter(|(_, entry)| state.console.show_internal || !entry.internal)
+        .filter(|(_, entry)| state.console.matches(entry))
     {
         let ok = entry.error.is_none();
         let mut head = row![
@@ -2682,6 +2690,12 @@ fn completion_list<'a>(
 fn log_menu(at: usize, has_error: bool, dark: bool) -> Element<'static, Message> {
     use super::LogCopy;
     let mut items: Vec<Element<'static, Message>> = vec![
+        menu_bar::item(
+            t!("db.log_reuse").to_string(),
+            None,
+            dark,
+            Message::Db(DbMsg::LogReuse(at)),
+        ),
         menu_bar::item(
             t!("db.log_copy_sql").to_string(),
             None,

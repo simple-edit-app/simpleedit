@@ -79,6 +79,8 @@ pub struct Console {
     pub selected_log: Option<usize>,
     /// Statements that wait for a yes: they are risky.
     pub guard: Option<Guard>,
+    /// What is typed to find an entry of the log.
+    pub log_filter: String,
 }
 
 /// What waits for a confirmation, and why.
@@ -110,6 +112,43 @@ fn queries_file() -> Option<PathBuf> {
 }
 
 impl Console {
+    /// Whether an entry of the log is what the filter looks for (its SQL, its
+    /// connection or its error, whatever the case).
+    pub fn matches(&self, entry: &LogEntry) -> bool {
+        let needle = self.log_filter.trim().to_lowercase();
+        needle.is_empty()
+            || entry.sql.to_lowercase().contains(&needle)
+            || entry.connection.to_lowercase().contains(&needle)
+            || entry
+                .error
+                .as_ref()
+                .is_some_and(|e| e.to_lowercase().contains(&needle))
+    }
+
+    /// Adds a statement at the end of the queries, on its own lines.
+    pub fn append_query(&mut self, sql: &str) {
+        use text_editor::{Action, Edit, Motion};
+        self.editor.perform(Action::Move(Motion::DocumentEnd));
+        let written = self.editor.text();
+        // A blank line between statements, and a `;` to end the last one.
+        let separator = if written.trim().is_empty() {
+            String::new()
+        } else {
+            let closed = written.trim_end().ends_with(';');
+            let newlines = written.len() - written.trim_end_matches('\n').len();
+            format!(
+                "{}{}",
+                if closed { "" } else { ";" },
+                "\n".repeat(2usize.saturating_sub(newlines))
+            )
+        };
+        let text = format!("{separator}{};\n", sql.trim().trim_end_matches(';'));
+        self.editor
+            .perform(Action::Edit(Edit::Paste(std::sync::Arc::new(text))));
+    }
+}
+
+impl Console {
     /// The queries written last time are there again.
     pub fn load() -> Self {
         let text = queries_file()
@@ -130,6 +169,7 @@ impl Console {
             completion: None,
             selected_log: None,
             guard: None,
+            log_filter: String::new(),
         }
     }
 
@@ -570,5 +610,42 @@ mod tests {
         console.editor = text_editor::Content::new();
         assert!(console.statements(false).is_empty());
         assert!(console.statements(true).is_empty());
+    }
+
+    #[test]
+    fn the_log_is_searched_by_sql_connection_or_error() {
+        let mut console = Console::load();
+        console.log.clear();
+        console.push(
+            "shop",
+            &[Executed {
+                sql: "SELECT * FROM Orders".into(),
+                ms: 1,
+                rows: Some(1),
+                error: Some("Boom".into()),
+                internal: false,
+            }],
+        );
+        let entry = console.log[0].clone();
+        assert!(console.matches(&entry));
+        for needle in ["orders", "SHOP", "boom"] {
+            console.log_filter = needle.into();
+            assert!(console.matches(&entry), "{needle}");
+        }
+        console.log_filter = "invoices".into();
+        assert!(!console.matches(&entry));
+    }
+
+    #[test]
+    fn an_entry_goes_back_into_the_queries_on_its_own_lines() {
+        let mut console = Console::load();
+        console.editor = text_editor::Content::new();
+        console.append_query("SELECT 1;");
+        assert_eq!(console.editor.text().trim_end(), "SELECT 1;");
+        console.append_query("SELECT 2");
+        assert_eq!(console.editor.text().trim_end(), "SELECT 1;\n\nSELECT 2;");
+        console.editor = text_editor::Content::with_text("SELECT 0");
+        console.append_query("SELECT 1");
+        assert_eq!(console.editor.text().trim_end(), "SELECT 0;\n\nSELECT 1;");
     }
 }

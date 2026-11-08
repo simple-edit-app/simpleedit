@@ -1299,6 +1299,19 @@ impl SimpleEditApp {
                 }
                 _ => Task::none(),
             },
+            DbMsg::LogFilter(text) => {
+                self.db.console.log_filter = text;
+                self.db.console.selected_log = None;
+                Task::none()
+            }
+            DbMsg::LogReuse(at) => {
+                if let Some(sql) = self.db.console.log.get(at).map(|e| e.sql.clone()) {
+                    self.db.console.append_query(&sql);
+                    self.db.console.tab = database::console::ConsoleTab::Queries;
+                    self.db.console.save();
+                }
+                Task::none()
+            }
             DbMsg::GuardCancel => {
                 self.db.console.guard = None;
                 Task::none()
