@@ -187,6 +187,35 @@ impl SimpleEditApp {
             return Task::none();
         }
         let statements = self.db.console.statements(all);
+        self.db_run_statements(statements)
+    }
+
+    /// Runs what the SQL file being edited says (its selection, or all of
+    /// it), on the data source of the console, as the console would.
+    fn db_run_file(&mut self) -> Task<Message> {
+        if self.editor.language.as_deref() != Some("sql") {
+            self.set_status(t!("db.file_not_sql"), false);
+            return Task::none();
+        }
+        let text = self
+            .editor
+            .content
+            .selection()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| crate::editor::buffer_text(&self.editor.content));
+        let statements: Vec<String> = database::console::split_statements(&text)
+            .into_iter()
+            .map(|span| text[span.start..span.end].to_string())
+            .collect();
+        // The result and the log are shown where the console shows them.
+        self.db.console.open = true;
+        self.db_run_statements(statements)
+    }
+
+    fn db_run_statements(&mut self, statements: Vec<String>) -> Task<Message> {
+        if self.db.console.running {
+            return Task::none();
+        }
         let Some(conn) = self
             .db
             .console
@@ -1318,6 +1347,7 @@ impl SimpleEditApp {
                 self.db.console.save();
                 Task::none()
             }
+            DbMsg::RunFile => self.db_run_file(),
             DbMsg::FormatSql => {
                 self.db.console.format();
                 self.db.console.completion = None;

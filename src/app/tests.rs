@@ -2587,6 +2587,21 @@ mod behavior_tests {
     }
 
     #[test]
+    fn an_sql_file_runs_on_the_data_source_of_the_console() {
+        use crate::database::DbMsg;
+        let (mut app, _) = db_app(true);
+        app.editor.content = crate::code_editor::Content::with_text("SELECT 1;\nSELECT 2");
+        // Not an SQL file: nothing runs.
+        app.editor.language = Some("md".into());
+        let _ = app.update(Message::Db(DbMsg::RunFile));
+        assert!(!app.db.console.running);
+        app.editor.language = Some("sql".into());
+        let _ = app.update(Message::Db(DbMsg::RunFile));
+        assert!(app.db.console.running && app.db.console.open);
+        assert_eq!(app.db.console.running_sql, vec!["SELECT 1", "SELECT 2"]);
+    }
+
+    #[test]
     fn the_arrows_and_tab_move_the_focus_from_cell_to_cell() {
         let (mut app, path) = db_app(true);
         let key = |app: &mut SimpleEditApp, k: &str, shift: bool| {

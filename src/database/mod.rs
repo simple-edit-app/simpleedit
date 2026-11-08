@@ -195,6 +195,9 @@ pub enum DbMsg {
     LogFilter(String),
     /// Lays out the selection, or all the queries.
     FormatSql,
+    /// The SQL of the file being edited (its selection, or all of it) runs
+    /// on the data source of the console.
+    RunFile,
     LogReuse(usize),
     GuardRun,
     GuardCancel,
