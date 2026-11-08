@@ -97,6 +97,15 @@ pub enum DbMsg {
     SearchText(PathBuf, String),
     ColumnFilter(PathBuf, String, String),
     ToggleColumnFilters(PathBuf),
+    /// A row as a form: open it, close it, go to the row before or after,
+    /// type in a field, make it NULL, lay out its JSON.
+    OpenForm(PathBuf, usize),
+    CloseForm(PathBuf),
+    FormMove(PathBuf, i32),
+    FormInput(PathBuf, usize, String),
+    FormNull(PathBuf, usize),
+    FormJson(PathBuf, usize),
+    ChoicesLoaded(PathBuf, Done<Vec<protocol::Choices>>),
     PageSize(PathBuf, u64),
     /// A column header was clicked: ascending, descending, then none.
     Sort(PathBuf, usize),
@@ -1159,6 +1168,14 @@ pub async fn table_columns(params: Params) -> Done<protocol::Catalog> {
     })
 }
 
+/// The columns of a table that take their values from a list.
+pub async fn table_choices(params: Params, table: TableRef) -> Done<Vec<protocol::Choices>> {
+    let request = table_request(&params, "choices", &table);
+    call_with(params.browse.clone(), params.driver.clone(), request)
+        .await
+        .map(|answer| serde_json::from_value(answer["choices"].clone()).map_err(|e| e.to_string()))
+}
+
 /// What running statements gave: a result for each that went well, and the
 /// one that failed, if one did (the ones after it did not run).
 #[derive(Debug, Clone)]
@@ -1376,6 +1393,11 @@ pub struct TableTab {
     pub column_filters: std::collections::BTreeMap<String, String>,
     /// The fields under the column names are shown.
     pub show_filters: bool,
+    /// The row shown as a form, if one is.
+    pub form: Option<usize>,
+    /// The columns that take their values from a list (read when the form
+    /// opens first).
+    pub choices: Option<Vec<protocol::Choices>>,
     /// The sort that was applied: columns, and whether each is descending.
     pub order: Vec<(String, bool)>,
     pub page_size: u64,
@@ -1459,6 +1481,8 @@ impl TableTab {
             column_text: Default::default(),
             column_filters: Default::default(),
             show_filters: false,
+            form: None,
+            choices: None,
             order: Vec::new(),
             page_size,
             pending: Pending::default(),
@@ -1611,6 +1635,7 @@ impl TableTab {
         self.picker = None;
         self.selected = None;
         self.anchor = None;
+        self.form = None;
     }
 
     /// The block of cells that is selected, when it is more than one.
@@ -3445,6 +3470,12 @@ mod tests {
                 && f.ref_table == "customers"
                 && !f.columns.is_empty()
                 && f.columns.len() == f.ref_columns.len()));
+            // The columns that take their values from a list.
+            let listed = table_choices(params.clone(), tref("public", "items")).await;
+            assert!(listed.executed.iter().all(|e| e.internal));
+            let listed = listed.result.unwrap();
+            let fk = listed.iter().find(|c| c.kind == "fk").expect("a foreign key");
+            assert!(!fk.values.is_empty() && fk.values.len() <= protocol::MAX_CHOICES);
             // TLS asked of a server that has none.
             let mut tls = params;
             tls.target.ssl.mode = SslMode::Require;

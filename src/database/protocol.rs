@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped when a request or an answer changes; the app only uses a driver
 /// that answers `--protocol` with the same number.
-pub const PROTOCOL: u32 = 14;
+pub const PROTOCOL: u32 = 15;
 
 pub const DEFAULT_PORT: u16 = 5432;
 pub const DEFAULT_SSH_PORT: u16 = 22;
@@ -226,6 +226,22 @@ pub struct ForeignKey {
     pub ref_table: String,
     pub ref_columns: Vec<String>,
 }
+
+/// The values a column can take, when the database says so: the labels of an
+/// enumeration, or the keys of the table a foreign key points to.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Choices {
+    pub column: String,
+    /// `enum` or `fk`.
+    pub kind: String,
+    pub values: Vec<String>,
+    /// There were more than the list holds.
+    #[serde(default)]
+    pub more: bool,
+}
+
+/// Most values of a foreign key that are listed.
+pub const MAX_CHOICES: usize = 200;
 
 /// What the completion knows of a database besides its tree.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

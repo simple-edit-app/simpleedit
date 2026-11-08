@@ -205,6 +205,7 @@ fn run(input: &str, slot: &mut Option<(String, Session)>, serving: bool) -> Resu
             Ok(answer)
         }
         "columns" => columns(client, &request),
+        "choices" => choices(client, &request),
         "structure" => structure(client, &request),
         "definition" => definition(client, &request),
         "cancel" => {
@@ -1764,6 +1765,78 @@ fn columns(client: &mut Client, request: &Request) -> Result<Value, String> {
         })
         .collect();
     Ok(json!({ "columns": list, "foreign_keys": foreign_keys }))
+}
+
+/// The columns of a table that take their values from a list: the labels of
+/// an enumeration, or the keys of the table a one-column foreign key points to.
+fn choices(client: &mut Client, request: &Request) -> Result<Value, String> {
+    let (schema, table) = (request.schema.as_str(), request.table.as_str());
+    let mut out: Vec<protocol::Choices> = Vec::new();
+    let enums = internal_query(
+        client,
+        "SELECT a.attname::text, array_agg(e.enumlabel::text ORDER BY e.enumsortorder) \
+         FROM pg_attribute a \
+         JOIN pg_enum e ON e.enumtypid = a.atttypid \
+         JOIN pg_class c ON c.oid = a.attrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         WHERE n.nspname = $1 AND c.relname = $2 AND a.attnum > 0 AND NOT a.attisdropped \
+         GROUP BY a.attnum, a.attname ORDER BY a.attnum",
+        &[&schema, &table],
+    )
+    .map_err(clean)?;
+    for row in &enums {
+        out.push(protocol::Choices {
+            column: row.get(0),
+            kind: "enum".into(),
+            values: row.get::<_, Vec<String>>(1),
+            more: false,
+        });
+    }
+    let keys = internal_query(
+        client,
+        "SELECT a.attname::text, n2.nspname::text, c2.relname::text, a2.attname::text \
+         FROM pg_constraint con \
+         JOIN pg_class c ON c.oid = con.conrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = con.conkey[1] \
+         JOIN pg_class c2 ON c2.oid = con.confrelid \
+         JOIN pg_namespace n2 ON n2.oid = c2.relnamespace \
+         JOIN pg_attribute a2 ON a2.attrelid = con.confrelid AND a2.attnum = con.confkey[1] \
+         WHERE con.contype = 'f' AND array_length(con.conkey, 1) = 1 \
+           AND n.nspname = $1 AND c.relname = $2 \
+         ORDER BY con.conname",
+        &[&schema, &table],
+    )
+    .map_err(clean)?;
+    for row in &keys {
+        let column: String = row.get(0);
+        if out.iter().any(|c| c.column == column) {
+            continue;
+        }
+        let (ref_schema, ref_table, ref_column): (String, String, String) =
+            (row.get(1), row.get(2), row.get(3));
+        let select = format!(
+            "SELECT DISTINCT {col}::text FROM {sch}.{tbl} WHERE {col} IS NOT NULL ORDER BY 1 LIMIT {limit}",
+            col = protocol::quote_ident(&ref_column),
+            sch = protocol::quote_ident(&ref_schema),
+            tbl = protocol::quote_ident(&ref_table),
+            limit = protocol::MAX_CHOICES + 1,
+        );
+        // A table that cannot be read gives no list, not an error.
+        let Ok(found) = internal_query(client, &select, &[]) else {
+            continue;
+        };
+        let mut values: Vec<String> = found.iter().map(|r| r.get(0)).collect();
+        let more = values.len() > protocol::MAX_CHOICES;
+        values.truncate(protocol::MAX_CHOICES);
+        out.push(protocol::Choices {
+            column,
+            kind: "fk".into(),
+            values,
+            more,
+        });
+    }
+    Ok(json!({ "choices": out }))
 }
 
 /// Runs the statements one after the other, in one session: the rows they

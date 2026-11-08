@@ -226,6 +226,27 @@ impl Pending {
         }
     }
 
+    /// Types into a cell as a form does, letter by letter: an empty text in a
+    /// cell that was NULL is still NULL, not an empty text.
+    pub fn type_into(&mut self, page: &Page, row: usize, col: usize, text: String) {
+        let was_null = page
+            .rows
+            .get(row)
+            .and_then(|r| r.get(col))
+            .is_some_and(|v| v.is_none());
+        let value = if text.is_empty() && (was_null || self.is_new(page, row)) {
+            None
+        } else {
+            Some(text)
+        };
+        // In a row that is added, empty is the column's default.
+        if self.is_new(page, row) && value.is_none() {
+            self.set(page, row, col, Some(String::new()));
+        } else {
+            self.set(page, row, col, value);
+        }
+    }
+
     /// A cell of a row that is added goes back to the column's default.
     pub fn set_default(&mut self, page: &Page, row: usize, col: usize) {
         if self.is_new(page, row) {
@@ -865,5 +886,21 @@ mod tests {
             block_text(&page, &p, (2, 2), (9, 9), CopyFormat::Tsv, "t"),
             "".to_string()
         );
+    }
+
+    #[test]
+    fn typing_in_a_form_keeps_null_until_something_is_typed() {
+        let page = page();
+        let mut p = Pending::default();
+        // The note of the first row is NULL.
+        p.type_into(&page, 0, 2, "a".into());
+        assert_eq!(p.value(&page, 0, 2), Some("a"));
+        // Back to nothing: it is NULL again, not an empty text, and no edit.
+        p.type_into(&page, 0, 2, String::new());
+        assert!(!p.is_edited(0, 2));
+        assert_eq!(p.cell(&page, 0, 2), Cell::Null);
+        // A cell that held a text and is emptied holds an empty text.
+        p.type_into(&page, 1, 2, String::new());
+        assert_eq!(p.value(&page, 1, 2), Some(""));
     }
 }

@@ -2625,6 +2625,50 @@ mod behavior_tests {
     }
 
     #[test]
+    fn a_row_is_edited_in_a_form_that_moves_from_row_to_row() {
+        use crate::database::DbMsg;
+        let (mut app, path) = db_app(true);
+        let _ = app.update(Message::Db(DbMsg::OpenForm(path.clone(), 1)));
+        assert_eq!(app.db_tabs[&path].form, Some(1));
+        // A letter typed, then the field emptied: the cell was not NULL.
+        let _ = app.update(Message::Db(DbMsg::FormInput(path.clone(), 1, "new".into())));
+        assert!(app.db_tabs[&path].pending.is_edited(1, 1));
+        let _ = app.update(Message::Db(DbMsg::FormNull(path.clone(), 1)));
+        assert_eq!(
+            app.db_tabs[&path]
+                .pending
+                .cell(app.db_tabs[&path].page.as_ref().unwrap(), 1, 1),
+            crate::database::grid::Cell::Null
+        );
+        // The row before and after, and no further than the rows there are.
+        let _ = app.update(Message::Db(DbMsg::FormMove(path.clone(), -1)));
+        assert_eq!(app.db_tabs[&path].form, Some(0));
+        let _ = app.update(Message::Db(DbMsg::FormMove(path.clone(), -1)));
+        assert_eq!(app.db_tabs[&path].form, Some(0));
+        let _ = app.update(Message::Db(DbMsg::FormMove(path.clone(), 9)));
+        assert_eq!(app.db_tabs[&path].form, Some(2));
+        // The lists of values arrive; a failure is no list, not an error.
+        let _ = app.update(Message::Db(DbMsg::ChoicesLoaded(
+            path.clone(),
+            Done::err("nope"),
+        )));
+        assert_eq!(app.db_tabs[&path].choices, Some(Vec::new()));
+        // Escape closes it.
+        assert!(app.db_escape());
+        assert_eq!(app.db_tabs[&path].form, None);
+    }
+
+    #[test]
+    fn a_form_changes_nothing_in_a_table_that_is_read_only() {
+        use crate::database::DbMsg;
+        let (mut app, path) = db_app(false);
+        let _ = app.update(Message::Db(DbMsg::OpenForm(path.clone(), 0)));
+        let _ = app.update(Message::Db(DbMsg::FormInput(path.clone(), 1, "x".into())));
+        let _ = app.update(Message::Db(DbMsg::FormNull(path.clone(), 1)));
+        assert!(app.db_tabs[&path].pending.is_empty());
+    }
+
+    #[test]
     fn the_arrows_and_tab_move_the_focus_from_cell_to_cell() {
         let (mut app, path) = db_app(true);
         let key = |app: &mut SimpleEditApp, k: &str, shift: bool| {

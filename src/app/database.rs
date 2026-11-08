@@ -368,6 +368,9 @@ impl SimpleEditApp {
                     (row.saturating_sub(1), cols - 1)
                 }
             }
+            ("F4", false, false) => {
+                return Some(self.db_message(DbMsg::OpenForm(path, row)));
+            }
             ("F2", false, false) => {
                 return Some(self.db_message(DbMsg::Edit(path, row, col)));
             }
@@ -461,7 +464,7 @@ impl SimpleEditApp {
         else {
             return false;
         };
-        tab.picker.take().is_some() || tab.editing.take().is_some()
+        tab.picker.take().is_some() || tab.editing.take().is_some() || tab.form.take().is_some()
     }
 
     /// Opens a table in a tab, or goes to the one that shows it.
@@ -854,6 +857,90 @@ impl SimpleEditApp {
             DbMsg::Filter(path, text) => {
                 if let Some(tab) = self.db_tabs.get_mut(&path) {
                     tab.filter_text = text;
+                }
+                Task::none()
+            }
+            DbMsg::OpenForm(path, row) => {
+                let Some(tab) = self.db_tabs.get_mut(&path) else {
+                    return Task::none();
+                };
+                if tab.page.as_ref().is_none_or(|p| row >= tab.pending.rows(p)) {
+                    return Task::none();
+                }
+                tab.form = Some(row);
+                tab.selected = Some((row, tab.selected.map_or(0, |s| s.1)));
+                tab.anchor = None;
+                if tab.choices.is_some() {
+                    return Task::none();
+                }
+                let (conn, table) = (tab.conn, tab.table_ref());
+                match self.db_params(conn, false) {
+                    Some(params) => Task::perform(database::table_choices(params, table), {
+                        let path = path.clone();
+                        move |done| Message::Db(DbMsg::ChoicesLoaded(path.clone(), done))
+                    }),
+                    None => Task::none(),
+                }
+            }
+            DbMsg::ChoicesLoaded(path, done) => {
+                let conn = self.db_tabs.get(&path).map(|t| t.conn);
+                let log = conn.map_or_else(Task::none, |c| self.db_log(c, &done.executed));
+                if let Some(tab) = self.db_tabs.get_mut(&path) {
+                    // No list is not an error: the field is typed in.
+                    tab.choices = Some(done.result.unwrap_or_default());
+                }
+                log
+            }
+            DbMsg::CloseForm(path) => {
+                if let Some(tab) = self.db_tabs.get_mut(&path) {
+                    tab.form = None;
+                }
+                Task::none()
+            }
+            DbMsg::FormMove(path, by) => {
+                if let Some(tab) = self.db_tabs.get_mut(&path) {
+                    let count = tab.page.as_ref().map_or(0, |p| tab.pending.rows(p));
+                    if let (Some(row), true) = (tab.form, count > 0) {
+                        let next = (row as i64 + by as i64).clamp(0, count as i64 - 1) as usize;
+                        tab.form = Some(next);
+                        tab.selected = Some((next, tab.selected.map_or(0, |s| s.1)));
+                        return Self::db_reveal(tab, next);
+                    }
+                }
+                Task::none()
+            }
+            DbMsg::FormInput(path, col, text) => {
+                if let Some(tab) = self.db_tabs.get_mut(&path) {
+                    if let (Some(row), Some(page)) = (tab.form, tab.page.clone()) {
+                        if page.editable && !tab.pending.is_deleted(row) {
+                            tab.pending.type_into(&page, row, col, text);
+                        }
+                    }
+                }
+                Task::none()
+            }
+            DbMsg::FormNull(path, col) => {
+                if let Some(tab) = self.db_tabs.get_mut(&path) {
+                    if let (Some(row), Some(page)) = (tab.form, tab.page.clone()) {
+                        if page.editable && !tab.pending.is_deleted(row) {
+                            tab.pending.set(&page, row, col, None);
+                        }
+                    }
+                }
+                Task::none()
+            }
+            DbMsg::FormJson(path, col) => {
+                if let Some(tab) = self.db_tabs.get_mut(&path) {
+                    if let (Some(row), Some(page)) = (tab.form, tab.page.clone()) {
+                        let laid = tab
+                            .pending
+                            .value(&page, row, col)
+                            .and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok())
+                            .and_then(|v| serde_json::to_string_pretty(&v).ok());
+                        if let (Some(text), true) = (laid, page.editable) {
+                            tab.pending.type_into(&page, row, col, text);
+                        }
+                    }
                 }
                 Task::none()
             }

@@ -1518,15 +1518,197 @@ pub fn table<'a>(path: &'a Path, tab: &'a TableTab, dark: bool) -> Element<'a, M
         .style(se_theme::window(dark))
         .into();
 
-    match (&tab.picker, tab.preview) {
-        (Some(picker), _) => {
+    match (&tab.picker, tab.preview, tab.form) {
+        (Some(picker), _, _) => {
             crate::floating::modal(view, date_picker(path, picker, dark), None, dark, false)
         }
-        (None, true) => {
+        (None, true, _) => {
             crate::floating::modal(view, preview_card(path, tab, dark), None, dark, false)
         }
-        (None, false) => view,
+        (None, false, Some(row)) => crate::floating::modal(
+            view,
+            form_card(path, tab, row, dark),
+            Some(Message::Db(DbMsg::CloseForm(path.to_path_buf()))),
+            dark,
+            false,
+        ),
+        (None, false, None) => view,
     }
+}
+
+/// A row as a form: a field for each column, typed by what the column holds.
+fn form_card<'a>(
+    path: &'a Path,
+    tab: &'a TableTab,
+    row: usize,
+    dark: bool,
+) -> Element<'a, Message> {
+    let p = se_theme::palette(dark);
+    let Some(page) = &tab.page else {
+        return Space::new().into();
+    };
+    let count = tab.pending.rows(page);
+    let deleted = tab.pending.is_deleted(row);
+    let editable = page.editable && !deleted;
+    let owned = || path.to_path_buf();
+    let mut fields = column![].spacing(10).padding([0, 12]);
+    for (c, column) in page.columns.iter().enumerate() {
+        let cell = tab.pending.cell(page, row, c);
+        let current = match cell {
+            Cell::Value(v) => v.to_string(),
+            _ => String::new(),
+        };
+        let kind = column.kind.to_lowercase();
+        let listed = tab
+            .choices
+            .as_ref()
+            .and_then(|all| all.iter().find(|ch| ch.column == column.name));
+        let placeholder = match cell {
+            Cell::Null => "NULL",
+            Cell::Default => "DEFAULT",
+            Cell::Value(_) => "",
+        };
+        let on_input = {
+            let path = owned();
+            move |t: String| Message::Db(DbMsg::FormInput(path.clone(), c, t))
+        };
+        let mut control = row![].spacing(8).align_y(Alignment::Center);
+        let input: Element<Message> = if !editable {
+            text(if current.is_empty() {
+                placeholder.to_string()
+            } else {
+                current.clone()
+            })
+            .size(12.5)
+            .color(if current.is_empty() { p.muted } else { p.text })
+            .into()
+        } else if kind == "boolean" || kind == "bool" {
+            let chosen = match current.to_lowercase().as_str() {
+                "t" | "true" => Some("true".to_string()),
+                "f" | "false" => Some("false".to_string()),
+                _ => None,
+            };
+            pick_list(
+                vec!["true".to_string(), "false".to_string()],
+                chosen,
+                on_input,
+            )
+            .placeholder(placeholder)
+            .text_size(12.5)
+            .padding([3, 8])
+            .style(se_theme::Select { dark }.style())
+            .menu_style(se_theme::Select { dark }.menu_style())
+            .into()
+        } else if let Some(list) = listed {
+            // The values the database allows: an enumeration, or the keys of
+            // the table a foreign key points to.
+            let mut values = list.values.clone();
+            if !current.is_empty() && !values.contains(&current) {
+                values.insert(0, current.clone());
+            }
+            let chosen = (!current.is_empty()).then_some(current.clone());
+            let mut line = row![pick_list(values, chosen, on_input)
+                .placeholder(placeholder)
+                .text_size(12.5)
+                .padding([3, 8])
+                .style(se_theme::Select { dark }.style())
+                .menu_style(se_theme::Select { dark }.menu_style())]
+            .spacing(8)
+            .align_y(Alignment::Center);
+            if list.more {
+                line = line.push(
+                    text(t!("db.choices_more", n = protocol::MAX_CHOICES).to_string())
+                        .size(11.5)
+                        .color(p.muted),
+                );
+            }
+            line.into()
+        } else {
+            text_input(placeholder, &current)
+                .on_input(on_input)
+                .size(12.5)
+                .padding([3, 8])
+                .width(Length::Fill)
+                .style(se_theme::Field::new(dark).style())
+                .into()
+        };
+        control = control.push(input);
+        if editable && (kind == "json" || kind == "jsonb") && !current.is_empty() {
+            let valid = serde_json::from_str::<serde_json::Value>(&current).is_ok();
+            control = control
+                .push(
+                    text(if valid { "✓ JSON" } else { "✗ JSON" })
+                        .size(11.5)
+                        .color(if valid {
+                            p.accent
+                        } else {
+                            se_theme::error_color(dark)
+                        }),
+                )
+                .push(
+                    button(text(t!("db.form_format").to_string()).size(12))
+                        .padding([2, 8])
+                        .on_press_maybe(valid.then(|| Message::Db(DbMsg::FormJson(owned(), c))))
+                        .style((se_theme::Outline { dark }).style()),
+                );
+        }
+        if editable && column.nullable && !matches!(cell, Cell::Null) {
+            control = control.push(
+                button(text("NULL").size(11.5))
+                    .padding([2, 8])
+                    .on_press(Message::Db(DbMsg::FormNull(owned(), c)))
+                    .style((se_theme::Outline { dark }).style()),
+            );
+        }
+        fields = fields.push(
+            row![
+                column![
+                    text(column.name.as_str())
+                        .size(12.5)
+                        .font(se_theme::UI_SEMIBOLD),
+                    text(column.kind.as_str()).size(11).color(p.muted),
+                ]
+                .width(Length::Fixed(150.0)),
+                control,
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        );
+    }
+    let head = row![
+        text(t!("db.form_title", n = row + 1, total = count).to_string())
+            .size(13.5)
+            .font(se_theme::UI_SEMIBOLD),
+        Space::new().width(Length::Fill),
+        button(text("‹").size(14))
+            .padding([0, 8])
+            .on_press_maybe((row > 0).then(|| Message::Db(DbMsg::FormMove(owned(), -1))))
+            .style(ghost(dark, false)),
+        button(text("›").size(14))
+            .padding([0, 8])
+            .on_press_maybe((row + 1 < count).then(|| Message::Db(DbMsg::FormMove(owned(), 1))))
+            .style(ghost(dark, false)),
+        button(text("×").size(16).color(p.muted))
+            .padding([0, 7])
+            .on_press(Message::Db(DbMsg::CloseForm(owned())))
+            .style(ghost(dark, false)),
+    ]
+    .spacing(4)
+    .align_y(Alignment::Center);
+    container(
+        column![
+            head,
+            scrollable(fields)
+                .style(se_theme::Scrollbar { dark }.style())
+                .height(Length::Shrink),
+        ]
+        .spacing(10)
+        .width(Length::Fixed(640.0)),
+    )
+    .max_height(560)
+    .padding(16)
+    .style(se_theme::card(dark))
+    .into()
 }
 
 /// The SQL that Commit would run, as the log will show it.
@@ -1650,6 +1832,12 @@ fn cell_menu(
             Message::Db(DbMsg::CopySelection(path.clone(), format)),
         ));
     }
+    items.push(menu_bar::item(
+        t!("db.form_open").to_string(),
+        None,
+        dark,
+        Message::Db(DbMsg::OpenForm(path.clone(), row)),
+    ));
     if !new_row {
         items.push(menu_bar::item(
             t!("db.row_copy").to_string(),
