@@ -1,5 +1,12 @@
 # Journal des modifications
 
+## [1.23.0] - 2026-11-09
+
+### Ajouté
+- Requêtes API, une version légère de Postman : un nouveau panneau (les deux flèches de la barre) pour envoyer des requêtes à une API. Une requête a sa méthode, son adresse, ses paramètres, ses en-têtes, un corps (JSON, texte, formulaire ou fichier) et une authentification (Bearer, Basic, clé d'API) ; la réponse montre son statut, sa durée et sa taille, le corps mis en forme (JSON, XML, HTML) ou brut, une recherche, les en-têtes et les cookies, et peut être copiée ou enregistrée.
+- Des collections et des dossiers de requêtes, gardés à raison d'un fichier chacune ; un historique de ce qui a été envoyé ; des environnements avec des `{{variables}}` (les valeurs secrètes restent dans le trousseau du système) ; Cmd/Ctrl+S garde la requête dans sa collection.
+- cURL : une commande collée devient une requête, et une requête se copie en commande. Les collections et les environnements de Postman (v2.1) s'importent et s'exportent ; ce qui ne peut pas être gardé est signalé.
+
 ## [1.22.0] - 2026-11-09
 
 ### Ajouté

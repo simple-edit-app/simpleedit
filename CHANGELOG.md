@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.23.0] - 2026-11-09
+
+### Added
+- API requests, a light version of Postman: a new panel (the two arrows in the bar) to send requests to an API. A request has its method, address, parameters, headers, a body (JSON, text, form or file) and a sign-in (Bearer, Basic, API key); the answer shows its status, time and size, the body laid out (JSON, XML, HTML) or raw, a search, the headers and the cookies, and can be copied or saved.
+- Collections and folders of requests, kept as one file each; a history of what was sent; environments with `{{variables}}` (secret values stay in the keychain of the system); Cmd/Ctrl+S keeps the request in its collection.
+- cURL: a command pasted becomes a request, and a request is copied as a command. Collections and environments of Postman (v2.1) are imported and exported; what cannot be kept is said.
+
 ## [1.22.0] - 2026-11-09
 
 ### Added
