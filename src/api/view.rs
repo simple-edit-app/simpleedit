@@ -960,7 +960,15 @@ fn body_section<'a>(path: &Path, tab: &'a ApiTab, dark: bool) -> Element<'a, Mes
         .align_y(Alignment::Center)
         .into(),
     };
-    column![kinds, content].spacing(10).into()
+    // A body that the method does not usually carry.
+    let hint = if tab.request.body.kind != BodyKind::None && !tab.request.method.has_body() {
+        t!("api.body_ignored", method = tab.request.method.as_str()).to_string()
+    } else {
+        String::new()
+    };
+    column![kinds, content, text(hint).size(11.5).color(p.muted)]
+        .spacing(10)
+        .into()
 }
 
 fn auth_section<'a>(path: &Path, tab: &'a ApiTab, dark: bool) -> Element<'a, Message> {

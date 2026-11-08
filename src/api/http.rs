@@ -448,6 +448,107 @@ mod tests {
     }
 
     #[test]
+    fn what_the_server_receives_is_what_the_request_says() {
+        use crate::api::model::{Auth, AuthKind, Body, BodyKind, Pair, Request};
+        use std::collections::HashMap;
+        let (port, seen) = serve(|_| {
+            vec![
+                answer("200 OK", &[], "one"),
+                answer("200 OK", &[], "two"),
+                answer("200 OK", &[], "three"),
+            ]
+        });
+        let vars: HashMap<String, String> =
+            [("host", format!("127.0.0.1:{port}")), ("tk", "abc".into())]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect();
+        // A JSON body, a parameter and a bearer token.
+        let mut one = Request::new("one");
+        one.method = Method::Post;
+        one.url = "http://{{host}}/items".into();
+        one.params = vec![Pair::new("q", "a b")];
+        one.auth = Auth {
+            kind: AuthKind::Bearer,
+            token: "{{tk}}".into(),
+            ..Auth::default()
+        };
+        one.body = Body {
+            kind: BodyKind::Json,
+            text: "{\"n\": 1}".into(),
+            ..Body::default()
+        };
+        assert_eq!(run(send(one.resolve(&vars))).unwrap().text(), "one");
+        // A form, and the sign-in of a user.
+        let mut two = Request::new("two");
+        two.method = Method::Put;
+        two.url = "{{host}}/f".into();
+        two.auth = Auth {
+            kind: AuthKind::Basic,
+            username: "u".into(),
+            password: "p".into(),
+            ..Auth::default()
+        };
+        two.body = Body {
+            kind: BodyKind::Form,
+            form: vec![Pair::new("a b", "c&d")],
+            ..Body::default()
+        };
+        assert_eq!(run(send(two.resolve(&vars))).unwrap().text(), "two");
+        // A file, sent as it is.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("data.bin");
+        std::fs::write(&file, [0u8, 1, 2, 255]).unwrap();
+        let mut three = Request::new("three");
+        three.method = Method::Patch;
+        three.url = "{{host}}/file".into();
+        three.body = Body {
+            kind: BodyKind::File,
+            file: file.to_string_lossy().to_string(),
+            ..Body::default()
+        };
+        assert_eq!(run(send(three.resolve(&vars))).unwrap().text(), "three");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0].request_line, "POST /items?q=a%20b HTTP/1.1");
+        assert_eq!(seen[0].header("authorization"), Some("Bearer abc"));
+        assert_eq!(seen[0].header("content-type"), Some("application/json"));
+        assert_eq!(seen[0].body, b"{\"n\": 1}");
+        assert_eq!(seen[1].request_line, "PUT /f HTTP/1.1");
+        assert_eq!(seen[1].header("authorization"), Some("Basic dTpw"));
+        assert_eq!(
+            seen[1].header("content-type"),
+            Some("application/x-www-form-urlencoded")
+        );
+        assert_eq!(seen[1].body, b"a+b=c%26d");
+        assert_eq!(seen[2].request_line, "PATCH /file HTTP/1.1");
+        assert_eq!(seen[2].body, vec![0u8, 1, 2, 255]);
+    }
+
+    #[test]
+    fn a_broken_compressed_answer_is_an_error_and_a_slow_server_times_out() {
+        // The server says it is gzip and is not: that is an error, said as one.
+        let (port, _) = serve(|_| vec![answer("200 OK", &["Content-Encoding: gzip"], "not gzip")]);
+        let error = run(send(resolved(
+            Method::Get,
+            format!("http://127.0.0.1:{port}/"),
+        )))
+        .unwrap_err();
+        assert!(!error.is_empty());
+        // A server that never answers: the time limit ends it.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hold = std::thread::spawn(move || {
+            let _held = listener.accept();
+            std::thread::sleep(std::time::Duration::from_millis(2500));
+        });
+        let mut slow = resolved(Method::Get, format!("http://127.0.0.1:{port}/"));
+        slow.settings.timeout_secs = 1;
+        let error = run(send(slow)).unwrap_err();
+        assert!(error.contains("timed out after 1 s"), "{error}");
+        drop(hold);
+    }
+
+    #[test]
     fn a_missing_address_or_scheme_is_refused_before_anything_is_sent() {
         let empty = run(send(resolved(Method::Get, String::new())));
         assert!(empty.unwrap_err().contains("empty"));

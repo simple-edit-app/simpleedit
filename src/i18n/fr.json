@@ -877,6 +877,7 @@
   "api.body": "Corps",
   "api.body_file": "Fichier",
   "api.body_form": "Formulaire",
+  "api.body_ignored": "La plupart des serveurs ignorent le corps d'une requête %{method}.",
   "api.body_json": "JSON",
   "api.body_none": "Aucun",
   "api.body_none_hint": "Cette requête n'a pas de corps.",

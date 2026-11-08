@@ -1,9 +1,6 @@
 //! A light version of Postman: requests to an API, the collections that keep
 //! them, the environments with their variables.
 
-// What the screens use is added step by step.
-#![allow(dead_code)]
-
 pub mod curl;
 pub mod http;
 pub mod model;
@@ -262,16 +259,6 @@ impl ApiTab {
     /// Something changed since the request was kept.
     pub fn changed(&self) -> bool {
         self.request != self.kept
-    }
-
-    /// What the tab is called.
-    pub fn title(&self) -> String {
-        let name = self.request.title();
-        if name.is_empty() {
-            t!("api.untitled").to_string()
-        } else {
-            name
-        }
     }
 }
 

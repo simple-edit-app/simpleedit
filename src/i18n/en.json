@@ -877,6 +877,7 @@
   "api.body": "Body",
   "api.body_file": "File",
   "api.body_form": "Form",
+  "api.body_ignored": "Most servers ignore the body of a %{method} request.",
   "api.body_json": "JSON",
   "api.body_none": "None",
   "api.body_none_hint": "This request has no body.",
