@@ -1352,6 +1352,19 @@ impl SimpleEditApp {
                 },
             ));
         }
+        if self.db.resizing.is_some() {
+            subscriptions.push(iced::event::listen_with(
+                |event, _status, _window| match event {
+                    iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+                        Some(Message::Db(crate::database::DbMsg::ResizeMove(position.x)))
+                    }
+                    iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                        iced::mouse::Button::Left,
+                    )) => Some(Message::Db(crate::database::DbMsg::ResizeEnd)),
+                    _ => None,
+                },
+            ));
+        }
         if self.panel_resizing {
             subscriptions.push(iced::event::listen_with(
                 |event, _status, _window| match event {
@@ -1531,6 +1544,12 @@ impl SimpleEditApp {
         } else if self.git.open {
             panel =
                 panel.push(container(self.git.view(dark)).height(Length::Fixed(self.panel_height)));
+        }
+        if self.db.console.open {
+            panel = panel.push(
+                container(crate::database::view::console(&self.db, dark))
+                    .height(Length::Fixed(self.panel_height)),
+            );
         }
         if self.scratch.open {
             panel = panel.push(self.scratch_panel(dark));
@@ -1729,6 +1748,50 @@ impl SimpleEditApp {
             Some(form) => crate::floating::modal(
                 with_prefs,
                 crate::database::view::dialog(&self.db, form, dark),
+                None,
+                dark,
+                false,
+            ),
+            None => with_prefs,
+        };
+
+        // The table designer, and the question before a drop or a deletion.
+        let with_prefs: Element<Message> = match &self.db.designer {
+            Some(designer) => crate::floating::modal(
+                with_prefs,
+                crate::database::admin_view::designer(designer, dark),
+                None,
+                dark,
+                false,
+            ),
+            None => with_prefs,
+        };
+        let with_prefs: Element<Message> = match &self.db.confirm {
+            Some(confirm) => crate::floating::modal(
+                with_prefs,
+                crate::database::admin_view::confirm(confirm, dark),
+                None,
+                dark,
+                false,
+            ),
+            None => with_prefs,
+        };
+
+        let with_prefs: Element<Message> = match &self.db.new_schema {
+            Some(n) => crate::floating::modal(
+                with_prefs,
+                crate::database::admin_view::new_schema(n, dark),
+                None,
+                dark,
+                false,
+            ),
+            None => with_prefs,
+        };
+        // A text shown whole (a DDL, a long value).
+        let with_prefs: Element<Message> = match &self.db.text {
+            Some(view) => crate::floating::modal(
+                with_prefs,
+                crate::database::admin_view::text_view(view, dark),
                 None,
                 dark,
                 false,
@@ -2385,6 +2448,7 @@ impl SimpleEditApp {
                     self.terminal.focused = false;
                     self.scratch.open = false;
                     self.bookmark_panel.open = false;
+                    self.db.console.open = false;
                 }
                 task
             }
@@ -2451,6 +2515,7 @@ impl SimpleEditApp {
                         self.scratch.open = false;
                         self.bookmark_panel.open = false;
                         self.git.open = false;
+                        self.db.console.open = false;
                     }
                 }
                 Task::none()
@@ -2462,6 +2527,7 @@ impl SimpleEditApp {
                     self.terminal.focused = false;
                     self.bookmark_panel.open = false;
                     self.git.open = false;
+                    self.db.console.open = false;
                     self.scratch.refresh();
                     self.scratch.error = None;
                 }
@@ -2491,6 +2557,7 @@ impl SimpleEditApp {
                     self.terminal.focused = false;
                     self.scratch.open = false;
                     self.git.open = false;
+                    self.db.console.open = false;
                     self.refresh_bookmark_texts(true);
                 }
                 Task::none()
@@ -2823,6 +2890,7 @@ impl SimpleEditApp {
                 self.scratch.open = false;
                 self.bookmark_panel.open = false;
                 self.git.open = false;
+                self.db.console.open = false;
                 Task::none()
             }
             Message::RevealInFileManager(path) => {
@@ -3740,6 +3808,12 @@ impl SimpleEditApp {
                 shift,
                 alt,
             } => {
+                // The keys of a table in front: arrows, F2, copy.
+                if self.capturing.is_none() {
+                    if let Some(task) = self.db_key(&key, ctrl, shift, alt) {
+                        return task;
+                    }
+                }
                 // In shortcut capture mode: save the new binding
                 if let Some(target) = self.capturing {
                     let sc = ShortcutConfig {
@@ -4361,6 +4435,10 @@ impl SimpleEditApp {
                 }
             }
             Message::EscapePressed => {
+                // A table cell being typed in, or a date being picked.
+                if self.db_escape() {
+                    return Task::none();
+                }
                 // Innermost first: the list of completions, a pending
                 // rebind, a dialog, the Preferences window, the search card.
                 self.completion.snippet = None;
@@ -6414,7 +6492,7 @@ impl SimpleEditApp {
     /// Puts a buffer in the editor and makes it the current tab.
     fn load_buffer(&mut self, path: PathBuf, buffer: CachedBuffer) {
         // Its tab is shown: its group opens.
-        let project = tab_groups::project_of(&self.projects.roots, &path).cloned();
+        let project = self.tab_key(&path);
         self.folded_tabs.remove(&project);
         let content = buffer.content.unwrap_or_default();
         let first_line = first_line_of(&content);
@@ -7197,6 +7275,7 @@ mod bookmark_panel;
 #[path = "app/completion.rs"]
 mod completion;
 mod database;
+mod db_tree;
 #[path = "app/everywhere.rs"]
 mod everywhere;
 pub(crate) use completion::Floating;
@@ -7218,6 +7297,7 @@ mod results;
 mod split;
 #[path = "app/tab_groups.rs"]
 mod tab_groups;
+mod table_admin;
 #[path = "app/views.rs"]
 mod views;
 pub(crate) use views::resize_edge;

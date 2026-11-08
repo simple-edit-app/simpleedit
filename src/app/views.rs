@@ -1306,8 +1306,9 @@ impl SimpleEditApp {
                     .filter(|_| !is_untitled(path))
                     .map(short_dir)
                     .unwrap_or_default();
-                let color = tab_groups::project_of(&self.projects.roots, path)
-                    .map_or(iced::Color::TRANSPARENT, |r| self.project_color(r));
+                let color = self
+                    .tab_key(path)
+                    .map_or(iced::Color::TRANSPARENT, |r| self.project_color(&r));
                 let mut line = row![
                     container(Space::new().width(8).height(8)).style(se_theme::dot(color)),
                     crate::file_icons::file(path, dark),

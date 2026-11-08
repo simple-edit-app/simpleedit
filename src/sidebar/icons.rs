@@ -11,6 +11,8 @@ enum Shape {
     Files,
     /// A database: a stack of discs.
     Database,
+    /// A console: a window with a prompt.
+    Console,
 }
 
 struct Icon {
@@ -44,6 +46,25 @@ impl<Message> Program<Message> for Icon {
                     p.line_to(Point::new(1.5, 4.0));
                 });
                 frame.stroke(&outline, stroke);
+            }
+            Shape::Console => {
+                frame.stroke(
+                    &Path::rectangle(Point::new(1.5, 2.5), iced::Size::new(13.0, 11.0)),
+                    stroke,
+                );
+                // The prompt: a chevron, then a cursor.
+                frame.stroke(
+                    &Path::new(|p| {
+                        p.move_to(Point::new(4.5, 6.0));
+                        p.line_to(Point::new(7.0, 8.2));
+                        p.line_to(Point::new(4.5, 10.4));
+                    }),
+                    stroke,
+                );
+                frame.stroke(
+                    &Path::line(Point::new(8.5, 10.6), Point::new(11.5, 10.6)),
+                    stroke,
+                );
             }
             Shape::Database => {
                 // The top disc, then the sides and the two bands below it.
@@ -105,6 +126,10 @@ fn icon<'a, Message: 'a>(shape: Shape, color: Color) -> Element<'a, Message> {
 
 pub fn folder<'a, Message: 'a>(color: Color) -> Element<'a, Message> {
     icon(Shape::Folder, color)
+}
+
+pub fn console<'a, Message: 'a>(color: Color) -> Element<'a, Message> {
+    icon(Shape::Console, color)
 }
 
 pub fn database<'a, Message: 'a>(color: Color) -> Element<'a, Message> {
