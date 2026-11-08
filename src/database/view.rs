@@ -2286,6 +2286,12 @@ pub fn console<'a>(state: &'a State, dark: bool) -> Element<'a, Message> {
                         .style((se_theme::Primary { dark }).style()),
                 )
                 .push(
+                    button(text(t!("db.format").to_string()).size(12.5))
+                        .padding([3, 12])
+                        .on_press(Message::Db(DbMsg::FormatSql))
+                        .style((se_theme::Outline { dark }).style()),
+                )
+                .push(
                     button(text(t!("db.explain").to_string()).size(12.5))
                         .padding([3, 12])
                         .on_press_maybe(ready.then_some(Message::Db(DbMsg::Explain(false))))

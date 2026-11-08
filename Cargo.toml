@@ -49,6 +49,7 @@ postgres = { version = "0.19", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-postgres-rustls = "0.14.0"
 rustls-native-certs = "0.8.5"
+sqlformat = "0.5.0"
 
 # The system menu bar on macOS (File, Edit, View and Help up there).
 [target.'cfg(target_os = "macos")'.dependencies]

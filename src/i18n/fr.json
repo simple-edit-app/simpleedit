@@ -925,6 +925,7 @@
   "db.guard_writes": "This is a production source: confirm the change.",
   "db.guard_run": "Run anyway",
   "db.guard_cancel": "Cancel",
+  "db.format": "Formater",
   "db.log_search": "Chercher dans l'historique…",
   "db.log_reuse": "Remettre dans l'éditeur",
   "db.opt_single": "Mode base unique",

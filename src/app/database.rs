@@ -1299,6 +1299,12 @@ impl SimpleEditApp {
                 }
                 _ => Task::none(),
             },
+            DbMsg::FormatSql => {
+                self.db.console.format();
+                self.db.console.completion = None;
+                self.db.console.save();
+                Task::none()
+            }
             DbMsg::LogFilter(text) => {
                 self.db.console.log_filter = text;
                 self.db.console.selected_log = None;

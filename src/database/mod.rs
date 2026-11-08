@@ -189,6 +189,8 @@ pub enum DbMsg {
     /// What is typed to find an entry of the log; an entry goes back into
     /// the queries.
     LogFilter(String),
+    /// Lays out the selection, or all the queries.
+    FormatSql,
     LogReuse(usize),
     GuardRun,
     GuardCancel,

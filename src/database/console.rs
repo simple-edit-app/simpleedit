@@ -111,7 +111,37 @@ fn queries_file() -> Option<PathBuf> {
     )
 }
 
+/// A text of SQL, laid out: keywords in capitals, a clause by line, the
+/// statements one blank line apart.
+pub fn format_sql(sql: &str) -> String {
+    let options = sqlformat::FormatOptions {
+        indent: sqlformat::Indent::Spaces(2),
+        uppercase: Some(true),
+        lines_between_queries: 2,
+        ..sqlformat::FormatOptions::default()
+    };
+    sqlformat::format(sql, &sqlformat::QueryParams::None, &options)
+}
+
 impl Console {
+    /// Lays out the selection, or all the queries when nothing is selected.
+    pub fn format(&mut self) {
+        use text_editor::{Action, Edit};
+        match self.editor.selection().filter(|s| !s.trim().is_empty()) {
+            Some(selection) => {
+                let text = format_sql(&selection);
+                self.editor
+                    .perform(Action::Edit(Edit::Paste(std::sync::Arc::new(text))));
+            }
+            None => {
+                let text = self.editor.text();
+                if !text.trim().is_empty() {
+                    self.editor = text_editor::Content::with_text(format_sql(&text).trim_end());
+                }
+            }
+        }
+    }
+
     /// Whether an entry of the log is what the filter looks for (its SQL, its
     /// connection or its error, whatever the case).
     pub fn matches(&self, entry: &LogEntry) -> bool {
@@ -610,6 +640,30 @@ mod tests {
         console.editor = text_editor::Content::new();
         assert!(console.statements(false).is_empty());
         assert!(console.statements(true).is_empty());
+    }
+
+    #[test]
+    fn the_sql_is_laid_out_with_capitals_and_a_clause_by_line() {
+        let out = format_sql("select a,b from t where a=1 and b<2; select 2");
+        assert!(out.contains("SELECT\n  a,\n  b\nFROM\n  t\nWHERE"), "{out}");
+        assert!(out.contains(";\n\nSELECT"), "{out}");
+        // A text already laid out stays as it is.
+        assert_eq!(format_sql(&out).trim_end(), out.trim_end());
+    }
+
+    #[test]
+    fn formatting_works_on_the_selection_or_on_all() {
+        use text_editor::{Action, Motion};
+        let mut console = Console::load();
+        console.editor = text_editor::Content::with_text("select 1;\nselect 2");
+        console.format();
+        assert!(console.editor.text().starts_with("SELECT\n  1;"));
+        console.editor = text_editor::Content::with_text("select 1;\nselect 2");
+        console.editor.perform(Action::Select(Motion::Right));
+        console.editor.perform(Action::Select(Motion::Right));
+        // Only `se` is selected: it is laid out, the rest is left alone.
+        console.format();
+        assert!(console.editor.text().ends_with("select 2"));
     }
 
     #[test]
