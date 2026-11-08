@@ -203,7 +203,18 @@ fn connection_rows<'a>(
             out = out.push(note(t!("db.loading").to_string(), p.muted));
         }
         Some(Tree::Failed(error)) => {
-            out = out.push(note(error.clone(), se_theme::error_color(dark)));
+            if error.as_str() == t!("db.err_driver_missing") {
+                // A click opens the settings of the source, where the driver
+                // is downloaded.
+                out = out.push(
+                    button(note(error.clone(), se_theme::error_color(dark)))
+                        .padding(0)
+                        .on_press(Message::Db(DbMsg::OpenDialog(Some(id))))
+                        .style(button::text),
+                );
+            } else {
+                out = out.push(note(error.clone(), se_theme::error_color(dark)));
+            }
         }
         Some(Tree::Loaded(databases)) if databases.iter().all(|d| d.schemas.is_empty()) => {
             out = out.push(note(t!("db.no_tables").to_string(), p.muted));
