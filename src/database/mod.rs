@@ -93,6 +93,10 @@ pub enum DbMsg {
     Filter(PathBuf, String),
     ApplyFilter(PathBuf),
     ClearFilter(PathBuf),
+    /// The search field, a field under a column, and the row of those.
+    SearchText(PathBuf, String),
+    ColumnFilter(PathBuf, String, String),
+    ToggleColumnFilters(PathBuf),
     PageSize(PathBuf, u64),
     /// A column header was clicked: ascending, descending, then none.
     Sort(PathBuf, usize),
@@ -1364,6 +1368,14 @@ pub struct TableTab {
     /// What is typed in the WHERE field, and what was applied of it.
     pub filter_text: String,
     pub filter: String,
+    /// What is typed in the search field and under the columns, and what was
+    /// applied of it.
+    pub search_text: String,
+    pub search: String,
+    pub column_text: std::collections::BTreeMap<String, String>,
+    pub column_filters: std::collections::BTreeMap<String, String>,
+    /// The fields under the column names are shown.
+    pub show_filters: bool,
     /// The sort that was applied: columns, and whether each is descending.
     pub order: Vec<(String, bool)>,
     pub page_size: u64,
@@ -1442,6 +1454,11 @@ impl TableTab {
             structure: None,
             filter_text: String::new(),
             filter: String::new(),
+            search_text: String::new(),
+            search: String::new(),
+            column_text: Default::default(),
+            column_filters: Default::default(),
+            show_filters: false,
             order: Vec::new(),
             page_size,
             pending: Pending::default(),
@@ -1481,12 +1498,47 @@ impl TableTab {
         self.query.is_some() && !self.paged
     }
 
+    /// What the rows are kept by: the WHERE typed, the search and the filters
+    /// of the columns, all of them at once.
+    pub fn where_clause(&self) -> String {
+        let columns: Vec<&str> = self
+            .page
+            .as_ref()
+            .map(|p| p.columns.iter().map(|c| c.name.as_str()).collect())
+            .unwrap_or_default();
+        let mut parts: Vec<String> = Vec::new();
+        if !self.filter.trim().is_empty() {
+            parts.push(format!("({})", self.filter.trim()));
+        }
+        if let Some(search) = protocol::search_condition(&columns, &self.search) {
+            parts.push(format!("({search})"));
+        }
+        for (column, text) in &self.column_filters {
+            if let Some(condition) = protocol::column_condition(column, text) {
+                parts.push(format!("({condition})"));
+            }
+        }
+        // One condition alone is sent as it was written.
+        if parts.len() == 1 && self.search.trim().is_empty() && self.column_filters.is_empty() {
+            return self.filter.trim().to_string();
+        }
+        parts.join(" AND ")
+    }
+
+    /// Something is kept by: the typed condition, a search or a column.
+    pub fn is_filtered(&self) -> bool {
+        !self.filter.is_empty()
+            || !self.filter_text.is_empty()
+            || !self.search_text.is_empty()
+            || self.column_text.values().any(|t| !t.is_empty())
+    }
+
     /// The query that gives the page at `offset`.
     pub fn query(&self, offset: u64) -> Query {
         Query {
             offset,
             limit: self.page_size,
-            filter: self.filter.clone(),
+            filter: self.where_clause(),
             order: self.order.clone(),
             sql: self.query.clone().filter(|_| self.paged),
         }
@@ -2439,6 +2491,49 @@ mod tests {
     }
 
     #[test]
+    fn the_where_typed_the_search_and_the_columns_are_all_applied_together() {
+        use protocol::Column;
+        let mut tab = TableTab::new(1, "shop".into(), "public".into(), "t".into(), 100);
+        let column = |n: &str| Column {
+            name: n.into(),
+            kind: "text".into(),
+            nullable: true,
+        };
+        tab.page = Some(Page {
+            columns: vec![column("a"), column("b")],
+            rows: Vec::new(),
+            has_more: false,
+            primary_key: Vec::new(),
+            ctids: Vec::new(),
+            editable: false,
+            source: None,
+            offset: 0,
+        });
+        // Nothing applied: no condition.
+        assert_eq!(tab.where_clause(), "");
+        // A typed condition alone goes as it was written.
+        tab.filter = "a > 1".into();
+        assert_eq!(tab.where_clause(), "a > 1");
+        // With more, each is in parentheses (an OR inside stays inside).
+        tab.search = "x".into();
+        tab.column_filters.insert("b".into(), "> 3".into());
+        assert_eq!(
+            tab.where_clause(),
+            "(a > 1) AND (\"a\"::text ILIKE '%x%' OR \"b\"::text ILIKE '%x%') AND (\"b\" > '3')"
+        );
+        // A search alone.
+        tab.filter.clear();
+        tab.column_filters.clear();
+        assert_eq!(
+            tab.where_clause(),
+            "(\"a\"::text ILIKE '%x%' OR \"b\"::text ILIKE '%x%')"
+        );
+        assert!(!tab.is_filtered() || !tab.search_text.is_empty() || !tab.filter.is_empty());
+        tab.column_text.insert("a".into(), "z".into());
+        assert!(tab.is_filtered());
+    }
+
+    #[test]
     fn a_new_page_throws_away_what_was_pending() {
         use grid::Pending;
         let mut tab = TableTab::new(1, "shop".into(), "public".into(), "t".into(), 500);
@@ -2808,6 +2903,19 @@ mod tests {
             assert_eq!(filtered.primary_key, vec!["id".to_string()]);
             assert!(filtered.editable);
             assert!(!filtered.columns[0].nullable && filtered.columns[1].nullable);
+            // The conditions the search and the column fields make run as they are.
+            let mut found = TableTab::new(1, "shop".into(), "public".into(), "live_items".into(), 10);
+            found.page = Some(filtered.clone());
+            found.search = "B".into();
+            found.column_filters.insert("score".into(), "> 2".into());
+            found.column_filters.insert("due".into(), "!null".into());
+            let one = rows(params.clone(), table.clone(), found.query(0)).await.result.unwrap();
+            assert_eq!(one.rows.len(), 1, "{}", found.where_clause());
+            assert_eq!(one.rows[0][0].as_deref(), Some("2"));
+            found.search = "no such text".into();
+            found.column_filters.clear();
+            let none = rows(params.clone(), table.clone(), found.query(0)).await.result.unwrap();
+            assert!(none.rows.is_empty());
             let bad_filter = Query {
                 limit: 10,
                 filter: "nope = 1".into(),

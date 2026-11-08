@@ -743,6 +743,72 @@ pub fn risk_of(sql: &str, production: bool) -> Option<Risk> {
     (production && !control && !reads_only(sql)).then_some(Risk::Writes)
 }
 
+/// A text as the inside of a `LIKE`: what it holds of `%`, `_` and `\` is
+/// taken as itself.
+fn like_text(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+/// The condition a text typed under a column makes: `> 10`, `= abc`, `<> x`,
+/// `~ regex`, `null`, `!null`; anything else is looked for inside the value,
+/// whatever the case.
+pub fn column_condition(column: &str, text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let name = quote_ident(column);
+    match text.to_lowercase().as_str() {
+        "null" | "is null" => return Some(format!("{name} IS NULL")),
+        "!null" | "not null" | "is not null" => return Some(format!("{name} IS NOT NULL")),
+        _ => {}
+    }
+    for (prefix, operator) in [
+        (">=", ">="),
+        ("<=", "<="),
+        ("<>", "<>"),
+        ("!=", "<>"),
+        ("=", "="),
+        (">", ">"),
+        ("<", "<"),
+    ] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            let value = rest.trim();
+            if value.is_empty() {
+                return None;
+            }
+            return Some(format!("{name} {operator} {}", quote_literal(value)));
+        }
+    }
+    if let Some(rest) = text.strip_prefix('~') {
+        let pattern = rest.trim();
+        if pattern.is_empty() {
+            return None;
+        }
+        return Some(format!("{name}::text ~ {}", quote_literal(pattern)));
+    }
+    Some(format!(
+        "{name}::text ILIKE {}",
+        quote_literal(&format!("%{}%", like_text(text)))
+    ))
+}
+
+/// The condition that keeps the rows with a text in any of the columns.
+pub fn search_condition(columns: &[&str], text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() || columns.is_empty() {
+        return None;
+    }
+    let pattern = quote_literal(&format!("%{}%", like_text(text)));
+    let parts: Vec<String> = columns
+        .iter()
+        .map(|c| format!("{}::text ILIKE {pattern}", quote_ident(c)))
+        .collect();
+    Some(parts.join(" OR "))
+}
+
 /// Whether a statement may run on a read-only data source: it only reads. The
 /// session is also read-only on the server's side, but a session can undo
 /// that, so the statements that could are refused (transaction control, `SET`,
@@ -1200,5 +1266,41 @@ mod tests {
         assert_eq!(risk_of("BEGIN", true), None);
         assert_eq!(risk_of("SET search_path = a", true), None);
         assert_eq!(risk_of("INSERT INTO t VALUES (1)", false), None);
+    }
+
+    #[test]
+    fn a_column_filter_reads_an_operator_or_looks_inside() {
+        let c = |t: &str| column_condition("age", t);
+        assert_eq!(c(""), None);
+        assert_eq!(c("  "), None);
+        assert_eq!(c("> 30").as_deref(), Some("\"age\" > '30'"));
+        assert_eq!(c(">=30").as_deref(), Some("\"age\" >= '30'"));
+        assert_eq!(c("!= 5").as_deref(), Some("\"age\" <> '5'"));
+        assert_eq!(c("= it's").as_deref(), Some("\"age\" = 'it''s'"));
+        assert_eq!(c(">"), None);
+        assert_eq!(c("NULL").as_deref(), Some("\"age\" IS NULL"));
+        assert_eq!(c("!null").as_deref(), Some("\"age\" IS NOT NULL"));
+        assert_eq!(c("~ ^a.*z$").as_deref(), Some("\"age\"::text ~ '^a.*z$'"));
+        assert_eq!(c("ab").as_deref(), Some("\"age\"::text ILIKE '%ab%'"));
+        // What `LIKE` reads as a joker is taken as itself.
+        assert_eq!(
+            c("50%_").as_deref(),
+            Some("\"age\"::text ILIKE '%50\\%\\_%'")
+        );
+        // A column with a quote in its name stays one name.
+        assert_eq!(
+            column_condition("a\"b", "x").as_deref(),
+            Some("\"a\"\"b\"::text ILIKE '%x%'")
+        );
+    }
+
+    #[test]
+    fn a_search_looks_in_every_column() {
+        assert_eq!(search_condition(&["a", "b"], ""), None);
+        assert_eq!(search_condition(&[], "x"), None);
+        assert_eq!(
+            search_condition(&["a", "b c"], " Foo ").as_deref(),
+            Some("\"a\"::text ILIKE '%Foo%' OR \"b c\"::text ILIKE '%Foo%'")
+        );
     }
 }

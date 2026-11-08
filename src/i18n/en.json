@@ -925,6 +925,8 @@
   "db.guard_writes": "This is a production source: confirm the change.",
   "db.guard_run": "Run anyway",
   "db.guard_cancel": "Cancel",
+  "db.search_hint": "Search in the table…",
+  "db.column_filters": "Filter each column",
   "db.copy_csv": "Copy selection as CSV",
   "db.copy_insert": "Copy selection as INSERT",
   "db.copy_markdown": "Copy selection as Markdown",

@@ -1448,11 +1448,26 @@ pub fn table<'a>(path: &'a Path, tab: &'a TableTab, dark: bool) -> Element<'a, M
             t!("db.apply").to_string(),
             Some(Message::Db(DbMsg::ApplyFilter(owned()))),
         ),
+        text_input(&t!("db.search_hint"), &tab.search_text)
+            .on_input({
+                let path = owned();
+                move |t| Message::Db(DbMsg::SearchText(path.clone(), t))
+            })
+            .on_submit(Message::Db(DbMsg::ApplyFilter(owned())))
+            .size(12.5)
+            .padding([4, 8])
+            .width(200)
+            .style(se_theme::Field::new(dark).style()),
+        nav(
+            "▽",
+            t!("db.column_filters").to_string(),
+            Some(Message::Db(DbMsg::ToggleColumnFilters(owned()))),
+        ),
     ]
     .spacing(8)
     .padding([0, 12])
     .align_y(Alignment::Center);
-    if !tab.filter.is_empty() || !tab.filter_text.is_empty() {
+    if tab.is_filtered() {
         filter_bar = filter_bar.push(
             button(text("×").size(15).color(p.muted))
                 .padding([0, 8])
@@ -1852,6 +1867,35 @@ fn grid<'a>(path: &'a Path, tab: &'a TableTab, dark: bool) -> Element<'a, Messag
         ..container::Style::default()
     });
 
+    // The fields under the names: a condition for each column.
+    let filters: Option<Element<'a, Message>> = tab.show_filters.then(|| {
+        let mut line = row![gutter(String::new())];
+        for (column, width) in page.columns.iter().zip(&tab.widths) {
+            let name = column.name.clone();
+            let shown = tab
+                .column_text
+                .get(&column.name)
+                .cloned()
+                .unwrap_or_default();
+            line = line.push(
+                container(
+                    text_input("", &shown)
+                        .on_input({
+                            let path = path.to_path_buf();
+                            move |t| Message::Db(DbMsg::ColumnFilter(path.clone(), name.clone(), t))
+                        })
+                        .on_submit(Message::Db(DbMsg::ApplyFilter(path.to_path_buf())))
+                        .size(12)
+                        .padding([2, 6])
+                        .style(se_theme::Field::new(dark).style()),
+                )
+                .width(Length::Fixed(*width))
+                .padding([2, 4]),
+            );
+        }
+        line.into()
+    });
+
     // The rows of the page, then the ones that are added.
     let count = tab.pending.rows(page);
     let (offset, height) = tab.scroll;
@@ -2023,7 +2067,11 @@ fn grid<'a>(path: &'a Path, tab: &'a TableTab, dark: bool) -> Element<'a, Messag
         .width(Length::Fixed(total_width))
         .height(Length::Fill);
 
-    scrollable(column![header, vertical].width(Length::Fixed(total_width)))
+    let mut top = column![header].width(Length::Fixed(total_width));
+    if let Some(filters) = filters {
+        top = top.push(filters);
+    }
+    scrollable(top.push(vertical))
         .direction(scrollable::Direction::Horizontal(
             scrollable::Scrollbar::new(),
         ))

@@ -857,12 +857,37 @@ impl SimpleEditApp {
                 }
                 Task::none()
             }
+            DbMsg::SearchText(path, text) => {
+                if let Some(tab) = self.db_tabs.get_mut(&path) {
+                    tab.search_text = text;
+                }
+                Task::none()
+            }
+            DbMsg::ColumnFilter(path, column, text) => {
+                if let Some(tab) = self.db_tabs.get_mut(&path) {
+                    tab.column_text.insert(column, text);
+                }
+                Task::none()
+            }
+            DbMsg::ToggleColumnFilters(path) => {
+                if let Some(tab) = self.db_tabs.get_mut(&path) {
+                    tab.show_filters = !tab.show_filters;
+                }
+                Task::none()
+            }
             DbMsg::ApplyFilter(path) => {
                 if self.db_blocked(&path) {
                     return Task::none();
                 }
                 if let Some(tab) = self.db_tabs.get_mut(&path) {
                     tab.filter = tab.filter_text.trim().to_string();
+                    tab.search = tab.search_text.trim().to_string();
+                    tab.column_filters = tab
+                        .column_text
+                        .iter()
+                        .filter(|(_, text)| !text.trim().is_empty())
+                        .map(|(c, t)| (c.clone(), t.clone()))
+                        .collect();
                     tab.notice = None;
                 }
                 self.db_load_rows(path, 0)
@@ -874,6 +899,10 @@ impl SimpleEditApp {
                 if let Some(tab) = self.db_tabs.get_mut(&path) {
                     tab.filter_text.clear();
                     tab.filter.clear();
+                    tab.search_text.clear();
+                    tab.search.clear();
+                    tab.column_text.clear();
+                    tab.column_filters.clear();
                     tab.notice = None;
                 }
                 self.db_load_rows(path, 0)
