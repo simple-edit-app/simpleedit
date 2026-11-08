@@ -1213,3 +1213,141 @@ pub fn import<'a>(im: &'a super::Import, dark: bool) -> Element<'a, Message> {
         .style(se_theme::card(dark))
         .into()
 }
+
+/// The window that copies a table to another data source: where it goes, and
+/// whether its rows go too.
+pub fn copy_table<'a>(
+    copy: &'a super::CopyTable,
+    connections: &'a [super::Connection],
+    dark: bool,
+) -> Element<'a, Message> {
+    use super::CopyField;
+    let p = se_theme::palette(dark);
+    let field = |label: String, value: &str, hint: String, which: CopyField| {
+        row![
+            text(label)
+                .size(12.5)
+                .color(p.muted)
+                .width(Length::Fixed(130.0)),
+            text_input(&hint, value)
+                .on_input(move |t| Message::Db(DbMsg::CopyField(which, t)))
+                .size(12.5)
+                .padding([4, 8])
+                .width(Length::Fill)
+                .style(se_theme::Field::new(dark).style()),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center)
+    };
+    // The data sources it can go to, by name.
+    let names: Vec<(u64, String)> = connections.iter().map(|c| (c.id, c.label())).collect();
+    let chosen = copy
+        .dest
+        .and_then(|id| names.iter().find(|(i, _)| *i == id).map(|(_, n)| n.clone()));
+    let by_name = names.clone();
+    let source_name = connections
+        .iter()
+        .find(|c| c.id == copy.from.0)
+        .map(|c| c.label())
+        .unwrap_or_default();
+    let ready = copy.dest.is_some()
+        && !copy.name.trim().is_empty()
+        && !copy.schema.trim().is_empty()
+        && !copy.running;
+    let mut body = column![
+        head(
+            t!(
+                "db.copy_title",
+                table = copy.from.3.as_str(),
+                source = source_name.as_str()
+            )
+            .to_string(),
+            Message::Db(DbMsg::CopyClose),
+            dark
+        ),
+        row![
+            text(t!("db.copy_to").to_string())
+                .size(12.5)
+                .color(p.muted)
+                .width(Length::Fixed(130.0)),
+            pick_list(
+                names.iter().map(|(_, n)| n.clone()).collect::<Vec<_>>(),
+                chosen,
+                move |name: String| {
+                    let id = by_name
+                        .iter()
+                        .find(|(_, n)| *n == name)
+                        .map_or(0, |(id, _)| *id);
+                    Message::Db(DbMsg::CopyDest(id))
+                }
+            )
+            .text_size(12.5)
+            .padding([3, 8])
+            .style(se_theme::Select { dark }.style())
+            .menu_style(se_theme::Select { dark }.menu_style()),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+        field(
+            t!("db.copy_database").to_string(),
+            &copy.database,
+            t!("db.copy_database_hint").to_string(),
+            CopyField::Database
+        ),
+        field(
+            t!("db.copy_schema").to_string(),
+            &copy.schema,
+            String::new(),
+            CopyField::Schema
+        ),
+        field(
+            t!("db.copy_name").to_string(),
+            &copy.name,
+            String::new(),
+            CopyField::Name
+        ),
+        checkbox(copy.with_data)
+            .label(t!("db.copy_with_data").to_string())
+            .size(14)
+            .text_size(12.5)
+            .on_toggle(|on| Message::Db(DbMsg::CopyData(on))),
+        text(t!("db.copy_hint").to_string()).size(12).color(p.muted),
+    ]
+    .spacing(10)
+    .width(Length::Fixed(560.0));
+    if let Some(error) = &copy.error {
+        body = body.push(
+            text(error.as_str())
+                .size(12.5)
+                .color(se_theme::error_color(dark)),
+        );
+    }
+    if let Some(rows) = copy.copied {
+        body = body.push(
+            text(t!("db.copy_done", n = rows).to_string())
+                .size(12.5)
+                .color(p.accent),
+        );
+    }
+    body = body.push(
+        row![
+            button(text(t!("db.copy_run").to_string()).size(12.5))
+                .padding([5, 18])
+                .on_press_maybe(ready.then_some(Message::Db(DbMsg::CopyRun)))
+                .style((se_theme::Primary { dark }).style()),
+            text(if copy.running {
+                t!("db.copy_running").to_string()
+            } else {
+                String::new()
+            })
+            .size(12)
+            .color(p.muted),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),
+    );
+    container(body)
+        .padding(16)
+        .style(se_theme::card(dark))
+        .into()
+}

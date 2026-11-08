@@ -233,6 +233,15 @@ pub enum DbMsg {
     ImportRun,
     ImportDone(Done<u64>),
     ImportClose,
+    /// The window that copies a table elsewhere: open it, where it goes, a
+    /// field of it, with the rows or not, go, done, close.
+    CopyOpen(u64, String, String, String),
+    CopyDest(u64),
+    CopyField(CopyField, String),
+    CopyData(bool),
+    CopyRun,
+    CopyDone(Box<Copied>),
+    CopyClose,
     /// Lays out the selection, or all the queries.
     FormatSql,
     /// The SQL of the file being edited (its selection, or all of it) runs
@@ -537,6 +546,13 @@ pub enum Field {
     SchemaPattern,
     ObjectFilter,
     DriverFile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyField {
+    Database,
+    Schema,
+    Name,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1258,6 +1274,112 @@ pub async fn table_columns(params: Params) -> Done<protocol::Catalog> {
                 .unwrap_or_default(),
         })
     })
+}
+
+/// What a copy of a table did, with what each of the two sources was asked.
+#[derive(Debug, Clone)]
+pub struct Copied {
+    /// How many rows were loaded (none when only the structure is copied).
+    pub result: Result<u64, String>,
+    pub source_log: Vec<protocol::Executed>,
+    pub dest_log: Vec<protocol::Executed>,
+}
+
+/// Copies a table to another data source (or another database of the same):
+/// the table first, then, if asked, its rows through a file.
+pub async fn copy_table(
+    source: Params,
+    dest: Params,
+    from: TableRef,
+    to: TableRef,
+    with_data: bool,
+) -> Copied {
+    let mut source_log = Vec::new();
+    let mut dest_log = Vec::new();
+    let result = async {
+        let read = structure(source.clone(), from.clone()).await;
+        source_log.extend(read.executed);
+        let shape = read.result?;
+        let made = run_transaction(
+            dest.clone(),
+            to.database.clone(),
+            ddl::copy_statements(&to.schema, &to.table, &shape),
+        )
+        .await;
+        dest_log.extend(made.executed);
+        if let Some((_, error)) = made.result?.failed {
+            return Err(error);
+        }
+        if !with_data {
+            return Ok(0);
+        }
+        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let file = dir.path().join("rows.csv").to_string_lossy().to_string();
+        let out = export(
+            None,
+            source.clone(),
+            from.clone(),
+            Query::default(),
+            file.clone(),
+            "csv",
+        )
+        .await;
+        source_log.extend(out.executed);
+        out.result?;
+        let spec = protocol::ImportSpec {
+            format: "csv".into(),
+            delimiter: ",".into(),
+            header: true,
+            file_columns: shape.columns.len(),
+            empty_null: false,
+            mapping: shape
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| !c.generated)
+                .map(|(index, c)| protocol::ImportColumn {
+                    index,
+                    column: c.name.clone(),
+                    kind: c.kind.clone(),
+                    ..Default::default()
+                })
+                .collect(),
+        };
+        let loaded = import_file(dest.clone(), to.clone(), file, spec).await;
+        dest_log.extend(loaded.executed);
+        let rows = loaded
+            .result
+            .map_err(|e| format!("{} {e}", t!("db.copy_data_failed")))?;
+        let restart = ddl::restart_sequences(&to.schema, &to.table, &shape);
+        if !restart.is_empty() {
+            let put = run_statements_in(dest.clone(), to.database.clone(), restart).await;
+            dest_log.extend(put.executed);
+        }
+        Ok(rows)
+    }
+    .await;
+    Copied {
+        result,
+        source_log,
+        dest_log,
+    }
+}
+
+/// The window that copies a table to another data source.
+#[derive(Debug, Clone)]
+pub struct CopyTable {
+    pub from: TableKey,
+    /// Where it goes: the data source, the database (empty: the data
+    /// source's own), the schema, the name.
+    pub dest: Option<u64>,
+    pub database: String,
+    pub schema: String,
+    pub name: String,
+    pub with_data: bool,
+    pub running: bool,
+    pub error: Option<String>,
+    /// How many rows were copied, once it is done.
+    pub copied: Option<u64>,
 }
 
 /// Puts the rows of a CSV or JSON file into a table, all or none; how many.
@@ -2029,6 +2151,7 @@ pub struct State {
     /// The health of a database, on show.
     pub health: Option<HealthView>,
     pub import: Option<Import>,
+    pub copy_table: Option<CopyTable>,
     pub confirm: Option<Confirm>,
     /// What each table is made of, read when a table of the tree opens.
     pub structures: HashMap<TableKey, protocol::Structure>,
@@ -2085,6 +2208,7 @@ impl State {
             designer: None,
             health: None,
             import: None,
+            copy_table: None,
             confirm: None,
             structures: HashMap::new(),
             tree_filter: String::new(),
@@ -3591,6 +3715,65 @@ mod tests {
                 && f.ref_table == "customers"
                 && !f.columns.is_empty()
                 && f.columns.len() == f.ref_columns.len()));
+            // A table copied elsewhere, with its rows, its keys and its indexes.
+            let _ = run_statements(
+                params.clone(),
+                vec!["DROP SCHEMA IF EXISTS live_copy CASCADE".into()],
+            )
+            .await;
+            let copied = copy_table(
+                params.clone(),
+                params.clone(),
+                tref("public", "customers"),
+                tref("live_copy", "customers2"),
+                true,
+            )
+            .await;
+            assert_eq!(copied.result, Ok(1200));
+            assert!(!copied.source_log.is_empty() && !copied.dest_log.is_empty());
+            let copy_rows = rows(
+                params.clone(),
+                tref("live_copy", "customers2"),
+                Query {
+                    limit: 5,
+                    order: vec![("id".into(), true)],
+                    ..Query::default()
+                },
+            )
+            .await
+            .result
+            .unwrap();
+            // Same rows, same key, and still a working sequence.
+            assert_eq!(copy_rows.primary_key, vec!["id".to_string()]);
+            let original = rows(
+                params.clone(),
+                tref("public", "customers"),
+                Query {
+                    limit: 5,
+                    order: vec![("id".into(), true)],
+                    ..Query::default()
+                },
+            )
+            .await
+            .result
+            .unwrap();
+            assert_eq!(copy_rows.rows, original.rows);
+            // A name that is taken is an error, and the other table is untouched.
+            let again = copy_table(
+                params.clone(),
+                params.clone(),
+                tref("public", "customers"),
+                tref("live_copy", "customers2"),
+                false,
+            )
+            .await;
+            assert!(again.result.is_err());
+            let cleaned = run_statements(
+                params.clone(),
+                vec!["DROP SCHEMA live_copy CASCADE".into()],
+            )
+            .await;
+            assert!(cleaned.result.unwrap().failed.is_none());
             // A file into a table, all or none.
             let dir = tempfile::tempdir().unwrap();
             let csv = dir.path().join("in.csv");

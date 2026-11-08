@@ -2794,6 +2794,60 @@ mod behavior_tests {
     }
 
     #[test]
+    fn a_table_is_copied_to_another_source_from_its_window() {
+        use crate::database::{Copied, CopyField, DbMsg};
+        let (mut app, _) = db_app(true);
+        let id = app.db.connections[0].id;
+        let _ = app.update(Message::Db(DbMsg::CopyOpen(
+            id,
+            "shop".into(),
+            "public".into(),
+            "items".into(),
+        )));
+        let copy = app.db.copy_table.as_ref().expect("the window opens");
+        assert_eq!(
+            (copy.name.as_str(), copy.schema.as_str()),
+            ("items", "public")
+        );
+        assert!(copy.with_data && copy.dest == Some(id));
+        // Nothing goes without a name.
+        let _ = app.update(Message::Db(DbMsg::CopyField(CopyField::Name, "  ".into())));
+        let _ = app.update(Message::Db(DbMsg::CopyRun));
+        assert!(!app.db.copy_table.as_ref().unwrap().running);
+        let _ = app.update(Message::Db(DbMsg::CopyField(
+            CopyField::Name,
+            "items2".into(),
+        )));
+        let _ = app.update(Message::Db(DbMsg::CopyData(false)));
+        let _ = app.update(Message::Db(DbMsg::CopyRun));
+        assert!(app.db.copy_table.as_ref().unwrap().running);
+        // It cannot be closed, or changed, while it runs.
+        assert!(!app.db_escape());
+        let _ = app.update(Message::Db(DbMsg::CopyField(
+            CopyField::Name,
+            "other".into(),
+        )));
+        assert_eq!(app.db.copy_table.as_ref().unwrap().name, "items2");
+        let failed = Copied {
+            result: Err("relation already exists".into()),
+            source_log: Vec::new(),
+            dest_log: Vec::new(),
+        };
+        let _ = app.update(Message::Db(DbMsg::CopyDone(Box::new(failed))));
+        let copy = app.db.copy_table.as_ref().unwrap();
+        assert!(!copy.running && copy.error.as_deref() == Some("relation already exists"));
+        let _ = app.update(Message::Db(DbMsg::CopyRun));
+        let done = Copied {
+            result: Ok(0),
+            source_log: Vec::new(),
+            dest_log: Vec::new(),
+        };
+        let _ = app.update(Message::Db(DbMsg::CopyDone(Box::new(done))));
+        assert_eq!(app.db.copy_table.as_ref().unwrap().copied, Some(0));
+        assert!(app.db_escape() && app.db.copy_table.is_none());
+    }
+
+    #[test]
     fn the_arrows_and_tab_move_the_focus_from_cell_to_cell() {
         let (mut app, path) = db_app(true);
         let key = |app: &mut SimpleEditApp, k: &str, shift: bool| {

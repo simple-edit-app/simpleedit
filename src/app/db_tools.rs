@@ -4,7 +4,7 @@ use iced::Task;
 
 use super::{Message, SimpleEditApp};
 use crate::database::import::{self, Format};
-use crate::database::{self, DbMsg, HealthTab, HealthView, Import, TableRef};
+use crate::database::{self, CopyField, CopyTable, DbMsg, HealthTab, HealthView, Import, TableRef};
 
 impl SimpleEditApp {
     pub(super) fn db_tools_message(&mut self, msg: DbMsg) -> Task<Message> {
@@ -302,6 +302,130 @@ impl SimpleEditApp {
                         log
                     }
                 }
+            }
+            DbMsg::CopyOpen(conn, database, schema, table) => {
+                self.db.copy_table = Some(CopyTable {
+                    name: table.clone(),
+                    schema: schema.clone(),
+                    from: (conn, database, schema, table),
+                    dest: Some(conn),
+                    database: String::new(),
+                    with_data: true,
+                    running: false,
+                    error: None,
+                    copied: None,
+                });
+                Task::none()
+            }
+            DbMsg::CopyDest(id) => {
+                if let Some(c) = self.db.copy_table.as_mut().filter(|c| !c.running) {
+                    c.dest = Some(id);
+                    c.error = None;
+                    c.copied = None;
+                }
+                Task::none()
+            }
+            DbMsg::CopyField(field, text) => {
+                if let Some(c) = self.db.copy_table.as_mut().filter(|c| !c.running) {
+                    match field {
+                        CopyField::Database => c.database = text,
+                        CopyField::Schema => c.schema = text,
+                        CopyField::Name => c.name = text,
+                    }
+                    c.error = None;
+                    c.copied = None;
+                }
+                Task::none()
+            }
+            DbMsg::CopyData(on) => {
+                if let Some(c) = self.db.copy_table.as_mut().filter(|c| !c.running) {
+                    c.with_data = on;
+                }
+                Task::none()
+            }
+            DbMsg::CopyRun => {
+                let Some(c) = self.db.copy_table.as_ref().filter(|c| !c.running) else {
+                    return Task::none();
+                };
+                let (name, schema) = (c.name.trim().to_string(), c.schema.trim().to_string());
+                let Some(dest) = c.dest else {
+                    return Task::none();
+                };
+                if name.is_empty() || schema.is_empty() {
+                    return Task::none();
+                }
+                let (src_conn, src_db, src_schema, src_table) = c.from.clone();
+                let dest_database = if c.database.trim().is_empty() {
+                    self.db
+                        .connection(dest)
+                        .map(|conn| conn.database.clone())
+                        .unwrap_or_default()
+                } else {
+                    c.database.trim().to_string()
+                };
+                let with_data = c.with_data;
+                let Some(source) = self.db_params(src_conn, false) else {
+                    return self.db_ask_password(src_conn);
+                };
+                let Some(target) = self.db_params(dest, false) else {
+                    return self.db_ask_password(dest);
+                };
+                if let Some(c) = self.db.copy_table.as_mut() {
+                    c.running = true;
+                    c.error = None;
+                    c.copied = None;
+                }
+                let from = TableRef {
+                    database: src_db,
+                    schema: src_schema,
+                    table: src_table,
+                };
+                let to = TableRef {
+                    database: dest_database,
+                    schema,
+                    table: name,
+                };
+                Task::perform(
+                    database::copy_table(source, target, from, to, with_data),
+                    |copied| Message::Db(DbMsg::CopyDone(Box::new(copied))),
+                )
+            }
+            DbMsg::CopyDone(copied) => {
+                let copied = *copied;
+                let Some((source, dest)) = self
+                    .db
+                    .copy_table
+                    .as_ref()
+                    .map(|c| (c.from.0, c.dest.unwrap_or(c.from.0)))
+                else {
+                    return Task::none();
+                };
+                let logs = Task::batch([
+                    self.db_log(source, &copied.source_log),
+                    self.db_log(dest, &copied.dest_log),
+                ]);
+                let Some(c) = self.db.copy_table.as_mut() else {
+                    return logs;
+                };
+                c.running = false;
+                match copied.result {
+                    Ok(rows) => {
+                        c.copied = Some(rows);
+                        // The tree of the data source it went to shows it.
+                        let reload = self.db_message(DbMsg::Reload(dest));
+                        Task::batch([logs, reload])
+                    }
+                    Err(error) => {
+                        c.error = Some(error);
+                        logs
+                    }
+                }
+            }
+            DbMsg::CopyClose => {
+                if self.db.copy_table.as_ref().is_some_and(|c| !c.running) {
+                    self.db.copy_table = None;
+                }
+                Task::none()
             }
             DbMsg::ImportClose => {
                 if self.db.import.as_ref().is_some_and(|i| !i.running) {

@@ -450,6 +450,10 @@ impl SimpleEditApp {
             self.db.import = None;
             return true;
         }
+        if self.db.copy_table.as_ref().is_some_and(|c| !c.running) {
+            self.db.copy_table = None;
+            return true;
+        }
         // A question waiting for a yes, or the table designer.
         if self.db.confirm.as_ref().is_some_and(|c| !c.running) {
             self.db.confirm = None;
@@ -969,7 +973,14 @@ impl SimpleEditApp {
             | DbMsg::ImportMap(..)
             | DbMsg::ImportRun
             | DbMsg::ImportDone(_)
-            | DbMsg::ImportClose) => self.db_tools_message(msg),
+            | DbMsg::ImportClose
+            | DbMsg::CopyOpen(..)
+            | DbMsg::CopyDest(_)
+            | DbMsg::CopyField(..)
+            | DbMsg::CopyData(_)
+            | DbMsg::CopyRun
+            | DbMsg::CopyDone(_)
+            | DbMsg::CopyClose) => self.db_tools_message(msg),
             DbMsg::SearchText(path, text) => {
                 if let Some(tab) = self.db_tabs.get_mut(&path) {
                     tab.search_text = text;

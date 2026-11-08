@@ -120,6 +120,110 @@ pub fn table_ddl(schema: &str, table: &str, s: &Structure) -> String {
     out
 }
 
+/// A table made to be made again somewhere else: its columns, its keys and
+/// checks, its indexes and its comments. Left out are what points to other
+/// tables (a foreign key), triggers, and partitioning; a column that took its
+/// values from a sequence gets an identity of its own.
+pub fn portable(s: &Structure) -> Structure {
+    let mut out = s.clone();
+    out.extra = Default::default();
+    out.referenced_by.clear();
+    out.constraints
+        .retain(|c| !matches!(c.kind, ConstraintKind::Foreign | ConstraintKind::Other));
+    for c in &mut out.columns {
+        let from_sequence = c
+            .default
+            .as_deref()
+            .is_some_and(|d| d.starts_with("nextval("));
+        let whole = matches!(c.kind.as_str(), "integer" | "bigint" | "smallint");
+        if from_sequence {
+            c.default = None;
+            if whole && !c.generated {
+                c.identity = "d".to_string();
+            }
+        }
+        // To load the rows with the numbers they had, whatever the identity.
+        if !c.identity.is_empty() {
+            c.identity = "d".to_string();
+        }
+    }
+    out
+}
+
+/// The statements that make a copy of a table: a schema if it is missing, the
+/// table, then its indexes (named after the new table) and comments.
+pub fn copy_statements(schema: &str, table: &str, s: &Structure) -> Vec<String> {
+    let mut structure = portable(s);
+    // An index is made again for the new table, under a name of its own.
+    for index in &mut structure.indexes {
+        index.definition = rename_index(&index.definition, schema, table);
+    }
+    let text = table_ddl(schema, table, &structure);
+    let mut out = vec![format!(
+        "CREATE SCHEMA IF NOT EXISTS {}",
+        quote_ident(schema)
+    )];
+    out.extend(
+        super::console::split_statements(&text)
+            .into_iter()
+            .map(|span| text[span.start..span.end].to_string()),
+    );
+    out
+}
+
+/// A `CREATE INDEX` that is for another table, under another name.
+fn rename_index(definition: &str, schema: &str, table: &str) -> String {
+    let pattern = regex::Regex::new(
+        r#"^(CREATE (?:UNIQUE )?INDEX (?:CONCURRENTLY )?)("(?:[^"]|"")*"|\S+) ON (?:ONLY )?("(?:[^"]|"")*"|[^\s."]+)(?:\.("(?:[^"]|"")*"|[^\s."]+))? (.*)$"#,
+    )
+    .expect("a valid pattern");
+    let Some(found) = pattern.captures(definition) else {
+        return definition.to_string();
+    };
+    let unquote = |s: &str| {
+        s.strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .map_or_else(|| s.to_string(), |s| s.replace("\"\"", "\""))
+    };
+    // `schema.table`, or `table` alone when the schema is the default one.
+    let old_index = unquote(&found[2]);
+    let mut name = format!("{table}_{old_index}");
+    if name.len() > 63 {
+        let mut cut = 63;
+        while !name.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        name.truncate(cut);
+    }
+    format!(
+        "{}{} ON {}.{} {}",
+        &found[1],
+        quote_ident(&name),
+        quote_ident(schema),
+        quote_ident(table),
+        &found[5]
+    )
+}
+
+/// The statement that puts a sequence back where the rows are, after rows
+/// were loaded with their own numbers.
+pub fn restart_sequences(schema: &str, table: &str, s: &Structure) -> Vec<String> {
+    let name = format!("{}.{}", quote_ident(schema), quote_ident(table));
+    portable(s)
+        .columns
+        .iter()
+        .filter(|c| !c.identity.is_empty())
+        .map(|c| {
+            let column = quote_ident(&c.name);
+            format!(
+                "SELECT setval(pg_get_serial_sequence({}, {}), COALESCE(MAX({column}), 1), MAX({column}) IS NOT NULL) FROM {name}",
+                quote_literal(&name),
+                quote_literal(&c.name)
+            )
+        })
+        .collect()
+}
+
 /// Rows linked to a row: the table, and the condition that picks them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Link {
@@ -394,5 +498,84 @@ mod tests {
             qualified("sales.\"Order. Items\""),
             (Some("sales".into()), "Order. Items".into())
         );
+    }
+
+    #[test]
+    fn a_copy_leaves_out_what_points_elsewhere_and_gives_sequences_an_identity() {
+        let mut s = Structure {
+            columns: vec![col("id", "integer", false), col("owner", "integer", true)],
+            ..Structure::default()
+        };
+        s.columns[0].default = Some("nextval('old_id_seq'::regclass)".into());
+        s.constraints = vec![
+            ConstraintDef {
+                name: "old_pkey".into(),
+                kind: ConstraintKind::Primary,
+                definition: "PRIMARY KEY (id)".into(),
+            },
+            ConstraintDef {
+                name: "old_owner_fkey".into(),
+                kind: ConstraintKind::Foreign,
+                definition: "FOREIGN KEY (owner) REFERENCES users(id)".into(),
+            },
+        ];
+        s.extra.triggers =
+            vec!["CREATE TRIGGER t BEFORE INSERT ON old FOR EACH ROW EXECUTE FUNCTION f()".into()];
+        let p = portable(&s);
+        assert_eq!(p.columns[0].default, None);
+        assert_eq!(p.columns[0].identity, "d");
+        assert_eq!(p.constraints.len(), 1);
+        assert!(p.extra.triggers.is_empty());
+        let statements = copy_statements("copy", "new", &s);
+        assert_eq!(statements[0], "CREATE SCHEMA IF NOT EXISTS \"copy\"");
+        assert!(statements[1].starts_with("CREATE TABLE \"copy\".\"new\" ("));
+        assert!(statements[1].contains("\"id\" integer GENERATED BY DEFAULT AS IDENTITY NOT NULL"));
+        assert!(!statements.join("\n").contains("REFERENCES"));
+        assert!(!statements.join("\n").contains("TRIGGER"));
+        // An identity that is always generated is loaded by default.
+        let mut always = s.clone();
+        always.columns[1].identity = "a".into();
+        assert_eq!(portable(&always).columns[1].identity, "d");
+    }
+
+    #[test]
+    fn an_index_is_made_again_for_the_new_table_under_its_own_name() {
+        let old = "CREATE UNIQUE INDEX items_label_idx ON public.items USING btree (label)";
+        assert_eq!(
+            rename_index(old, "copy", "items2"),
+            "CREATE UNIQUE INDEX \"items2_items_label_idx\" ON \"copy\".\"items2\" USING btree (label)"
+        );
+        // Quoted names, and a table without its schema.
+        let quoted = "CREATE INDEX \"My Idx\" ON \"Sales\".\"Order Items\" USING gin (tags)";
+        assert_eq!(
+            rename_index(quoted, "s", "t"),
+            "CREATE INDEX \"t_My Idx\" ON \"s\".\"t\" USING gin (tags)"
+        );
+        // Something that is not an index is left as it is.
+        assert_eq!(rename_index("nonsense", "s", "t"), "nonsense");
+        // A long name is cut to what PostgreSQL keeps.
+        let long = format!(
+            "CREATE INDEX {} ON public.t USING btree (a)",
+            "x".repeat(60)
+        );
+        let out = rename_index(&long, "s", "table_name");
+        let name = out.split('"').nth(1).unwrap();
+        assert!(name.len() <= 63, "{}", name.len());
+    }
+
+    #[test]
+    fn the_sequences_of_a_copy_are_put_back_where_the_rows_are() {
+        let mut s = Structure {
+            columns: vec![col("id", "integer", false), col("n", "text", true)],
+            ..Structure::default()
+        };
+        s.columns[0].identity = "a".into();
+        let sql = restart_sequences("s", "t", &s);
+        assert_eq!(sql.len(), 1);
+        assert!(sql[0].starts_with("SELECT setval(pg_get_serial_sequence('\"s\".\"t\"', 'id')"));
+        assert!(sql[0].ends_with("FROM \"s\".\"t\""));
+        // No identity, nothing to restart.
+        s.columns[0].identity.clear();
+        assert!(restart_sequences("s", "t", &s).is_empty());
     }
 }
