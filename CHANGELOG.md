@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.18.0] - 2026-11-08
+
+### Added
+- Databases, as in a JetBrains IDE: a database button opens a panel of data sources. **Only PostgreSQL is supported in this first version.** Its driver is a small separate program, downloaded and checked by signature the first time.
+  - A data source: URL or host, user and password (kept in the system keychain with *Forever*), TLS from disable to verify-full, SSH tunnel, `.pgpass`, read-only, time zone, startup script, query time limit, schema and object filters, driver file.
+  - The tree: databases, schemas, tables and views opened to their columns, keys and indexes, functions, sequences and types, a search box, a right click to make a table or a schema.
+  - A table opens in a tab, grouped and colored by data source: pages, sort, `WHERE`, editing cell by cell (NULL, date picker, add, delete, commit in one transaction), tables without a primary key too, resizable columns, a viewer for long values and JSON, copy of a cell or a row, and the rows linked by foreign keys, both ways.
+  - A console: queries run (selection, current or all), a Stop button, SQL highlighting and completion, a log of what the app runs.
+  - A table designer: columns, types (with a `USING` expression), defaults, keys, constraints and indexes edited in place, schema, name, comments, and the SQL it runs in one transaction; the DDL of a table with Copy; empty and drop with a confirmation. PostgreSQL cannot move a column: new ones are added at the end.
+- A data source asks for a second click before it is deleted.
+
 ## [1.17.0] - 2026-11-07
 
 ### Added

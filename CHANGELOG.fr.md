@@ -1,5 +1,16 @@
 # Journal des modifications
 
+## [1.18.0] - 2026-11-08
+
+### Ajouté
+- Les bases de données, comme dans un IDE JetBrains : un bouton ouvre un panneau de sources de données. **Seul PostgreSQL est pris en charge dans cette première version.** Son driver est un petit programme séparé, téléchargé et vérifié par signature la première fois.
+  - Une source : URL ou hôte, utilisateur et mot de passe (gardé dans le trousseau du système avec *Toujours*), TLS de désactivé à verify-full, tunnel SSH, `.pgpass`, lecture seule, fuseau horaire, script de démarrage, durée maximale des requêtes, filtres de schémas et d'objets, fichier de driver.
+  - L'arbre : bases, schémas, tables et vues dépliables sur leurs colonnes, clés et index, fonctions, séquences et types, une zone de recherche, un clic droit pour créer une table ou un schéma.
+  - Une table s'ouvre dans un onglet, groupé et coloré par source : pages, tri, `WHERE`, édition cellule par cellule (NULL, sélecteur de date, ajout, suppression, validation en une transaction), tables sans clé primaire aussi, colonnes redimensionnables, visualiseur de valeurs longues et de JSON, copie d'une cellule ou d'une ligne, et lignes liées par clés étrangères, dans les deux sens.
+  - Une console : requêtes exécutées (sélection, courante ou toutes), bouton Arrêter, coloration et complétion SQL, journal de ce que l'app exécute.
+  - Un éditeur de table : colonnes, types (avec une expression `USING`), valeurs par défaut, clés, contraintes et index modifiés sur place, schéma, nom, commentaires, et le SQL exécuté en une transaction ; le DDL d'une table avec Copier ; vider et supprimer avec confirmation. PostgreSQL ne sait pas déplacer une colonne : les nouvelles sont ajoutées à la fin.
+- Une source de données demande un second clic avant d'être supprimée.
+
 ## [1.17.0] - 2026-11-07
 
 ### Ajouté
