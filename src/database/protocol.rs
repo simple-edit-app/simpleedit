@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped when a request or an answer changes; the app only uses a driver
 /// that answers `--protocol` with the same number.
-pub const PROTOCOL: u32 = 11;
+pub const PROTOCOL: u32 = 12;
 
 pub const DEFAULT_PORT: u16 = 5432;
 pub const DEFAULT_SSH_PORT: u16 = 22;
@@ -189,6 +189,8 @@ pub struct Request {
     pub sql: String,
     /// For `query`: the statements are one transaction, all or none.
     pub transaction: bool,
+    /// For `definition`: `view` or `matview`, named by `schema` and `table`.
+    pub object: String,
     /// For `export`: the file to write, and its format (`csv` or `json`).
     pub path: String,
     pub format: String,
@@ -265,6 +267,32 @@ pub struct Structure {
     /// The foreign keys of other tables that point to this one.
     #[serde(default)]
     pub referenced_by: Vec<Reference>,
+    /// What only some tables have (boxed: the structure is carried in many
+    /// messages).
+    #[serde(default)]
+    pub extra: Box<TableExtra>,
+}
+
+/// Partitioning, triggers and the like.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TableExtra {
+    /// `RANGE (created)`, `LIST (country)`…: the table is partitioned by it.
+    pub partition_key: String,
+    /// The table is a partition of another one.
+    pub partition_of: Option<PartitionOf>,
+    /// The definitions of the triggers (`CREATE TRIGGER …`).
+    pub triggers: Vec<String>,
+    pub unlogged: bool,
+}
+
+/// The table a partition belongs to, and the values it holds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PartitionOf {
+    pub schema: String,
+    pub table: String,
+    /// `FOR VALUES FROM (…) TO (…)`, or `DEFAULT`.
+    pub bound: String,
 }
 
 /// A foreign key, in another table, that points to the table.

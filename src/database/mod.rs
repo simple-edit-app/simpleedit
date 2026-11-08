@@ -124,6 +124,9 @@ pub enum DbMsg {
     /// The plan of the statement at the caret; with `true`, run for real
     /// (only a reading statement is).
     Explain(bool),
+    /// The SQL of a view or a materialized view, shown whole.
+    ShowDefinition(u64, String, String, String, Kind),
+    Definition(u64, String, String, String, Done<String>),
     /// Ends the transaction the console left open.
     EndTransaction(bool),
     /// The rows of a tab, all of them, written to a file: `csv` or `json`.
@@ -973,6 +976,9 @@ pub struct Params {
     pub target: Target,
     pub scope: Scope,
     pub driver: String,
+    /// The session the tables and the tree are read through: connecting (and
+    /// the tunnel, and TLS) is paid once, not for every page.
+    pub browse: Option<Live>,
 }
 
 impl Params {
@@ -1002,11 +1008,13 @@ pub async fn test(params: Params) -> Done<String> {
 }
 
 pub async fn tree(params: Params) -> Done<Vec<Database>> {
-    call(params.driver.clone(), params.request("tree"))
-        .await
-        .map(|answer| {
-            serde_json::from_value(answer["databases"].clone()).map_err(|e| e.to_string())
-        })
+    call_with(
+        params.browse.clone(),
+        params.driver.clone(),
+        params.request("tree"),
+    )
+    .await
+    .map(|answer| serde_json::from_value(answer["databases"].clone()).map_err(|e| e.to_string()))
 }
 
 /// Which rows of a table, and how.
@@ -1074,16 +1082,20 @@ pub async fn rows_with(
 pub async fn apply(params: Params, table: TableRef, changes: Vec<protocol::Change>) -> Done<u64> {
     let mut request = table_request(&params, "apply", &table);
     request.changes = changes;
-    call(params.driver.clone(), request)
+    call_with(params.browse.clone(), params.driver.clone(), request)
         .await
         .map(|answer| Ok(answer["applied"].as_u64().unwrap_or(0)))
 }
 
 /// The columns of every table of the database, for the completion.
 pub async fn table_columns(params: Params) -> Done<Vec<protocol::TableColumn>> {
-    call(params.driver.clone(), params.request("columns"))
-        .await
-        .map(|answer| serde_json::from_value(answer["columns"].clone()).map_err(|e| e.to_string()))
+    call_with(
+        params.browse.clone(),
+        params.driver.clone(),
+        params.request("columns"),
+    )
+    .await
+    .map(|answer| serde_json::from_value(answer["columns"].clone()).map_err(|e| e.to_string()))
 }
 
 /// What running statements gave: a result for each that went well, and the
@@ -1099,9 +1111,30 @@ pub struct Ran {
 /// What a table is made of.
 pub async fn structure(params: Params, table: TableRef) -> Done<protocol::Structure> {
     let request = table_request(&params, "structure", &table);
-    call(params.driver.clone(), request).await.map(|answer| {
-        serde_json::from_value(answer["structure"].clone()).map_err(|e| e.to_string())
-    })
+    call_with(params.browse.clone(), params.driver.clone(), request)
+        .await
+        .map(|answer| {
+            serde_json::from_value(answer["structure"].clone()).map_err(|e| e.to_string())
+        })
+}
+
+/// The SQL that makes a view or a materialized view.
+pub async fn definition(params: Params, table: TableRef, kind: Kind) -> Done<String> {
+    let mut request = table_request(&params, "definition", &table);
+    request.object = if kind == Kind::Matview {
+        "matview"
+    } else {
+        "view"
+    }
+    .to_string();
+    call_with(params.browse.clone(), params.driver.clone(), request)
+        .await
+        .map(|answer| {
+            Ok(answer["definition"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string())
+        })
 }
 
 /// Runs statements one after the other in one session.
@@ -1702,12 +1735,22 @@ pub struct State {
     pub resizing: Option<Resizing>,
     /// The sessions that stay, one per data source the console ran on.
     pub live: HashMap<u64, Live>,
+    /// The sessions the tables are read through, one per data source.
+    browse: std::sync::Mutex<HashMap<u64, Live>>,
 }
 
 impl State {
     /// The session of a data source, made when there is none.
     pub fn live_of(&mut self, id: u64) -> Live {
         self.live.entry(id).or_default().clone()
+    }
+
+    /// Closes the session the tables of a data source are read through.
+    fn forget_browse(&self, id: u64) {
+        self.browse
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id);
     }
 
     /// Ends the session of a data source (its transaction is rolled back).
@@ -1741,6 +1784,7 @@ impl State {
             new_schema: None,
             resizing: None,
             live: HashMap::new(),
+            browse: Default::default(),
         }
     }
 
@@ -1798,6 +1842,14 @@ impl State {
             target: c.target(password, ssh_secret),
             scope: c.scope.clone(),
             driver: self.driver_path.clone(),
+            browse: Some(
+                self.browse
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entry(id)
+                    .or_default()
+                    .clone(),
+            ),
         })
     }
 
@@ -1834,6 +1886,7 @@ impl State {
         self.trees.remove(&id);
         // The settings may have changed: the next run connects afresh.
         self.live.remove(&id);
+        self.forget_browse(id);
         self.persist();
         Some(id)
     }
@@ -1864,6 +1917,7 @@ impl State {
         self.once.remove(&id);
         self.trees.remove(&id);
         self.live.remove(&id);
+        self.forget_browse(id);
         let prefix = format!("{id}/");
         self.open
             .retain(|k| *k != id.to_string() && !k.starts_with(&prefix));
@@ -2307,6 +2361,7 @@ mod tests {
             target,
             scope: Scope::default(),
             driver: String::new(),
+            browse: Some(Live::default()),
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2497,6 +2552,7 @@ mod tests {
             target,
             scope: Scope::default(),
             driver: String::new(),
+            browse: None,
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

@@ -194,6 +194,7 @@ fn run(input: &str, slot: &mut Option<(String, Session)>, serving: bool) -> Resu
         }
         "columns" => columns(client, &request),
         "structure" => structure(client, &request),
+        "definition" => definition(client, &request),
         other => Err(format!("unknown operation: {other}")),
     }
 }
@@ -1529,7 +1530,55 @@ fn structure(client: &mut Client, request: &Request) -> Result<Value, String> {
         &[&name],
     )
     .map_err(clean)?;
+    let (partition_key, unlogged) = {
+        let found = internal_query(
+            client,
+            "SELECT pg_get_partkeydef(c.oid), c.relpersistence::text FROM pg_class c \
+             WHERE c.oid = $1::text::regclass",
+            &[&name],
+        )
+        .map_err(clean)?;
+        match found.first() {
+            Some(r) => (
+                r.get::<_, Option<String>>(0).unwrap_or_default(),
+                r.get::<_, String>(1) == "u",
+            ),
+            None => (String::new(), false),
+        }
+    };
+    let partition_of = internal_query(
+        client,
+        "SELECT pn.nspname::text, pc.relname::text, pg_get_expr(c.relpartbound, c.oid) \
+         FROM pg_class c JOIN pg_inherits i ON i.inhrelid = c.oid \
+         JOIN pg_class pc ON pc.oid = i.inhparent \
+         JOIN pg_namespace pn ON pn.oid = pc.relnamespace \
+         WHERE c.oid = $1::text::regclass AND c.relispartition",
+        &[&name],
+    )
+    .map_err(clean)?
+    .first()
+    .map(|r| protocol::PartitionOf {
+        schema: r.get(0),
+        table: r.get(1),
+        bound: r.get::<_, Option<String>>(2).unwrap_or_default(),
+    });
+    let triggers: Vec<String> = internal_query(
+        client,
+        "SELECT pg_get_triggerdef(oid) FROM pg_trigger \
+         WHERE tgrelid = $1::text::regclass AND NOT tgisinternal ORDER BY tgname",
+        &[&name],
+    )
+    .map_err(clean)?
+    .iter()
+    .map(|r| r.get(0))
+    .collect();
     let structure = protocol::Structure {
+        extra: Box::new(protocol::TableExtra {
+            partition_key,
+            partition_of,
+            triggers,
+            unlogged,
+        }),
         referenced_by: referenced_by
             .iter()
             .map(|r| protocol::Reference {
@@ -1576,6 +1625,28 @@ fn structure(client: &mut Client, request: &Request) -> Result<Value, String> {
         comment,
     };
     Ok(json!({ "structure": structure }))
+}
+
+/// The SQL that makes a view or a materialized view.
+fn definition(client: &mut Client, request: &Request) -> Result<Value, String> {
+    let name = format!("{}.{}", quote(&request.schema), quote(&request.table));
+    let rows = internal_query(
+        client,
+        "SELECT pg_get_viewdef($1::text::regclass, true)",
+        &[&name],
+    )
+    .map_err(clean)?;
+    let body: String = rows
+        .first()
+        .and_then(|r| r.get::<_, Option<String>>(0))
+        .ok_or_else(|| format!("{name}: no such view"))?;
+    let body = body.trim_end().trim_end_matches(';');
+    let text = if request.object == "matview" {
+        format!("CREATE MATERIALIZED VIEW {name} AS\n{body}\nWITH DATA;\n")
+    } else {
+        format!("CREATE OR REPLACE VIEW {name} AS\n{body};\n")
+    };
+    Ok(json!({ "definition": text }))
 }
 
 /// Every column of every table and view of the database, for the completion

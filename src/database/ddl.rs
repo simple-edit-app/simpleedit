@@ -55,11 +55,47 @@ pub fn table_ddl(schema: &str, table: &str, s: &Structure) -> String {
             c.definition
         ));
     }
-    let mut out = format!("CREATE TABLE {name} (\n{}\n);\n", parts.join(",\n"));
-    if !s.indexes.is_empty() {
+    let extra = &s.extra;
+    let unlogged = if extra.unlogged { "UNLOGGED " } else { "" };
+    let mut out = match &extra.partition_of {
+        // A partition takes its columns from the table it belongs to.
+        Some(of) => format!(
+            "CREATE {unlogged}TABLE {name} PARTITION OF {}.{} {}{};\n",
+            quote_ident(&of.schema),
+            quote_ident(&of.table),
+            of.bound,
+            if extra.partition_key.is_empty() {
+                String::new()
+            } else {
+                format!(" PARTITION BY {}", extra.partition_key)
+            }
+        ),
+        None => format!(
+            "CREATE {unlogged}TABLE {name} (\n{}\n){};\n",
+            parts.join(",\n"),
+            if extra.partition_key.is_empty() {
+                String::new()
+            } else {
+                format!(" PARTITION BY {}", extra.partition_key)
+            }
+        ),
+    };
+    // The indexes of a partition come with its table.
+    let indexes: &[_] = if extra.partition_of.is_some() {
+        &[]
+    } else {
+        &s.indexes
+    };
+    if !indexes.is_empty() {
         out.push('\n');
-        for i in &s.indexes {
+        for i in indexes {
             out.push_str(&format!("{};\n", i.definition));
+        }
+    }
+    if !extra.triggers.is_empty() {
+        out.push('\n');
+        for t in &extra.triggers {
+            out.push_str(&format!("{t};\n"));
         }
     }
     let mut comments = Vec::new();
@@ -245,7 +281,37 @@ mod tests {
                 table: "order lines".into(),
                 definition: "FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE".into(),
             }],
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_partitioned_table_a_partition_and_a_trigger_are_written_as_they_are() {
+        use super::super::protocol::{PartitionOf, TableExtra};
+        let mut s = Structure {
+            columns: vec![col("at", "date", false)],
+            extra: Box::new(TableExtra {
+                partition_key: "RANGE (at)".into(),
+                triggers: vec![
+                    "CREATE TRIGGER t BEFORE INSERT ON public.log FOR EACH ROW EXECUTE FUNCTION f()"
+                        .into(),
+                ],
+                unlogged: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let parent = table_ddl("public", "log", &s);
+        assert!(parent.starts_with("CREATE UNLOGGED TABLE \"public\".\"log\" (\n  \"at\" date NOT NULL\n) PARTITION BY RANGE (at);"), "{parent}");
+        assert!(parent.contains("CREATE TRIGGER t BEFORE INSERT"));
+        s.extra.partition_key.clear();
+        s.extra.partition_of = Some(PartitionOf {
+            schema: "public".into(),
+            table: "log".into(),
+            bound: "FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')".into(),
+        });
+        let child = table_ddl("public", "log_2026", &s);
+        assert!(child.starts_with("CREATE UNLOGGED TABLE \"public\".\"log_2026\" PARTITION OF \"public\".\"log\" FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');"), "{child}");
     }
 
     #[test]

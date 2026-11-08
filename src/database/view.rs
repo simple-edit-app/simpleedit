@@ -2682,6 +2682,20 @@ fn table_menu(
             )),
         ));
     }
+    if matches!(kind, Kind::View | Kind::Matview) {
+        items.push(menu_bar::item(
+            t!("db.table_ddl").to_string(),
+            None,
+            dark,
+            Message::Db(DbMsg::ShowDefinition(
+                id,
+                database.clone(),
+                schema.clone(),
+                table.clone(),
+                kind,
+            )),
+        ));
+    }
     items.push(menu_bar::separator(dark));
     if kind == Kind::Table {
         items.push(menu_bar::item(

@@ -594,6 +594,7 @@ impl SimpleEditApp {
                     target: form.target(),
                     scope: form.draft.scope.clone(),
                     driver: self.db.driver_path.clone(),
+                    browse: None,
                 };
                 form.test = TestState::Running;
                 Task::perform(database::test(params), |result| {
@@ -1203,6 +1204,8 @@ impl SimpleEditApp {
             | DbMsg::SchemaClose
             | DbMsg::ToggleTable(..)
             | DbMsg::StructureRead(..)
+            | DbMsg::ShowDefinition(..)
+            | DbMsg::Definition(..)
             | DbMsg::ShowDdl(..)
             | DbMsg::TreeFilter(_)
             | DbMsg::ViewValue(..)

@@ -149,6 +149,36 @@ impl SimpleEditApp {
                 }
                 self.db_read_structure(key, true)
             }
+            DbMsg::ShowDefinition(conn, database, schema, name, kind) => {
+                let Some(params) = self.db_params(conn, false) else {
+                    return self.db_ask_password(conn);
+                };
+                let table = database::TableRef {
+                    database: database.clone(),
+                    schema: schema.clone(),
+                    table: name.clone(),
+                };
+                Task::perform(database::definition(params, table, kind), move |done| {
+                    Message::Db(DbMsg::Definition(
+                        conn,
+                        database.clone(),
+                        schema.clone(),
+                        name.clone(),
+                        done,
+                    ))
+                })
+            }
+            DbMsg::Definition(conn, _database, schema, name, done) => {
+                let log = self.db_log(conn, &done.executed);
+                self.db.text = Some(TextView {
+                    title: format!("{schema}.{name}"),
+                    text: match done.result {
+                        Ok(text) => text,
+                        Err(error) => error,
+                    },
+                });
+                log
+            }
             DbMsg::TreeFilter(text) => {
                 self.db.tree_filter = text;
                 Task::none()
