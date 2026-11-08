@@ -127,6 +127,10 @@ pub enum DbMsg {
     /// The SQL of a view or a materialized view, shown whole.
     ShowDefinition(u64, String, String, String, Kind),
     Definition(u64, String, String, String, Done<String>),
+    /// The SQL of a function: database, schema, name and arguments.
+    ShowFunction(u64, String, String, String, String),
+    /// The statement of a stopped session was stopped on the server too.
+    Stopped(Done<bool>),
     /// Ends the transaction the console left open.
     EndTransaction(bool),
     /// The rows of a tab, all of them, written to a file: `csv` or `json`.
@@ -896,7 +900,17 @@ struct LiveProcess {
 }
 
 #[derive(Clone, Default)]
-pub struct Live(std::sync::Arc<tokio::sync::Mutex<Option<LiveProcess>>>);
+pub struct Live(
+    std::sync::Arc<tokio::sync::Mutex<Option<LiveProcess>>>,
+    /// The backend of the server the session is (0: not known yet).
+    std::sync::Arc<std::sync::atomic::AtomicI64>,
+);
+
+impl Live {
+    pub fn pid(&self) -> i64 {
+        self.1.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
 
 impl std::fmt::Debug for Live {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -913,6 +927,7 @@ async fn call_live(
     let path = find_driver(&picked)
         .await
         .ok_or_else(|| t!("db.err_driver_missing").to_string())?;
+    let pid_cell = live.1.clone();
     let mut guard = live.0.lock().await;
     let mut line = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
     line.push(b'\n');
@@ -941,16 +956,28 @@ async fn call_live(
             .await
             .map_err(|e| e.to_string())?;
         process.stdin.flush().await.map_err(|e| e.to_string())?;
-        let mut out = String::new();
-        let read = process
-            .stdout
-            .read_line(&mut out)
-            .await
-            .map_err(|e| e.to_string())?;
-        if read == 0 {
-            return Err(t!("db.err_driver_answer").to_string());
+        // A line that says which backend the session is comes first when the
+        // connection was just made; the answer is the line with `ok` in it.
+        loop {
+            let mut out = String::new();
+            let read = process
+                .stdout
+                .read_line(&mut out)
+                .await
+                .map_err(|e| e.to_string())?;
+            if read == 0 {
+                return Err(t!("db.err_driver_answer").to_string());
+            }
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(out.trim()) {
+                if value.get("ok").is_none() {
+                    if let Some(pid) = value["backend_pid"].as_i64() {
+                        pid_cell.store(pid, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    continue;
+                }
+            }
+            return Ok::<String, String>(out);
         }
-        Ok::<String, String>(out)
     };
     let out = match wait_limit(&request) {
         Some(limit) => tokio::time::timeout(limit, work)
@@ -964,6 +991,7 @@ async fn call_live(
         // gone): the next request starts another.
         Ok(Err(error)) | Err(error) => {
             *guard = None;
+            pid_cell.store(0, std::sync::atomic::Ordering::Relaxed);
             Err(error)
         }
     }
@@ -1115,6 +1143,41 @@ pub async fn structure(params: Params, table: TableRef) -> Done<protocol::Struct
         .await
         .map(|answer| {
             serde_json::from_value(answer["structure"].clone()).map_err(|e| e.to_string())
+        })
+}
+
+/// Stops the statement a session is running, on the server. It is asked from
+/// another connection: a server before PostgreSQL 14 does not notice that the
+/// client went away.
+pub async fn cancel(params: Params, pid: i64) -> Done<bool> {
+    let mut request = params.request("cancel");
+    request.pid = pid;
+    call(params.driver.clone(), request)
+        .await
+        .map(|answer| Ok(answer["stopped"].as_bool().unwrap_or(false)))
+}
+
+/// The SQL of a function or a procedure.
+pub async fn function_definition(
+    params: Params,
+    database: String,
+    schema: String,
+    name: String,
+    args: String,
+) -> Done<String> {
+    let mut request = params.request("definition");
+    request.database = database;
+    request.schema = schema;
+    request.table = name;
+    request.sql = args;
+    request.object = "function".to_string();
+    call_with(params.browse.clone(), params.driver.clone(), request)
+        .await
+        .map(|answer| {
+            Ok(answer["definition"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string())
         })
 }
 
@@ -2419,6 +2482,52 @@ mod tests {
             .result
             .unwrap();
             assert!(gone.failed.is_some());
+
+            // A statement that runs is stopped on the server from the outside.
+            let slow = Live::default();
+            let running = tokio::spawn(run_with(
+                Some(slow.clone()),
+                params.clone(),
+                String::new(),
+                sql(&["DO $$ BEGIN PERFORM pg_sleep(20); END $$"]),
+                false,
+            ));
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            let pid = slow.pid();
+            assert!(pid > 0);
+            let started = std::time::Instant::now();
+            assert!(cancel(params.clone(), pid).await.result.unwrap());
+            let stopped = running.await.unwrap().result.unwrap();
+            assert!(started.elapsed() < Duration::from_secs(5));
+            assert!(stopped
+                .failed
+                .is_some_and(|(_, e)| e.contains("canceling statement")));
+
+            // The SQL of a function and of a view.
+            run_statements(
+                params.clone(),
+                sql(&[
+                    "CREATE OR REPLACE FUNCTION live_fn(a int) RETURNS int LANGUAGE sql AS 'SELECT a + 1'",
+                ]),
+            )
+            .await
+            .result
+            .unwrap();
+            let text = function_definition(
+                params.clone(),
+                String::new(),
+                "public".into(),
+                "live_fn".into(),
+                "a integer".into(),
+            )
+            .await
+            .result
+            .unwrap();
+            assert!(text.contains("CREATE OR REPLACE FUNCTION public.live_fn"), "{text}");
+            run_statements(params.clone(), sql(&["DROP FUNCTION live_fn(int)"]))
+                .await
+                .result
+                .unwrap();
 
             // A change is all or none.
             let broken = run_transaction(

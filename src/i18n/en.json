@@ -1124,5 +1124,6 @@
   "db.tx_rollback": "Rollback",
   "db.export_csv": "Export all the rows as CSV",
   "db.export_json": "Export all the rows as JSON",
-  "db.exported": "Exported to %{path}"
+  "db.exported": "Exported to %{path}",
+  "db.completion_partial": "The completion knows only the first 100,000 columns of this database."
 }

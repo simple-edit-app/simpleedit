@@ -1205,6 +1205,8 @@ impl SimpleEditApp {
             | DbMsg::ToggleTable(..)
             | DbMsg::StructureRead(..)
             | DbMsg::ShowDefinition(..)
+            | DbMsg::ShowFunction(..)
+            | DbMsg::Stopped(..)
             | DbMsg::Definition(..)
             | DbMsg::ShowDdl(..)
             | DbMsg::TreeFilter(_)
@@ -1261,6 +1263,13 @@ impl SimpleEditApp {
                 self.db.console.completion = None;
                 Task::none()
             }
+            DbMsg::Stopped(done) => {
+                // What the stop ran is in the log; nothing else to say.
+                match self.db.console.connection {
+                    Some(conn) => self.db_log(conn, &done.executed),
+                    None => Task::none(),
+                }
+            }
             DbMsg::ColumnsLoaded(id, done) => {
                 let log = self.db_log(id, &done.executed);
                 if let Ok(columns) = done.result {
@@ -1279,11 +1288,23 @@ impl SimpleEditApp {
                     self.db.console.running = false;
                     // The driver is stopped with the session it held, and a
                     // transaction of it is rolled back by the server.
+                    let mut stop = Task::none();
                     if let Some(conn) = self.db.console.connection {
+                        // The server is told to stop it: before PostgreSQL 14 it
+                        // would not notice that the driver went away.
+                        let pid = self.db.live.get(&conn).map_or(0, database::Live::pid);
+                        if pid > 0 {
+                            if let Some(params) = self.db_params(conn, false) {
+                                stop = Task::perform(database::cancel(params, pid), |done| {
+                                    Message::Db(DbMsg::Stopped(done))
+                                });
+                            }
+                        }
                         self.db.end_live(conn);
                     }
                     self.db.console.in_transaction = false;
                     self.db.console.last = Some((false, t!("db.console_cancelled").to_string()));
+                    return stop;
                 }
                 Task::none()
             }

@@ -343,7 +343,10 @@ fn connection_rows<'a>(
                     }
                     // Functions, sequences and types, each in a folder.
                     let mut folder =
-                        |name: &str, title: String, glyph: &'static str, items: Vec<String>| {
+                        |name: &str,
+                         title: String,
+                         glyph: &'static str,
+                         items: Vec<(String, Option<Message>)>| {
                             if items.is_empty() {
                                 return;
                             }
@@ -357,13 +360,15 @@ fn connection_rows<'a>(
                                 dark,
                             ));
                             if open {
-                                for item in items {
-                                    out = std::mem::replace(&mut out, column![]).push(info_line(
-                                        depth + 2,
-                                        glyph,
-                                        item,
-                                        dark,
-                                    ));
+                                for (item, message) in items {
+                                    let line = match message {
+                                        // A click shows the SQL of the object.
+                                        Some(message) => {
+                                            node(depth + 2, glyph, item, message, dark).into()
+                                        }
+                                        None => info_line(depth + 2, glyph, item, dark),
+                                    };
+                                    out = std::mem::replace(&mut out, column![]).push(line);
                                 }
                             }
                         };
@@ -373,20 +378,31 @@ fn connection_rows<'a>(
                         "ƒ",
                         routines
                             .iter()
-                            .map(|r| format!("{}({})", r.name, r.args))
+                            .map(|r| {
+                                (
+                                    format!("{}({})", r.name, r.args),
+                                    Some(Message::Db(DbMsg::ShowFunction(
+                                        id,
+                                        database.name.clone(),
+                                        schema.name.clone(),
+                                        r.name.clone(),
+                                        r.args.clone(),
+                                    ))),
+                                )
+                            })
                             .collect(),
                     );
                     folder(
                         "sequences",
                         t!("db.tree_sequences").to_string(),
                         "#",
-                        sequences.iter().map(|n| n.to_string()).collect(),
+                        sequences.iter().map(|n| (n.to_string(), None)).collect(),
                     );
                     folder(
                         "types",
                         t!("db.tree_types").to_string(),
                         "τ",
-                        types.iter().map(|n| n.to_string()).collect(),
+                        types.iter().map(|n| (n.to_string(), None)).collect(),
                     );
                 }
             }
@@ -2547,10 +2563,27 @@ fn queries_view<'a>(state: &'a State, dark: bool) -> Element<'a, Message> {
             .size(12)
             .color(p.muted)
             .into(),
-        None => text(t!("db.console_shortcuts").to_string())
+        None => {
+            // The completion knows all the columns, or says it does not.
+            let partial = c.connection.is_some_and(|id| {
+                state
+                    .columns
+                    .get(&id)
+                    .is_some_and(|k| k.len() >= protocol::MAX_COMPLETION_COLUMNS)
+            });
+            text(if partial {
+                t!("db.completion_partial").to_string()
+            } else {
+                t!("db.console_shortcuts").to_string()
+            })
             .size(12)
-            .color(p.muted)
-            .into(),
+            .color(if partial {
+                se_theme::error_color(dark)
+            } else {
+                p.muted
+            })
+            .into()
+        }
     };
     column![editor, container(status).padding([4, 14])]
         .height(Length::Fill)

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped when a request or an answer changes; the app only uses a driver
 /// that answers `--protocol` with the same number.
-pub const PROTOCOL: u32 = 12;
+pub const PROTOCOL: u32 = 13;
 
 pub const DEFAULT_PORT: u16 = 5432;
 pub const DEFAULT_SSH_PORT: u16 = 22;
@@ -189,12 +189,19 @@ pub struct Request {
     pub sql: String,
     /// For `query`: the statements are one transaction, all or none.
     pub transaction: bool,
-    /// For `definition`: `view` or `matview`, named by `schema` and `table`.
+    /// For `definition`: `view`, `matview` or `function` (its arguments in
+    /// `sql`), named by `schema` and `table`.
     pub object: String,
+    /// For `cancel`: the backend whose statement is stopped.
+    pub pid: i64,
     /// For `export`: the file to write, and its format (`csv` or `json`).
     pub path: String,
     pub format: String,
 }
+
+/// Most columns the driver gives for the completion; as many means there
+/// were more.
+pub const MAX_COMPLETION_COLUMNS: usize = 100_000;
 
 /// Most rows kept of the result of a statement.
 pub const MAX_RESULT_ROWS: usize = 1000;
@@ -737,6 +744,19 @@ fn explained(sql: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Whether the text holds several commands (a `;` followed by more than
+/// comments): the server cannot prepare it, it can only run it.
+pub fn is_multiple(sql: &str) -> bool {
+    let tokens = sql_tokens(sql);
+    tokens.iter().enumerate().any(|(i, t)| {
+        t.kind == TokenKind::Punct
+            && &sql[t.start..t.end] == ";"
+            && tokens[i + 1..]
+                .iter()
+                .any(|n| n.kind != TokenKind::Comment && &sql[n.start..n.end] != ";")
+    })
+}
+
 /// Whether a condition typed in a filter holds a `;` of its own: it would
 /// start another statement.
 pub fn has_semicolon(sql: &str) -> bool {
@@ -1007,6 +1027,14 @@ mod tests {
             "SELECT set_config('default_transaction_read_only','off',false)"
         ));
         assert!(!reads_only("CREATE TABLE t()"));
+    }
+
+    #[test]
+    fn several_commands_are_told_from_one() {
+        assert!(is_multiple("DROP TABLE a; DROP TABLE b"));
+        assert!(!is_multiple("SELECT 1;"));
+        assert!(!is_multiple("SELECT 'a;b' -- x; y"));
+        assert!(!is_multiple("SELECT 1; -- done"));
     }
 
     #[test]

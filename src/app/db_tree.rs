@@ -168,6 +168,24 @@ impl SimpleEditApp {
                     ))
                 })
             }
+            DbMsg::ShowFunction(conn, database, schema, name, args) => {
+                let Some(params) = self.db_params(conn, false) else {
+                    return self.db_ask_password(conn);
+                };
+                let shown = (database.clone(), schema.clone(), name.clone());
+                Task::perform(
+                    database::function_definition(params, database, schema, name, args),
+                    move |done| {
+                        Message::Db(DbMsg::Definition(
+                            conn,
+                            shown.0.clone(),
+                            shown.1.clone(),
+                            shown.2.clone(),
+                            done,
+                        ))
+                    },
+                )
+            }
             DbMsg::Definition(conn, _database, schema, name, done) => {
                 let log = self.db_log(conn, &done.executed);
                 self.db.text = Some(TextView {

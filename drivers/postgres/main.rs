@@ -150,7 +150,19 @@ fn run(input: &str, slot: &mut Option<(String, Session)>, serving: bool) -> Resu
     let usable = matches!(slot, Some((k, s)) if *k == key && !s.client.is_closed());
     if !usable {
         *slot = None;
-        *slot = Some((key, Session::open(&request.target, &request.database)?));
+        let opened = Session::open(&request.target, &request.database)?;
+        *slot = Some((key, opened));
+        if serving {
+            // Said at once, before the request is answered: whoever wants to
+            // stop a long statement needs it while the statement runs.
+            if let Some((_, session)) = slot.as_mut() {
+                if let Ok(row) = session.client.query_one("SELECT pg_backend_pid()", &[]) {
+                    let mut out = std::io::stdout();
+                    let _ = writeln!(out, "{}", json!({ "backend_pid": row.get::<_, i32>(0) }));
+                    let _ = out.flush();
+                }
+            }
+        }
     }
     let session = &mut slot.as_mut().expect("just opened").1;
     let client = &mut session.client;
@@ -195,6 +207,15 @@ fn run(input: &str, slot: &mut Option<(String, Session)>, serving: bool) -> Resu
         "columns" => columns(client, &request),
         "structure" => structure(client, &request),
         "definition" => definition(client, &request),
+        "cancel" => {
+            // From another connection: the statement stops on the server, which
+            // is the only way on servers that don't watch their clients.
+            let started = Instant::now();
+            let sql = "SELECT pg_cancel_backend($1)";
+            let stopped = internal_query(client, sql, &[&(request.pid as i32)]).map_err(clean)?;
+            let _ = started;
+            Ok(json!({ "stopped": stopped.first().is_some_and(|r| r.get::<_, bool>(0)) }))
+        }
         other => Err(format!("unknown operation: {other}")),
     }
 }
@@ -1629,6 +1650,23 @@ fn structure(client: &mut Client, request: &Request) -> Result<Value, String> {
 
 /// The SQL that makes a view or a materialized view.
 fn definition(client: &mut Client, request: &Request) -> Result<Value, String> {
+    if request.object == "function" {
+        let rows = internal_query(
+            client,
+            "SELECT pg_get_functiondef(p.oid) FROM pg_proc p \
+             JOIN pg_namespace n ON n.oid = p.pronamespace \
+             WHERE n.nspname = $1 AND p.proname = $2 \
+               AND pg_get_function_identity_arguments(p.oid) = $3 \
+               AND p.prokind IN ('f', 'p')",
+            &[&request.schema, &request.table, &request.sql],
+        )
+        .map_err(clean)?;
+        let text: String = rows
+            .first()
+            .and_then(|r| r.get::<_, Option<String>>(0))
+            .ok_or_else(|| format!("{}.{}: no such function", request.schema, request.table))?;
+        return Ok(json!({ "definition": format!("{};\n", text.trim_end()) }));
+    }
     let name = format!("{}.{}", quote(&request.schema), quote(&request.table));
     let rows = internal_query(
         client,
@@ -1650,7 +1688,7 @@ fn definition(client: &mut Client, request: &Request) -> Result<Value, String> {
 }
 
 /// Every column of every table and view of the database, for the completion
-/// (at most a few tens of thousands).
+/// (at most a hundred thousand, those of the schemas in use first).
 fn columns(client: &mut Client, request: &Request) -> Result<Value, String> {
     let rows = internal_query(
         client,
@@ -1662,10 +1700,16 @@ fn columns(client: &mut Client, request: &Request) -> Result<Value, String> {
          WHERE a.attnum > 0 AND NOT a.attisdropped AND c.relkind IN ('r', 'p', 'v', 'm', 'f') \
            AND ($1 OR (n.nspname NOT IN ('pg_catalog', 'information_schema') \
                        AND n.nspname NOT LIKE 'pg\\_toast%' AND n.nspname NOT LIKE 'pg\\_temp%')) \
-         ORDER BY n.nspname, c.relname, a.attnum LIMIT 30000",
-        &[&request.scope.system_schemas],
+         ORDER BY (n.nspname = ANY (current_schemas(false))) DESC, n.nspname, c.relname, a.attnum \
+         LIMIT $2",
+        &[
+            &request.scope.system_schemas,
+            &(protocol::MAX_COMPLETION_COLUMNS as i64),
+        ],
     )
     .map_err(clean)?;
+    // The schemas the session looks into come first, so that what is cut, if
+    // anything is, is what is far away.
     let list: Vec<protocol::TableColumn> = rows
         .iter()
         .map(|r| protocol::TableColumn {
@@ -1703,16 +1747,23 @@ fn query(client: &mut Client, request: &Request) -> Result<Value, String> {
         // to prepare is refused here, with its own error (after one, an open
         // transaction would only answer that it is aborted).
         let started = Instant::now();
-        let statement = match client.prepare(sql) {
-            Ok(statement) => statement,
-            Err(e) => {
-                let message = clean(e);
-                record(sql, started, None, Some(message.clone()));
-                failed = Some(json!({ "index": index, "error": message }));
-                break;
+        // Several commands in one text can't be prepared, only run.
+        let statement = if protocol::is_multiple(sql) {
+            None
+        } else {
+            match client.prepare(sql) {
+                Ok(statement) => Some(statement),
+                Err(e) => {
+                    let message = clean(e);
+                    record(sql, started, None, Some(message.clone()));
+                    failed = Some(json!({ "index": index, "error": message }));
+                    break;
+                }
             }
         };
-        if !statement.columns().is_empty() && protocol::wrappable(sql) {
+        if let Some(statement) =
+            statement.filter(|s| !s.columns().is_empty() && protocol::wrappable(sql))
+        {
             results.push(QueryResult {
                 sql: sql.clone(),
                 ms: 0,

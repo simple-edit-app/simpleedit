@@ -1124,5 +1124,6 @@
   "db.tx_rollback": "Annuler",
   "db.export_csv": "Exporter toutes les lignes en CSV",
   "db.export_json": "Exporter toutes les lignes en JSON",
-  "db.exported": "Exporté vers %{path}"
+  "db.exported": "Exporté vers %{path}",
+  "db.completion_partial": "La complétion ne connaît que les 100 000 premières colonnes de cette base."
 }
