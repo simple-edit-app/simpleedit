@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.22.0] - 2026-11-09
+
+### Added
+- Console: several consoles in tabs; a search in the history of what ran, and a way to put an entry back in the editor; a Format button for the SQL; the word the server blamed is underlined; the SQL of a file being edited runs on the data source of the console (Actions: "Run the SQL of the file").
+- Completion: after `JOIN`, the tables a foreign key links come first; after `ON`, the condition of the foreign key is proposed; the functions of the schemas are proposed too.
+- Tables: select a block of cells (Shift and a click or the arrows) and copy it as TSV, CSV, `INSERT` or Markdown; a search in all the columns, and a field under each column (`> 10`, `= abc`, `~ regex`, `null`), all together with the `WHERE`; a row opens as a form (F4) with a list for booleans, enumerations and foreign keys, and a check and a layout for JSON.
+- Import of a CSV or JSON file into a table, with the column each field goes to, all or none.
+- Copy of a table, with or without its rows, to another data source; backup and restore of a database, a schema or a table (`pg_dump`, `pg_restore`, `psql` are looked for on the machine, also through an SSH tunnel).
+- Health of a database: sizes, dead rows, last vacuum and analyze, `VACUUM` and `ANALYZE` of a table, and the indexes nobody reads.
+- A data source can be marked as production: every change asked for in the console is confirmed. On any source, an `UPDATE` or a `DELETE` without `WHERE` is confirmed first.
+
+### Changed
+- The rows a row is linked to are listed in a window of their own ("Linked rows"), in two groups with their meaning, and with short conditions, instead of a long list in the menu of a cell.
+- The driver protocol is now 18: the driver is downloaded again at the first use.
+
 ## [1.21.0] - 2026-11-08
 
 ### Added

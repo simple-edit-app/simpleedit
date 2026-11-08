@@ -1,5 +1,20 @@
 # Journal des modifications
 
+## [1.22.0] - 2026-11-09
+
+### Ajouté
+- Console : plusieurs consoles en onglets ; une recherche dans l'historique de ce qui a été exécuté et de quoi remettre une entrée dans l'éditeur ; un bouton Formater pour le SQL ; le mot que le serveur a mis en cause est souligné ; le SQL d'un fichier en cours d'édition s'exécute sur la source de données de la console (Actions : « Exécuter le SQL du fichier »).
+- Complétion : après `JOIN`, les tables liées par une clé étrangère viennent en premier ; après `ON`, la condition de la clé étrangère est proposée ; les fonctions des schémas le sont aussi.
+- Tables : sélection d'un bloc de cellules (Maj et un clic ou les flèches), copié en TSV, CSV, `INSERT` ou Markdown ; une recherche dans toutes les colonnes, et un champ sous chaque colonne (`> 10`, `= abc`, `~ regex`, `null`), le tout avec le `WHERE` ; une ligne s'ouvre en formulaire (F4), avec une liste pour les booléens, les énumérations et les clés étrangères, et un contrôle et une mise en forme du JSON.
+- Import d'un fichier CSV ou JSON dans une table, avec la colonne où va chaque champ, tout ou rien.
+- Copie d'une table, avec ou sans ses lignes, vers une autre source de données ; sauvegarde et restauration d'une base, d'un schéma ou d'une table (`pg_dump`, `pg_restore` et `psql` sont cherchés sur la machine, y compris à travers un tunnel SSH).
+- Santé d'une base : tailles, lignes mortes, dernier vacuum et analyze, `VACUUM` et `ANALYZE` d'une table, et les index que personne ne lit.
+- Une source de données peut être marquée comme production : chaque modification demandée dans la console est confirmée. Sur toute source, un `UPDATE` ou un `DELETE` sans `WHERE` est confirmé d'abord.
+
+### Modifié
+- Les lignes liées à une ligne sont listées dans une fenêtre à part (« Lignes liées »), en deux groupes avec leur sens et des conditions courtes, au lieu d'une longue liste dans le menu d'une cellule.
+- Le protocole du driver passe à 18 : le driver est téléchargé de nouveau au premier usage.
+
 ## [1.21.0] - 2026-11-08
 
 ### Ajouté
