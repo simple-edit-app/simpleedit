@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use super::protocol::{sql_tokens, Kind, Token, TokenKind};
+use super::protocol::{sql_tokens, ForeignKey, Kind, Token, TokenKind};
 
 /// What a connection is known to hold, for the completion.
 #[derive(Debug, Clone, Default)]
@@ -12,12 +12,18 @@ pub struct Known {
     pub tables: Vec<(String, String, Kind)>,
     /// The columns of each table: `(schema, table)` to name and type.
     pub columns: HashMap<(String, String), Vec<(String, String)>>,
+    /// The foreign keys: what a `JOIN` is made on.
+    pub foreign_keys: Vec<ForeignKey>,
+    /// The functions and procedures of the schemas: schema, name, arguments.
+    pub routines: Vec<(String, String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ItemKind {
     Keyword,
     Function,
+    /// A condition to join two tables on.
+    Join,
     Schema,
     Table,
     View,
@@ -370,6 +376,33 @@ pub fn suggest(text: &str, caret: usize, known: &Known, force: bool) -> Option<S
             }
             out
         };
+        // After `ON`: the conditions the foreign keys give between the table
+        // that was just joined and the others.
+        let joins = || -> Vec<Item> {
+            join_conditions(&referenced, known)
+                .into_iter()
+                .filter(|c| matches(c))
+                .map(|c| Item {
+                    insert: c.clone(),
+                    label: c,
+                    detail: t!("db.completion_fk").to_string(),
+                    kind: ItemKind::Join,
+                })
+                .collect()
+        };
+        let routines = || -> Vec<Item> {
+            known
+                .routines
+                .iter()
+                .filter(|(_, name, _)| matches(name))
+                .map(|(schema, name, args)| Item {
+                    label: name.clone(),
+                    insert: format!("{}(", quoted(name)),
+                    detail: format!("{schema} · {args}"),
+                    kind: ItemKind::Function,
+                })
+                .collect()
+        };
         let words = |list: &[&str], kind: ItemKind| -> Vec<Item> {
             list.iter()
                 .filter(|w| matches(w))
@@ -392,14 +425,33 @@ pub fn suggest(text: &str, caret: usize, known: &Known, force: bool) -> Option<S
                 })
                 .collect()
         };
-        if tables_first {
-            items.extend(tables());
+        if after.as_deref() == Some("ON") {
+            items.extend(joins());
+            items.extend(columns());
+            items.extend(words(KEYWORDS, ItemKind::Keyword));
+        } else if tables_first {
+            let mut listed = tables();
+            // After `JOIN`: the tables a foreign key links to the ones of the
+            // statement come first.
+            if after.as_deref() == Some("JOIN") {
+                let linked = linked_tables(&referenced, known);
+                let (mut first, rest): (Vec<Item>, Vec<Item>) = listed
+                    .into_iter()
+                    .partition(|i| i.kind != ItemKind::Schema && linked.contains(&i.label));
+                for item in &mut first {
+                    item.detail = format!("{} · {}", item.detail, t!("db.completion_fk"));
+                }
+                first.extend(rest);
+                listed = first;
+            }
+            items.extend(listed);
             items.extend(words(KEYWORDS, ItemKind::Keyword));
         } else if before.is_empty() {
             items.extend(words(KEYWORDS, ItemKind::Keyword));
         } else {
             items.extend(columns());
             items.extend(words(FUNCTIONS, ItemKind::Function));
+            items.extend(routines());
             items.extend(words(KEYWORDS, ItemKind::Keyword));
             items.extend(tables());
         }
@@ -659,6 +711,63 @@ fn referenced_tables(text: &str, tokens: &[Token], from: usize, known: &Known) -
     out
 }
 
+/// The names of the tables a foreign key links to a table of the statement.
+fn linked_tables(referenced: &[Referenced], known: &Known) -> Vec<String> {
+    let mut out = Vec::new();
+    for fk in &known.foreign_keys {
+        for r in referenced {
+            if r.key == (fk.schema.clone(), fk.table.clone()) {
+                out.push(fk.ref_table.clone());
+            }
+            if r.key == (fk.ref_schema.clone(), fk.ref_table.clone()) {
+                out.push(fk.table.clone());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The conditions a foreign key gives between the table joined last and the
+/// other tables of the statement: `o.customer_id = c.id`.
+fn join_conditions(referenced: &[Referenced], known: &Known) -> Vec<String> {
+    let Some((joined, others)) = referenced.split_last() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for other in others {
+        for fk in &known.foreign_keys {
+            let from = (fk.schema.clone(), fk.table.clone());
+            let to = (fk.ref_schema.clone(), fk.ref_table.clone());
+            let pairs =
+                |a: &Referenced, a_columns: &[String], b: &Referenced, b_columns: &[String]| {
+                    a_columns
+                        .iter()
+                        .zip(b_columns)
+                        .map(|(x, y)| {
+                            format!(
+                                "{}.{} = {}.{}",
+                                quoted(&a.name),
+                                quoted(x),
+                                quoted(&b.name),
+                                quoted(y)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" AND ")
+                };
+            if joined.key == from && other.key == to {
+                out.push(pairs(joined, &fk.columns, other, &fk.ref_columns));
+            } else if joined.key == to && other.key == from {
+                out.push(pairs(other, &fk.columns, joined, &fk.ref_columns));
+            }
+        }
+    }
+    out.dedup();
+    out
+}
+
 /// The known table of this name; in the usual schema first.
 fn find_table(known: &Known, schema: Option<&str>, table: &str) -> Option<(String, String)> {
     let mut found: Option<(String, String)> = None;
@@ -747,6 +856,19 @@ mod tests {
             known.tables.push((schema.into(), table.into(), kind));
             known.columns.insert((schema.into(), table.into()), columns);
         }
+        known.foreign_keys.push(ForeignKey {
+            schema: "public".into(),
+            table: "orders".into(),
+            columns: vec!["customer_id".into()],
+            ref_schema: "public".into(),
+            ref_table: "customers".into(),
+            ref_columns: vec!["id".into()],
+        });
+        known.routines.push((
+            "public".into(),
+            "total_of".into(),
+            "order_id integer".into(),
+        ));
         known
     }
 
@@ -891,5 +1013,46 @@ mod tests {
     #[test]
     fn what_is_complete_already_is_left_alone() {
         assert!(at_end("SELECT * FROM customer_names").is_none());
+    }
+
+    #[test]
+    fn after_join_the_tables_a_foreign_key_links_come_first() {
+        let s = suggest("SELECT * FROM customers c JOIN ", 31, &known(), true);
+        let items = &s.unwrap().items;
+        assert_eq!(items[0].label, "orders");
+        assert!(
+            items[0].detail.contains("foreign key"),
+            "{}",
+            items[0].detail
+        );
+        // From the other side too.
+        let text = "SELECT * FROM orders o JOIN ";
+        let s = suggest(text, text.len(), &known(), true).unwrap();
+        assert_eq!(s.items[0].label, "customers");
+    }
+
+    #[test]
+    fn after_on_the_condition_of_the_foreign_key_is_proposed() {
+        let text = "SELECT * FROM customers c JOIN orders o ON ";
+        let s = suggest(text, text.len(), &known(), true).unwrap();
+        assert_eq!(s.items[0].label, "o.customer_id = c.id");
+        assert_eq!(s.items[0].kind, ItemKind::Join);
+        // Joined the other way round, the condition is the same.
+        let text = "SELECT * FROM orders o JOIN customers c ON ";
+        let s = suggest(text, text.len(), &known(), true).unwrap();
+        assert_eq!(s.items[0].label, "o.customer_id = c.id");
+        // After `o.`, it is the columns of `o` that are proposed.
+        let text = "SELECT * FROM customers c JOIN orders o ON o.cu";
+        let s = suggest(text, text.len(), &known(), false).unwrap();
+        assert_eq!(s.items[0].label, "customer_id");
+    }
+
+    #[test]
+    fn the_functions_of_the_schemas_are_proposed() {
+        let s = at_end("SELECT total_");
+        let first = &s.unwrap().items[0];
+        assert_eq!(first.label, "total_of");
+        assert_eq!(first.insert, "total_of(");
+        assert!(first.detail.contains("order_id integer"));
     }
 }

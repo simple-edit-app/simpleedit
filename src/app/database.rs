@@ -1319,8 +1319,9 @@ impl SimpleEditApp {
             }
             DbMsg::ColumnsLoaded(id, done) => {
                 let log = self.db_log(id, &done.executed);
-                if let Ok(columns) = done.result {
-                    self.db.columns.insert(id, columns);
+                if let Ok(catalog) = done.result {
+                    self.db.columns.insert(id, catalog.columns);
+                    self.db.foreign_keys.insert(id, catalog.foreign_keys);
                 }
                 log
             }

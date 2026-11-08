@@ -2712,6 +2712,7 @@ fn completion_list<'a>(
         let (glyph, color) = match item.kind {
             ItemKind::Keyword => ("K", p.muted),
             ItemKind::Function => ("ƒ", p.accent),
+            ItemKind::Join => ("⋈", p.accent),
             ItemKind::Schema => ("S", p.muted),
             ItemKind::Table => ("▦", p.accent),
             ItemKind::View => ("◫", p.accent),

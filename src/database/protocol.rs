@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped when a request or an answer changes; the app only uses a driver
 /// that answers `--protocol` with the same number.
-pub const PROTOCOL: u32 = 13;
+pub const PROTOCOL: u32 = 14;
 
 pub const DEFAULT_PORT: u16 = 5432;
 pub const DEFAULT_SSH_PORT: u16 = 22;
@@ -214,6 +214,25 @@ pub struct TableColumn {
     pub name: String,
     #[serde(rename = "type")]
     pub kind: String,
+}
+
+/// A foreign key: the columns of a table that point to the columns of another.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ForeignKey {
+    pub schema: String,
+    pub table: String,
+    pub columns: Vec<String>,
+    pub ref_schema: String,
+    pub ref_table: String,
+    pub ref_columns: Vec<String>,
+}
+
+/// What the completion knows of a database besides its tree.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Catalog {
+    pub columns: Vec<TableColumn>,
+    #[serde(default)]
+    pub foreign_keys: Vec<ForeignKey>,
 }
 
 /// A column of a table, as the table designer shows and changes it.

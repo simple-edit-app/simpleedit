@@ -925,6 +925,7 @@
   "db.guard_writes": "This is a production source: confirm the change.",
   "db.guard_run": "Run anyway",
   "db.guard_cancel": "Cancel",
+  "db.completion_fk": "clé étrangère",
   "palette.run_sql_file": "Exécuter le SQL du fichier sur la source de données",
   "db.file_not_sql": "Ce fichier n'est pas du SQL : choisissez d'abord le langage SQL.",
   "db.console_title": "Console %{n}",

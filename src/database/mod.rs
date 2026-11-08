@@ -137,7 +137,7 @@ pub enum DbMsg {
     Export(PathBuf, &'static str),
     /// `None`: the file dialog was closed.
     Exported(PathBuf, Option<Done<String>>),
-    ColumnsLoaded(u64, Done<Vec<protocol::TableColumn>>),
+    ColumnsLoaded(u64, Done<protocol::Catalog>),
     /// The completion list of the queries: asked for, moved in, taken,
     /// picked with the mouse, closed.
     Complete,
@@ -1136,14 +1136,21 @@ pub async fn apply(params: Params, table: TableRef, changes: Vec<protocol::Chang
 }
 
 /// The columns of every table of the database, for the completion.
-pub async fn table_columns(params: Params) -> Done<Vec<protocol::TableColumn>> {
+pub async fn table_columns(params: Params) -> Done<protocol::Catalog> {
     call_with(
         params.browse.clone(),
         params.driver.clone(),
         params.request("columns"),
     )
     .await
-    .map(|answer| serde_json::from_value(answer["columns"].clone()).map_err(|e| e.to_string()))
+    .map(|answer| {
+        Ok(protocol::Catalog {
+            columns: serde_json::from_value(answer["columns"].clone())
+                .map_err(|e| e.to_string())?,
+            foreign_keys: serde_json::from_value(answer["foreign_keys"].clone())
+                .unwrap_or_default(),
+        })
+    })
 }
 
 /// What running statements gave: a result for each that went well, and the
@@ -1810,6 +1817,7 @@ pub struct State {
     pub console: Console,
     /// The columns of the tables of each connection, once read.
     pub columns: HashMap<u64, Vec<protocol::TableColumn>>,
+    pub foreign_keys: HashMap<u64, Vec<protocol::ForeignKey>>,
     /// The table being modified, and a drop or deletion waiting for a yes.
     pub designer: Option<designer::Designer>,
     pub confirm: Option<Confirm>,
@@ -1864,6 +1872,7 @@ impl State {
             },
             console: Console::load(),
             columns: HashMap::new(),
+            foreign_keys: HashMap::new(),
             designer: None,
             confirm: None,
             structures: HashMap::new(),
@@ -1888,6 +1897,19 @@ impl State {
                     known
                         .tables
                         .push((schema.name.clone(), table.name.clone(), table.kind));
+                }
+            }
+        }
+        known.foreign_keys = self.foreign_keys.get(&id).cloned().unwrap_or_default();
+        if let Some(Tree::Loaded(databases)) = self.trees.get(&id) {
+            let current = databases.iter().find(|d| d.current).or(databases.first());
+            for schema in current.into_iter().flat_map(|d| &d.schemas) {
+                for routine in &schema.routines {
+                    known.routines.push((
+                        schema.name.clone(),
+                        routine.name.clone(),
+                        routine.args.clone(),
+                    ));
                 }
             }
         }
@@ -3292,10 +3314,16 @@ mod tests {
             // The columns of the tables, for the completion.
             let columns = table_columns(params.clone()).await;
             assert!(columns.executed.iter().all(|e| e.internal));
-            let columns = columns.result.unwrap();
-            assert!(columns
+            let catalog = columns.result.unwrap();
+            assert!(catalog
+                .columns
                 .iter()
                 .any(|c| c.table == "customers" && c.name == "email" && c.schema == "public"));
+            // The foreign keys come with them, columns in order.
+            assert!(catalog.foreign_keys.iter().any(|f| f.table == "items"
+                && f.ref_table == "customers"
+                && !f.columns.is_empty()
+                && f.columns.len() == f.ref_columns.len()));
             // TLS asked of a server that has none.
             let mut tls = params;
             tls.target.ssl.mode = SslMode::Require;

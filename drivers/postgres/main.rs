@@ -1728,7 +1728,42 @@ fn columns(client: &mut Client, request: &Request) -> Result<Value, String> {
             kind: r.get(3),
         })
         .collect();
-    Ok(json!({ "columns": list }))
+    // The foreign keys, for the `JOIN … ON` the completion proposes.
+    let keys = internal_query(
+        client,
+        "SELECT n.nspname::text, c.relname::text, \
+                (SELECT array_agg(a.attname::text ORDER BY k.ord) \
+                   FROM unnest(con.conkey) WITH ORDINALITY k(num, ord) \
+                   JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.num), \
+                rn.nspname::text, rc.relname::text, \
+                (SELECT array_agg(a.attname::text ORDER BY k.ord) \
+                   FROM unnest(con.confkey) WITH ORDINALITY k(num, ord) \
+                   JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = k.num) \
+         FROM pg_constraint con \
+         JOIN pg_class c ON c.oid = con.conrelid \
+         JOIN pg_namespace n ON n.oid = c.relnamespace \
+         JOIN pg_class rc ON rc.oid = con.confrelid \
+         JOIN pg_namespace rn ON rn.oid = rc.relnamespace \
+         WHERE con.contype = 'f' \
+           AND ($1 OR (n.nspname NOT IN ('pg_catalog', 'information_schema') \
+                       AND n.nspname NOT LIKE 'pg\\_toast%' AND n.nspname NOT LIKE 'pg\\_temp%')) \
+         ORDER BY n.nspname, c.relname, con.conname \
+         LIMIT 20000",
+        &[&request.scope.system_schemas],
+    )
+    .map_err(clean)?;
+    let foreign_keys: Vec<protocol::ForeignKey> = keys
+        .iter()
+        .map(|r| protocol::ForeignKey {
+            schema: r.get(0),
+            table: r.get(1),
+            columns: r.get::<_, Option<Vec<String>>>(2).unwrap_or_default(),
+            ref_schema: r.get(3),
+            ref_table: r.get(4),
+            ref_columns: r.get::<_, Option<Vec<String>>>(5).unwrap_or_default(),
+        })
+        .collect();
+    Ok(json!({ "columns": list, "foreign_keys": foreign_keys }))
 }
 
 /// Runs the statements one after the other, in one session: the rows they
