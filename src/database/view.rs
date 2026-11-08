@@ -956,6 +956,12 @@ fn options_tab<'a>(dialog: &'a Dialog, dark: bool) -> Element<'a, Message> {
         ),
         hint(t!("db.opt_read_only_hint").to_string(), dark),
         check(
+            t!("db.opt_production").to_string(),
+            d.production,
+            Flag::Production
+        ),
+        hint(t!("db.opt_production_hint").to_string(), dark),
+        check(
             t!("db.opt_single").to_string(),
             d.scope.single_database,
             Flag::SingleDatabase
@@ -2561,6 +2567,27 @@ fn queries_view<'a>(state: &'a State, dark: bool) -> Element<'a, Message> {
         None => editor,
     };
     let status: Element<Message> = match &c.last {
+        _ if c.guard.is_some() => {
+            let risk = c.guard.as_ref().map(|g| g.risk);
+            let message = match risk {
+                Some(protocol::Risk::NoWhere) => t!("db.guard_no_where").to_string(),
+                _ => t!("db.guard_writes").to_string(),
+            };
+            row![
+                text(message).size(12).color(se_theme::error_color(dark)),
+                button(text(t!("db.guard_run").to_string()).size(12.5))
+                    .padding([3, 12])
+                    .on_press(Message::Db(DbMsg::GuardRun))
+                    .style((se_theme::Primary { dark }).style()),
+                button(text(t!("db.guard_cancel").to_string()).size(12.5))
+                    .padding([3, 12])
+                    .on_press(Message::Db(DbMsg::GuardCancel))
+                    .style((se_theme::Outline { dark }).style()),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center)
+            .into()
+        }
         _ if c.running => text(t!("db.console_running").to_string())
             .size(12)
             .color(p.muted)

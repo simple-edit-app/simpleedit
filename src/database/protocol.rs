@@ -685,6 +685,45 @@ pub fn sql_words(sql: &str) -> Vec<String> {
         .collect()
 }
 
+/// Why a statement is worth a second look before it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Risk {
+    /// An `UPDATE` or a `DELETE` with no `WHERE`: it touches every row.
+    NoWhere,
+    /// It changes data or structure, on a source marked as production.
+    Writes,
+}
+
+/// What is risky in a statement. `production`: the source is one where every
+/// change is asked about.
+pub fn risk_of(sql: &str, production: bool) -> Option<Risk> {
+    let words = sql_words(sql);
+    let first = words.first().map(String::as_str)?;
+    // `EXPLAIN` without `ANALYZE` and the like do not run what they describe.
+    if first == "EXPLAIN" && !words.iter().any(|w| w == "ANALYZE") {
+        return None;
+    }
+    let touches_all = matches!(first, "UPDATE" | "DELETE")
+        && !words.iter().any(|w| w == "WHERE" || w == "CURRENT");
+    if touches_all {
+        return Some(Risk::NoWhere);
+    }
+    // Controlling a transaction or the session is not a change of the data.
+    let control = matches!(
+        first,
+        "BEGIN"
+            | "START"
+            | "COMMIT"
+            | "END"
+            | "ROLLBACK"
+            | "SAVEPOINT"
+            | "RELEASE"
+            | "SET"
+            | "RESET"
+    );
+    (production && !control && !reads_only(sql)).then_some(Risk::Writes)
+}
+
 /// Whether a statement may run on a read-only data source: it only reads. The
 /// session is also read-only on the server's side, but a session can undo
 /// that, so the statements that could are refused (transaction control, `SET`,
@@ -1111,5 +1150,36 @@ mod tests {
             "jdbc:postgresql://localhost:5432/shop"
         );
         assert_eq!(jdbc_url("h", 1, " "), "jdbc:postgresql://h:1/");
+    }
+
+    #[test]
+    fn an_update_or_a_delete_without_where_is_risky() {
+        assert_eq!(risk_of("UPDATE t SET a = 1", false), Some(Risk::NoWhere));
+        assert_eq!(risk_of("delete from t", false), Some(Risk::NoWhere));
+        assert_eq!(risk_of("DELETE FROM t WHERE id = 1", false), None);
+        // A `WHERE` in a string or a comment is not one.
+        assert_eq!(
+            risk_of("DELETE FROM t -- WHERE id = 1", false),
+            Some(Risk::NoWhere)
+        );
+        assert_eq!(risk_of("SELECT * FROM t", false), None);
+        assert_eq!(risk_of("EXPLAIN DELETE FROM t", false), None);
+    }
+
+    #[test]
+    fn on_a_production_source_every_change_is_risky() {
+        assert_eq!(
+            risk_of("INSERT INTO t VALUES (1)", true),
+            Some(Risk::Writes)
+        );
+        assert_eq!(risk_of("DROP TABLE t", true), Some(Risk::Writes));
+        assert_eq!(
+            risk_of("UPDATE t SET a = 1 WHERE b", true),
+            Some(Risk::Writes)
+        );
+        assert_eq!(risk_of("SELECT 1", true), None);
+        assert_eq!(risk_of("BEGIN", true), None);
+        assert_eq!(risk_of("SET search_path = a", true), None);
+        assert_eq!(risk_of("INSERT INTO t VALUES (1)", false), None);
     }
 }

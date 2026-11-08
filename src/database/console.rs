@@ -77,6 +77,16 @@ pub struct Console {
     pub completion: Option<Completion>,
     /// The entry of the log that was clicked: what is copied.
     pub selected_log: Option<usize>,
+    /// Statements that wait for a yes: they are risky.
+    pub guard: Option<Guard>,
+}
+
+/// What waits for a confirmation, and why.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Guard {
+    pub conn: u64,
+    pub statements: Vec<String>,
+    pub risk: super::protocol::Risk,
 }
 
 /// The proposals shown under the caret.
@@ -119,6 +129,7 @@ impl Console {
             show_internal: true,
             completion: None,
             selected_log: None,
+            guard: None,
         }
     }
 

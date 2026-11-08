@@ -2550,6 +2550,39 @@ mod behavior_tests {
     }
 
     #[test]
+    fn a_risky_statement_waits_for_a_yes_before_it_runs() {
+        use crate::database::DbMsg;
+        let (mut app, _) = db_app(true);
+        app.db.console.editor = iced::widget::text_editor::Content::with_text("DELETE FROM t");
+        let _ = app.update(Message::Db(DbMsg::Run(false)));
+        assert!(!app.db.console.running);
+        assert!(app.db.console.guard.is_some());
+        // Giving up leaves nothing waiting.
+        let _ = app.update(Message::Db(DbMsg::GuardCancel));
+        assert!(app.db.console.guard.is_none() && !app.db.console.running);
+        // A yes runs it.
+        let _ = app.update(Message::Db(DbMsg::Run(false)));
+        let _ = app.update(Message::Db(DbMsg::GuardRun));
+        assert!(app.db.console.running && app.db.console.guard.is_none());
+    }
+
+    #[test]
+    fn on_a_production_source_a_change_with_a_where_waits_too() {
+        use crate::database::DbMsg;
+        let (mut app, _) = db_app(true);
+        app.db.console.editor =
+            iced::widget::text_editor::Content::with_text("UPDATE t SET a = 1 WHERE id = 2");
+        let _ = app.update(Message::Db(DbMsg::Run(false)));
+        assert!(app.db.console.running, "not production: it runs");
+        app.db.console.running = false;
+        let id = app.db.connections[0].id;
+        app.db.connections[0].production = true;
+        app.db.console.connection = Some(id);
+        let _ = app.update(Message::Db(DbMsg::Run(false)));
+        assert!(app.db.console.guard.is_some() && !app.db.console.running);
+    }
+
+    #[test]
     fn the_arrows_and_tab_move_the_focus_from_cell_to_cell() {
         let (mut app, path) = db_app(true);
         let key = |app: &mut SimpleEditApp, k: &str, shift: bool| {

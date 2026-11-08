@@ -185,6 +185,9 @@ pub enum DbMsg {
     ResizeEnd,
     /// Stops the query that runs.
     Cancel,
+    /// The risky statements that wait are run, or given up.
+    GuardRun,
+    GuardCancel,
     ClearLog,
     /// An entry of the log was clicked, or is copied.
     SelectLog(usize),
@@ -419,6 +422,7 @@ pub enum Field {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flag {
     ReadOnly,
+    Production,
     SingleDatabase,
     SystemSchemas,
     TemplateDatabases,
@@ -477,6 +481,8 @@ pub struct Connection {
     /// The ssh password or key passphrase, kept like the password.
     pub ssh_secret: String,
     pub read_only: bool,
+    /// A source where every change is asked about before it runs.
+    pub production: bool,
     pub startup_script: String,
     pub time_zone: String,
     pub props: Vec<(String, String)>,
@@ -504,6 +510,7 @@ impl Default for Connection {
             ssh: Ssh::default(),
             ssh_secret: String::new(),
             read_only: false,
+            production: false,
             startup_script: String::new(),
             time_zone: String::new(),
             props: Vec::new(),
@@ -1683,6 +1690,7 @@ impl Dialog {
         let d = &mut self.draft;
         match flag {
             Flag::ReadOnly => d.read_only = on,
+            Flag::Production => d.production = on,
             Flag::SingleDatabase => d.scope.single_database = on,
             Flag::SystemSchemas => d.scope.system_schemas = on,
             Flag::TemplateDatabases => d.scope.template_databases = on,

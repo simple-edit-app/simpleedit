@@ -203,6 +203,19 @@ impl SimpleEditApp {
             self.db.console.last = Some((false, t!("db.console_nothing").to_string()));
             return Task::none();
         }
+        let production = self.db.connection(conn).is_some_and(|c| c.production);
+        let risk = statements
+            .iter()
+            .find_map(|sql| database::protocol::risk_of(sql, production));
+        if let Some(risk) = risk {
+            self.db.console.last = None;
+            self.db.console.guard = Some(database::console::Guard {
+                conn,
+                statements,
+                risk,
+            });
+            return Task::none();
+        }
         self.db_exec(conn, statements)
     }
 
@@ -1276,7 +1289,20 @@ impl SimpleEditApp {
                 }
                 log
             }
-            DbMsg::Run(all) => self.db_run(all),
+            DbMsg::Run(all) => {
+                self.db.console.guard = None;
+                self.db_run(all)
+            }
+            DbMsg::GuardRun => match self.db.console.guard.take() {
+                Some(guard) if !self.db.console.running => {
+                    self.db_exec(guard.conn, guard.statements)
+                }
+                _ => Task::none(),
+            },
+            DbMsg::GuardCancel => {
+                self.db.console.guard = None;
+                Task::none()
+            }
             DbMsg::Cancel => {
                 // The task is dropped, so is the driver: the server sees the
                 // connection go and stops the query.
