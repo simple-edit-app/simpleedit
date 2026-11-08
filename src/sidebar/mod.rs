@@ -68,6 +68,7 @@ pub enum Panel {
     Files,
     Projects,
     Database,
+    Api,
 }
 
 /// Which panels of the sidebar are open.
@@ -76,6 +77,7 @@ pub struct Panels {
     pub files: bool,
     pub projects: bool,
     pub database: bool,
+    pub api: bool,
 }
 
 pub struct SidebarState {

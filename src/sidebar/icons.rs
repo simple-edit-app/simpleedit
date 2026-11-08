@@ -13,6 +13,8 @@ enum Shape {
     Database,
     /// A console: a window with a prompt.
     Console,
+    /// A request and its answer: two arrows, one each way.
+    Api,
 }
 
 struct Icon {
@@ -65,6 +67,21 @@ impl<Message> Program<Message> for Icon {
                     &Path::line(Point::new(8.5, 10.6), Point::new(11.5, 10.6)),
                     stroke,
                 );
+            }
+            Shape::Api => {
+                // Out and back: an arrow to the right above, one to the left below.
+                for (y, from, to) in [(5.0, 2.0, 13.5), (11.0, 14.0, 2.5)] {
+                    frame.stroke(&Path::line(Point::new(from, y), Point::new(to, y)), stroke);
+                    let wing = if to > from { -2.6 } else { 2.6 };
+                    frame.stroke(
+                        &Path::new(|p| {
+                            p.move_to(Point::new(to + wing, y - 2.6));
+                            p.line_to(Point::new(to, y));
+                            p.line_to(Point::new(to + wing, y + 2.6));
+                        }),
+                        stroke,
+                    );
+                }
             }
             Shape::Database => {
                 // The top disc, then the sides and the two bands below it.
@@ -134,6 +151,10 @@ pub fn console<'a, Message: 'a>(color: Color) -> Element<'a, Message> {
 
 pub fn database<'a, Message: 'a>(color: Color) -> Element<'a, Message> {
     icon(Shape::Database, color)
+}
+
+pub fn api<'a, Message: 'a>(color: Color) -> Element<'a, Message> {
+    icon(Shape::Api, color)
 }
 
 pub fn files<'a, Message: 'a>(color: Color) -> Element<'a, Message> {

@@ -339,6 +339,29 @@ impl Collection {
         take(&mut self.items, id)
     }
 
+    /// Puts a copy of a request after it, under a new id; the id of the copy.
+    pub fn duplicate(&mut self, id: u64, new_id: u64, suffix: &str) -> Option<u64> {
+        fn go(items: &mut Vec<Item>, id: u64, new_id: u64, suffix: &str) -> bool {
+            if let Some(at) = items
+                .iter()
+                .position(|i| matches!(i, Item::Request(r) if r.id == id))
+            {
+                if let Item::Request(r) = &items[at] {
+                    let mut copy = r.clone();
+                    copy.id = new_id;
+                    copy.name = format!("{} {suffix}", r.title());
+                    items.insert(at + 1, Item::Request(copy));
+                    return true;
+                }
+            }
+            items.iter_mut().any(|i| match i {
+                Item::Folder(f) => go(&mut f.items, id, new_id, suffix),
+                _ => false,
+            })
+        }
+        go(&mut self.items, id, new_id, suffix).then_some(new_id)
+    }
+
     /// Renames a request or a folder.
     pub fn rename(&mut self, id: u64, name: &str) -> bool {
         fn go(items: &mut [Item], id: u64, name: &str) -> bool {
@@ -934,6 +957,19 @@ mod tests {
         assert_eq!(c.items_of(5).unwrap().len(), 2);
         assert!(c.items_of(99).is_none());
         assert!(c.remove(99).is_none());
+        // A copy comes right after the request it copies, in its folder.
+        assert_eq!(c.duplicate(6, 20, "copy"), Some(20));
+        assert_eq!(c.request(20).unwrap().name, "x copy");
+        assert_eq!(
+            c.items_of(5)
+                .unwrap()
+                .iter()
+                .map(Item::id)
+                .collect::<Vec<_>>(),
+            vec![6, 20, 4]
+        );
+        assert_eq!(c.duplicate(99, 21, "copy"), None);
+        assert!(c.remove(20).is_some());
         c.request_mut(2).unwrap().url = "https://x".into();
         assert_eq!(c.request(2).unwrap().url, "https://x");
         // Items without an id are numbered after the last one.

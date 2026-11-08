@@ -545,6 +545,7 @@ mod behavior_tests {
             files: true,
             projects: false,
             database: false,
+            api: false,
         };
         app.show_sidebar = false;
         let file = dir.path().join("src/main.rs");
@@ -2931,6 +2932,320 @@ mod behavior_tests {
             "\"customer_id\" = '1'".into(),
         )));
         assert!(app.db.links.is_none());
+    }
+
+    /// An application whose API data is empty, with the files of the tests to
+    /// itself.
+    fn api_app() -> (SimpleEditApp, std::sync::MutexGuard<'static, ()>) {
+        let guard = crate::api::store::test_lock();
+        (app(), guard)
+    }
+
+    fn api_tab_path(app: &SimpleEditApp) -> PathBuf {
+        app.api_tabs.keys().next().expect("a tab").clone()
+    }
+
+    fn api_answer(status: u16, body: &str) -> crate::api::http::Response {
+        crate::api::http::Response {
+            status,
+            reason: "OK".into(),
+            version: "HTTP/1.1".into(),
+            headers: vec![("Content-Type".into(), "application/json".into())],
+            cookies: Vec::new(),
+            body: body.as_bytes().to_vec(),
+            truncated: false,
+            ms: 12,
+            url: "http://x/".into(),
+        }
+    }
+
+    #[test]
+    fn a_request_opens_in_a_tab_is_sent_and_its_answer_is_read() {
+        use crate::api::{Act, ApiMsg};
+        let (mut app, _guard) = api_app();
+        let _ = app.update(Message::Api(ApiMsg::NewRequest));
+        let path = api_tab_path(&app);
+        assert!(is_api(&path) && is_virtual(&path) && is_untitled(&path));
+        assert_eq!(app.current_file.as_ref(), Some(&path));
+        let act = |app: &mut SimpleEditApp, a: Act| {
+            let _ = app.update(Message::Api(ApiMsg::Tab(api_tab_path(app), a)));
+        };
+        act(&mut app, Act::Url("localhost:3000/items".into()));
+        act(&mut app, Act::PairAdd(crate::api::Table::Params));
+        act(
+            &mut app,
+            Act::PairKey(crate::api::Table::Params, 0, "q".into()),
+        );
+        act(
+            &mut app,
+            Act::PairValue(crate::api::Table::Params, 0, "a b".into()),
+        );
+        assert!(app.api_tabs[&path].changed());
+        // Sending: one at a time.
+        act(&mut app, Act::Send);
+        let token = app.api_tabs[&path].token;
+        assert!(app.api_tabs[&path].sending);
+        act(&mut app, Act::Send);
+        assert_eq!(app.api_tabs[&path].token, token);
+        // An answer of an older sending is dropped.
+        act(
+            &mut app,
+            Act::Sent(token + 7, Box::new(Ok(api_answer(500, "old")))),
+        );
+        assert!(app.api_tabs[&path].sending);
+        act(
+            &mut app,
+            Act::Sent(token, Box::new(Ok(api_answer(200, "{\"a\":1}")))),
+        );
+        let tab = &app.api_tabs[&path];
+        assert!(!tab.sending && tab.error.is_none());
+        let view = tab.response.as_ref().unwrap();
+        assert_eq!(view.response.status, 200);
+        assert!(view.pretty.as_deref().unwrap().contains("\"a\": 1"));
+        // It is in the history, newest first.
+        assert_eq!(app.api.history.len(), 1);
+        assert_eq!(app.api.history[0].status, Some(200));
+        // Raw and pretty.
+        act(&mut app, Act::Pretty(false));
+        assert!(app.api_tabs[&path]
+            .response
+            .as_ref()
+            .unwrap()
+            .editor
+            .text()
+            .starts_with("{\"a\":1}"));
+        // A failure is said, and kept in the history too.
+        act(&mut app, Act::Send);
+        let token = app.api_tabs[&path].token;
+        act(
+            &mut app,
+            Act::Sent(token, Box::new(Err("Could not connect".into()))),
+        );
+        let tab = &app.api_tabs[&path];
+        assert_eq!(tab.error.as_deref(), Some("Could not connect"));
+        assert!(tab.response.is_none());
+        assert_eq!(
+            app.api.history[0].error.as_deref(),
+            Some("Could not connect")
+        );
+        // Cancelling drops what comes later.
+        act(&mut app, Act::Send);
+        let token = app.api_tabs[&path].token;
+        act(&mut app, Act::Cancel);
+        assert!(!app.api_tabs[&path].sending);
+        act(
+            &mut app,
+            Act::Sent(token, Box::new(Ok(api_answer(200, "late")))),
+        );
+        assert!(app.api_tabs[&path].response.is_none());
+        // Closing the tab forgets it.
+        let _ = app.close_path(path.clone());
+        assert!(app.api_tabs.is_empty());
+    }
+
+    #[test]
+    fn a_request_is_kept_in_a_collection_and_comes_back_after_a_restart() {
+        use crate::api::{Act, ApiMsg};
+        let (mut app, _guard) = api_app();
+        let _ = app.update(Message::Api(ApiMsg::NewRequest));
+        let path = api_tab_path(&app);
+        let _ = app.update(Message::Api(ApiMsg::Tab(
+            path.clone(),
+            Act::Url("https://x/a".into()),
+        )));
+        let _ = app.update(Message::Api(ApiMsg::Tab(
+            path.clone(),
+            Act::Name("first".into()),
+        )));
+        // The first save makes a collection of its own.
+        let _ = app.update(Message::Api(ApiMsg::Tab(path.clone(), Act::Save)));
+        assert_eq!(app.api.collections.len(), 1);
+        let tab = &app.api_tabs[&path];
+        assert!(!tab.changed());
+        let (collection, id) = tab.origin.expect("kept");
+        // Changing it again, then saving, writes over the same request.
+        let _ = app.update(Message::Api(ApiMsg::Tab(
+            path.clone(),
+            Act::Method(crate::api::model::Method::Post),
+        )));
+        assert!(app.api_tabs[&path].changed());
+        let _ = app.update(Message::Api(ApiMsg::Tab(path.clone(), Act::Save)));
+        assert_eq!(app.api.collection(collection).unwrap().count(), 1);
+        assert_eq!(
+            app.api
+                .collection(collection)
+                .unwrap()
+                .request(id)
+                .unwrap()
+                .method,
+            crate::api::model::Method::Post
+        );
+        // A new start reads it from its file.
+        let again = crate::api::State::load();
+        assert_eq!(again.collections.len(), 1);
+        assert_eq!(again.collections[0].request(id).unwrap().url, "https://x/a");
+        // Opening it from the panel goes to the tab that has it.
+        let _ = app.update(Message::Api(ApiMsg::OpenRequest(collection, id)));
+        assert_eq!(app.api_tabs.len(), 1);
+    }
+
+    #[test]
+    fn the_collections_are_organized_from_the_panel() {
+        use crate::api::{ApiMsg, Dialog, NameFor, Removal};
+        let (mut app, _guard) = api_app();
+        let ask = |app: &mut SimpleEditApp, msg: ApiMsg, text: &str| {
+            let _ = app.update(Message::Api(msg));
+            let _ = app.update(Message::Api(ApiMsg::DialogText(text.into())));
+            let _ = app.update(Message::Api(ApiMsg::DialogOk));
+        };
+        ask(&mut app, ApiMsg::AskNewCollection, "shop");
+        let c = app.api.collections[0].id;
+        ask(&mut app, ApiMsg::AskNewFolder(c, 0), "users");
+        let folder = match &app.api.collections[0].items[0] {
+            crate::api::model::Item::Folder(f) => f.id,
+            other => panic!("a folder, not {other:?}"),
+        };
+        // A name left empty makes nothing.
+        let _ = app.update(Message::Api(ApiMsg::AskNewFolder(c, 0)));
+        let _ = app.update(Message::Api(ApiMsg::DialogOk));
+        assert_eq!(app.api.collections[0].items.len(), 1);
+        assert!(app.api.dialog.is_some());
+        let _ = app.update(Message::Api(ApiMsg::DialogClose));
+        // A request in the folder opens in a tab.
+        let _ = app.update(Message::Api(ApiMsg::NewIn(c, folder)));
+        assert_eq!(app.api.collections[0].count(), 1);
+        let (_, tab) = app.api_tabs.iter().next().unwrap();
+        let (_, id) = tab.origin.unwrap();
+        // Renamed, its tab takes the name.
+        ask(&mut app, ApiMsg::AskRename(c, id), "list users");
+        assert_eq!(
+            app.api_tabs.values().next().unwrap().request.name,
+            "list users"
+        );
+        // Duplicated, then the first is deleted: its tab comes loose.
+        let _ = app.update(Message::Api(ApiMsg::Duplicate(c, id)));
+        assert_eq!(app.api.collections[0].count(), 2);
+        let _ = app.update(Message::Api(ApiMsg::AskDelete(c, id)));
+        assert_eq!(
+            app.api.dialog,
+            Some(Dialog::Delete {
+                what: Removal::Item(c, id)
+            })
+        );
+        let _ = app.update(Message::Api(ApiMsg::DialogOk));
+        assert_eq!(app.api.collections[0].count(), 1);
+        assert!(app.api_tabs.values().next().unwrap().origin.is_none());
+        // Escape closes a window.
+        let _ = app.update(Message::Api(ApiMsg::AskNewCollection));
+        assert!(app.db_escape() && app.api.dialog.is_none());
+        let _ = NameFor::NewCollection;
+        // A collection that is deleted is gone from its file as well.
+        let _ = app.update(Message::Api(ApiMsg::AskDelete(c, 0)));
+        let _ = app.update(Message::Api(ApiMsg::DialogOk));
+        assert!(app.api.collections.is_empty());
+        assert!(crate::api::State::load().collections.is_empty());
+    }
+
+    #[test]
+    fn an_environment_fills_the_variables_of_a_request() {
+        use crate::api::{Act, ApiMsg, Dialog};
+        let (mut app, _guard) = api_app();
+        let _ = app.update(Message::Api(ApiMsg::OpenEnvironments));
+        assert_eq!(app.api.dialog, Some(Dialog::Environments));
+        let _ = app.update(Message::Api(ApiMsg::AskNewEnv));
+        let _ = app.update(Message::Api(ApiMsg::DialogText("dev".into())));
+        let _ = app.update(Message::Api(ApiMsg::DialogOk));
+        // The window of the environments comes back, on the new one.
+        assert_eq!(app.api.dialog, Some(Dialog::Environments));
+        let env = app.api.editing_env.unwrap();
+        let _ = app.update(Message::Api(ApiMsg::VarAdd));
+        let _ = app.update(Message::Api(ApiMsg::VarKey(0, "host".into())));
+        let _ = app.update(Message::Api(ApiMsg::VarValue(0, "api.test".into())));
+        let _ = app.update(Message::Api(ApiMsg::VarAdd));
+        let _ = app.update(Message::Api(ApiMsg::VarKey(1, "token".into())));
+        let _ = app.update(Message::Api(ApiMsg::VarValue(1, "s3cret".into())));
+        let _ = app.update(Message::Api(ApiMsg::VarSecret(1, true)));
+        let _ = app.update(Message::Api(ApiMsg::SelectEnv(Some(env))));
+        assert_eq!(
+            app.api.variables().get("host").map(String::as_str),
+            Some("api.test")
+        );
+        // A request is made ready with them; one that is undefined is noted.
+        let mut request = crate::api::model::Request::new("r");
+        request.url = "https://{{host}}/x/{{nope}}".into();
+        let out = request.resolve(&app.api.variables());
+        assert_eq!(out.url, "https://api.test/x/{{nope}}");
+        assert_eq!(out.missing, vec!["nope"]);
+        // No environment: no variables.
+        let _ = app.update(Message::Api(ApiMsg::SelectEnv(None)));
+        assert!(app.api.variables().is_empty());
+        // A copy, then the original is deleted: the secret is not left behind.
+        let _ = app.update(Message::Api(ApiMsg::DuplicateEnv(env)));
+        assert_eq!(app.api.environments.len(), 2);
+        let _ = app.update(Message::Api(ApiMsg::AskDeleteEnv(env)));
+        let _ = app.update(Message::Api(ApiMsg::DialogOk));
+        assert_eq!(app.api.environments.len(), 1);
+        assert!(app.api.active_env.is_none());
+        let _ = Act::Send;
+        // What was kept comes back, secret included.
+        let back = crate::api::State::load();
+        assert_eq!(back.environments.len(), 1);
+        assert_eq!(back.environments[0].vars[1].value, "s3cret");
+    }
+
+    #[test]
+    fn a_curl_command_and_a_postman_file_are_imported() {
+        use crate::api::{ApiMsg, Dialog};
+        let (mut app, _guard) = api_app();
+        let _ = app.update(Message::Api(ApiMsg::OpenCurl));
+        app.api.curl = iced::widget::text_editor::Content::with_text(
+            "curl -X POST https://x/y -d '{\"a\":1}'",
+        );
+        let _ = app.update(Message::Api(ApiMsg::CurlRead));
+        assert!(app.api.dialog.is_none());
+        let tab = app.api_tabs.values().next().unwrap();
+        assert_eq!(tab.request.url, "https://x/y");
+        assert_eq!(tab.request.body.kind, crate::api::model::BodyKind::Json);
+        // A command that cannot be read says why, and keeps its window.
+        let _ = app.update(Message::Api(ApiMsg::OpenCurl));
+        app.api.curl = iced::widget::text_editor::Content::with_text("curl -X");
+        let _ = app.update(Message::Api(ApiMsg::CurlRead));
+        assert_eq!(app.api.dialog, Some(Dialog::Curl));
+        assert!(app.api.curl_error.is_some());
+        let _ = app.update(Message::Api(ApiMsg::DialogClose));
+        // A collection of Postman, with its variables and one thing it cannot keep.
+        let collection = r#"{"info":{"name":"Shop","schema":"https://schema.getpostman.com/json/collection/v2.1.0/collection.json"},
+          "variable":[{"key":"base","value":"https://s.test"}],
+          "item":[{"name":"List","request":{"method":"GET","url":"{{base}}/items"}},
+                  {"name":"Oauth","request":{"method":"GET","url":"{{base}}/o","auth":{"type":"oauth2"}}}]}"#;
+        let _ = app.update(Message::Api(ApiMsg::Imported(Some((
+            "shop.json".into(),
+            Ok(collection.to_string()),
+        )))));
+        assert_eq!(app.api.collections.len(), 1);
+        assert_eq!(app.api.collections[0].count(), 2);
+        assert_eq!(app.api.environments.len(), 1);
+        // The report says what was left out.
+        let Some(Dialog::Report(lines)) = &app.api.dialog else {
+            panic!("a report")
+        };
+        assert!(lines.iter().any(|l| l.contains("oauth2")), "{lines:?}");
+        let _ = app.update(Message::Api(ApiMsg::DialogClose));
+        // An environment of Postman, and a file that is not JSON.
+        let env = r#"{"name":"staging","values":[{"key":"k","value":"v","enabled":true}]}"#;
+        let _ = app.update(Message::Api(ApiMsg::Imported(Some((
+            "e.json".into(),
+            Ok(env.into()),
+        )))));
+        assert_eq!(app.api.environments.len(), 2);
+        let _ = app.update(Message::Api(ApiMsg::Imported(Some((
+            "bad.json".into(),
+            Ok("nope".into()),
+        )))));
+        let Some(Dialog::Report(lines)) = &app.api.dialog else {
+            panic!("a report")
+        };
+        assert!(lines[0].contains("Not a JSON"));
     }
 
     #[test]
