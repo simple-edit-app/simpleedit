@@ -1008,7 +1008,6 @@
   "db.console_running": "Running…",
   "db.console_done": "%{n} statements run in %{ms} ms.",
   "db.console_failed": "Statement %{n} failed: %{error}",
-  "db.console_no_rows": "The query gave no rows.",
   "db.result": "Result",
   "db.result_truncated": "First %{n} rows only.",
   "db.close_group": "Close the tabs of this database",
@@ -1115,5 +1114,15 @@
   "db.text_copy": "Copy",
   "db.text_size": "%{n} characters",
   "db.new_schema_title": "New schema",
-  "db.new_schema_name": "Name of the schema"
+  "db.new_schema_name": "Name of the schema",
+  "db.console_database": "Database",
+  "db.explain": "Explain",
+  "db.explain_analyze": "Explain analyze",
+  "db.explain_not_read": "Explain analyze runs the statement: only a reading statement can be measured",
+  "db.tx_open": "Transaction open",
+  "db.tx_commit": "Commit",
+  "db.tx_rollback": "Rollback",
+  "db.export_csv": "Export all the rows as CSV",
+  "db.export_json": "Export all the rows as JSON",
+  "db.exported": "Exported to %{path}"
 }

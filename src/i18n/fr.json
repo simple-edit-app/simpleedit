@@ -1008,7 +1008,6 @@
   "db.console_running": "Exécution…",
   "db.console_done": "%{n} requêtes exécutées en %{ms} ms.",
   "db.console_failed": "La requête %{n} a échoué : %{error}",
-  "db.console_no_rows": "La requête n'a donné aucune ligne.",
   "db.result": "Résultat",
   "db.result_truncated": "Seulement les %{n} premières lignes.",
   "db.close_group": "Fermer les onglets de cette base",
@@ -1115,5 +1114,15 @@
   "db.text_copy": "Copier",
   "db.text_size": "%{n} caractères",
   "db.new_schema_title": "Nouveau schéma",
-  "db.new_schema_name": "Nom du schéma"
+  "db.new_schema_name": "Nom du schéma",
+  "db.console_database": "Base",
+  "db.explain": "Plan",
+  "db.explain_analyze": "Plan mesuré",
+  "db.explain_not_read": "Le plan mesuré exécute la requête : seule une requête de lecture peut l'être",
+  "db.tx_open": "Transaction ouverte",
+  "db.tx_commit": "Valider",
+  "db.tx_rollback": "Annuler",
+  "db.export_csv": "Exporter toutes les lignes en CSV",
+  "db.export_json": "Exporter toutes les lignes en JSON",
+  "db.exported": "Exporté vers %{path}"
 }

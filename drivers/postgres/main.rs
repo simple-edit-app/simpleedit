@@ -16,7 +16,7 @@
 mod protocol;
 
 use std::cell::RefCell;
-use std::io::Read;
+use std::io::{BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -40,26 +40,51 @@ use protocol::{
 };
 
 fn main() {
-    if std::env::args().nth(1).as_deref() == Some("--protocol") {
-        println!("{PROTOCOL}");
-        return;
+    match std::env::args().nth(1).as_deref() {
+        Some("--protocol") => println!("{PROTOCOL}"),
+        // A session that stays: one request per line, one answer per line,
+        // the connection (and what it holds: a transaction, temporary
+        // tables, `SET`s) kept from one request to the next.
+        Some("--serve") => serve(),
+        _ => {
+            let mut input = String::new();
+            let answer = match std::io::stdin().read_to_string(&mut input) {
+                Ok(_) => run(&input, &mut None, false),
+                Err(e) => Err(e.to_string()),
+            };
+            println!("{}", answer_line(answer));
+        }
     }
-    let mut input = String::new();
-    let answer = match std::io::stdin().read_to_string(&mut input) {
-        Ok(_) => run(&input),
-        Err(e) => Err(e.to_string()),
-    };
-    // What was run goes back with the answer, whether it went well or not.
+}
+
+/// The answer line: what was run goes back with it, whether it went well or
+/// not.
+fn answer_line(answer: Result<Value, String>) -> Value {
     let executed = LOG.with(|log| std::mem::take(&mut *log.borrow_mut()));
-    let line = match answer {
+    match answer {
         Ok(mut value) => {
             value["ok"] = json!(true);
             value["executed"] = json!(executed);
             value
         }
         Err(error) => json!({ "ok": false, "error": error, "executed": executed }),
-    };
-    println!("{line}");
+    }
+}
+
+fn serve() {
+    let mut slot: Option<(String, Session)> = None;
+    let stdin = std::io::stdin();
+    let mut out = std::io::stdout();
+    for line in stdin.lock().lines() {
+        let Ok(line) = line else { break };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let answer = run(&line, &mut slot, true);
+        if writeln!(out, "{}", answer_line(answer)).is_err() || out.flush().is_err() {
+            break;
+        }
+    }
 }
 
 thread_local! {
@@ -109,14 +134,30 @@ fn internal_query(
     }
 }
 
-fn run(input: &str) -> Result<Value, String> {
+/// The connection a request is about, kept in `slot` when the driver serves
+/// several requests: it is reused while the target and the database are the
+/// same and the server has not hung up.
+fn run(input: &str, slot: &mut Option<(String, Session)>, serving: bool) -> Result<Value, String> {
     let request: Request = serde_json::from_str(input).map_err(|e| e.to_string())?;
-    let session = Session::open(&request.target, &request.database)?;
+    // The database named or, when none is, the connection's own: the same
+    // session either way.
+    let database = if request.database.is_empty() {
+        &request.target.database
+    } else {
+        &request.database
+    };
+    let key = serde_json::to_string(&(&request.target, database)).unwrap_or_default();
+    let usable = matches!(slot, Some((k, s)) if *k == key && !s.client.is_closed());
+    if !usable {
+        *slot = None;
+        *slot = Some((key, Session::open(&request.target, &request.database)?));
+    }
+    let session = &mut slot.as_mut().expect("just opened").1;
+    let client = &mut session.client;
     match request.op.as_str() {
         "test" => {
-            let mut session = session;
             let started = Instant::now();
-            let row = match session.client.query_one("SELECT version()", &[]) {
+            let row = match client.query_one("SELECT version()", &[]) {
                 Ok(row) => row,
                 Err(e) => {
                     let message = clean(e);
@@ -129,30 +170,61 @@ fn run(input: &str) -> Result<Value, String> {
         }
         "tree" => tree(session, &request),
         "rows" => {
-            let mut session = session;
-            limit(&mut session.client, &request.target)?;
-            rows(&mut session.client, &request)
+            limit(client, &request.target)?;
+            guarded(client, &request.target, |c| rows(c, &request))
+        }
+        "export" => {
+            limit(client, &request.target)?;
+            guarded(client, &request.target, |c| export(c, &request))
         }
         "apply" => {
-            let mut session = session;
-            limit(&mut session.client, &request.target)?;
-            apply(&mut session.client, &request)
+            if request.target.read_only {
+                return Err("this data source is read-only".to_string());
+            }
+            limit(client, &request.target)?;
+            apply(client, &request)
         }
         "query" => {
-            let mut session = session;
-            limit(&mut session.client, &request.target)?;
-            query(&mut session.client, &request)
+            limit(client, &request.target)?;
+            let mut answer = guarded(client, &request.target, |c| query(c, &request))?;
+            if serving {
+                answer["in_transaction"] = json!(in_transaction(client));
+            }
+            Ok(answer)
         }
-        "columns" => {
-            let mut session = session;
-            columns(&mut session.client, &request)
-        }
-        "structure" => {
-            let mut session = session;
-            structure(&mut session.client, &request)
-        }
+        "columns" => columns(client, &request),
+        "structure" => structure(client, &request),
         other => Err(format!("unknown operation: {other}")),
     }
+}
+
+/// Whether a transaction is open on the session (an aborted one too).
+fn in_transaction(client: &mut Client) -> bool {
+    // In a transaction of its own, a statement starts it: the two clocks
+    // read the same.
+    match client.simple_query("SELECT transaction_timestamp() <> statement_timestamp()") {
+        Ok(messages) => messages
+            .iter()
+            .any(|m| matches!(m, postgres::SimpleQueryMessage::Row(r) if r.get(0) == Some("t"))),
+        Err(_) => true,
+    }
+}
+
+/// On a read-only source, what runs is inside a read-only transaction that is
+/// never kept: nothing that changes data can go through, a function that
+/// writes included.
+fn guarded<T>(
+    client: &mut Client,
+    target: &Target,
+    f: impl FnOnce(&mut Client) -> Result<T, String>,
+) -> Result<T, String> {
+    if !target.read_only {
+        return f(client);
+    }
+    client.batch_execute("BEGIN READ ONLY").map_err(clean)?;
+    let out = f(client);
+    let _ = client.batch_execute("ROLLBACK");
+    out
 }
 
 /// The longest a statement may run, and the server watching that the client
@@ -178,11 +250,23 @@ fn limit(client: &mut Client, target: &Target) -> Result<(), String> {
 struct Session {
     client: Client,
     _tunnel: Option<Tunnel>,
+    /// The local end of the tunnel the connection goes through, if any.
+    tunnel_port: Option<u16>,
 }
 
 impl Session {
     /// Connects to `database` (the target's own when empty).
     fn open(target: &Target, database: &str) -> Result<Session, String> {
+        Session::open_via(target, database, None)
+    }
+
+    /// The same, through the tunnel that is already up on `tunnel_port`, if
+    /// one is (a fixed local port can't be taken twice).
+    fn open_via(
+        target: &Target,
+        database: &str,
+        tunnel_port: Option<u16>,
+    ) -> Result<Session, String> {
         let password = match target.auth {
             Auth::UserPassword => Some(target.password.clone()).filter(|p| !p.is_empty()),
             Auth::NoAuth => None,
@@ -197,13 +281,24 @@ impl Session {
                 &target.user,
             ),
         };
-        let (host, port, tunnel) = if target.ssh.enabled {
-            let tunnel = Tunnel::open(target)?;
-            ("127.0.0.1".to_string(), tunnel.port, Some(tunnel))
+        let (port, tunnel) = if !target.ssh.enabled {
+            (target.port, None)
+        } else if let Some(port) = tunnel_port {
+            (port, None)
         } else {
-            (target.host.clone(), target.port, None)
+            let tunnel = Tunnel::open(target)?;
+            (tunnel.port, Some(tunnel))
         };
-        let mut config = config(target, &host, port, password.as_deref(), database)?;
+        let tunnel_port = target.ssh.enabled.then_some(port);
+        // Through a tunnel the name stays the server's (the certificate is
+        // checked against it); only the place to knock at changes.
+        let mut config = config(
+            target,
+            port,
+            tunnel_port.map(|_| "127.0.0.1"),
+            password.as_deref(),
+            database,
+        )?;
         let mut client = connect(&mut config, target)?;
         // The session is set up the way the connection asks.
         if target.read_only {
@@ -236,6 +331,7 @@ impl Session {
         Ok(Session {
             client,
             _tunnel: tunnel,
+            tunnel_port,
         })
     }
 }
@@ -247,8 +343,8 @@ fn conninfo_value(value: &str) -> String {
 
 fn config(
     target: &Target,
-    host: &str,
     port: u16,
+    hostaddr: Option<&str>,
     password: Option<&str>,
     database: &str,
 ) -> Result<Config, String> {
@@ -256,7 +352,10 @@ fn config(
     let mut add = |key: &str, value: &str| {
         info.push_str(&format!("{key}={} ", conninfo_value(value)));
     };
-    add("host", host);
+    add("host", &target.host);
+    if let Some(addr) = hostaddr {
+        add("hostaddr", addr);
+    }
     add("port", &port.to_string());
     if !target.user.trim().is_empty() {
         add("user", target.user.trim());
@@ -736,7 +835,7 @@ fn selected(
     out
 }
 
-fn tree(mut session: Session, request: &Request) -> Result<Value, String> {
+fn tree(session: &mut Session, request: &Request) -> Result<Value, String> {
     let scope: &Scope = &request.scope;
     let filters = Filters::parse(&scope.object_filter)?;
     let current: String = internal_query(&mut session.client, "SELECT current_database()", &[])
@@ -775,7 +874,7 @@ fn tree(mut session: Session, request: &Request) -> Result<Value, String> {
         let schemas = if name == current {
             schemas_of(&mut session.client, scope, &filters, wanted.as_deref())?
         } else {
-            let mut other = Session::open(&request.target, &name)?;
+            let mut other = Session::open_via(&request.target, &name, session.tunnel_port)?;
             schemas_of(&mut other.client, scope, &filters, wanted.as_deref())?
         };
         databases.push(Database {
@@ -956,22 +1055,46 @@ fn shape(client: &mut Client, schema: &str, table: &str) -> Result<Shape, String
 /// ` WHERE (…)` and ` ORDER BY …` for a request; the parts are known columns
 /// and the user's own condition, on its own lines so that a comment in it
 /// can't swallow what follows.
-fn clauses(request: &Request, names: &[&str]) -> Result<String, String> {
+///
+/// `qualifier` (`"schema"."table".`, or empty) puts the sorted columns in the
+/// table: a bare name would be the column of the list, which is cast to text
+/// (and would sort `10` before `2`).
+///
+/// `tiebreak` names the columns that make the order total (the primary key,
+/// or `ctid`): they follow the user's sort, so that a row is on one page only.
+fn clauses(
+    request: &Request,
+    names: &[&str],
+    tiebreak: &[String],
+    qualifier: &str,
+) -> Result<String, String> {
     let mut sql = String::new();
+    if protocol::has_semicolon(&request.filter) {
+        return Err("the condition cannot hold a `;`".to_string());
+    }
     if !request.filter.trim().is_empty() {
         sql.push_str(&format!(" WHERE (\n{}\n)", request.filter.trim()));
     }
-    if !request.order.is_empty() {
+    if !request.order.is_empty() || !tiebreak.is_empty() {
         let mut parts = Vec::new();
         for sort in &request.order {
             if !names.contains(&sort.column.as_str()) {
                 return Err(format!("no column {}", sort.column));
             }
             parts.push(format!(
-                "{} {}",
+                "{qualifier}{} {}",
                 quote(&sort.column),
                 if sort.desc { "DESC" } else { "ASC" }
             ));
+        }
+        for name in tiebreak {
+            if !request.order.iter().any(|s| s.column == *name) {
+                parts.push(if name == "ctid" {
+                    format!("{qualifier}ctid")
+                } else {
+                    format!("{qualifier}{}", quote(name))
+                });
+            }
         }
         sql.push_str(&format!(" ORDER BY {}", parts.join(", ")));
     }
@@ -993,6 +1116,15 @@ fn rows(client: &mut Client, request: &Request) -> Result<Value, String> {
         .collect();
     // Without a primary key, a row is found again by its place.
     let keyless = shape.is_table && shape.primary_key.is_empty();
+    let qualifier = format!("{}.{}.", quote(schema), quote(table));
+    // Without a stable order the pages of a table could overlap or skip rows.
+    let tiebreak: Vec<String> = if !shape.is_table {
+        Vec::new()
+    } else if keyless {
+        vec!["ctid".to_string()]
+    } else {
+        shape.primary_key.clone()
+    };
     if keyless {
         select.push("ctid::text".to_string());
     }
@@ -1002,7 +1134,7 @@ fn rows(client: &mut Client, request: &Request) -> Result<Value, String> {
         select.join(", "),
         quote(schema),
         quote(table),
-        clauses(request, &names)?,
+        clauses(request, &names, &tiebreak, &qualifier)?,
         limit + 1,
         request.offset
     );
@@ -1011,7 +1143,7 @@ fn rows(client: &mut Client, request: &Request) -> Result<Value, String> {
         "SELECT * FROM {}.{}{} LIMIT {} OFFSET {}",
         quote(schema),
         quote(table),
-        clauses(request, &names)?,
+        clauses(request, &names, &tiebreak, &qualifier)?,
         limit,
         request.offset
     );
@@ -1089,7 +1221,7 @@ fn result_rows(client: &mut Client, request: &Request) -> Result<Value, String> 
     let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
     let wrapped = format!(
         "SELECT * FROM (\n{sql}\n) AS \"q\"{} LIMIT {} OFFSET {}",
-        clauses(request, &names)?,
+        clauses(request, &names, &[], "")?,
         limit + 1,
         request.offset
     );
@@ -1481,27 +1613,50 @@ fn columns(client: &mut Client, request: &Request) -> Result<Value, String> {
 fn query(client: &mut Client, request: &Request) -> Result<Value, String> {
     let mut results: Vec<QueryResult> = Vec::new();
     let mut failed: Option<Value> = None;
+    // All or none: the statements are one transaction of their own.
+    let wrapped = request.transaction && !request.target.read_only;
+    if wrapped {
+        let started = Instant::now();
+        client.batch_execute("BEGIN").map_err(clean)?;
+        record_internal("BEGIN", started, None, None);
+    }
     for (index, sql) in request.statements.iter().enumerate() {
+        if request.target.read_only && !protocol::reads_only(sql) {
+            let message = "this data source is read-only".to_string();
+            record(sql, Instant::now(), None, Some(message.clone()));
+            failed = Some(json!({ "index": index, "error": message }));
+            break;
+        }
         // What the statement gives, without running it: a reading statement
-        // is left to the tab that pages it.
-        if let Ok(statement) = client.prepare(sql) {
-            if !statement.columns().is_empty() && protocol::wrappable(sql) {
-                results.push(QueryResult {
-                    sql: sql.clone(),
-                    ms: 0,
-                    has_rows: true,
-                    columns: statement
-                        .columns()
-                        .iter()
-                        .map(|c| c.name().to_string())
-                        .collect(),
-                    rows: Vec::new(),
-                    affected: 0,
-                    truncated: false,
-                    deferred: true,
-                });
-                continue;
+        // is left to the tab that pages it. A statement the server refuses
+        // to prepare is refused here, with its own error (after one, an open
+        // transaction would only answer that it is aborted).
+        let started = Instant::now();
+        let statement = match client.prepare(sql) {
+            Ok(statement) => statement,
+            Err(e) => {
+                let message = clean(e);
+                record(sql, started, None, Some(message.clone()));
+                failed = Some(json!({ "index": index, "error": message }));
+                break;
             }
+        };
+        if !statement.columns().is_empty() && protocol::wrappable(sql) {
+            results.push(QueryResult {
+                sql: sql.clone(),
+                ms: 0,
+                has_rows: true,
+                columns: statement
+                    .columns()
+                    .iter()
+                    .map(|c| c.name().to_string())
+                    .collect(),
+                rows: Vec::new(),
+                affected: 0,
+                truncated: false,
+                deferred: true,
+            });
+            continue;
         }
         let started = Instant::now();
         let messages = match client.simple_query(sql) {
@@ -1559,7 +1714,110 @@ fn query(client: &mut Client, request: &Request) -> Result<Value, String> {
         record(sql, started, Some(count), None);
         results.push(result);
     }
+    if wrapped {
+        let started = Instant::now();
+        let end = if failed.is_some() {
+            "ROLLBACK"
+        } else {
+            "COMMIT"
+        };
+        // The commit itself can fail (a deferred constraint): then nothing was
+        // made, whatever the statements said.
+        match client.batch_execute(end) {
+            Ok(()) => record_internal(end, started, None, None),
+            Err(e) => {
+                let message = clean(e);
+                record_internal(end, started, None, Some(message.clone()));
+                return Err(message);
+            }
+        }
+    }
     Ok(json!({ "results": results, "failed": failed }))
+}
+
+/// Writes the rows of a table or a query (all of them, with the filter and
+/// the sort of the tab) to a file, as CSV or as a JSON array. The server
+/// streams them, so nothing big is held in memory.
+fn export(client: &mut Client, request: &Request) -> Result<Value, String> {
+    let select = if request.sql.trim().is_empty() {
+        let (schema, table) = (request.schema.as_str(), request.table.as_str());
+        let shape = shape(client, schema, table)?;
+        let names: Vec<&str> = shape.columns.iter().map(|c| c.name.as_str()).collect();
+        let tiebreak: Vec<String> = if shape.is_table && !shape.primary_key.is_empty() {
+            shape.primary_key.clone()
+        } else {
+            Vec::new()
+        };
+        format!(
+            "SELECT * FROM {}.{}{}",
+            quote(schema),
+            quote(table),
+            clauses(request, &names, &tiebreak, "")?
+        )
+    } else {
+        let sql = request.sql.trim().trim_end_matches(';').trim().to_string();
+        if !protocol::wrappable(&sql) {
+            return Err("this query cannot be exported".to_string());
+        }
+        let statement = client.prepare(&sql).map_err(clean)?;
+        let names: Vec<&str> = statement.columns().iter().map(|c| c.name()).collect();
+        format!(
+            "SELECT * FROM (\n{sql}\n) AS \"q\"{}",
+            clauses(request, &names, &[], "")?
+        )
+    };
+    let json = request.format == "json";
+    let copy = if json {
+        // One JSON object per line, between markers that JSON never holds.
+        format!(
+            "COPY (SELECT to_json(\"e\")::text FROM ({select}) AS \"e\") TO STDOUT \
+             WITH (FORMAT csv, DELIMITER E'\\x02', QUOTE E'\\x01')"
+        )
+    } else {
+        format!("COPY ({select}) TO STDOUT WITH (FORMAT csv, HEADER true)")
+    };
+    let started = Instant::now();
+    let done = (|| -> Result<u64, String> {
+        let file =
+            std::fs::File::create(&request.path).map_err(|e| format!("{}: {e}", request.path))?;
+        let mut out = std::io::BufWriter::new(file);
+        let mut reader = client.copy_out(copy.as_str()).map_err(clean)?;
+        let mut rows = 0u64;
+        if json {
+            out.write_all(b"[").map_err(|e| e.to_string())?;
+            let mut lines = std::io::BufReader::new(&mut reader);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if lines.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+                    break;
+                }
+                let text = line.trim_end_matches(['\n', '\r']);
+                out.write_all(if rows == 0 { b"\n  " } else { b",\n  " })
+                    .and_then(|_| out.write_all(text.as_bytes()))
+                    .map_err(|e| e.to_string())?;
+                rows += 1;
+            }
+            out.write_all(if rows == 0 { b"]\n" } else { b"\n]\n" })
+                .map_err(|e| e.to_string())?;
+        } else {
+            std::io::copy(&mut reader, &mut out).map_err(|e| e.to_string())?;
+        }
+        out.flush().map_err(|e| e.to_string())?;
+        Ok(rows)
+    })();
+    match done {
+        Ok(rows) => {
+            record(&select, started, json.then_some(rows), None);
+            Ok(json!({ "exported": rows, "path": request.path }))
+        }
+        Err(message) => {
+            record(&select, started, None, Some(message.clone()));
+            // A file half written is of no use.
+            let _ = std::fs::remove_file(&request.path);
+            Err(message)
+        }
+    }
 }
 
 #[cfg(test)]

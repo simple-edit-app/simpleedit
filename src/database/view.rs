@@ -1378,6 +1378,22 @@ pub fn table<'a>(path: &'a Path, tab: &'a TableTab, dark: bool) -> Element<'a, M
         t!("db.reload").to_string(),
         (!tab.loading).then(|| Message::Db(DbMsg::Refresh(owned()))),
     ));
+    // All the rows with the filter and the sort, not only this page (what a
+    // query that cannot be paged gave is on show already).
+    if tab.query.is_none() || tab.paged {
+        let ready = !tab.loading && tab.error.is_none();
+        bar = bar
+            .push(nav(
+                "CSV",
+                t!("db.export_csv").to_string(),
+                ready.then(|| Message::Db(DbMsg::Export(owned(), "csv"))),
+            ))
+            .push(nav(
+                "JSON",
+                t!("db.export_json").to_string(),
+                ready.then(|| Message::Db(DbMsg::Export(owned(), "json"))),
+            ));
+    }
 
     // The WHERE field: a condition on the rows, sent with the query.
     let filter_path = owned();
@@ -2167,7 +2183,60 @@ pub fn console<'a>(state: &'a State, dark: bool) -> Element<'a, Message> {
                 .style(se_theme::Select { dark }.style())
                 .menu_style(se_theme::Select { dark }.menu_style()),
             );
+            // The database of the server the queries run in, when the tree
+            // knows more than one.
+            if let Some(Tree::Loaded(databases)) = c.connection.and_then(|id| state.trees.get(&id))
+            {
+                if databases.len() > 1 {
+                    let names: Vec<String> = databases.iter().map(|d| d.name.clone()).collect();
+                    let current = databases.iter().find(|d| d.current).map(|d| d.name.clone());
+                    let chosen = if c.database.is_empty() {
+                        current.clone()
+                    } else {
+                        Some(c.database.clone())
+                    };
+                    header = header.push(
+                        pick_list(names, chosen, move |name: String| {
+                            let own = current.as_deref() == Some(name.as_str());
+                            Message::Db(DbMsg::ConsoleDatabase(if own {
+                                String::new()
+                            } else {
+                                name
+                            }))
+                        })
+                        .text_size(12.5)
+                        .padding([3, 8])
+                        .placeholder(t!("db.console_database").to_string())
+                        .style(se_theme::Select { dark }.style())
+                        .menu_style(se_theme::Select { dark }.menu_style()),
+                    );
+                }
+            }
             let ready = !c.running && state.driver == Driver::Ready;
+            if c.in_transaction {
+                header = header
+                    .push(
+                        text(t!("db.tx_open").to_string())
+                            .size(12)
+                            .color(se_theme::error_color(dark)),
+                    )
+                    .push(
+                        button(text(t!("db.tx_commit").to_string()).size(12.5))
+                            .padding([3, 10])
+                            .on_press_maybe(
+                                ready.then_some(Message::Db(DbMsg::EndTransaction(true))),
+                            )
+                            .style((se_theme::Outline { dark }).style()),
+                    )
+                    .push(
+                        button(text(t!("db.tx_rollback").to_string()).size(12.5))
+                            .padding([3, 10])
+                            .on_press_maybe(
+                                ready.then_some(Message::Db(DbMsg::EndTransaction(false))),
+                            )
+                            .style((se_theme::Outline { dark }).style()),
+                    );
+            }
             if c.running {
                 header = header.push(icon_button(
                     "■",
@@ -2182,6 +2251,18 @@ pub fn console<'a>(state: &'a State, dark: bool) -> Element<'a, Message> {
                         .padding([3, 12])
                         .on_press_maybe(ready.then_some(Message::Db(DbMsg::Run(false))))
                         .style((se_theme::Primary { dark }).style()),
+                )
+                .push(
+                    button(text(t!("db.explain").to_string()).size(12.5))
+                        .padding([3, 12])
+                        .on_press_maybe(ready.then_some(Message::Db(DbMsg::Explain(false))))
+                        .style((se_theme::Outline { dark }).style()),
+                )
+                .push(
+                    button(text(t!("db.explain_analyze").to_string()).size(12.5))
+                        .padding([3, 12])
+                        .on_press_maybe(ready.then_some(Message::Db(DbMsg::Explain(true))))
+                        .style((se_theme::Outline { dark }).style()),
                 )
                 .push(
                     button(text(t!("db.run_all").to_string()).size(12.5))

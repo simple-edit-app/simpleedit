@@ -119,6 +119,17 @@ pub enum DbMsg {
     ToggleConsole,
     ConsoleTab(console::ConsoleTab),
     ConsoleConnection(u64),
+    /// The database of the server the console runs in (empty: the connection's own).
+    ConsoleDatabase(String),
+    /// The plan of the statement at the caret; with `true`, run for real
+    /// (only a reading statement is).
+    Explain(bool),
+    /// Ends the transaction the console left open.
+    EndTransaction(bool),
+    /// The rows of a tab, all of them, written to a file: `csv` or `json`.
+    Export(PathBuf, &'static str),
+    /// `None`: the file dialog was closed.
+    Exported(PathBuf, Option<Done<String>>),
     ColumnsLoaded(u64, Done<Vec<protocol::TableColumn>>),
     /// The completion list of the queries: asked for, moved in, taken,
     /// picked with the mouse, closed.
@@ -786,10 +797,53 @@ impl<T> Done<T> {
 /// One operation of the driver: the request on its standard input, its
 /// answer on its standard output.
 async fn call(picked: String, request: protocol::Request) -> Done<serde_json::Value> {
-    match call_inner(picked, request).await {
+    call_with(None, picked, request).await
+}
+
+/// The same, in the session that stays when there is one (see `Live`).
+async fn call_with(
+    live: Option<Live>,
+    picked: String,
+    request: protocol::Request,
+) -> Done<serde_json::Value> {
+    let result = match live {
+        Some(live) => call_live(live, picked, request).await,
+        None => call_inner(picked, request).await,
+    };
+    match result {
         Ok(done) => done,
         Err(error) => Done::failed(error),
     }
+}
+
+/// How long a request may take before the app gives up on the driver.
+fn wait_limit(request: &protocol::Request) -> Option<Duration> {
+    // What reads or changes data waits as long as the connection allows (the
+    // server stops it), the rest does not wait for long.
+    match request.op.as_str() {
+        "query" | "rows" | "apply" | "export" => match request.target.query_timeout {
+            0 => None,
+            seconds => Some(Duration::from_secs(seconds) + CALL_TIMEOUT),
+        },
+        _ => Some(CALL_TIMEOUT),
+    }
+}
+
+/// What the driver answered, as a `Done`.
+fn read_answer(out: &str) -> Result<Done<serde_json::Value>, String> {
+    let answer: serde_json::Value =
+        serde_json::from_str(out.trim()).map_err(|_| t!("db.err_driver_answer").to_string())?;
+    let executed: Vec<Executed> =
+        serde_json::from_value(answer["executed"].clone()).unwrap_or_default();
+    let result = if answer["ok"].as_bool() == Some(true) {
+        Ok(answer)
+    } else {
+        Err(answer["error"]
+            .as_str()
+            .unwrap_or("unknown error")
+            .to_string())
+    };
+    Ok(Done { result, executed })
 }
 
 async fn call_inner(
@@ -819,34 +873,97 @@ async fn call_inner(
             .map_err(|e| e.to_string())?;
         Ok::<String, String>(out)
     };
-    // What reads or changes data waits as long as the connection allows (the
-    // server stops it), the rest does not wait for long.
-    let limit = match request.op.as_str() {
-        "query" | "rows" | "apply" => match request.target.query_timeout {
-            0 => None,
-            seconds => Some(Duration::from_secs(seconds) + CALL_TIMEOUT),
-        },
-        _ => Some(CALL_TIMEOUT),
-    };
-    let out = match limit {
+    let out = match wait_limit(&request) {
         Some(limit) => tokio::time::timeout(limit, work)
             .await
             .map_err(|_| t!("db.err_timeout").to_string())??,
         None => work.await?,
     };
-    let answer: serde_json::Value =
-        serde_json::from_str(out.trim()).map_err(|_| t!("db.err_driver_answer").to_string())?;
-    let executed: Vec<Executed> =
-        serde_json::from_value(answer["executed"].clone()).unwrap_or_default();
-    let result = if answer["ok"].as_bool() == Some(true) {
-        Ok(answer)
-    } else {
-        Err(answer["error"]
-            .as_str()
-            .unwrap_or("unknown error")
-            .to_string())
+    read_answer(&out)
+}
+
+/// A driver process that stays, with the connection it holds: a transaction
+/// that was begun, temporary tables and `SET`s last from one request to the
+/// next, as in a console of a JetBrains IDE. One per data source, for the
+/// console and the result tabs it opened.
+struct LiveProcess {
+    _child: tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    stdout: tokio::io::BufReader<tokio::process::ChildStdout>,
+}
+
+#[derive(Clone, Default)]
+pub struct Live(std::sync::Arc<tokio::sync::Mutex<Option<LiveProcess>>>);
+
+impl std::fmt::Debug for Live {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Live")
+    }
+}
+
+async fn call_live(
+    live: Live,
+    picked: String,
+    request: protocol::Request,
+) -> Result<Done<serde_json::Value>, String> {
+    use tokio::io::AsyncBufReadExt;
+    let path = find_driver(&picked)
+        .await
+        .ok_or_else(|| t!("db.err_driver_missing").to_string())?;
+    let mut guard = live.0.lock().await;
+    let mut line = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
+    line.push(b'\n');
+    let work = async {
+        if guard.is_none() {
+            let mut child = tokio::process::Command::new(path)
+                .arg("--serve")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|e| e.to_string())?;
+            let stdin = child.stdin.take().ok_or("no stdin")?;
+            let stdout = child.stdout.take().ok_or("no stdout")?;
+            *guard = Some(LiveProcess {
+                _child: child,
+                stdin,
+                stdout: tokio::io::BufReader::new(stdout),
+            });
+        }
+        let process = guard.as_mut().ok_or("no driver")?;
+        process
+            .stdin
+            .write_all(&line)
+            .await
+            .map_err(|e| e.to_string())?;
+        process.stdin.flush().await.map_err(|e| e.to_string())?;
+        let mut out = String::new();
+        let read = process
+            .stdout
+            .read_line(&mut out)
+            .await
+            .map_err(|e| e.to_string())?;
+        if read == 0 {
+            return Err(t!("db.err_driver_answer").to_string());
+        }
+        Ok::<String, String>(out)
     };
-    Ok(Done { result, executed })
+    let out = match wait_limit(&request) {
+        Some(limit) => tokio::time::timeout(limit, work)
+            .await
+            .map_err(|_| t!("db.err_timeout").to_string()),
+        None => Ok(work.await),
+    };
+    match out {
+        Ok(Ok(out)) => read_answer(&out),
+        // The process can't be trusted any more (it may still be at work, or
+        // gone): the next request starts another.
+        Ok(Err(error)) | Err(error) => {
+            *guard = None;
+            Err(error)
+        }
+    }
 }
 
 /// What a call needs: the connection's settings with their secrets, the
@@ -921,7 +1038,18 @@ fn table_request(params: &Params, op: &str, table: &TableRef) -> protocol::Reque
     request
 }
 
+#[cfg(test)]
 pub async fn rows(params: Params, table: TableRef, query: Query) -> Done<Page> {
+    rows_with(None, params, table, query).await
+}
+
+/// The same, in the session of the console when it is given.
+pub async fn rows_with(
+    live: Option<Live>,
+    params: Params,
+    table: TableRef,
+    query: Query,
+) -> Done<Page> {
     let mut request = table_request(&params, "rows", &table);
     request.limit = query.limit;
     request.offset = query.offset;
@@ -933,11 +1061,13 @@ pub async fn rows(params: Params, table: TableRef, query: Query) -> Done<Page> {
         .map(|(column, desc)| protocol::Sort { column, desc })
         .collect();
     let offset = query.offset;
-    call(params.driver.clone(), request).await.map(|answer| {
-        let mut page: Page = serde_json::from_value(answer).map_err(|e| e.to_string())?;
-        page.offset = offset;
-        Ok(page)
-    })
+    call_with(live, params.driver.clone(), request)
+        .await
+        .map(|answer| {
+            let mut page: Page = serde_json::from_value(answer).map_err(|e| e.to_string())?;
+            page.offset = offset;
+            Ok(page)
+        })
 }
 
 /// Makes the changes in the table, all or none; how many rows were touched.
@@ -962,6 +1092,8 @@ pub async fn table_columns(params: Params) -> Done<Vec<protocol::TableColumn>> {
 pub struct Ran {
     pub results: Vec<QueryResult>,
     pub failed: Option<(usize, String)>,
+    /// A transaction is open on the session when the statements ended.
+    pub in_transaction: bool,
 }
 
 /// What a table is made of.
@@ -973,6 +1105,7 @@ pub async fn structure(params: Params, table: TableRef) -> Done<protocol::Struct
 }
 
 /// Runs statements one after the other in one session.
+#[cfg(test)]
 pub async fn run_statements(params: Params, statements: Vec<String>) -> Done<Ran> {
     run_statements_in(params, String::new(), statements).await
 }
@@ -983,36 +1116,73 @@ pub async fn run_statements_in(
     database: String,
     statements: Vec<String>,
 ) -> Done<Ran> {
+    run_with(None, params, database, statements, false).await
+}
+
+/// Runs statements as one transaction: if one fails, none is made.
+pub async fn run_transaction(
+    params: Params,
+    database: String,
+    statements: Vec<String>,
+) -> Done<Ran> {
+    run_with(None, params, database, statements, true).await
+}
+
+/// Runs statements in the session that stays, if one is given: what an
+/// earlier run left (a transaction, a temporary table) is still there.
+pub async fn run_with(
+    live: Option<Live>,
+    params: Params,
+    database: String,
+    statements: Vec<String>,
+    transaction: bool,
+) -> Done<Ran> {
     let mut request = params.request("query");
     request.database = database;
     request.statements = statements;
-    call(params.driver.clone(), request).await.map(|answer| {
-        let results: Vec<QueryResult> =
-            serde_json::from_value(answer["results"].clone()).map_err(|e| e.to_string())?;
-        let failed = answer["failed"].as_object().map(|f| {
-            (
-                f["index"].as_u64().unwrap_or(0) as usize,
-                f["error"].as_str().unwrap_or("").to_string(),
-            )
-        });
-        Ok(Ran { results, failed })
-    })
+    request.transaction = transaction;
+    call_with(live, params.driver.clone(), request)
+        .await
+        .map(|answer| {
+            let results: Vec<QueryResult> =
+                serde_json::from_value(answer["results"].clone()).map_err(|e| e.to_string())?;
+            let failed = answer["failed"].as_object().map(|f| {
+                (
+                    f["index"].as_u64().unwrap_or(0) as usize,
+                    f["error"].as_str().unwrap_or("").to_string(),
+                )
+            });
+            Ok(Ran {
+                results,
+                failed,
+                in_transaction: answer["in_transaction"].as_bool().unwrap_or(false),
+            })
+        })
 }
 
-impl Done<Ran> {
-    /// The first rows a query gave, as the page of a result tab.
-    pub fn map_page(self) -> Done<Page> {
-        self.map(|ran| {
-            if let Some((_, error)) = ran.failed {
-                return Err(error);
-            }
-            ran.results
-                .iter()
-                .find(|r| r.has_rows)
-                .map(result_page)
-                .ok_or_else(|| t!("db.console_no_rows").to_string())
-        })
-    }
+/// Writes all the rows of a table (with its filter and sort) or of a query to
+/// a file; how many there were (CSV counts none).
+pub async fn export(
+    live: Option<Live>,
+    params: Params,
+    table: TableRef,
+    query: Query,
+    path: String,
+    format: &str,
+) -> Done<String> {
+    let mut request = table_request(&params, "export", &table);
+    request.filter = query.filter;
+    request.sql = query.sql.unwrap_or_default();
+    request.order = query
+        .order
+        .into_iter()
+        .map(|(column, desc)| protocol::Sort { column, desc })
+        .collect();
+    request.path = path;
+    request.format = format.to_string();
+    call_with(live, params.driver.clone(), request)
+        .await
+        .map(|answer| Ok(answer["path"].as_str().unwrap_or_default().to_string()))
 }
 
 /// The rows a statement gave, as a page; its place is the first one.
@@ -1090,6 +1260,9 @@ pub struct TableTab {
     pub custom_widths: HashMap<String, f32>,
     /// What the table is made of, once read: for the links of its rows.
     pub structure: Option<protocol::Structure>,
+    /// The tab shows a query of the console: its rows are asked for in the
+    /// session of the console, which may hold what the query needs.
+    pub live: bool,
 }
 
 /// What stands for a data source among the projects of the tabs: the tabs of
@@ -1149,6 +1322,7 @@ impl TableTab {
             query: None,
             title: String::new(),
             paged: false,
+            live: false,
         }
     }
 
@@ -1526,9 +1700,21 @@ pub struct State {
     pub text: Option<TextView>,
     pub new_schema: Option<NewSchema>,
     pub resizing: Option<Resizing>,
+    /// The sessions that stay, one per data source the console ran on.
+    pub live: HashMap<u64, Live>,
 }
 
 impl State {
+    /// The session of a data source, made when there is none.
+    pub fn live_of(&mut self, id: u64) -> Live {
+        self.live.entry(id).or_default().clone()
+    }
+
+    /// Ends the session of a data source (its transaction is rolled back).
+    pub fn end_live(&mut self, id: u64) {
+        self.live.remove(&id);
+    }
+
     pub fn load() -> Self {
         let stored = load_stored();
         State {
@@ -1554,6 +1740,7 @@ impl State {
             text: None,
             new_schema: None,
             resizing: None,
+            live: HashMap::new(),
         }
     }
 
@@ -1645,6 +1832,8 @@ impl State {
             None => self.connections.push(connection),
         }
         self.trees.remove(&id);
+        // The settings may have changed: the next run connects afresh.
+        self.live.remove(&id);
         self.persist();
         Some(id)
     }
@@ -1674,6 +1863,7 @@ impl State {
         self.passwords.remove(&id);
         self.once.remove(&id);
         self.trees.remove(&id);
+        self.live.remove(&id);
         let prefix = format!("{id}/");
         self.open
             .retain(|k| *k != id.to_string() && !k.starts_with(&prefix));
@@ -2093,6 +2283,195 @@ mod tests {
             offset: 0,
         });
         assert!(tab.pending.is_empty() && tab.editing.is_none());
+    }
+
+    /// The session that stays, the transaction of a change, a read-only
+    /// source and the export, against a real server (same variables as
+    /// `live_postgres_is_read_through_the_driver`).
+    #[test]
+    #[ignore]
+    fn live_session_transaction_read_only_and_export() {
+        let Ok(spec) = std::env::var("SE_PG_TEST") else {
+            return;
+        };
+        let p: Vec<&str> = spec.split(':').collect();
+        let target = Target {
+            host: p[0].into(),
+            port: p[1].parse().unwrap(),
+            database: p[2].into(),
+            user: p[3].into(),
+            password: p[4].into(),
+            ..Target::default()
+        };
+        let params = Params {
+            target,
+            scope: Scope::default(),
+            driver: String::new(),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let sql = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            // One session: a transaction and a temporary table last from one
+            // run to the next, and the rows of a query are read inside them.
+            let live = Live::default();
+            let begun = run_with(
+                Some(live.clone()),
+                params.clone(),
+                String::new(),
+                sql(&[
+                    "BEGIN",
+                    "CREATE TEMP TABLE live_tmp (a int)",
+                    "INSERT INTO live_tmp VALUES (1), (2)",
+                ]),
+                false,
+            )
+            .await
+            .result
+            .unwrap();
+            assert!(begun.failed.is_none() && begun.in_transaction);
+            let query = Query {
+                limit: 10,
+                sql: Some("SELECT a FROM live_tmp".into()),
+                ..Query::default()
+            };
+            let page = rows_with(Some(live.clone()), params.clone(), tref("", ""), query)
+                .await
+                .result
+                .unwrap();
+            assert_eq!(page.rows.len(), 2);
+            let ended = run_with(
+                Some(live.clone()),
+                params.clone(),
+                String::new(),
+                sql(&["ROLLBACK"]),
+                false,
+            )
+            .await
+            .result
+            .unwrap();
+            assert!(!ended.in_transaction);
+            let gone = run_with(
+                Some(live.clone()),
+                params.clone(),
+                String::new(),
+                sql(&["SELECT a FROM live_tmp"]),
+                false,
+            )
+            .await
+            .result
+            .unwrap();
+            assert!(gone.failed.is_some());
+
+            // A change is all or none.
+            let broken = run_transaction(
+                params.clone(),
+                String::new(),
+                sql(&["CREATE TABLE live_atomic (a int)", "SELEKT 1"]),
+            )
+            .await
+            .result
+            .unwrap();
+            assert_eq!(broken.failed.as_ref().map(|f| f.0), Some(1));
+            let absent = run_statements(params.clone(), sql(&["SELECT 1 FROM live_atomic"]))
+                .await
+                .result
+                .unwrap();
+            assert!(absent.failed.is_some());
+
+            // A read-only source stays read-only, whatever is typed.
+            let mut locked = params.clone();
+            locked.target.read_only = true;
+            for attempt in [
+                "SET default_transaction_read_only = off",
+                "BEGIN READ WRITE",
+                "CREATE TABLE live_nope (a int)",
+                "COMMIT",
+            ] {
+                let ran = run_statements(locked.clone(), sql(&[attempt]))
+                    .await
+                    .result
+                    .unwrap();
+                assert!(ran.failed.is_some(), "{attempt}");
+            }
+            let semicolon = Query {
+                limit: 10,
+                filter: "true); CREATE TABLE live_nope (a int); --".into(),
+                ..Query::default()
+            };
+            assert!(
+                rows(locked.clone(), tref("public", "live_export"), semicolon)
+                    .await
+                    .result
+                    .is_err()
+            );
+
+            // The pages of a table follow its key, and all the rows go to a file.
+            run_transaction(
+                params.clone(),
+                String::new(),
+                sql(&[
+                    "DROP TABLE IF EXISTS live_export",
+                    "CREATE TABLE live_export (id int PRIMARY KEY, label text)",
+                    "INSERT INTO live_export SELECT g, 'row \"' || g || E'\\n' FROM generate_series(1, 30) g",
+                ]),
+            )
+            .await
+            .result
+            .unwrap();
+            let first = Query {
+                limit: 10,
+                ..Query::default()
+            };
+            let second = Query {
+                offset: 10,
+                limit: 10,
+                ..Query::default()
+            };
+            let a = rows(params.clone(), tref("public", "live_export"), first)
+                .await
+                .result
+                .unwrap();
+            let b = rows(params.clone(), tref("public", "live_export"), second)
+                .await
+                .result
+                .unwrap();
+            assert_eq!(a.rows[0][0].as_deref(), Some("1"));
+            assert_eq!(b.rows[0][0].as_deref(), Some("11"));
+            let dir = tempfile::tempdir().unwrap();
+            for (format, ext) in [("csv", "csv"), ("json", "json")] {
+                let file = dir.path().join(format!("out.{ext}"));
+                export(
+                    None,
+                    params.clone(),
+                    tref("public", "live_export"),
+                    Query::default(),
+                    file.to_string_lossy().to_string(),
+                    format,
+                )
+                .await
+                .result
+                .unwrap();
+                let text = std::fs::read_to_string(&file).unwrap();
+                if format == "csv" {
+                    // The header, then one record per row (a label holds a line break).
+                    assert!(text.starts_with("id,label\n1,"));
+                } else {
+                    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(parsed.as_array().unwrap().len(), 30);
+                    assert_eq!(parsed[0]["id"], 1);
+                }
+            }
+            run_statements(
+                params.clone(),
+                sql(&["DROP TABLE live_export"]),
+            )
+            .await
+            .result
+            .unwrap();
+        });
     }
 
     /// Against a real server, with the driver built next to the app:

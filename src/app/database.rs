@@ -57,7 +57,13 @@ impl SimpleEditApp {
         };
         let (conn, table, query) = (tab.conn, tab.table_ref(), tab.query(offset));
         // A query that cannot be paged is run again as it is.
-        let sql = tab.query.clone().filter(|_| !tab.paged);
+        // A query that cannot be paged (it writes, or it is a plan) is not run
+        // again: what it gave stays on show, and running it twice could do
+        // its work twice.
+        if tab.query.is_some() && !tab.paged {
+            return Task::none();
+        }
+        let live = tab.live.then(|| self.db.live.get(&conn).cloned()).flatten();
         let Some(params) = self.db_params(conn, false) else {
             // The tab says why it is empty; the form asks for the password.
             if let Some(tab) = self.db_tabs.get_mut(&path) {
@@ -70,19 +76,10 @@ impl SimpleEditApp {
             tab.loading = true;
             tab.error = None;
         }
-        match sql {
-            // The tab of a query: the query is run again.
-            Some(sql) => Task::perform(
-                async move {
-                    let done = database::run_statements(params, vec![sql]).await;
-                    done.map_page()
-                },
-                move |done| Message::Db(DbMsg::Rows(path.clone(), done)),
-            ),
-            None => Task::perform(database::rows(params, table, query), move |done| {
-                Message::Db(DbMsg::Rows(path.clone(), done))
-            }),
-        }
+        Task::perform(
+            database::rows_with(live, params, table, query),
+            move |done| Message::Db(DbMsg::Rows(path.clone(), done)),
+        )
     }
 
     /// Puts what the driver ran in the log of the console, and shows the end.
@@ -118,7 +115,7 @@ impl SimpleEditApp {
         let path = PathBuf::from(format!("db://{}/{title}", self.db_counter));
         let mut tab = TableTab::new(
             conn,
-            String::new(),
+            self.db.console.database.clone(),
             String::new(),
             String::new(),
             self.db.page_size,
@@ -126,6 +123,7 @@ impl SimpleEditApp {
         tab.title = title;
         tab.query = Some(result.sql.clone());
         tab.paged = result.deferred;
+        tab.live = true;
         if !result.deferred {
             tab.set_page(database::result_page(result));
         }
@@ -205,16 +203,23 @@ impl SimpleEditApp {
             self.db.console.last = Some((false, t!("db.console_nothing").to_string()));
             return Task::none();
         }
+        self.db_exec(conn, statements)
+    }
+
+    /// Runs statements in the session of the console.
+    fn db_exec(&mut self, conn: u64, statements: Vec<String>) -> Task<Message> {
         let Some(params) = self.db_params(conn, false) else {
             return self.db_ask_password(conn);
         };
         self.db.console.running = true;
         self.db.console.last = None;
-        let (task, handle) =
-            Task::perform(database::run_statements(params, statements), move |done| {
-                Message::Db(DbMsg::Ran(conn, done))
-            })
-            .abortable();
+        let live = self.db.live_of(conn);
+        let database = self.db.console.database.clone();
+        let (task, handle) = Task::perform(
+            database::run_with(Some(live), params, database, statements, false),
+            move |done| Message::Db(DbMsg::Ran(conn, done)),
+        )
+        .abortable();
         self.db.console.abort = Some(handle);
         task
     }
@@ -1045,8 +1050,105 @@ impl SimpleEditApp {
                 Task::none()
             }
             DbMsg::ConsoleConnection(id) => {
+                if self.db.console.connection != Some(id) {
+                    // Another connection: its session, not this one's.
+                    self.db.console.database.clear();
+                    self.db.console.in_transaction = false;
+                }
                 self.db.console.connection = Some(id);
                 Task::none()
+            }
+            DbMsg::ConsoleDatabase(name) => {
+                if self.db.console.database != name {
+                    // The session moves to another database: a transaction
+                    // of the old one is rolled back.
+                    self.db.console.database = name;
+                    self.db.console.in_transaction = false;
+                }
+                Task::none()
+            }
+            DbMsg::Explain(analyze) => {
+                if self.db.console.running {
+                    return Task::none();
+                }
+                let statements = self.db.console.statements(false);
+                let Some(conn) = self.db.console.connection else {
+                    self.db.console.last =
+                        Some((false, t!("db.console_no_connection").to_string()));
+                    return Task::none();
+                };
+                if statements.is_empty() {
+                    self.db.console.last = Some((false, t!("db.console_nothing").to_string()));
+                    return Task::none();
+                }
+                // Only a statement that reads can be run to be measured.
+                if analyze && statements.iter().any(|s| !database::protocol::wrappable(s)) {
+                    self.db.console.last = Some((false, t!("db.explain_not_read").to_string()));
+                    return Task::none();
+                }
+                let prefix = if analyze {
+                    "EXPLAIN (ANALYZE, BUFFERS) "
+                } else {
+                    "EXPLAIN "
+                };
+                let statements = statements
+                    .into_iter()
+                    .map(|s| format!("{prefix}{s}"))
+                    .collect();
+                self.db_exec(conn, statements)
+            }
+            DbMsg::EndTransaction(commit) => {
+                let Some(conn) = self.db.console.connection else {
+                    return Task::none();
+                };
+                if self.db.console.running {
+                    return Task::none();
+                }
+                let end = if commit { "COMMIT" } else { "ROLLBACK" };
+                self.db_exec(conn, vec![end.to_string()])
+            }
+            DbMsg::Export(path, format) => {
+                let Some(tab) = self.db_tabs.get(&path) else {
+                    return Task::none();
+                };
+                let (conn, table, query) = (tab.conn, tab.table_ref(), tab.query(0));
+                let live = tab.live.then(|| self.db.live.get(&conn).cloned()).flatten();
+                let name = if tab.query.is_some() || tab.table.is_empty() {
+                    "result".to_string()
+                } else {
+                    tab.table.clone()
+                };
+                let Some(params) = self.db_params(conn, false) else {
+                    return self.db_ask_password(conn);
+                };
+                let ext = format.to_string();
+                Task::perform(
+                    async move {
+                        let file = rfd::AsyncFileDialog::new()
+                            .set_file_name(format!("{name}.{ext}"))
+                            .save_file()
+                            .await?;
+                        let target = file.path().to_string_lossy().to_string();
+                        Some(database::export(live, params, table, query, target, format).await)
+                    },
+                    move |done| Message::Db(DbMsg::Exported(path.clone(), done)),
+                )
+            }
+            DbMsg::Exported(path, done) => {
+                let Some(done) = done else {
+                    return Task::none();
+                };
+                let log = match self.db_tabs.get(&path).map(|t| t.conn) {
+                    Some(conn) => self.db_log(conn, &done.executed),
+                    None => Task::none(),
+                };
+                if let Some(tab) = self.db_tabs.get_mut(&path) {
+                    tab.notice = Some(match done.result {
+                        Ok(file) => t!("db.exported", path = file.as_str()).to_string(),
+                        Err(error) => error,
+                    });
+                }
+                log
             }
             DbMsg::ShowInternal(on) => {
                 self.db.console.show_internal = on;
@@ -1172,6 +1274,12 @@ impl SimpleEditApp {
                 }
                 if self.db.console.running {
                     self.db.console.running = false;
+                    // The driver is stopped with the session it held, and a
+                    // transaction of it is rolled back by the server.
+                    if let Some(conn) = self.db.console.connection {
+                        self.db.end_live(conn);
+                    }
+                    self.db.console.in_transaction = false;
                     self.db.console.last = Some((false, t!("db.console_cancelled").to_string()));
                 }
                 Task::none()
@@ -1182,8 +1290,13 @@ impl SimpleEditApp {
                 let log = self.db_log(conn, &done.executed);
                 let mut tasks = vec![log];
                 match done.result {
-                    Err(error) => self.db.console.last = Some((false, error)),
+                    Err(error) => {
+                        // The session is gone with its transaction.
+                        self.db.console.in_transaction = false;
+                        self.db.console.last = Some((false, error));
+                    }
                     Ok(ran) => {
+                        self.db.console.in_transaction = ran.in_transaction;
                         let ms: u64 = ran.results.iter().map(|r| r.ms).sum();
                         self.db.console.last = Some(match &ran.failed {
                             Some((index, error)) => (

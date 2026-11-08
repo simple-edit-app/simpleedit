@@ -56,7 +56,9 @@ impl SimpleEditApp {
         };
         let target_db = database.clone();
         Task::perform(
-            database::run_statements_in(params, target_db, statements),
+            // All or none: a change that stops half way would leave the table
+            // as neither the old one nor the new one.
+            database::run_transaction(params, target_db, statements),
             move |done| {
                 Message::Db(DbMsg::Altered(Box::new(Altered {
                     what: what.clone(),

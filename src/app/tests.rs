@@ -2408,6 +2408,7 @@ mod behavior_tests {
             conn,
             Done {
                 result: Ok(Ran {
+                    in_transaction: false,
                     results: vec![select, update],
                     failed: None,
                 }),
@@ -2427,6 +2428,77 @@ mod behavior_tests {
     }
 
     #[test]
+    fn a_result_that_cannot_be_paged_is_never_run_again() {
+        use crate::database::{DbMsg, Executed, QueryResult, Ran};
+        let (mut app, _) = db_app(true);
+        let conn = app.db.connections[0].id;
+        let insert = QueryResult {
+            sql: "INSERT INTO t VALUES (1) RETURNING id".into(),
+            ms: 1,
+            has_rows: true,
+            columns: vec!["id".into()],
+            rows: vec![vec![Some("1".into())]],
+            affected: 0,
+            truncated: false,
+            deferred: false,
+        };
+        let _ = app.update(Message::Db(DbMsg::Ran(
+            conn,
+            Done {
+                result: Ok(Ran {
+                    in_transaction: false,
+                    results: vec![insert],
+                    failed: None,
+                }),
+                executed: Vec::<Executed>::new(),
+            },
+        )));
+        let path = app
+            .db_tabs
+            .iter()
+            .find(|(_, t)| t.query.is_some())
+            .map(|(p, _)| p.clone())
+            .unwrap();
+        // Reload does nothing: the write would be made twice.
+        let _ = app.update(Message::Db(DbMsg::Refresh(path.clone())));
+        let tab = &app.db_tabs[&path];
+        assert!(!tab.loading && tab.page.as_ref().unwrap().rows.len() == 1);
+    }
+
+    #[test]
+    fn an_open_transaction_is_shown_and_cancelling_ends_the_session() {
+        use crate::database::{DbMsg, Ran};
+        let (mut app, _) = db_app(true);
+        let conn = app.db.connections[0].id;
+        app.db.console.connection = Some(conn);
+        let _ = app.db.live_of(conn);
+        let _ = app.update(Message::Db(DbMsg::Ran(
+            conn,
+            Done {
+                result: Ok(Ran {
+                    in_transaction: true,
+                    results: vec![],
+                    failed: None,
+                }),
+                executed: vec![],
+            },
+        )));
+        assert!(app.db.console.in_transaction);
+        // Another database, another session: the transaction is gone.
+        let _ = app.update(Message::Db(DbMsg::ConsoleDatabase("other".into())));
+        assert!(!app.db.console.in_transaction);
+        // A run that is stopped takes its session with it.
+        app.db.console.running = true;
+        app.db.console.in_transaction = true;
+        let _ = app.update(Message::Db(DbMsg::Cancel));
+        assert!(!app.db.console.in_transaction && !app.db.live.contains_key(&conn));
+        // Removing a data source ends its session too.
+        let _ = app.db.live_of(conn);
+        app.db.remove(conn);
+        assert!(app.db.live.is_empty());
+    }
+
+    #[test]
     fn a_failed_query_shows_the_log_and_says_which_statement() {
         use crate::database::console::ConsoleTab;
         use crate::database::{DbMsg, Executed, Ran};
@@ -2437,6 +2509,7 @@ mod behavior_tests {
             conn,
             Done {
                 result: Ok(Ran {
+                    in_transaction: false,
                     results: vec![],
                     failed: Some((1, "syntax error".into())),
                 }),
@@ -2565,6 +2638,7 @@ mod behavior_tests {
             conn,
             Done {
                 result: Ok(Ran {
+                    in_transaction: false,
                     results: vec![select],
                     failed: None,
                 }),
@@ -2815,10 +2889,12 @@ mod behavior_tests {
         use crate::database::Ran;
         let done = match result {
             Ok(()) => Done::ok(Ran {
+                in_transaction: false,
                 results: vec![],
                 failed: None,
             }),
             Err(e) => Done::ok(Ran {
+                in_transaction: false,
                 results: vec![],
                 failed: Some((0, e)),
             }),
@@ -3136,6 +3212,7 @@ mod behavior_tests {
         assert_eq!(n.error.as_deref(), Some("already exists"));
         let _ = app.update(Message::Db(DbMsg::SchemaCreate));
         let _ = app.update(altered(Done::ok(Ran {
+            in_transaction: false,
             results: vec![],
             failed: None,
         })));

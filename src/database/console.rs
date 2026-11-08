@@ -62,6 +62,10 @@ pub struct Console {
     pub editor: text_editor::Content,
     /// The connection the queries run on.
     pub connection: Option<u64>,
+    /// The database of the server they run in (the connection's own when empty).
+    pub database: String,
+    /// A transaction is open on the session of the console.
+    pub in_transaction: bool,
     pub running: bool,
     /// Stops what runs: the task is dropped, and the driver with it.
     pub abort: Option<iced::task::Handle>,
@@ -107,6 +111,8 @@ impl Console {
             log: Vec::new(),
             editor: text_editor::Content::with_text(&text),
             connection: None,
+            database: String::new(),
+            in_transaction: false,
             running: false,
             abort: None,
             last: None,

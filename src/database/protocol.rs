@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped when a request or an answer changes; the app only uses a driver
 /// that answers `--protocol` with the same number.
-pub const PROTOCOL: u32 = 10;
+pub const PROTOCOL: u32 = 11;
 
 pub const DEFAULT_PORT: u16 = 5432;
 pub const DEFAULT_SSH_PORT: u16 = 22;
@@ -187,6 +187,11 @@ pub struct Request {
     pub statements: Vec<String>,
     /// For `rows`: a query whose rows are wanted, in place of a table's.
     pub sql: String,
+    /// For `query`: the statements are one transaction, all or none.
+    pub transaction: bool,
+    /// For `export`: the file to write, and its format (`csv` or `json`).
+    pub path: String,
+    pub format: String,
 }
 
 /// Most rows kept of the result of a statement.
@@ -645,6 +650,73 @@ pub fn sql_words(sql: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether a statement may run on a read-only data source: it only reads. The
+/// session is also read-only on the server's side, but a session can undo
+/// that, so the statements that could are refused (transaction control, `SET`,
+/// `RESET`, and anything that is not a plain reading statement).
+pub fn reads_only(sql: &str) -> bool {
+    let words = sql_words(sql);
+    let Some(first) = words.first().map(String::as_str) else {
+        return true;
+    };
+    match first {
+        "SELECT" | "WITH" | "VALUES" | "TABLE" | "SHOW" => !words.iter().any(|w| {
+            matches!(
+                w.as_str(),
+                "INSERT"
+                    | "UPDATE"
+                    | "DELETE"
+                    | "MERGE"
+                    | "INTO"
+                    | "COPY"
+                    | "SET_CONFIG"
+                    | "COMMIT"
+                    | "ROLLBACK"
+                    | "BEGIN"
+                    | "END"
+            )
+        }),
+        // Plans are fine, but ANALYZE runs the statement.
+        "EXPLAIN" => {
+            !words.iter().any(|w| w == "ANALYZE" || w == "ANALYSE") && reads_only(&explained(sql))
+        }
+        _ => false,
+    }
+}
+
+/// The statement an `EXPLAIN` is about.
+fn explained(sql: &str) -> String {
+    let tokens = sql_tokens(sql);
+    // Skip `EXPLAIN` and an option list in parentheses.
+    let mut i = 1;
+    if tokens.get(i).is_some_and(|t| &sql[t.start..t.end] == "(") {
+        let mut depth = 0;
+        while let Some(t) = tokens.get(i) {
+            match &sql[t.start..t.end] {
+                "(" => depth += 1,
+                ")" => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+            if depth == 0 {
+                break;
+            }
+        }
+    }
+    tokens
+        .get(i)
+        .map(|t| sql[t.start..].to_string())
+        .unwrap_or_default()
+}
+
+/// Whether a condition typed in a filter holds a `;` of its own: it would
+/// start another statement.
+pub fn has_semicolon(sql: &str) -> bool {
+    sql_tokens(sql)
+        .iter()
+        .any(|t| t.kind == TokenKind::Punct && &sql[t.start..t.end] == ";")
+}
+
 /// Whether a statement can be the inside of `SELECT * FROM (…) AS q`, so that
 /// its rows can be sorted, filtered and paged: it only reads (a SELECT, a
 /// WITH that only reads, VALUES or TABLE).
@@ -656,11 +728,15 @@ pub fn wrappable(sql: &str) -> bool {
     ) {
         return false;
     }
-    // Writes (also in a WITH), SELECT … INTO, FOR UPDATE, RETURNING.
+    // Writes (also in a WITH), SELECT … INTO, FOR UPDATE, RETURNING, and
+    // functions that change the state of the session.
     !words.iter().any(|w| {
         matches!(
             w.as_str(),
             "INSERT" | "UPDATE" | "DELETE" | "MERGE" | "INTO" | "RETURNING" | "COPY"
+                // Functions that change state: running them again for each page
+                // would change it again.
+                | "NEXTVAL" | "SETVAL" | "SET_CONFIG"
         )
     })
 }
@@ -882,6 +958,33 @@ mod tests {
         assert!(!wrappable("EXPLAIN SELECT 1"));
         assert!(!wrappable("SHOW search_path"));
         assert!(!wrappable(""));
+        assert!(!wrappable("SELECT nextval('s')"));
+    }
+
+    #[test]
+    fn a_read_only_source_refuses_what_could_write_or_undo_it() {
+        assert!(reads_only("SELECT 1"));
+        assert!(reads_only("  with x as (select 1) select * from x"));
+        assert!(reads_only("SHOW search_path"));
+        assert!(reads_only("EXPLAIN SELECT 1"));
+        assert!(reads_only("EXPLAIN (COSTS off) SELECT 1"));
+        assert!(!reads_only("EXPLAIN ANALYZE DELETE FROM t"));
+        assert!(!reads_only("EXPLAIN (ANALYZE) SELECT 1"));
+        assert!(!reads_only("SET default_transaction_read_only = off"));
+        assert!(!reads_only("BEGIN READ WRITE"));
+        assert!(!reads_only("COMMIT"));
+        assert!(!reads_only("DELETE FROM t"));
+        assert!(!reads_only("SELECT * INTO u FROM t"));
+        assert!(!reads_only(
+            "SELECT set_config('default_transaction_read_only','off',false)"
+        ));
+        assert!(!reads_only("CREATE TABLE t()"));
+    }
+
+    #[test]
+    fn a_semicolon_outside_a_string_is_found() {
+        assert!(has_semicolon("a = 1); DELETE FROM t; --"));
+        assert!(!has_semicolon("a = 'x;y' AND b = \"c;d\""));
     }
 
     #[test]
