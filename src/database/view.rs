@@ -12,7 +12,7 @@ use iced::{Alignment, Element, Length};
 
 use super::console::ConsoleTab;
 use super::ddl;
-use super::grid::{Cell, PickKind, Picker, TimePart};
+use super::grid::{Cell, CopyFormat, PickKind, Picker, TimePart};
 use super::protocol;
 use super::{
     Auth, Choice, Connection, DbMsg, Dialog, DialogTab, Driver, Field, Flag, Kind, Remember,
@@ -1622,6 +1622,19 @@ fn cell_menu(
             Message::Db(DbMsg::CopyCell(path.clone(), row, col)),
         ));
     }
+    for (label, format) in [
+        (t!("db.copy_csv"), CopyFormat::Csv),
+        (t!("db.copy_insert"), CopyFormat::Insert),
+        (t!("db.copy_markdown"), CopyFormat::Markdown),
+        (t!("db.copy_tsv"), CopyFormat::Tsv),
+    ] {
+        items.push(menu_bar::item(
+            label.to_string(),
+            None,
+            dark,
+            Message::Db(DbMsg::CopySelection(path.clone(), format)),
+        ));
+    }
     if !new_row {
         items.push(menu_bar::item(
             t!("db.row_copy").to_string(),
@@ -1914,6 +1927,9 @@ fn grid<'a>(path: &'a Path, tab: &'a TableTab, dark: bool) -> Element<'a, Messag
             // The cell that has the focus is outlined, so that what is done
             // to it (the right click) is seen.
             let focused = tab.selected == Some((i, c));
+            let in_block = tab.block().is_some_and(|((r0, c0), (r1, c1))| {
+                (r0..=r1).contains(&i) && (c0..=c1).contains(&c)
+            });
             let base = base.style(move |_: &iced::Theme| container::Style {
                 background: if edited {
                     Some(iced::Background::Color(iced::Color {
@@ -1921,8 +1937,8 @@ fn grid<'a>(path: &'a Path, tab: &'a TableTab, dark: bool) -> Element<'a, Messag
                         ..p.accent
                     }))
                 } else {
-                    focused.then_some(iced::Background::Color(iced::Color {
-                        a: 0.10,
+                    (focused || in_block).then_some(iced::Background::Color(iced::Color {
+                        a: if in_block && !focused { 0.18 } else { 0.10 },
                         ..p.accent
                     }))
                 },

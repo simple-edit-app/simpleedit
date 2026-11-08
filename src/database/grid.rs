@@ -8,6 +8,129 @@ use chrono::{Datelike, Local, NaiveDate, Timelike};
 
 use super::protocol::{Change, ChangeKind, Page};
 
+// -------------------------------------------------------------- selection
+
+/// How a block of cells is written to the clipboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyFormat {
+    /// Tab-separated, no header: what a spreadsheet pastes.
+    Tsv,
+    Csv,
+    /// One `INSERT` for each row.
+    Insert,
+    Markdown,
+}
+
+/// The block between two cells, whichever corner each is: top left, bottom
+/// right.
+pub fn block(a: (usize, usize), b: (usize, usize)) -> ((usize, usize), (usize, usize)) {
+    ((a.0.min(b.0), a.1.min(b.1)), (a.0.max(b.0), a.1.max(b.1)))
+}
+
+/// The cells of a block as text. `table` is the name `INSERT` writes to.
+pub fn block_text(
+    page: &Page,
+    pending: &Pending,
+    from: (usize, usize),
+    to: (usize, usize),
+    format: CopyFormat,
+    table: &str,
+) -> String {
+    let (from, to) = block(from, to);
+    let last_col = to.1.min(page.columns.len().saturating_sub(1));
+    let last_row = to.0.min(pending.rows(page).saturating_sub(1));
+    let names: Vec<&str> = (from.1..=last_col)
+        .map(|c| page.columns[c].name.as_str())
+        .collect();
+    let rows: Vec<Vec<Cell>> = (from.0..=last_row)
+        .map(|r| {
+            (from.1..=last_col)
+                .map(|c| pending.cell(page, r, c))
+                .collect()
+        })
+        .collect();
+    let plain = |cell: &Cell| match cell {
+        Cell::Value(v) => v.to_string(),
+        _ => String::new(),
+    };
+    match format {
+        CopyFormat::Tsv => rows
+            .iter()
+            .map(|row| row.iter().map(plain).collect::<Vec<_>>().join("\t"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        CopyFormat::Csv => {
+            let quote = |v: String| {
+                if v.contains([',', '"', '\n', '\r']) {
+                    format!("\"{}\"", v.replace('"', "\"\""))
+                } else {
+                    v
+                }
+            };
+            let mut lines = vec![names
+                .iter()
+                .map(|n| quote(n.to_string()))
+                .collect::<Vec<_>>()
+                .join(",")];
+            lines.extend(rows.iter().map(|row| {
+                row.iter()
+                    .map(|c| quote(plain(c)))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }));
+            lines.join("\n")
+        }
+        CopyFormat::Markdown => {
+            let clean = |v: String| v.replace('|', "\\|").replace(['\n', '\r'], " ");
+            let mut lines = vec![
+                format!(
+                    "| {} |",
+                    names
+                        .iter()
+                        .map(|n| clean(n.to_string()))
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                ),
+                format!("|{}|", vec![" --- "; names.len()].join("|")),
+            ];
+            lines.extend(rows.iter().map(|row| {
+                format!(
+                    "| {} |",
+                    row.iter()
+                        .map(|c| clean(plain(c)))
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                )
+            }));
+            lines.join("\n")
+        }
+        CopyFormat::Insert => {
+            let columns: Vec<String> = names
+                .iter()
+                .map(|n| super::protocol::quote_ident(n))
+                .collect();
+            rows.iter()
+                .map(|row| {
+                    let values: Vec<String> = row
+                        .iter()
+                        .map(|c| match c {
+                            Cell::Value(v) => super::protocol::quote_literal(v),
+                            Cell::Null => "NULL".to_string(),
+                            Cell::Default => "DEFAULT".to_string(),
+                        })
+                        .collect();
+                    format!(
+                        "INSERT INTO {table} ({}) VALUES ({});",
+                        columns.join(", "),
+                        values.join(", ")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+    }
+}
+
 // ----------------------------------------------------------------- pending
 
 /// A cell of a row that is added.
@@ -710,5 +833,37 @@ mod tests {
         p.today();
         assert!(p.value().is_some());
         assert_eq!(p.value().unwrap().len(), 19);
+    }
+
+    #[test]
+    fn a_block_is_the_same_from_any_corner() {
+        assert_eq!(block((2, 1), (0, 3)), ((0, 1), (2, 3)));
+        assert_eq!(block((1, 1), (1, 1)), ((1, 1), (1, 1)));
+    }
+
+    #[test]
+    fn a_block_is_copied_in_the_four_formats() {
+        let page = page();
+        let mut p = Pending::default();
+        p.set(&page, 0, 1, Some("a,\"q\"".into()));
+        let text = |format| block_text(&page, &p, (0, 1), (1, 2), format, "\"public\".\"t\"");
+        // NULL is an empty cell for a spreadsheet.
+        assert_eq!(text(CopyFormat::Tsv), "a,\"q\"\t\nb\tx");
+        assert_eq!(text(CopyFormat::Csv), "name,note\n\"a,\"\"q\"\"\",\nb,x");
+        assert_eq!(
+            text(CopyFormat::Markdown),
+            "| name | note |\n| --- | --- |\n| a,\"q\" |  |\n| b | x |"
+        );
+        // INSERT keeps NULL as NULL, and quotes what it writes.
+        assert_eq!(
+            text(CopyFormat::Insert),
+            "INSERT INTO \"public\".\"t\" (\"name\", \"note\") VALUES ('a,\"q\"', NULL);\n\
+             INSERT INTO \"public\".\"t\" (\"name\", \"note\") VALUES ('b', 'x');"
+        );
+        // A block past the rows and columns is cut to what exists.
+        assert_eq!(
+            block_text(&page, &p, (2, 2), (9, 9), CopyFormat::Tsv, "t"),
+            "".to_string()
+        );
     }
 }

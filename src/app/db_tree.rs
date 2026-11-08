@@ -241,6 +241,32 @@ impl SimpleEditApp {
                     None => Task::none(),
                 }
             }
+            DbMsg::CopySelection(path, format) => {
+                let Some(tab) = self.db_tabs.get(&path) else {
+                    return Task::none();
+                };
+                let Some(page) = &tab.page else {
+                    return Task::none();
+                };
+                let Some(cell) = tab.selected else {
+                    return Task::none();
+                };
+                let (from, to) = tab.block().unwrap_or((cell, cell));
+                let table = tab.table_ref();
+                let name = format!(
+                    "{}.{}",
+                    database::protocol::quote_ident(&table.schema),
+                    database::protocol::quote_ident(&table.table)
+                );
+                iced::clipboard::write(database::grid::block_text(
+                    page,
+                    &tab.pending,
+                    from,
+                    to,
+                    format,
+                    &name,
+                ))
+            }
             DbMsg::TextCopy => match &self.db.text {
                 Some(view) => iced::clipboard::write(view.text.clone()),
                 None => Task::none(),

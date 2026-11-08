@@ -176,6 +176,8 @@ pub enum DbMsg {
     TextCopy,
     TextClose,
     CopyCell(PathBuf, usize, usize),
+    /// The block of selected cells, or the cell, in a format.
+    CopySelection(PathBuf, grid::CopyFormat),
     /// Opens a table with a condition on it (the rows another one points
     /// to, or the rows that point to this one).
     OpenRelated(u64, String, String, String, String),
@@ -1377,6 +1379,9 @@ pub struct TableTab {
     pub preview: bool,
     /// The cell that has the focus, by row of the page and column.
     pub selected: Option<(usize, usize)>,
+    /// Where a block of cells started, when more than one is selected: the
+    /// block runs from here to `selected`.
+    pub anchor: Option<(usize, usize)>,
     /// The SQL of a result tab: it shows what a query gave, not a table.
     pub query: Option<String>,
     /// What a result tab is called.
@@ -1446,6 +1451,7 @@ impl TableTab {
             committing: false,
             preview: false,
             selected: None,
+            anchor: None,
             query: None,
             title: String::new(),
             paged: false,
@@ -1552,6 +1558,13 @@ impl TableTab {
         self.editing = None;
         self.picker = None;
         self.selected = None;
+        self.anchor = None;
+    }
+
+    /// The block of cells that is selected, when it is more than one.
+    pub fn block(&self) -> Option<((usize, usize), (usize, usize))> {
+        let (anchor, head) = (self.anchor?, self.selected?);
+        (anchor != head).then(|| grid::block(anchor, head))
     }
 }
 

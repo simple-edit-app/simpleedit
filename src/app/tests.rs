@@ -2602,6 +2602,29 @@ mod behavior_tests {
     }
 
     #[test]
+    fn shift_extends_a_block_of_cells_that_is_copied_as_a_whole() {
+        use crate::database::DbMsg;
+        let (mut app, path) = db_app(true);
+        let _ = app.update(Message::Db(DbMsg::Select(path.clone(), 0, 0)));
+        assert!(app.db_tabs[&path].block().is_none());
+        // Shift and an arrow grow the block from where it started.
+        assert!(app.db_key("ArrowDown", false, true, false).is_some());
+        assert!(app.db_key("ArrowRight", false, true, false).is_some());
+        assert_eq!(app.db_tabs[&path].block(), Some(((0, 0), (1, 1))));
+        // A move without Shift leaves it.
+        assert!(app.db_key("ArrowDown", false, false, false).is_some());
+        assert!(app.db_tabs[&path].block().is_none());
+        // Shift and a click do the same.
+        let _ = app.update(Message::Db(DbMsg::Select(path.clone(), 0, 0)));
+        app.mod_shift = true;
+        let _ = app.update(Message::Db(DbMsg::Select(path.clone(), 1, 1)));
+        assert_eq!(app.db_tabs[&path].block(), Some(((0, 0), (1, 1))));
+        app.mod_shift = false;
+        let _ = app.update(Message::Db(DbMsg::Select(path.clone(), 1, 1)));
+        assert!(app.db_tabs[&path].block().is_none());
+    }
+
+    #[test]
     fn the_arrows_and_tab_move_the_focus_from_cell_to_cell() {
         let (mut app, path) = db_app(true);
         let key = |app: &mut SimpleEditApp, k: &str, shift: bool| {

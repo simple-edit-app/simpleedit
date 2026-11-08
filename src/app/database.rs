@@ -375,12 +375,34 @@ impl SimpleEditApp {
                 return Some(self.db_message(DbMsg::DeleteRow(path, row)));
             }
             // The console's own editor has Cmd/Ctrl+C when it is the one in use.
+            ("c", true, false) if !shift && !console_typing && tab.block().is_some() => {
+                let ((r0, c0), (r1, c1)) = tab.block()?;
+                let text = grid::block_text(
+                    page,
+                    &tab.pending,
+                    (r0, c0),
+                    (r1, c1),
+                    grid::CopyFormat::Tsv,
+                    "",
+                );
+                return Some(iced::clipboard::write(text));
+            }
             ("c", true, false) if !shift && !console_typing => {
                 let value = tab.pending.value(page, row, col)?.to_string();
                 return Some(iced::clipboard::write(value));
             }
             _ => return None,
         };
+        // Shift with an arrow extends the block; any other move leaves it.
+        let arrow = matches!(
+            key,
+            "ArrowUp" | "ArrowDown" | "ArrowLeft" | "ArrowRight" | "Home" | "End"
+        );
+        if shift && arrow {
+            tab.anchor = tab.anchor.or(tab.selected).or(Some((row, col)));
+        } else {
+            tab.anchor = None;
+        }
         tab.selected = Some(target);
         Some(Self::db_reveal(tab, target.0))
     }
@@ -1061,7 +1083,14 @@ impl SimpleEditApp {
                         self.db_commit_edit(&path);
                     }
                 }
+                let extend = self.mod_shift;
                 if let Some(tab) = self.db_tabs.get_mut(&path) {
+                    // Shift extends the block from where it started.
+                    if extend {
+                        tab.anchor = tab.anchor.or(tab.selected);
+                    } else {
+                        tab.anchor = None;
+                    }
                     tab.selected = Some((row, col));
                 }
                 Task::none()
@@ -1257,6 +1286,7 @@ impl SimpleEditApp {
             | DbMsg::CopyRow(..)
             | DbMsg::TextCopy
             | DbMsg::CopyCell(..)
+            | DbMsg::CopySelection(..)
             | DbMsg::TextClose
             | DbMsg::OpenRelated(..)
             | DbMsg::ResizeStart(..)
