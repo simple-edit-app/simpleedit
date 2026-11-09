@@ -743,6 +743,8 @@
   "findrep.files": "%{n} fichiers",
   "findrep.multiline": "Plusieurs lignes (Ctrl+Alt+↑↓ parcourent les correspondances)",
   "findrep.ignored": "Fichiers ignorés par Git",
+  "findrep.pick_dir": "Chercher dans le dossier",
+  "findrep.bad_dir": "Ce dossier n'existe pas",
   "tabs.other_files": "Autres fichiers",
   "tabs.project_color": "Couleur du projet",
   "tabs.close_project": "Fermer tous les onglets de ce projet",

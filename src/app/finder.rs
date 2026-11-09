@@ -14,8 +14,16 @@ use iced::widget::{column, rich_text, span, text_input};
 const ROW: f32 = 30.0;
 /// Searches and replacements remembered (Alt+↓).
 const HISTORY: usize = 20;
-/// Lines shown above and under a match in the preview.
-const AROUND: usize = 4;
+
+/// What the right-click menu of the preview does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewMenu {
+    Copy,
+    Cut,
+    Paste,
+    Delete,
+    SelectAll,
+}
 
 /// Where the search looks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -65,6 +73,8 @@ pub struct Search {
 pub enum Menu {
     Context,
     History,
+    /// The folders to look in (the projects, the last ones).
+    Dirs,
 }
 
 /// A file a replacement wrote, to put it back.
@@ -112,7 +122,16 @@ pub struct FinderState {
     /// What the last replacement wrote (to undo it).
     pub undo: Vec<Written>,
     /// The text of the file of the selected match, for the preview.
-    preview: Option<(PathBuf, std::sync::Arc<String>)>,
+    preview: Option<(PathBuf, crate::code_editor::Content)>,
+    /// The preview was typed in: the list keeps its place when it is looked
+    /// at again, and the preview its cursor.
+    preview_edited: bool,
+    /// The last row clicked, to tell a double click.
+    last_click: Option<(usize, std::time::Instant)>,
+    /// The folder as typed in its field (it may not be one yet).
+    dir_text: String,
+    /// The folders looked in, the last first.
+    dir_history: Vec<PathBuf>,
 }
 
 impl Default for FinderState {
@@ -146,6 +165,10 @@ impl Default for FinderState {
             confirm_all: false,
             undo: Vec::new(),
             preview: None,
+            preview_edited: false,
+            last_click: None,
+            dir_text: String::new(),
+            dir_history: Vec::new(),
         }
     }
 }
@@ -327,7 +350,7 @@ impl SimpleEditApp {
         match picked {
             Some(dir) if !whole => {
                 self.finder.scope = Scope::Directory;
-                self.finder.dir = Some(dir);
+                self.set_finder_dir(dir);
             }
             _ if self.finder.scope == Scope::Directory => self.finder.scope = Scope::Project,
             _ => {}
@@ -343,6 +366,27 @@ impl SimpleEditApp {
             iced::widget::operation::focus(focus),
             iced::widget::operation::select_all(find_field_id()),
         ])
+    }
+
+    /// The folder to look in, remembered for the list.
+    pub(super) fn set_finder_dir(&mut self, dir: PathBuf) {
+        self.finder.dir_text = dir.display().to_string();
+        self.finder.dir_history.retain(|d| *d != dir);
+        self.finder.dir_history.insert(0, dir.clone());
+        self.finder.dir_history.truncate(HISTORY);
+        self.finder.dir = Some(dir);
+    }
+
+    /// The folder field typed in: a folder that exists is looked in.
+    pub(super) fn finder_dir_typed(&mut self, text: String) -> Task<Message> {
+        let dir = PathBuf::from(text.trim());
+        let valid = !text.trim().is_empty() && dir.is_dir();
+        self.finder.dir_text = text;
+        if !valid || self.finder.dir.as_ref() == Some(&dir) {
+            return Task::none();
+        }
+        self.finder.dir = Some(dir);
+        self.load_scope_files()
     }
 
     /// Looks in a folder of a project (from its menu in the tree).
@@ -531,7 +575,13 @@ impl SimpleEditApp {
         match result {
             Ok(hits) => {
                 self.finder.hits = hits;
-                self.finder.selected = 0;
+                self.finder.selected = if self.finder.preview_edited {
+                    self.finder
+                        .selected
+                        .min(self.finder.hits.len().saturating_sub(1))
+                } else {
+                    0
+                };
             }
             Err(e) => {
                 self.finder.hits.clear();
@@ -552,16 +602,21 @@ impl SimpleEditApp {
             self.finder.preview = None;
             return;
         };
-        if self
+        let hit = self.finder.hits[self.finder.selected].hit.clone();
+        let same = self
             .finder
             .preview
             .as_ref()
-            .is_some_and(|(p, _)| *p == path)
-        {
-            return;
+            .is_some_and(|(p, _)| *p == path);
+        if !same {
+            let text = self.file_text(&path).map(|(t, _)| t).unwrap_or_default();
+            self.finder.preview = Some((path, crate::code_editor::Content::with_text(&text)));
         }
-        let text = self.file_text(&path).map(|(t, _)| t).unwrap_or_default();
-        self.finder.preview = Some((path, std::sync::Arc::new(text)));
+        if !(same && self.finder.preview_edited) {
+            if let Some((_, content)) = self.finder.preview.as_mut() {
+                content.select_bytes(hit.line, hit.col, hit.len);
+            }
+        }
     }
 
     /// A file's text now (the editor's, a tab's, or the file's), and where
@@ -651,9 +706,73 @@ impl SimpleEditApp {
         self.finder.generation
     }
 
-    pub(super) fn finder_select(&mut self, index: usize) {
+    /// A row clicked: it is selected; clicked twice, it is opened.
+    pub(super) fn finder_select(&mut self, index: usize) -> Task<Message> {
+        let now = std::time::Instant::now();
+        let twice = self.finder.last_click.is_some_and(|(i, at)| {
+            i == index && now.duration_since(at) < std::time::Duration::from_millis(450)
+        });
+        self.finder.last_click = Some((index, now));
         self.finder.selected = index;
+        self.finder.preview_edited = false;
         self.refresh_finder_preview();
+        if twice {
+            self.finder.last_click = None;
+            return self.find_open(Some(index));
+        }
+        Task::none()
+    }
+
+    /// A key or a click in the preview: it is the file, edited there.
+    pub(super) fn finder_preview_action(&mut self, action: text_editor::Action) -> Task<Message> {
+        let edited = action.is_edit();
+        let Some((path, content)) = self.finder.preview.as_mut() else {
+            return Task::none();
+        };
+        content.perform(action);
+        if !edited {
+            return Task::none();
+        }
+        let path = path.clone();
+        let new = crate::editor::buffer_text(content);
+        let Some((old, holder)) = self.file_text(&path) else {
+            return Task::none();
+        };
+        if old != new && self.put_text(&path, &holder, &old, &new) {
+            self.finder.preview_edited = true;
+            return self.search_files(true);
+        }
+        Task::none()
+    }
+
+    /// The right-click menu of the preview, on its own text.
+    pub(super) fn finder_preview_menu(&mut self, what: PreviewMenu) -> Task<Message> {
+        let Some((_, content)) = self.finder.preview.as_mut() else {
+            return Task::none();
+        };
+        let selected = content.selection();
+        match what {
+            PreviewMenu::Copy => selected.map_or_else(Task::none, iced::clipboard::write),
+            PreviewMenu::Cut => {
+                let Some(text) = selected else {
+                    return Task::none();
+                };
+                let task = self
+                    .finder_preview_action(text_editor::Action::Edit(text_editor::Edit::Delete));
+                Task::batch([iced::clipboard::write(text), task])
+            }
+            PreviewMenu::Delete => {
+                if selected.is_none() {
+                    return Task::none();
+                }
+                self.finder_preview_action(text_editor::Action::Edit(text_editor::Edit::Delete))
+            }
+            PreviewMenu::Paste => iced::clipboard::read().map(Message::FindPreviewPasted),
+            PreviewMenu::SelectAll => {
+                content.perform(text_editor::Action::SelectAll);
+                Task::none()
+            }
+        }
     }
 
     // ── Replacing ──
@@ -932,75 +1051,53 @@ impl SimpleEditApp {
         line.clip(true).into()
     }
 
-    /// The lines around the selected match, the match marked.
+    /// The file of the selected match, in an editor: the match selected,
+    /// the text editable, a right-click menu.
     fn finder_preview(&self, dark: bool) -> Element<'_, Message> {
-        let p = se_theme::palette(dark);
-        let (Some(o), Some((path, content))) = (
-            self.finder.hits.get(self.finder.selected),
-            self.finder.preview.as_ref(),
-        ) else {
+        let Some((path, content)) = self.finder.preview.as_ref() else {
             return Space::new().height(Length::Fill).into();
         };
-        if o.hit.path != *path {
-            return Space::new().height(Length::Fill).into();
-        }
-        let hit = &o.hit;
-        let first = hit.line.saturating_sub(AROUND);
-        let mut lines = column![].spacing(0);
-        for (n, line) in content
-            .split('\n')
-            .enumerate()
-            .skip(first)
-            .take(AROUND * 2 + 1)
-        {
-            let line = line.trim_end_matches('\r');
-            let number = text(format!("{:>5}  ", n + 1))
-                .size(12)
-                .font(se_theme::MONO)
-                .color(p.gutter);
-            let shown: Element<Message> = if n == hit.line {
-                let start = hit.col.min(line.len());
-                let end = (hit.col + hit.len).min(line.len());
-                let piece = |a: usize, b: usize| line.get(a..b).unwrap_or("").to_string();
-                let mut spans: Vec<iced::widget::text::Span<'_, ()>> = vec![
-                    span(piece(0, start)).color(p.text).font(se_theme::MONO),
-                    span(piece(start, end))
-                        .color(p.accent)
-                        .background(p.search_match)
-                        .font(se_theme::MONO),
-                ];
-                if let Some(new) = o.replacement.as_ref().filter(|_| !o.excluded) {
-                    spans.push(
-                        span(format!(" → {}", new.replace('\n', "⏎")))
-                            .color(iced::Color::from_rgb8(0x6a, 0xb8, 0x4f))
-                            .font(se_theme::MONO),
-                    );
-                }
-                spans.push(
-                    span(piece(end, line.len()))
-                        .color(p.text)
-                        .font(se_theme::MONO),
-                );
-                rich_text(spans)
-                    .size(12)
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .into()
-            } else {
-                text(line.to_string())
-                    .size(12)
-                    .font(se_theme::MONO)
-                    .color(p.text)
-                    .wrapping(iced::widget::text::Wrapping::None)
-                    .into()
+        let first = content.line(0).map(|l| l.to_string()).unwrap_or_default();
+        let extension = crate::editor::detect_language(path, &first)
+            .map(str::to_string)
+            .unwrap_or_default();
+        let editor = crate::code_editor::CodeEditor::new(content)
+            .size(12)
+            .font(se_theme::MONO)
+            .on_action(Message::FindPreviewAction)
+            .highlight::<crate::editor::highlighter::Highlighter>(
+                crate::editor::highlighter::Settings { dark, extension },
+                crate::editor::highlighter::to_format,
+            )
+            .style(crate::theme::editor_style(dark))
+            .height(Length::Fill);
+        let labels = (
+            t!("ctx.cut").to_string(),
+            t!("ctx.copy").to_string(),
+            t!("ctx.paste").to_string(),
+            t!("ctx.delete").to_string(),
+            t!("ctx.select_all").to_string(),
+        );
+        crate::pointer_area::context_menu(editor, move || {
+            use crate::menu_bar::item;
+            let entry = |label: &String, what| {
+                item(label.clone(), None, dark, Message::FindPreviewMenu(what))
             };
-            lines = lines.push(row![number, shown]);
-        }
-        container(lines)
-            .padding([8, 12])
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .clip(true)
+            container(
+                column![
+                    entry(&labels.0, PreviewMenu::Cut),
+                    entry(&labels.1, PreviewMenu::Copy),
+                    entry(&labels.2, PreviewMenu::Paste),
+                    entry(&labels.3, PreviewMenu::Delete),
+                    entry(&labels.4, PreviewMenu::SelectAll),
+                ]
+                .spacing(1)
+                .padding(6)
+                .width(Length::Fixed(200.0)),
+            )
+            .style(crate::theme::card(dark))
             .into()
+        })
     }
 
     pub(super) fn view_find_in_files(&self, dark: bool) -> Element<'_, Message> {
@@ -1212,7 +1309,7 @@ impl SimpleEditApp {
                 }
                 body = body.push(container(list).padding([4, 16]));
             }
-            None => {}
+            Some(Menu::Dirs) | None => {}
         }
         // Where.
         let mut scopes = row![text(t!("findrep.where").to_string())
@@ -1221,18 +1318,15 @@ impl SimpleEditApp {
         .spacing(4)
         .align_y(Alignment::Center);
         for scope in Scope::ALL {
-            let label = match (scope, &f.dir) {
-                (Scope::Directory, Some(dir)) => {
-                    format!("{} {}", scope_label(scope), display_path(dir))
-                }
-                _ => scope_label(scope),
-            };
+            let label = scope_label(scope);
             let mut b = button(text(label).size(12))
                 .padding([3, 8])
                 .style(ghost(scope == f.scope));
-            if scope != Scope::Directory || f.dir.is_some() {
-                b = b.on_press(Message::FindScope(scope));
-            }
+            b = b.on_press(if scope == Scope::Directory && f.dir.is_none() {
+                Message::FindPickDir
+            } else {
+                Message::FindScope(scope)
+            });
             scopes = scopes.push(b);
         }
         if f.scope == Scope::Directory {
@@ -1251,7 +1345,63 @@ impl SimpleEditApp {
                 .size(14)
                 .on_toggle(Message::FindIgnored),
         );
-        body = body.push(container(scopes).padding([4, 12]));
+        // Wraps onto a second line rather than overflowing the window.
+        body = body.push(container(scopes.wrap().vertical_spacing(4)).padding([4, 12]));
+        // The folder, as a field with the folders already looked in, and a
+        // button to pick one.
+        if f.scope == Scope::Directory {
+            let valid = f
+                .dir
+                .as_ref()
+                .is_some_and(|d| d.display().to_string() == f.dir_text.trim());
+            let field = text_input("~/", &f.dir_text)
+                .on_input(Message::FindDirText)
+                .size(12.5)
+                .padding([4, 8])
+                .width(Length::Fill)
+                .style(se_theme::Field::new(dark).style());
+            let dir_row = row![
+                field,
+                button(text("▾").size(12))
+                    .padding([3, 8])
+                    .on_press(Message::FindMenu(Some(Menu::Dirs)))
+                    .style(ghost(f.menu == Some(Menu::Dirs))),
+                button(text("…").size(12))
+                    .padding([3, 8])
+                    .on_press(Message::FindPickDir)
+                    .style(ghost(false)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center);
+            body = body.push(container(dir_row).padding([2, 12]));
+            if !valid && !f.dir_text.trim().is_empty() {
+                body = body.push(
+                    container(
+                        text(t!("findrep.bad_dir").to_string())
+                            .size(11.5)
+                            .color(p.muted),
+                    )
+                    .padding([0, 14]),
+                );
+            }
+            if f.menu == Some(Menu::Dirs) {
+                let mut list = column![].spacing(1);
+                let roots = self.projects.roots.iter();
+                let mut dirs: Vec<&PathBuf> = f.dir_history.iter().chain(roots).collect();
+                let mut seen = std::collections::HashSet::new();
+                dirs.retain(|d| seen.insert((*d).clone()));
+                for dir in dirs {
+                    list = list.push(
+                        button(text(display_path(dir)).size(12.5).font(se_theme::MONO))
+                            .padding([5, 10])
+                            .width(Length::Fill)
+                            .on_press(Message::FindDirChosen(dir.clone()))
+                            .style(ghost(f.dir.as_ref() == Some(dir))),
+                    );
+                }
+                body = body.push(container(list).padding([4, 16]));
+            }
+        }
         body = body.push(
             container(Space::new().height(1))
                 .width(Length::Fill)
@@ -1460,6 +1610,54 @@ mod tests {
             Some("run")
         );
         assert!(app.config_dirty, "the history is kept");
+    }
+
+    #[test]
+    fn a_row_clicked_twice_is_opened() {
+        let dir = project();
+        let mut app = app_on(dir.path());
+        listed(&mut app, dir.path());
+        let _ = app.update(Message::OpenFindInFiles);
+        let _ = app.update(Message::FindQuery("run".into()));
+        searched(&mut app);
+        let _ = app.update(Message::FindSelect(1));
+        assert_eq!(app.overlay, ActiveOverlay::FindInFiles, "one click selects");
+        let _ = app.update(Message::FindSelect(1));
+        assert_eq!(app.overlay, ActiveOverlay::None, "two clicks open");
+    }
+
+    #[test]
+    fn the_folder_is_typed_or_taken_from_the_list() {
+        let dir = project();
+        let mut app = app_on(dir.path());
+        let _ = app.update(Message::OpenFindInFiles);
+        let src = dir.path().join("src");
+        let _ = app.update(Message::FindScope(Scope::Directory));
+        let _ = app.update(Message::FindDirText(src.display().to_string()));
+        assert_eq!(app.finder.dir.as_deref(), Some(src.as_path()));
+        let _ = app.update(Message::FindDirText("/does/not/exist".into()));
+        assert_eq!(app.finder.dir.as_deref(), Some(src.as_path()), "kept");
+        let _ = app.update(Message::FindDirChosen(dir.path().to_path_buf()));
+        assert_eq!(app.finder.dir.as_deref(), Some(dir.path()));
+        assert_eq!(app.finder.dir_history.len(), 1);
+    }
+
+    #[test]
+    fn the_preview_is_edited_in_the_file() {
+        let dir = project();
+        let mut app = app_on(dir.path());
+        listed(&mut app, dir.path());
+        let _ = app.update(Message::OpenFindInFiles);
+        let _ = app.update(Message::FindQuery("run".into()));
+        searched(&mut app);
+        let path = app.finder.hits[app.finder.selected].hit.path.clone();
+        let _ = app.update(Message::FindPreviewAction(text_editor::Action::Edit(
+            text_editor::Edit::Paste(std::sync::Arc::new("X".into())),
+        )));
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains('X'),
+            "the typing reaches the file"
+        );
     }
 
     #[test]

@@ -274,6 +274,13 @@ pub enum Message {
     FindMaskOn(bool),
     FindMask(String),
     FindScope(finder::Scope),
+    FindPickDir,
+    FindDirText(String),
+    FindDirChosen(PathBuf),
+    FindPreviewAction(text_editor::Action),
+    FindPreviewMenu(finder::PreviewMenu),
+    FindPreviewPasted(Option<String>),
+    FindDirPicked(Option<PathBuf>),
     FindRecursive,
     FindMenu(Option<finder::Menu>),
     FindHistory(String),
@@ -1327,6 +1334,22 @@ impl SimpleEditApp {
             iced::time::every(std::time::Duration::from_secs(1)).map(|_| Message::AutoSave);
 
         let mut subscriptions = vec![keys, double_shift, modifiers, autosave];
+        // Enter, when no field took it (a row was clicked): opens the match.
+        if self.overlay == ActiveOverlay::FindInFiles {
+            subscriptions.push(iced::event::listen_with(|event, status, _window| {
+                use iced::keyboard::{key::Named, Event, Key};
+                match event {
+                    iced::Event::Keyboard(Event::KeyPressed {
+                        key: Key::Named(Named::Enter),
+                        modifiers,
+                        ..
+                    }) if status == iced::event::Status::Ignored && modifiers.is_empty() => {
+                        Some(Message::FindOpen(None))
+                    }
+                    _ => None,
+                }
+            }));
+        }
         if self.sidebar_resizing {
             subscriptions.push(iced::event::listen_with(
                 |event, _status, _window| match event {
@@ -3160,6 +3183,29 @@ impl SimpleEditApp {
                     self.search_files(false)
                 }
             }
+            Message::FindPickDir => Task::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .set_title(t!("findrep.pick_dir").to_string())
+                        .pick_folder()
+                        .await
+                        .map(|h| h.path().to_path_buf())
+                },
+                Message::FindDirPicked,
+            ),
+            Message::FindDirPicked(dir) => {
+                let Some(dir) = dir else {
+                    return Task::none();
+                };
+                self.set_finder_dir(dir);
+                self.finder.scope = finder::Scope::Directory;
+                self.load_scope_files()
+            }
+            Message::FindDirText(text) => self.finder_dir_typed(text),
+            Message::FindDirChosen(dir) => {
+                self.finder.menu = None;
+                self.handle(Message::FindDirPicked(Some(dir)))
+            }
             Message::FindRecursive => {
                 self.finder.recursive = !self.finder.recursive;
                 self.search_files(false)
@@ -3178,10 +3224,15 @@ impl SimpleEditApp {
                 self.finder.pinned = !self.finder.pinned;
                 Task::none()
             }
-            Message::FindSelect(index) => {
-                self.finder_select(index);
-                Task::none()
-            }
+            Message::FindSelect(index) => self.finder_select(index),
+            Message::FindPreviewAction(action) => self.finder_preview_action(action),
+            Message::FindPreviewMenu(what) => self.finder_preview_menu(what),
+            Message::FindPreviewPasted(text) => match text {
+                Some(text) if text.len() <= MAX_PASTE_BYTES => self.finder_preview_action(
+                    text_editor::Action::Edit(text_editor::Edit::Paste(std::sync::Arc::new(text))),
+                ),
+                _ => Task::none(),
+            },
             Message::FindReplaceOne => self.finder_replace_one(),
             Message::FindReplaceAll => {
                 self.finder.confirm_all = true;
