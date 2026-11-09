@@ -20,6 +20,9 @@ pub struct FileSession {
     /// Whether the file ends with a line break (new files do).
     #[serde(default = "yes")]
     pub final_newline: bool,
+    /// The label of the encoding the file is in ("" is UTF-8).
+    #[serde(default)]
+    pub encoding: String,
     /// The state of the file on disk when `content` was read, to notice
     /// edits made while the app was closed.
     #[serde(default)]
@@ -157,6 +160,7 @@ mod tests {
             dirty: true,
             crlf: false,
             final_newline: true,
+            encoding: String::new(),
             stamp: None,
         };
         fs.set_path(path);

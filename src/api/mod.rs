@@ -1,9 +1,11 @@
 //! A light version of Postman: requests to an API, the collections that keep
 //! them, the environments with their variables.
 
+pub mod checks;
 pub mod curl;
 pub mod http;
 pub mod model;
+pub mod openapi;
 pub mod postman;
 pub mod store;
 #[cfg(test)]
@@ -34,6 +36,8 @@ pub enum ReqSection {
     Body,
     Auth,
     Settings,
+    /// The tests of the answer, and the values kept from it.
+    Tests,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +45,8 @@ pub enum RespSection {
     Body,
     Headers,
     Cookies,
+    /// How the tests of the request went.
+    Tests,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +107,19 @@ pub enum Act {
     Save,
     SaveTarget(u64),
     CopyCurl,
+    CheckAdd,
+    CheckDel(usize),
+    CheckOn(usize, bool),
+    CheckSource(usize, model::CheckSource),
+    CheckName(usize, String),
+    CheckOp(usize, model::CheckOp),
+    CheckExpected(usize, String),
+    ExtractAdd,
+    ExtractDel(usize),
+    ExtractOn(usize, bool),
+    ExtractVar(usize, String),
+    ExtractFrom(usize, model::ExtractSource),
+    ExtractPath(usize, String),
 }
 
 /// What the user is asked in a window.
@@ -167,6 +186,8 @@ pub struct ResponseView {
     pub search: String,
     /// The body is longer than what is shown.
     pub cut: bool,
+    /// How the tests of the request went on this answer.
+    pub outcomes: Vec<checks::Outcome>,
 }
 
 /// Most of a body that is put in the viewer.
@@ -193,6 +214,7 @@ impl ResponseView {
             editor: text_editor::Content::new(),
             search: String::new(),
             cut: false,
+            outcomes: Vec::new(),
         };
         view.show();
         view
@@ -331,6 +353,30 @@ impl State {
         self.next_id
     }
 
+    /// Puts a value in a variable of the environment that is on; `false`
+    /// when none is.
+    pub fn set_variable(&mut self, name: &str, value: &str) -> bool {
+        let Some(id) = self.active_env else {
+            return false;
+        };
+        let Some(env) = self.environments.iter_mut().find(|e| e.id == id) else {
+            return false;
+        };
+        match env.vars.iter_mut().find(|v| v.key.trim() == name) {
+            Some(var) => {
+                var.value = value.to_string();
+                var.enabled = true;
+            }
+            None => env.vars.push(model::Variable {
+                enabled: true,
+                key: name.to_string(),
+                value: value.to_string(),
+                secret: false,
+            }),
+        }
+        true
+    }
+
     pub fn collection(&self, id: u64) -> Option<&Collection> {
         self.collections.iter().find(|c| c.id == id)
     }
@@ -421,6 +467,10 @@ pub enum ApiMsg {
     ImportFile,
     Imported(Option<(PathBuf, Result<String, String>)>),
     ExportCollection(u64),
+    /// Sends all the requests of a collection, in order, and reports.
+    RunCollection(u64),
+    /// The results of a run, and the values it kept.
+    RunDone(String, Vec<checks::RunResult>, Vec<(String, String)>),
     ExportEnv(u64),
     Exported(Option<Result<String, String>>),
 }

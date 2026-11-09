@@ -173,6 +173,14 @@ impl SimpleEditApp {
             | ActiveOverlay::WhatsNew(_)
             | ActiveOverlay::GotoLine
             | ActiveOverlay::LanguagePicker
+            | ActiveOverlay::TextOptions(_)
+            | ActiveOverlay::Rename(_)
+            | ActiveOverlay::TaskPicker
+            | ActiveOverlay::Compare(..)
+            | ActiveOverlay::Spelling(_)
+            | ActiveOverlay::SpellLanguages
+            | ActiveOverlay::Remote(_)
+            | ActiveOverlay::Diagram(_)
             | ActiveOverlay::References(_)
             | ActiveOverlay::Shortcuts
             | ActiveOverlay::Conflicts
@@ -292,6 +300,97 @@ impl SimpleEditApp {
             t!("overwrite.confirm").to_string(),
             Message::ConfirmOverwrite,
         )
+    }
+
+    /// The tables of a schema and the foreign keys between them, drawn.
+    pub(super) fn view_diagram<'a>(
+        &self,
+        dark: bool,
+        view: &'a DiagramView,
+    ) -> Element<'a, Message> {
+        let p = se_theme::palette(dark);
+        let ghost = move |active: bool| (se_theme::GhostButton { dark, active }).style();
+        let header = row![
+            text(t!("db.diagram_title", schema = view.schema.as_str()).to_string())
+                .size(13)
+                .font(se_theme::UI_SEMIBOLD)
+                .color(p.text),
+            Space::new().width(Length::Fill),
+            button(text(t!("db.diagram_mermaid").to_string()).size(12.5))
+                .padding([4, 10])
+                .on_press(Message::Db(crate::database::DbMsg::CopyDiagram))
+                .style(ghost(false)),
+            button(text("×").size(17))
+                .padding([4, 8])
+                .on_press(Message::CloseOverlay)
+                .style(ghost(false)),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+        let drawing = iced::widget::canvas(crate::database::diagram::Drawing {
+            diagram: &view.diagram,
+            dark,
+        })
+        .width(Length::Fixed(view.diagram.width))
+        .height(Length::Fixed(view.diagram.height));
+        container(
+            column![
+                container(header).padding([8, 14]),
+                scrollable(drawing)
+                    .direction(iced::widget::scrollable::Direction::Both {
+                        vertical: Default::default(),
+                        horizontal: Default::default(),
+                    })
+                    .style(se_theme::Scrollbar { dark }.style())
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            ]
+            .spacing(0),
+        )
+        .width(1100)
+        .height(660)
+        .style(se_theme::palette_card(dark))
+        .into()
+    }
+
+    /// The new name of the symbol under the cursor.
+    pub(super) fn view_rename(&self, dark: bool, name: &str) -> Element<'_, Message> {
+        let p = se_theme::palette(dark);
+        container(
+            column![
+                text(t!("rename.title").to_string()).size(14).color(p.text),
+                text_input(t!("rename.placeholder").as_ref(), name)
+                    .id(rename_field_id())
+                    .on_input(Message::RenameInput)
+                    .on_submit(Message::RenameConfirm)
+                    .padding([8, 10])
+                    .size(14)
+                    .style(se_theme::Field::new(dark).style()),
+                row![
+                    button(text(t!("goto_line.cancel").to_string()).size(13))
+                        .padding([7, 16])
+                        .on_press(Message::CloseOverlay)
+                        .style(
+                            (se_theme::GhostButton {
+                                dark,
+                                active: false,
+                            })
+                            .style()
+                        ),
+                    Space::new().width(Length::Fill),
+                    button(text(t!("rename.confirm").to_string()).size(13))
+                        .padding([7, 16])
+                        .on_press(Message::RenameConfirm)
+                        .style((se_theme::GhostButton { dark, active: true }).style()),
+                ]
+                .align_y(Alignment::Center),
+            ]
+            .spacing(14)
+            .padding(24),
+        )
+        .width(340)
+        .style(se_theme::card(dark))
+        .into()
     }
 
     pub(super) fn view_goto_line_overlay(&self, dark: bool) -> Element<'_, Message> {
@@ -663,6 +762,119 @@ impl SimpleEditApp {
         .into()
     }
 
+    /// The choice window of the status bar: encoding, line endings or
+    /// indentation of the file in front.
+    pub(super) fn view_text_options(&self, dark: bool, which: TextOption) -> Element<'_, Message> {
+        use crate::tabs::{Encoding, LineEnding};
+        let p = se_theme::palette(dark);
+        let counted = std::cell::Cell::new(0usize);
+        let row_of = |label: String, checked: bool, message: Message| -> Element<'_, Message> {
+            let at = counted.get();
+            counted.set(at + 1);
+            let on_key = self.overlay_pick == at;
+            button(
+                row![
+                    text(label).size(13),
+                    Space::new().width(Length::Fill),
+                    text(if checked { "✓" } else { "" })
+                        .size(13)
+                        .color(p.accent)
+                        .shaping(iced::widget::text::Shaping::Advanced),
+                ]
+                .align_y(Alignment::Center),
+            )
+            .padding([6, 12])
+            .width(Length::Fill)
+            .on_press(message)
+            .style(
+                (se_theme::GhostButton {
+                    dark,
+                    active: checked || on_key,
+                })
+                .style(),
+            )
+            .into()
+        };
+        let heading =
+            |label: String| -> Element<'_, Message> { text(label).size(12).color(p.muted).into() };
+        let mut items: Vec<Element<Message>> = Vec::new();
+        let title = match which {
+            TextOption::Encoding => {
+                items.push(heading(t!("textopt.encoding_reload").to_string()));
+                for e in Encoding::ALL {
+                    items.push(row_of(
+                        e.label().to_string(),
+                        self.format.encoding == e,
+                        Message::ReloadEncoding(e),
+                    ));
+                }
+                items.push(heading(t!("textopt.encoding_save").to_string()));
+                for e in Encoding::ALL {
+                    items.push(row_of(
+                        e.label().to_string(),
+                        self.format.encoding == e,
+                        Message::SetEncoding(e),
+                    ));
+                }
+                t!("palette.set_encoding").to_string()
+            }
+            TextOption::LineEnding => {
+                for e in [LineEnding::Lf, LineEnding::Crlf] {
+                    items.push(row_of(
+                        e.label().to_string(),
+                        self.format.ending == e,
+                        Message::SetLineEnding(e),
+                    ));
+                }
+                t!("textopt.line_ending").to_string()
+            }
+            TextOption::Indent => {
+                let (spaces, width) = self.indent();
+                for n in [2, 3, 4, 8] {
+                    items.push(row_of(
+                        t!("textopt.spaces", n = n).to_string(),
+                        spaces && width == n,
+                        Message::SetIndent(true, n),
+                    ));
+                }
+                for n in [2, 4, 8] {
+                    items.push(row_of(
+                        t!("textopt.tabs", n = n).to_string(),
+                        !spaces && width == n,
+                        Message::SetIndent(false, n),
+                    ));
+                }
+                items.push(row_of(
+                    t!("textopt.detect").to_string(),
+                    false,
+                    Message::DetectIndent,
+                ));
+                items.push(row_of(
+                    t!("textopt.convert_spaces").to_string(),
+                    false,
+                    Message::ConvertIndent(true),
+                ));
+                items.push(row_of(
+                    t!("textopt.convert_tabs").to_string(),
+                    false,
+                    Message::ConvertIndent(false),
+                ));
+                t!("textopt.indent").to_string()
+            }
+        };
+        container(
+            column![
+                text(title).size(14).color(p.text),
+                scrollable(column(items).spacing(2).padding(4)).height(Length::Fixed(340.0)),
+            ]
+            .spacing(10)
+            .padding(16),
+        )
+        .width(280)
+        .style(se_theme::card(dark))
+        .into()
+    }
+
     pub(super) fn view_language_picker_overlay(&self, dark: bool) -> Element<'_, Message> {
         let p = se_theme::palette(dark);
         let current_lang = self.editor.language.as_deref().unwrap_or("");
@@ -690,15 +902,16 @@ impl SimpleEditApp {
             .style(
                 (se_theme::GhostButton {
                     dark,
-                    active: current_lang.is_empty(),
+                    active: current_lang.is_empty() || self.overlay_pick == 0,
                 })
                 .style(),
             )
             .into(),
         ];
 
-        for (token, name) in crate::editor::SUPPORTED_LANGUAGES {
+        for (row_index, (token, name)) in crate::editor::SUPPORTED_LANGUAGES.iter().enumerate() {
             let is_current = current_lang == *token;
+            let on_key = self.overlay_pick == row_index + 1;
             items.push(
                 button(
                     row![
@@ -721,7 +934,7 @@ impl SimpleEditApp {
                 .style(
                     (se_theme::GhostButton {
                         dark,
-                        active: is_current,
+                        active: is_current || on_key,
                     })
                     .style(),
                 )
@@ -828,6 +1041,7 @@ impl SimpleEditApp {
                     dirty,
                     crlf: format.ending == crate::tabs::LineEnding::Crlf,
                     final_newline: format.final_newline,
+                    encoding: format.encoding.label().to_string(),
                     stamp,
                 };
                 entry.set_path(path);
@@ -905,6 +1119,10 @@ impl SimpleEditApp {
                     LineEnding::Lf
                 },
                 final_newline: fs.final_newline,
+                encoding: crate::tabs::Encoding::ALL
+                    .into_iter()
+                    .find(|e| e.label() == fs.encoding)
+                    .unwrap_or_default(),
             };
             let buffer = match &fs.content {
                 Some(text) => CachedBuffer {

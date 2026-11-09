@@ -1,11 +1,18 @@
 //! Reading and writing the files of the tabs.
 
 use super::*;
+use crate::tabs::Encoding;
 
 /// Reads a text file, refusing ones too large to edit comfortably, devices
 /// and pipes (which have no length and may never end), and anything that
 /// isn't UTF-8.
 pub(super) fn read_text(path: &Path) -> Result<String, String> {
+    read_decoded(path).map(|(text, _)| text)
+}
+
+/// Like `read_text`, with the encoding the file is in (UTF-8, a byte order
+/// mark, or Windows-1252 when it is not valid UTF-8).
+pub(super) fn read_decoded(path: &Path) -> Result<(String, Encoding), String> {
     use std::io::Read;
 
     let meta = std::fs::metadata(path).map_err(read_error)?;
@@ -22,7 +29,68 @@ pub(super) fn read_text(path: &Path) -> Result<String, String> {
     if bytes.len() as u64 > MAX_OPEN_BYTES {
         return Err(t!("status.err_too_large", mb = MAX_OPEN_BYTES / (1024 * 1024)).to_string());
     }
-    String::from_utf8(bytes).map_err(|_| t!("status.err_not_utf8").to_string())
+    Ok(Encoding::detect(&bytes))
+}
+
+/// Part of a file too large to open whole: the lines from about `from` to
+/// about `from + window` bytes (the first part starts at the beginning, the
+/// others at the first line start after `from`), as `(text, start, end)`
+/// with the byte range the text covers in the file.
+pub(super) fn read_window(
+    path: &Path,
+    from: u64,
+    window: u64,
+) -> Result<(String, u64, u64), String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).map_err(read_error)?;
+    let size = file.metadata().map_err(read_error)?.len();
+    let from = from.min(size);
+    // The byte before the part tells whether it starts on a line.
+    let lead = u64::from(from > 0);
+    file.seek(SeekFrom::Start(from - lead))
+        .map_err(read_error)?;
+    let mut bytes = Vec::new();
+    file.take(window + lead)
+        .read_to_end(&mut bytes)
+        .map_err(read_error)?;
+    let mut start = from;
+    let mut body = &bytes[lead as usize..];
+    if lead == 1 && bytes[0] != b'\n' {
+        // The line that was cut belongs to the part before.
+        match body.iter().position(|b| *b == b'\n') {
+            Some(i) => {
+                body = &body[i + 1..];
+                start += i as u64 + 1;
+            }
+            None => {
+                start += body.len() as u64;
+                body = &[];
+            }
+        }
+    }
+    if from + (body.len() as u64) + (start - from) < size {
+        // And the last one to the part after.
+        if let Some(i) = body.iter().rposition(|b| *b == b'\n') {
+            body = &body[..=i];
+        }
+    }
+    let end = start + body.len() as u64;
+    let text = TextFormat::decode(&String::from_utf8_lossy(body)).0;
+    Ok((text, start, end))
+}
+
+/// The part of a file that ends at `end` (a line start) and is about
+/// `window` bytes long.
+pub(super) fn read_window_before(
+    path: &Path,
+    end: u64,
+    window: u64,
+) -> Result<(String, u64, u64), String> {
+    let from = end.saturating_sub(window);
+    let (text, start, _) = read_window(path, from, end - from)?;
+    // `read_window` cut at the last line break before `end`: that is `end`.
+    let end = start + text.len() as u64;
+    Ok((text, start, end))
 }
 
 /// A filesystem error in the interface language.
@@ -72,9 +140,20 @@ pub(super) async fn read_file(path: PathBuf, missing_ok: bool) -> Result<Loaded,
     tokio::task::spawn_blocking(move || {
         // Taken first: a change during the read then shows up as newer.
         let stamp = DiskStamp::of(&path);
-        match read_text(&path) {
-            Ok(raw) => {
-                let (text, format) = TextFormat::decode(&raw);
+        // Too large to open whole: the first part, to read.
+        if std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() > MAX_OPEN_BYTES) {
+            let (text, _, _) = read_window(&path, 0, LARGE_WINDOW)?;
+            return Ok(Loaded {
+                path,
+                text,
+                format: TextFormat::default(),
+                stamp,
+            });
+        }
+        match read_decoded(&path) {
+            Ok((raw, encoding)) => {
+                let (text, mut format) = TextFormat::decode(&raw);
+                format.encoding = encoding;
                 Ok(Loaded {
                     path,
                     text,
@@ -103,8 +182,10 @@ pub(super) async fn save_file(
     format: TextFormat,
 ) -> Result<(PathBuf, String), String> {
     tokio::task::spawn_blocking(move || {
-        let bytes = format.encode(&content);
-        crate::fsutil::write_atomic(&path, bytes.as_bytes(), false)
+        let Some(bytes) = format.encode_bytes(&content) else {
+            return Err(t!("status.err_encoding", name = format.encoding.label()).to_string());
+        };
+        crate::fsutil::write_atomic(&path, &bytes, false)
             .map(|()| (path, content))
             .map_err(|e| match e.kind() {
                 std::io::ErrorKind::PermissionDenied => t!("status.err_permission").to_string(),

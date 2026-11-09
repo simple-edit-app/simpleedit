@@ -328,6 +328,13 @@ const DIAG_DELAY: std::time::Duration = std::time::Duration::from_millis(350);
 
 type DiagHover<'a, Message> = Box<dyn Fn(Option<(usize, Point)>) -> Message + 'a>;
 
+/// What hears that the pointer rests on a name: (line, byte column, where
+/// its card goes), or nothing once it leaves.
+type SymbolHover<'a, Message> = Box<dyn Fn(Option<(usize, usize, Point)>) -> Message + 'a>;
+
+/// How long the pointer rests on a name before the card is asked for.
+const SYMBOL_DELAY: std::time::Duration = std::time::Duration::from_millis(550);
+
 /// A place of the text in the window: the bottom-left corner of its
 /// character and the height of a row (`None` when out of view).
 pub type Spot = Option<(Point, f32)>;
@@ -354,6 +361,19 @@ pub struct CompletionHook<'a, Message> {
 
 /// A multi-line text input.
 #[allow(missing_debug_implementations)]
+/// What the editor paints on the text besides the text itself.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ViewMarks {
+    /// Vertical lines at each indent step, with their color.
+    pub indent_guides: Option<Color>,
+    /// Dots for the spaces and a line for the tabs, with their color.
+    pub whitespace: Option<Color>,
+    /// A box around the bracket at the cursor and its mate.
+    pub bracket: Option<Color>,
+    /// Columns in a tab.
+    pub tab_width: usize,
+}
+
 pub struct CodeEditor<'a, Highlighter, Message, Theme = iced::Theme>
 where
     Highlighter: text::Highlighter,
@@ -385,9 +405,13 @@ where
     on_definition: Option<Box<dyn Fn() -> Message + 'a>>,
     diagnostics: Option<DiagPaint>,
     on_diagnostic: Option<DiagHover<'a, Message>>,
+    on_symbol: Option<SymbolHover<'a, Message>>,
     /// The list of completions is open: its keys are left to it.
     completion: Option<CompletionHook<'a, Message>>,
     style: Style,
+    marks: ViewMarks,
+    /// Ctrl and the wheel: -1 or 1 for a smaller or larger text.
+    on_zoom: Option<Box<dyn Fn(i32) -> Message + 'a>>,
     on_edit: Option<Box<dyn Fn(Action) -> Message + 'a>>,
     highlighter_settings: Highlighter::Settings,
     highlighter_format: fn(&Highlighter::Highlight, &Theme) -> highlighter::Format<Font>,
@@ -419,6 +443,7 @@ impl<'a, Message, Theme> CodeEditor<'a, highlighter::PlainText, Message, Theme> 
             on_definition: None,
             diagnostics: None,
             on_diagnostic: None,
+            on_symbol: None,
             completion: None,
             style: Style {
                 background: Background::Color(Color::TRANSPARENT),
@@ -426,6 +451,8 @@ impl<'a, Message, Theme> CodeEditor<'a, highlighter::PlainText, Message, Theme> 
                 value: Color::BLACK,
                 selection: Color::BLACK,
             },
+            marks: ViewMarks::default(),
+            on_zoom: None,
             on_edit: None,
             highlighter_settings: (),
             highlighter_format: |_highlight, _theme| highlighter::Format::default(),
@@ -605,8 +632,11 @@ where
             on_definition: self.on_definition,
             diagnostics: self.diagnostics,
             on_diagnostic: self.on_diagnostic,
+            on_symbol: self.on_symbol,
             completion: self.completion,
             style: self.style,
+            marks: self.marks,
+            on_zoom: self.on_zoom,
             on_edit: self.on_edit,
             highlighter_settings: settings,
             highlighter_format: to_format,
@@ -615,6 +645,25 @@ where
 
     pub fn style(mut self, style: Style) -> Self {
         self.style = style;
+        self
+    }
+
+    /// Told when the pointer rests on a name, and when it leaves.
+    pub fn on_symbol_hover(
+        mut self,
+        on_symbol: impl Fn(Option<(usize, usize, Point)>) -> Message + 'a,
+    ) -> Self {
+        self.on_symbol = Some(Box::new(on_symbol));
+        self
+    }
+
+    pub fn marks(mut self, marks: ViewMarks) -> Self {
+        self.marks = marks;
+        self
+    }
+
+    pub fn on_zoom(mut self, on_zoom: impl Fn(i32) -> Message + 'a) -> Self {
+        self.on_zoom = Some(Box::new(on_zoom));
         self
     }
 
@@ -972,6 +1021,58 @@ where
             .next()
     }
 
+    /// The word under a point of the widget: (line, byte where it starts).
+    fn word_at(&self, at: Point, padding: Padding) -> Option<(usize, usize)> {
+        let internal = self.content.0.borrow();
+        let cursor = internal
+            .editor
+            .buffer()
+            .hit(at.x - padding.left, at.y - padding.top)?;
+        let line = internal.editor.line(cursor.line)?;
+        let text = line.text;
+        let word = |c: char| c.is_alphanumeric() || c == '_';
+        let index = cursor.index.min(text.len());
+        if !text.get(index..)?.chars().next().is_some_and(word) {
+            return None;
+        }
+        let start = text[..index]
+            .char_indices()
+            .rev()
+            .take_while(|(_, c)| word(*c))
+            .last()
+            .map_or(index, |(i, _)| i);
+        Some((cursor.line, start))
+    }
+
+    /// Where the card of the name at (`line`, `col`) goes: under it.
+    fn symbol_card_point(
+        &self,
+        line: usize,
+        col: usize,
+        bounds: Rectangle,
+        padding: Padding,
+        renderer: &iced::Renderer,
+    ) -> Option<Point> {
+        let internal = self.content.0.borrow();
+        let row = self
+            .line_height
+            .to_absolute(Pixels(self.size_px(renderer)))
+            .0;
+        let run = internal
+            .editor
+            .buffer()
+            .layout_runs()
+            .find(|run| run.line_i == line && run.line_height > 0.0)?;
+        let (x, _) = run.highlight(
+            Cursor_::new(line, col.min(run.text.len())),
+            Cursor_::new(line, (col + 1).min(run.text.len())),
+        )?;
+        Some(Point::new(
+            bounds.x + padding.left + x,
+            bounds.y + padding.top + run.line_top + row + 2.0,
+        ))
+    }
+
     /// Where (line, byte `col`) is in the window: the bottom-left corner of
     /// its character, and the height of a row; `None` out of view.
     fn anchor_point(
@@ -1205,9 +1306,53 @@ struct Internal {
     /// The cursor must not stay in folded lines: set by an edit or a jump,
     /// acted on once the regions are up to date.
     reveal_cursor: bool,
+    /// The other cursors of a multi-cursor edit, valid while `revision` is
+    /// still `extras_revision` (any other edit makes them stale).
+    extras: Vec<Caret>,
+    extras_revision: u64,
+}
+
+/// A cursor and, if it selects, where the selection started: (line, byte).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Caret {
+    pub position: (usize, usize),
+    pub anchor: Option<(usize, usize)>,
+}
+
+impl Caret {
+    /// The ends of what it selects, in order (both at the cursor if nothing).
+    pub fn span(&self) -> ((usize, usize), (usize, usize)) {
+        match self.anchor {
+            Some(a) if a < self.position => (a, self.position),
+            Some(a) => (self.position, a),
+            None => (self.position, self.position),
+        }
+    }
 }
 
 impl Internal {
+    /// Puts the cursor (and the selection) where `caret` says.
+    fn set_caret(&mut self, caret: Caret) {
+        // `move_to` only ever sets a selection, never clears one.
+        if self.editor.cursor().selection.is_some() {
+            self.editor.perform(Action::Move(Motion::Left));
+        }
+        let at = |(line, column)| Position { line, column };
+        self.editor.move_to(Cursor {
+            position: at(caret.position),
+            selection: caret.anchor.map(at),
+        });
+        self.is_dirty = true;
+    }
+
+    fn main_caret(&self) -> Caret {
+        let c = self.editor.cursor();
+        Caret {
+            position: (c.position.line, c.position.column),
+            anchor: c.selection.map(|s| (s.line, s.column)),
+        }
+    }
+
     /// Brings the blocks up to date with the text, drops the folds that lost
     /// their block, and tells the editor which lines are folded away.
     fn refresh_folds(&mut self, kind: Kind) {
@@ -1295,10 +1440,414 @@ impl Content {
             regions: Arc::default(),
             regions_key: None,
             reveal_cursor: false,
+            extras: Vec::new(),
+            extras_revision: 0,
         }))
     }
 
+    /// Runs an action. With several cursors, an edit or a move applies to
+    /// each of them; a click goes back to one.
     pub fn perform(&mut self, action: Action) {
+        if !self.extra_carets().is_empty() {
+            match &action {
+                Action::Edit(_) | Action::Move(_) | Action::Select(_) => {
+                    self.perform_multi(action, false);
+                    return;
+                }
+                Action::Click(_) | Action::SelectWord | Action::SelectLine => self.clear_extras(),
+                _ => {}
+            }
+        }
+        self.perform_one(action);
+    }
+
+    /// The other cursors, if still valid.
+    pub fn extra_carets(&self) -> Vec<Caret> {
+        let internal = self.0.borrow();
+        if internal.extras_revision == internal.revision {
+            internal.extras.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// How many cursors there are.
+    pub fn cursor_count(&self) -> usize {
+        1 + self.extra_carets().len()
+    }
+
+    pub fn clear_extras(&self) {
+        self.0.borrow_mut().extras.clear();
+    }
+
+    /// A cursor more at (`line`, `col`); on a cursor that is there, it goes.
+    pub fn add_cursor(&self, line: usize, col: usize) {
+        let count = self.line_count();
+        if count == 0 {
+            return;
+        }
+        let line = line.min(count - 1);
+        let col = {
+            let Some(text) = self.line(line) else { return };
+            let mut col = col.min(text.len());
+            while !text.is_char_boundary(col) {
+                col -= 1;
+            }
+            col
+        };
+        let mut extras = self.extra_carets();
+        let before = extras.len();
+        extras.retain(|c| c.position != (line, col));
+        if extras.len() == before && self.cursor_position() != (line, col) {
+            extras.push(Caret {
+                position: (line, col),
+                anchor: None,
+            });
+        }
+        let mut internal = self.0.borrow_mut();
+        internal.extras = extras;
+        internal.extras_revision = internal.revision;
+        internal.is_dirty = true;
+    }
+
+    /// A cursor more where the point (in the text area) is; on a cursor that
+    /// is there, it goes.
+    pub fn add_cursor_at_point(&self, point: Point) {
+        let (main, mut extras) = (self.0.borrow().main_caret(), self.extra_carets());
+        let clicked = {
+            let mut internal = self.0.borrow_mut();
+            internal.editor.perform(Action::Click(point));
+            let clicked = internal.main_caret().position;
+            internal.set_caret(main);
+            clicked
+        };
+        let before = extras.len();
+        extras.retain(|c| c.position != clicked);
+        if extras.len() == before && clicked != main.position {
+            extras.push(Caret {
+                position: clicked,
+                anchor: None,
+            });
+        }
+        let mut internal = self.0.borrow_mut();
+        internal.extras = extras;
+        internal.extras_revision = internal.revision;
+        internal.is_dirty = true;
+    }
+
+    /// Where a point of the text area is, as (line, byte), without moving
+    /// the cursor.
+    pub fn position_at(&self, point: Point) -> (usize, usize) {
+        let mut internal = self.0.borrow_mut();
+        let main = internal.main_caret();
+        internal.editor.perform(Action::Click(point));
+        let at = internal.main_caret().position;
+        internal.set_caret(main);
+        at
+    }
+
+    /// A block of text selected from one place to another: a cursor on each
+    /// line between, selecting the same columns. The cursor is the one of
+    /// the line of `to`.
+    pub fn column_select(&self, from: (usize, usize), to: (usize, usize)) {
+        let chars = |line: usize, byte: usize| {
+            self.line(line).map_or(0, |t| {
+                t.get(..byte.min(t.len())).map_or(0, |p| p.chars().count())
+            })
+        };
+        let (a, b) = (chars(from.0, from.1), chars(to.0, to.1));
+        let (left, right) = (a.min(b), a.max(b));
+        let byte = |line: usize, n: usize| {
+            self.line(line)
+                .map_or(0, |t| t.char_indices().nth(n).map_or(t.len(), |(i, _)| i))
+        };
+        let (top, bottom) = (from.0.min(to.0), from.0.max(to.0));
+        let mut carets: Vec<Caret> = (top..=bottom)
+            .map(|l| {
+                let (start, end) = (byte(l, left), byte(l, right));
+                Caret {
+                    position: (l, end),
+                    anchor: (start != end).then_some((l, start)),
+                }
+            })
+            .collect();
+        // The one of the pointer's line first: it is the cursor.
+        let first = carets
+            .iter()
+            .position(|c| c.position.0 == to.0)
+            .unwrap_or(0);
+        carets.swap(0, first);
+        let mut internal = self.0.borrow_mut();
+        if let Some((main, rest)) = carets.split_first() {
+            internal.set_caret(*main);
+            internal.extras = rest.to_vec();
+        }
+        internal.extras_revision = internal.revision;
+    }
+
+    /// A cursor in the line above (or below) each one, at the same column.
+    pub fn add_cursor_vertically(&self, down: bool) {
+        let mut all = vec![self.0.borrow().main_caret()];
+        all.extend(self.extra_carets());
+        let last = self.line_count().saturating_sub(1);
+        for caret in all {
+            let (line, col) = caret.position;
+            let target = if down {
+                (line < last).then_some(line + 1)
+            } else {
+                line.checked_sub(1)
+            };
+            if let Some(target) = target {
+                self.add_cursor(target, col);
+            }
+        }
+    }
+
+    /// The word under the cursor, or, with a selection, its next occurrence
+    /// after the last cursor (all of them with `all`) gets a cursor with it
+    /// selected.
+    pub fn add_next_occurrence(&mut self, all: bool) {
+        // The selection of a double click is a word the editor tracks, not
+        // two ends: make it a plain one (or select the word at the cursor).
+        let had_selection = self.0.borrow().editor.cursor().selection.is_some();
+        let (line, col) = self.cursor_position();
+        let found = {
+            let Some(text) = self.line(line) else { return };
+            match self
+                .selection()
+                .filter(|s| !s.is_empty() && !s.contains('\n'))
+            {
+                Some(needle) if had_selection => text
+                    .match_indices(needle.as_str())
+                    .map(|(i, _)| i)
+                    .find(|i| *i == col || i + needle.len() == col)
+                    .map(|i| (i, needle.len())),
+                _ => {
+                    let word = |c: char| c.is_alphanumeric() || c == '_';
+                    let col = col.min(text.len());
+                    let start = text[..col]
+                        .char_indices()
+                        .rev()
+                        .take_while(|(_, c)| word(*c))
+                        .last()
+                        .map_or(col, |(i, _)| i);
+                    let end = text[col..]
+                        .char_indices()
+                        .take_while(|(_, c)| word(*c))
+                        .last()
+                        .map_or(col, |(i, c)| col + i + c.len_utf8());
+                    (end > start).then_some((start, end - start))
+                }
+            }
+        };
+        let Some((start, len)) = found else { return };
+        self.select_bytes(line, start, len);
+        if !had_selection && !all {
+            return;
+        }
+        let Some(needle) = self.selection().filter(|s| !s.is_empty()) else {
+            return;
+        };
+        let main = self.0.borrow().main_caret();
+        let mut carets = vec![main];
+        carets.extend(self.extra_carets());
+        let line_count = self.line_count();
+        let mut found: Vec<Caret> = Vec::new();
+        let last = carets.iter().map(|c| c.span().1).max().unwrap_or((0, 0));
+        // From the last cursor to the end, then from the start.
+        let order: Vec<usize> = (last.0..line_count).chain(0..last.0).collect();
+        'lines: for (n, &l) in order.iter().enumerate() {
+            let Some(text) = self.line(l) else { continue };
+            let mut from = if n == 0 { last.1 } else { 0 };
+            while let Some(i) = text.get(from..).and_then(|t| t.find(&needle)) {
+                let start = (l, from + i);
+                let end = (l, from + i + needle.len());
+                from = end.1;
+                if carets.iter().any(|c| c.span().0 == start) {
+                    continue;
+                }
+                found.push(Caret {
+                    position: end,
+                    anchor: Some(start),
+                });
+                if !all {
+                    break 'lines;
+                }
+            }
+        }
+        if found.is_empty() {
+            return;
+        }
+        let mut extras = self.extra_carets();
+        extras.extend(found);
+        let mut internal = self.0.borrow_mut();
+        internal.extras = extras;
+        internal.extras_revision = internal.revision;
+        internal.is_dirty = true;
+    }
+
+    /// What the selections hold, one per line when there are several
+    /// cursors; the selection of the cursor when there is one.
+    pub fn selection_all(&self) -> Option<String> {
+        let extras = self.extra_carets();
+        if extras.is_empty() {
+            return self.selection();
+        }
+        let mut carets = vec![self.0.borrow().main_caret()];
+        carets.extend(extras);
+        carets.sort_by_key(|c| c.span().0);
+        let pieces: Vec<String> = carets
+            .iter()
+            .filter(|c| c.anchor.is_some())
+            .map(|c| {
+                let (a, b) = c.span();
+                self.text_between(a, b)
+            })
+            .collect();
+        (!pieces.is_empty()).then(|| pieces.join("\n"))
+    }
+
+    fn text_between(&self, a: (usize, usize), b: (usize, usize)) -> String {
+        let mut out = String::new();
+        for l in a.0..=b.0 {
+            let Some(text) = self.line(l) else { break };
+            let from = if l == a.0 { a.1.min(text.len()) } else { 0 };
+            let to = if l == b.0 {
+                b.1.min(text.len())
+            } else {
+                text.len()
+            };
+            out.push_str(text.get(from..to).unwrap_or(""));
+            if l < b.0 {
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    fn total_len(&self) -> usize {
+        self.lines().map(|l| l.len() + 1).sum()
+    }
+
+    fn line_starts(&self) -> Vec<usize> {
+        let mut at = 0;
+        self.lines()
+            .map(|l| {
+                let start = at;
+                at += l.len() + 1;
+                start
+            })
+            .collect()
+    }
+
+    /// An action done at every cursor. `auto_indent`: Enter keeps the
+    /// indentation of the line it breaks.
+    pub fn perform_multi(&mut self, action: Action, auto_indent: bool) {
+        let mut all = vec![self.0.borrow().main_caret()];
+        all.extend(self.extra_carets());
+        match action {
+            Action::Edit(edit) => self.multi_edit(all, edit, auto_indent),
+            Action::Move(_) | Action::Select(_) => {
+                let mut moved = Vec::with_capacity(all.len());
+                for caret in all {
+                    self.0.get_mut().set_caret(caret);
+                    self.perform_raw(action.clone());
+                    moved.push(self.0.borrow().main_caret());
+                }
+                self.keep_carets(moved);
+            }
+            other => self.perform_one(other),
+        }
+    }
+
+    /// The first caret becomes the cursor, the others the extra ones (two on
+    /// the same spot are one).
+    fn keep_carets(&mut self, carets: Vec<Caret>) {
+        let mut seen = std::collections::HashSet::new();
+        let carets: Vec<Caret> = carets
+            .into_iter()
+            .filter(|c| seen.insert(c.position))
+            .collect();
+        let internal = self.0.get_mut();
+        if let Some((main, rest)) = carets.split_first() {
+            internal.set_caret(*main);
+            internal.extras = rest.to_vec();
+        }
+        internal.extras_revision = internal.revision;
+    }
+
+    fn multi_edit(&mut self, all: Vec<Caret>, edit: Edit, auto_indent: bool) {
+        let starts = self.line_starts();
+        let offset = |p: (usize, usize)| starts[p.0.min(starts.len() - 1)] + p.1;
+        let start_of = |c: &Caret| offset(c.span().0);
+        let mut ascending: Vec<usize> = (0..all.len()).collect();
+        ascending.sort_by_key(|&i| start_of(&all[i]));
+        // A text with as many lines as cursors goes one line to each.
+        let pieces: Option<Vec<String>> = match &edit {
+            Edit::Paste(text) => {
+                let text = normalize_pasted(text);
+                let lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+                (lines.len() == all.len()).then_some(lines)
+            }
+            _ => None,
+        };
+        let mut piece_of = vec![None; all.len()];
+        if let Some(lines) = pieces {
+            for (rank, &i) in ascending.iter().enumerate() {
+                piece_of[i] = Some(lines[rank].clone());
+            }
+        }
+        // From the last to the first: an edit never moves the ones before.
+        let mut results: Vec<(usize, usize)> = Vec::new();
+        for &i in ascending.iter().rev() {
+            let caret = all[i];
+            let before = self.total_len();
+            self.0.get_mut().set_caret(caret);
+            let (at_line, at_col) = caret.span().0;
+            let indent = match (&edit, auto_indent) {
+                (Edit::Enter, true) => self
+                    .line(at_line)
+                    .map(|l| {
+                        let ws: String =
+                            l.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+                        ws[..ws.len().min(at_col)].to_string()
+                    })
+                    .unwrap_or_default(),
+                _ => String::new(),
+            };
+            let this = match &piece_of[i] {
+                Some(piece) => Edit::Paste(Arc::new(piece.clone())),
+                None => edit.clone(),
+            };
+            self.perform_one(Action::Edit(this));
+            if !indent.is_empty() {
+                self.perform_one(Action::Edit(Edit::Paste(Arc::new(indent))));
+            }
+            let delta = self.total_len() as isize - before as isize;
+            for r in &mut results {
+                r.1 = (r.1 as isize + delta).max(0) as usize;
+            }
+            let here = self.0.borrow().editor.cursor().position;
+            let starts_now = self.line_starts();
+            let at = starts_now.get(here.line).copied().unwrap_or(0) + here.column;
+            results.push((i, at));
+        }
+        results.sort_by_key(|r| r.0);
+        let starts = self.line_starts();
+        let carets: Vec<Caret> = results
+            .into_iter()
+            .map(|(_, at)| {
+                let line = starts.partition_point(|s| *s <= at).saturating_sub(1);
+                Caret {
+                    position: (line, at - starts[line]),
+                    anchor: None,
+                }
+            })
+            .collect();
+        self.keep_carets(carets);
+    }
+
+    pub fn perform_one(&mut self, action: Action) {
         // cosmic-text drops one trailing control character from every pasted
         // segment (meant for the newline), which eats a final tab, and keeps
         // the `\r` of Windows line endings.
@@ -1589,6 +2138,8 @@ struct State<Highlighter: text::Highlighter> {
     partial_scroll: f32,
     /// A drag that started in the minimap.
     minimap_drag: bool,
+    /// Where a block selection started (Alt+Shift and a drag).
+    column_anchor: Option<(usize, usize)>,
     modifiers: keyboard::Modifiers,
     /// The line whose chevron the pointer is on.
     hovered_fold: Option<usize>,
@@ -1601,6 +2152,11 @@ struct State<Highlighter: text::Highlighter> {
     hovered_diag: Option<usize>,
     diag_since: Option<std::time::Instant>,
     diag_shown: bool,
+    /// The name the pointer rests on (line, start of the word), since when,
+    /// and whether its card was asked for.
+    hovered_symbol: Option<(usize, usize)>,
+    symbol_since: Option<std::time::Instant>,
+    symbol_shown: bool,
     /// Where the list of completions and the help on parameters were last
     /// said to be.
     completion_anchor: Option<(Spot, Spot)>,
@@ -1641,6 +2197,7 @@ where
             drag_click: None,
             partial_scroll: 0.0,
             minimap_drag: false,
+            column_anchor: None,
             modifiers: keyboard::Modifiers::default(),
             hovered_fold: None,
             hovered_note: None,
@@ -1648,6 +2205,9 @@ where
             hovered_diag: None,
             diag_since: None,
             diag_shown: false,
+            hovered_symbol: None,
+            symbol_since: None,
+            symbol_shown: false,
             completion_anchor: None,
             highlighter: RefCell::new(Highlighter::new(&self.highlighter_settings)),
             highlighter_settings: self.highlighter_settings.clone(),
@@ -1843,6 +2403,53 @@ where
             }
         }
 
+        if let Some(on_symbol) = &self.on_symbol {
+            let bounds = layout.bounds();
+            // Typing or scrolling closes the card.
+            if state.symbol_shown
+                && matches!(
+                    event,
+                    Event::Keyboard(keyboard::Event::KeyPressed { .. })
+                        | Event::Mouse(mouse::Event::WheelScrolled { .. })
+                        | Event::Mouse(mouse::Event::ButtonPressed(_))
+                )
+            {
+                shell.publish(on_symbol(None));
+                state.symbol_shown = false;
+                state.hovered_symbol = None;
+            }
+            let over = cursor.position_in(bounds).filter(|at| {
+                at.x >= padding.left && at.x < bounds.width - padding.right - MINIMAP_WIDTH
+            });
+            let hovered = over.and_then(|at| self.word_at(at, padding));
+            if hovered != state.hovered_symbol {
+                if state.symbol_shown {
+                    shell.publish(on_symbol(None));
+                    state.symbol_shown = false;
+                }
+                state.hovered_symbol = hovered;
+                state.symbol_since = hovered.map(|_| std::time::Instant::now());
+                if hovered.is_some() {
+                    shell.request_redraw_at(
+                        std::time::Instant::now()
+                            + SYMBOL_DELAY
+                            + std::time::Duration::from_millis(20),
+                    );
+                }
+            } else if let (Some((line, col)), Some(since), false) =
+                (hovered, state.symbol_since, state.symbol_shown)
+            {
+                if since.elapsed() >= SYMBOL_DELAY {
+                    if let Some(point) =
+                        self.symbol_card_point(line, col, bounds, padding, renderer)
+                    {
+                        shell.publish(on_symbol(Some((line, col, point))));
+                        state.symbol_shown = true;
+                    }
+                }
+            }
+        }
+
         if self.folding.is_some() {
             let hovered = cursor
                 .position_in(layout.bounds())
@@ -1958,12 +2565,68 @@ where
             }
         }
 
+        if let (Event::Mouse(mouse::Event::WheelScrolled { delta }), Some(zoom)) =
+            (event, &self.on_zoom)
+        {
+            if state.modifiers.command() && cursor.is_over(layout.bounds()) {
+                let y = match delta {
+                    mouse::ScrollDelta::Lines { y, .. } => *y,
+                    mouse::ScrollDelta::Pixels { y, .. } => *y / 20.0,
+                };
+                if y != 0.0 {
+                    shell.publish(zoom(y.signum() as i32));
+                    shell.capture_event();
+                    return;
+                }
+            }
+        }
+
+        // A block selection follows the pointer.
+        if let (Some(anchor), Event::Mouse(mouse::Event::CursorMoved { .. })) =
+            (state.column_anchor, event)
+        {
+            if let Some(at) = cursor.position_in(layout.bounds()) {
+                let point = at - Vector::new(padding.left, padding.top);
+                self.content
+                    .column_select(anchor, self.content.position_at(point));
+                shell.request_redraw();
+            }
+            shell.capture_event();
+            return;
+        }
+        if let (Some(_), Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))) =
+            (state.column_anchor, event)
+        {
+            state.column_anchor = None;
+            return;
+        }
+
         let Some(update) = Update::from_event(event, state, layout.bounds(), padding, cursor)
         else {
             return;
         };
 
         match update {
+            // Alt, Shift and a click: a block selection starts.
+            Update::Click(click)
+                if state.modifiers.alt()
+                    && state.modifiers.shift()
+                    && click.kind() == mouse::click::Kind::Single =>
+            {
+                state.is_focused = true;
+                let at = self.content.position_at(click.position());
+                state.column_anchor = Some(at);
+                self.content.column_select(at, at);
+                shell.request_redraw();
+            }
+            // Alt and a click: one more cursor there.
+            Update::Click(click)
+                if state.modifiers.alt() && click.kind() == mouse::click::Kind::Single =>
+            {
+                state.is_focused = true;
+                self.content.add_cursor_at_point(click.position());
+                shell.request_redraw();
+            }
             Update::Click(click) => {
                 let action = match click.kind() {
                     mouse::click::Kind::Single => Action::Click(click.position()),
@@ -2008,12 +2671,12 @@ where
                 shell.publish(on_edit(action));
             }
             Update::Copy => {
-                if let Some(selection) = self.content.selection() {
+                if let Some(selection) = self.content.selection_all() {
                     clipboard.write(clipboard::Kind::Standard, selection);
                 }
             }
             Update::Cut => {
-                if let Some(selection) = self.content.selection() {
+                if let Some(selection) = self.content.selection_all() {
                     clipboard.write(clipboard::Kind::Standard, selection);
                     shell.publish(on_edit(Action::Edit(Edit::Delete)));
                 }
@@ -2168,6 +2831,142 @@ where
             }
         }
 
+        // Indent guides, whitespace marks and the bracket pair: monospace
+        // columns, as the page guide.
+        let marks = self.marks;
+        if marks.indent_guides.is_some() || marks.whitespace.is_some() {
+            let cell = size * 0.6;
+            let tab = marks.tab_width.max(1);
+            let mut previous_lead = 0usize;
+            for run in internal.editor.buffer().layout_runs() {
+                if run.line_height <= 0.0 {
+                    continue;
+                }
+                let top = bounds.y + padding.top + run.line_top;
+                let blank = run.text.trim().is_empty();
+                // Width of the indentation, in columns.
+                let mut lead = 0usize;
+                for c in run.text.chars() {
+                    match c {
+                        ' ' => lead += 1,
+                        '\t' => lead += tab - lead % tab,
+                        _ => break,
+                    }
+                }
+                let lead = if blank { previous_lead } else { lead };
+                if !blank {
+                    previous_lead = lead;
+                }
+                if let Some(color) = marks.indent_guides {
+                    let mut col = 0;
+                    while col < lead {
+                        let x = origin.x + col as f32 * cell;
+                        if let Some(rect) = bounds.intersection(&Rectangle {
+                            x,
+                            y: top,
+                            width: 1.0,
+                            height: row_height,
+                        }) {
+                            renderer.fill_quad(
+                                renderer::Quad {
+                                    bounds: rect,
+                                    ..renderer::Quad::default()
+                                },
+                                color,
+                            );
+                        }
+                        col += tab;
+                    }
+                }
+                if let (Some(color), false) = (marks.whitespace, blank && run.text.is_empty()) {
+                    let mut col = 0usize;
+                    for c in run.text.chars() {
+                        let x = origin.x + col as f32 * cell;
+                        match c {
+                            ' ' => {
+                                if x > bounds.x + bounds.width {
+                                    break;
+                                }
+                                if let Some(rect) = bounds.intersection(&Rectangle {
+                                    x: x + cell / 2.0 - 1.0,
+                                    y: top + row_height / 2.0 - 1.0,
+                                    width: 2.0,
+                                    height: 2.0,
+                                }) {
+                                    renderer.fill_quad(
+                                        renderer::Quad {
+                                            bounds: rect,
+                                            ..renderer::Quad::default()
+                                        },
+                                        color,
+                                    );
+                                }
+                                col += 1;
+                            }
+                            '\t' => {
+                                let width = tab - col % tab;
+                                if let Some(rect) = bounds.intersection(&Rectangle {
+                                    x: x + 2.0,
+                                    y: top + row_height / 2.0,
+                                    width: (width as f32 * cell - 4.0).max(1.0),
+                                    height: 1.0,
+                                }) {
+                                    renderer.fill_quad(
+                                        renderer::Quad {
+                                            bounds: rect,
+                                            ..renderer::Quad::default()
+                                        },
+                                        color,
+                                    );
+                                }
+                                col += width;
+                            }
+                            _ => col += 1,
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(color) = marks.bracket {
+            if let Some((a, b)) = bracket_pair(&internal.editor) {
+                for run in internal.editor.buffer().layout_runs() {
+                    if run.line_height <= 0.0 {
+                        continue;
+                    }
+                    let top = bounds.y + padding.top + run.line_top;
+                    for (line, col) in [a, b] {
+                        if run.line_i != line {
+                            continue;
+                        }
+                        let Some((x, width)) =
+                            run.highlight(Cursor_::new(line, col), Cursor_::new(line, col + 1))
+                        else {
+                            continue;
+                        };
+                        if let Some(rect) = bounds.intersection(&Rectangle {
+                            x: origin.x + x,
+                            y: top,
+                            width,
+                            height: row_height,
+                        }) {
+                            renderer.fill_quad(
+                                renderer::Quad {
+                                    bounds: rect,
+                                    border: iced::Border {
+                                        color,
+                                        width: 1.0,
+                                        radius: 2.0.into(),
+                                    },
+                                    ..renderer::Quad::default()
+                                },
+                                Color { a: 0.18, ..color },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(paint) = &self.diagnostics {
             for run in internal.editor.buffer().layout_runs() {
                 if run.line_height <= 0.0 {
@@ -2308,6 +3107,71 @@ where
                             },
                             self.style.selection,
                         );
+                    }
+                }
+            }
+        }
+
+        if state.is_focused && internal.extras_revision == internal.revision {
+            for caret in internal.extras.iter() {
+                let (from, to) = caret.span();
+                for run in internal.editor.buffer().layout_runs() {
+                    if run.line_height <= 0.0 {
+                        continue;
+                    }
+                    let top = bounds.y + padding.top + run.line_top;
+                    if caret.anchor.is_some() && (from.0..=to.0).contains(&run.line_i) {
+                        let a = if run.line_i == from.0 { from.1 } else { 0 };
+                        let b = if run.line_i == to.0 {
+                            to.1
+                        } else {
+                            run.text.len()
+                        };
+                        if let Some((x, width)) =
+                            run.highlight(Cursor_::new(run.line_i, a), Cursor_::new(run.line_i, b))
+                        {
+                            if let Some(rect) = bounds.intersection(&Rectangle {
+                                x: origin.x + x,
+                                y: top,
+                                width,
+                                height: row_height,
+                            }) {
+                                renderer.fill_quad(
+                                    renderer::Quad {
+                                        bounds: rect,
+                                        ..renderer::Quad::default()
+                                    },
+                                    self.style.selection,
+                                );
+                            }
+                        }
+                    }
+                    if caret.position.0 == run.line_i {
+                        let x = if run.glyphs.is_empty() {
+                            Some(0.0)
+                        } else {
+                            run.highlight(
+                                Cursor_::new(run.line_i, caret.position.1),
+                                Cursor_::new(run.line_i, caret.position.1),
+                            )
+                            .map(|(x, _)| x)
+                        };
+                        if let Some(x) = x {
+                            if let Some(rect) = bounds.intersection(&Rectangle {
+                                x: origin.x + x,
+                                y: top + (row_height - caret_height) / 2.0,
+                                width: 2.0,
+                                height: caret_height,
+                            }) {
+                                renderer.fill_quad(
+                                    renderer::Quad {
+                                        bounds: rect,
+                                        ..renderer::Quad::default()
+                                    },
+                                    self.style.value,
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -2877,6 +3741,70 @@ enum Update {
     Paste,
 }
 
+/// The bracket at the cursor (or just before it) and the one it closes or
+/// opens, as (line, byte) positions; it looks a few thousand characters far.
+fn bracket_pair(editor: &Editor) -> Option<((usize, usize), (usize, usize))> {
+    const REACH: usize = 20_000;
+    let cursor = editor.cursor();
+    let (line, col) = (cursor.position.line, cursor.position.column);
+    let text = editor.line(line)?.text.to_string();
+    let after = text
+        .get(col..)
+        .and_then(|t| t.chars().next())
+        .map(|c| (c, col));
+    let before = text
+        .get(..col)
+        .and_then(|t| t.chars().next_back())
+        .map(|c| (c, col - c.len_utf8()));
+    for (ch, at) in [after, before].into_iter().flatten() {
+        let (open, close, forward) = match ch {
+            '(' => ('(', ')', true),
+            '[' => ('[', ']', true),
+            '{' => ('{', '}', true),
+            ')' => ('(', ')', false),
+            ']' => ('[', ']', false),
+            '}' => ('{', '}', false),
+            _ => continue,
+        };
+        let mut depth = 0i32;
+        let mut budget = REACH;
+        if forward {
+            for l in line..editor.line_count() {
+                let t = editor.line(l)?.text.to_string();
+                let from = if l == line { at } else { 0 };
+                for (i, c) in t.get(from..)?.char_indices() {
+                    budget = budget.checked_sub(1)?;
+                    if c == open {
+                        depth += 1;
+                    } else if c == close {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(((line, at), (l, from + i)));
+                        }
+                    }
+                }
+            }
+        } else {
+            for l in (0..=line).rev() {
+                let t = editor.line(l)?.text.to_string();
+                let to = if l == line { at + 1 } else { t.len() };
+                for (i, c) in t.get(..to)?.char_indices().rev() {
+                    budget = budget.checked_sub(1)?;
+                    if c == close {
+                        depth += 1;
+                    } else if c == open {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(((l, i), (line, at)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 impl Update {
     fn from_event<H: Highlighter>(
         event: &Event,
@@ -3153,6 +4081,7 @@ mod tests {
             drag_click: None,
             partial_scroll: 0.0,
             minimap_drag: false,
+            column_anchor: None,
             modifiers: keyboard::Modifiers::default(),
             hovered_fold: None,
             hovered_note: None,
@@ -3161,6 +4090,9 @@ mod tests {
             hovered_diag: None,
             diag_since: None,
             diag_shown: false,
+            hovered_symbol: None,
+            symbol_since: None,
+            symbol_shown: false,
             highlighter: RefCell::new(highlighter::PlainText::new(&())),
             highlighter_settings: (),
             highlighter_format_address: 0,
@@ -3233,5 +4165,140 @@ mod tests {
         assert!(gutter_width(16.0, 999) > gutter_width(16.0, 99));
         assert!(gutter_width(16.0, 9999) > gutter_width(16.0, 999));
         assert!(gutter_width(30.0, 999) > gutter_width(12.0, 999));
+    }
+}
+
+#[cfg(test)]
+mod multi_tests {
+    use super::*;
+
+    fn type_char(content: &mut Content, c: char) {
+        content.perform(Action::Edit(Edit::Insert(c)));
+    }
+
+    #[test]
+    fn typing_goes_to_every_cursor() {
+        let mut content = Content::with_text("a\nb\nc");
+        content.add_cursor(1, 0);
+        content.add_cursor(2, 0);
+        assert_eq!(content.cursor_count(), 3);
+        type_char(&mut content, 'x');
+        assert_eq!(content.text(), "xa\nxb\nxc\n");
+        type_char(&mut content, 'y');
+        assert_eq!(content.text(), "xya\nxyb\nxyc\n");
+        assert_eq!(content.cursor_count(), 3);
+    }
+
+    #[test]
+    fn two_cursors_on_a_line_keep_their_places() {
+        let mut content = Content::with_text("ab cd");
+        content.add_cursor(0, 3);
+        // The cursor is at the start: one before "ab", one before "cd".
+        type_char(&mut content, '-');
+        assert_eq!(content.text(), "-ab -cd\n");
+        content.perform(Action::Edit(Edit::Backspace));
+        assert_eq!(content.text(), "ab cd\n");
+    }
+
+    #[test]
+    fn enter_at_each_cursor_and_backspace_join() {
+        let mut content = Content::with_text("ab\ncd");
+        content.add_cursor(1, 1);
+        content.perform_multi(Action::Edit(Edit::Enter), false);
+        assert_eq!(content.text(), "\nab\nc\nd\n");
+    }
+
+    #[test]
+    fn a_click_goes_back_to_one_cursor() {
+        let mut content = Content::with_text("a\nb");
+        content.add_cursor(1, 0);
+        content.perform(Action::Click(Point::new(1.0, 1.0)));
+        assert_eq!(content.cursor_count(), 1);
+    }
+
+    #[test]
+    fn an_edit_from_elsewhere_makes_the_extra_cursors_stale() {
+        let mut content = Content::with_text("a\nb");
+        content.add_cursor(1, 0);
+        content.perform_one(Action::Edit(Edit::Insert('z')));
+        assert_eq!(content.cursor_count(), 1);
+    }
+
+    #[test]
+    fn the_next_occurrence_gets_a_cursor_and_all_with_all() {
+        let mut content = Content::with_text("foo bar foo\nfoo");
+        content.select_bytes(0, 0, 3);
+        content.add_next_occurrence(false);
+        assert_eq!(content.cursor_count(), 2);
+        content.add_next_occurrence(true);
+        assert_eq!(content.cursor_count(), 3);
+        type_char(&mut content, 'x');
+        assert_eq!(content.text(), "x bar x\nx\n");
+        assert_eq!(content.selection_all(), None);
+    }
+
+    #[test]
+    fn copying_with_several_cursors_gives_a_line_each() {
+        let mut content = Content::with_text("foo bar foo");
+        content.select_bytes(0, 0, 3);
+        content.add_next_occurrence(false);
+        assert_eq!(content.selection_all().as_deref(), Some("foo\nfoo"));
+    }
+
+    #[test]
+    fn a_text_of_as_many_lines_goes_one_to_each_cursor() {
+        let mut content = Content::with_text("a\nb");
+        content.add_cursor(1, 0);
+        content.perform(Action::Edit(Edit::Paste(Arc::new("1\n2".into()))));
+        assert_eq!(content.text(), "1a\n2b\n");
+    }
+
+    #[test]
+    fn cursors_above_and_below() {
+        let mut content = Content::with_text("aa\nbb\ncc");
+        content.select_bytes(1, 1, 0);
+        content.add_cursor_vertically(true);
+        content.add_cursor_vertically(false);
+        assert_eq!(content.cursor_count(), 3);
+    }
+
+    #[test]
+    fn the_bracket_at_the_cursor_finds_its_mate() {
+        let content = Content::with_text("f(a, [b])\n{\n  x\n}");
+        let mut c = content;
+        c.select_bytes(0, 1, 0);
+        let pair = bracket_pair(&c.0.borrow().editor);
+        assert_eq!(pair, Some(((0, 1), (0, 8))));
+        c.select_bytes(0, 9, 0);
+        let pair = bracket_pair(&c.0.borrow().editor);
+        assert_eq!(pair, Some(((0, 1), (0, 8))));
+        c.select_bytes(1, 0, 0);
+        assert_eq!(bracket_pair(&c.0.borrow().editor), Some(((1, 0), (3, 0))));
+        c.select_bytes(2, 2, 0);
+        assert_eq!(bracket_pair(&c.0.borrow().editor), None);
+    }
+}
+
+#[cfg(test)]
+mod column_tests {
+    use super::*;
+
+    #[test]
+    fn a_block_selects_the_same_columns_on_each_line() {
+        let mut content = Content::with_text("abcd\nefgh\nij");
+        content.column_select((0, 1), (2, 2));
+        assert_eq!(content.cursor_count(), 3);
+        assert_eq!(content.selection_all().as_deref(), Some("b\nf\nj"));
+        content.perform(Action::Edit(Edit::Delete));
+        assert_eq!(content.text(), "acd\negh\ni\n");
+    }
+
+    #[test]
+    fn an_empty_block_is_a_column_of_cursors() {
+        let mut content = Content::with_text("abc\nabc");
+        content.column_select((0, 1), (1, 1));
+        assert_eq!(content.cursor_count(), 2);
+        content.perform(Action::Edit(Edit::Insert('-')));
+        assert_eq!(content.text(), "a-bc\na-bc\n");
     }
 }

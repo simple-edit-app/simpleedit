@@ -231,6 +231,36 @@ pub(super) fn matches_text(n: usize) -> String {
     }
 }
 
+/// The comments that call for work in the files of `roots`.
+fn todo_hits(
+    roots: &[PathBuf],
+    exclude: &[String],
+    open: &HashMap<PathBuf, String>,
+) -> Result<Vec<Occurrence>, String> {
+    let files: Vec<PathBuf> = roots
+        .iter()
+        .flat_map(|root| crate::finder::list_files(root, exclude, false))
+        .collect();
+    let options = Options {
+        query: r"\b(?:TODO|FIXME|HACK|XXX|BUG)\b.*".into(),
+        case_sensitive: true,
+        words: false,
+        regex: true,
+        context: Context::InComments,
+        mask: None,
+    };
+    crate::finder::find_occurrences(&files, open, &options, None).map(|found| {
+        found
+            .into_iter()
+            .map(|(hit, replacement)| Occurrence {
+                hit,
+                replacement,
+                excluded: false,
+            })
+            .collect()
+    })
+}
+
 /// "1 file", "3 files".
 pub(super) fn files_text(n: usize) -> String {
     let count = n.to_string();
@@ -487,7 +517,7 @@ impl SimpleEditApp {
 
     /// The texts of the files open in the editor (their unsaved changes are
     /// what is searched and replaced).
-    fn open_texts(&self) -> HashMap<PathBuf, String> {
+    pub(super) fn open_texts(&self) -> HashMap<PathBuf, String> {
         let mut texts: HashMap<PathBuf, String> = self
             .file_cache
             .iter()
@@ -539,6 +569,27 @@ impl SimpleEditApp {
                 .unwrap_or_else(|e| Err(e.to_string()))
             },
             on_done,
+        )
+    }
+
+    /// The TODO, FIXME, HACK, XXX and BUG comments of the projects, to the
+    /// Results panel.
+    pub(super) fn find_todos(&mut self) -> Task<Message> {
+        let roots = self.finder_roots();
+        if roots.is_empty() {
+            self.set_status(t!("finder.no_project"), true);
+            return Task::none();
+        }
+        let exclude = self.config.projects_exclude.clone();
+        let open = self.open_texts();
+        self.set_status(t!("todo.looking"), false);
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || todo_hits(&roots, &exclude, &open))
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()))
+            },
+            Message::TodosFound,
         )
     }
 
@@ -1836,5 +1887,46 @@ mod tests {
         remember(&mut list, "q5");
         assert_eq!(list.len(), HISTORY);
         assert_eq!(list[0], "q5");
+    }
+}
+
+#[cfg(test)]
+mod todo_tests {
+    use super::*;
+
+    #[test]
+    fn comments_that_call_for_work_are_listed_but_not_strings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "// TODO: first\nlet s = \"TODO not this\";\nfn f() {} // FIXME later\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("b.py"), "# HACK: ugly\nx = 1\n").unwrap();
+        let found = todo_hits(&[dir.path().to_path_buf()], &[], &HashMap::new()).unwrap();
+        let mut lines: Vec<(String, usize)> = found
+            .iter()
+            .map(|o| {
+                (
+                    o.hit
+                        .path
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    o.hit.line,
+                )
+            })
+            .collect();
+        lines.sort();
+        assert_eq!(
+            lines,
+            vec![("a.rs".into(), 0), ("a.rs".into(), 2), ("b.py".into(), 0)]
+        );
+        // The text open in the editor counts, not the file.
+        let mut open = HashMap::new();
+        open.insert(dir.path().join("b.py"), "x = 1\n".to_string());
+        let found = todo_hits(&[dir.path().to_path_buf()], &[], &open).unwrap();
+        assert_eq!(found.len(), 2);
     }
 }

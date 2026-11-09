@@ -697,7 +697,7 @@ impl SimpleEditApp {
             .editor
             .language
             .as_deref()
-            .is_some_and(crate::formatter::has_formatter);
+            .is_some_and(crate::formatter::can_format);
         let entries =
             crate::palette::entries(&self.config, has_formatter, self.language_picker_enabled());
         let mut scored: Vec<(i64, Row)> = entries

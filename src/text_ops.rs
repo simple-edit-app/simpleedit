@@ -360,3 +360,322 @@ mod tests {
         assert_eq!(spaces_to_tab_stop("x", 0), 1);
     }
 }
+
+/// What a command on lines does to them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineOp {
+    SortAscending,
+    SortDescending,
+    /// Ignoring the case.
+    SortInsensitive,
+    /// By the number each line starts with (`10 x` after `9 x`).
+    SortNumeric,
+    /// Keeps the first of the identical lines.
+    Unique,
+    Reverse,
+    /// The lines become one, with a space between.
+    Join,
+    TrimTrailing,
+}
+
+/// Applies `op` to lines `first..=last`. Without a selection of several
+/// lines (`first == last`) the commands that need many lines work on the
+/// whole text, and `Join` takes the line below.
+pub fn line_op(text: &str, first: usize, last: usize, op: LineOp) -> String {
+    let (lines, nl) = split(text);
+    let len = lines.len();
+    let (mut first, mut last) = (first.min(len - 1), last.min(len - 1));
+    let whole = first == last && !matches!(op, LineOp::Join | LineOp::TrimTrailing);
+    if whole {
+        (first, last) = (0, len - 1);
+    }
+    if op == LineOp::Join && first == last {
+        if last + 1 >= len {
+            return text.to_string();
+        }
+        last += 1;
+    }
+    if op == LineOp::TrimTrailing && first == last {
+        (first, last) = (0, len - 1);
+    }
+    let mut part: Vec<String> = lines[first..=last].iter().map(|l| l.to_string()).collect();
+    match op {
+        LineOp::SortAscending => part.sort(),
+        LineOp::SortDescending => part.sort_by(|a, b| b.cmp(a)),
+        LineOp::SortInsensitive => part.sort_by_key(|l| l.to_lowercase()),
+        LineOp::SortNumeric => part.sort_by(|a, b| {
+            let number = |l: &str| {
+                let t = l.trim_start();
+                let end = t
+                    .char_indices()
+                    .find(|(i, c)| !(c.is_ascii_digit() || (*i == 0 && *c == '-') || *c == '.'))
+                    .map_or(t.len(), |(i, _)| i);
+                t[..end].parse::<f64>().ok()
+            };
+            match (number(a), number(b)) {
+                (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.cmp(b),
+            }
+        }),
+        LineOp::Unique => {
+            let mut seen = std::collections::HashSet::new();
+            part.retain(|l| seen.insert(l.clone()));
+        }
+        LineOp::Reverse => part.reverse(),
+        LineOp::Join => {
+            let joined = part
+                .iter()
+                .enumerate()
+                .map(|(i, l)| if i == 0 { l.trim_end() } else { l.trim() })
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            part = vec![joined];
+        }
+        LineOp::TrimTrailing => part = part.iter().map(|l| l.trim_end().to_string()).collect(),
+    }
+    let mut out: Vec<String> = lines[..first].iter().map(|l| l.to_string()).collect();
+    out.extend(part);
+    out.extend(lines[last + 1..].iter().map(|l| l.to_string()));
+    join(&out, nl)
+}
+
+/// How a text is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseOp {
+    Upper,
+    Lower,
+    /// Each word starts with a capital.
+    Title,
+    Camel,
+    Pascal,
+    Snake,
+    ScreamingSnake,
+    Kebab,
+}
+
+/// The words of an identifier or a phrase: split at separators and at a
+/// lower-to-upper change (`fooBar` → foo, Bar).
+fn words(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut previous: Option<char> = None;
+    let chars: Vec<char> = text.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        if !c.is_alphanumeric() {
+            if !current.is_empty() {
+                out.push(std::mem::take(&mut current));
+            }
+            previous = None;
+            continue;
+        }
+        let next_lower = chars.get(i + 1).is_some_and(|n| n.is_lowercase());
+        let boundary = c.is_uppercase()
+            && previous.is_some_and(|p| {
+                p.is_lowercase() || p.is_ascii_digit() || (p.is_uppercase() && next_lower)
+            });
+        if boundary && !current.is_empty() {
+            out.push(std::mem::take(&mut current));
+        }
+        current.push(c);
+        previous = Some(c);
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+fn capitalized(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
+        None => String::new(),
+    }
+}
+
+/// `text` written as `op` says.
+pub fn convert_case(text: &str, op: CaseOp) -> String {
+    match op {
+        CaseOp::Upper => text.to_uppercase(),
+        CaseOp::Lower => text.to_lowercase(),
+        CaseOp::Title => {
+            let mut out = String::with_capacity(text.len());
+            let mut start = true;
+            for c in text.chars() {
+                if c.is_alphanumeric() {
+                    if start {
+                        out.extend(c.to_uppercase());
+                    } else {
+                        out.extend(c.to_lowercase());
+                    }
+                    start = false;
+                } else {
+                    out.push(c);
+                    start = !(c == '\'' || c == '’');
+                }
+            }
+            out
+        }
+        CaseOp::Camel | CaseOp::Pascal => {
+            let w = words(text);
+            w.iter()
+                .enumerate()
+                .map(|(i, word)| {
+                    if i == 0 && op == CaseOp::Camel {
+                        word.to_lowercase()
+                    } else {
+                        capitalized(word)
+                    }
+                })
+                .collect()
+        }
+        CaseOp::Snake => words(text)
+            .iter()
+            .map(|w| w.to_lowercase())
+            .collect::<Vec<_>>()
+            .join("_"),
+        CaseOp::ScreamingSnake => words(text)
+            .iter()
+            .map(|w| w.to_uppercase())
+            .collect::<Vec<_>>()
+            .join("_"),
+        CaseOp::Kebab => words(text)
+            .iter()
+            .map(|w| w.to_lowercase())
+            .collect::<Vec<_>>()
+            .join("-"),
+    }
+}
+
+/// How a file seems to be indented: (with spaces, width). `None` when the
+/// lines don't say (fewer than three indented ones).
+pub fn detect_indent(text: &str, tab_width: usize) -> Option<(bool, usize)> {
+    let (mut tabs, mut spaces) = (0usize, 0usize);
+    let mut steps = [0usize; 9];
+    let mut previous = 0usize;
+    for line in text.split('\n').take(4000) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if line.starts_with('\t') {
+            tabs += 1;
+            continue;
+        }
+        let lead = line.len() - line.trim_start_matches(' ').len();
+        if lead > 0 {
+            spaces += 1;
+        }
+        let diff = lead.abs_diff(previous);
+        if lead > 0 && (2..=8).contains(&diff) {
+            steps[diff] += 1;
+        }
+        previous = lead;
+    }
+    if tabs + spaces < 3 {
+        return None;
+    }
+    if tabs > spaces {
+        return Some((false, tab_width));
+    }
+    let (width, votes) = steps
+        .iter()
+        .enumerate()
+        .max_by_key(|(w, n)| (**n, std::cmp::Reverse(*w)))
+        .map(|(w, n)| (w, *n))?;
+    (votes > 0).then_some((true, width))
+}
+
+/// The indentation of every line written with spaces or with tabs, `width`
+/// columns a level (what comes after the indentation is left alone).
+pub fn convert_indent(text: &str, to_spaces: bool, width: usize) -> String {
+    let width = width.max(1);
+    let (lines, nl) = split(text);
+    let out: Vec<String> = lines
+        .iter()
+        .map(|line| {
+            let body = line.trim_start_matches([' ', '\t']);
+            let lead = &line[..line.len() - body.len()];
+            let mut columns = 0;
+            for c in lead.chars() {
+                columns += if c == '\t' {
+                    width - columns % width
+                } else {
+                    1
+                };
+            }
+            let new_lead = if to_spaces {
+                " ".repeat(columns)
+            } else {
+                "\t".repeat(columns / width) + &" ".repeat(columns % width)
+            };
+            format!("{new_lead}{body}")
+        })
+        .collect();
+    join(&out, nl)
+}
+
+#[cfg(test)]
+mod more_tests {
+    use super::*;
+
+    #[test]
+    fn lines_are_sorted_uniqued_reversed_and_joined() {
+        let t = "b\na\nc\na\n";
+        assert_eq!(line_op(t, 0, 0, LineOp::SortAscending), "a\na\nb\nc\n");
+        assert_eq!(line_op(t, 0, 3, LineOp::SortDescending), "c\nb\na\na\n");
+        assert_eq!(line_op(t, 0, 3, LineOp::Unique), "b\na\nc\n");
+        assert_eq!(line_op(t, 1, 2, LineOp::Reverse), "b\nc\na\na\n");
+        assert_eq!(line_op("a\n  b\n c\n", 0, 2, LineOp::Join), "a b c\n");
+        assert_eq!(line_op("a\n  b\nc\n", 0, 0, LineOp::Join), "a b\nc\n");
+        assert_eq!(line_op("a  \nb \n", 0, 1, LineOp::TrimTrailing), "a\nb\n");
+        assert_eq!(
+            line_op("B\na\nC\n", 0, 0, LineOp::SortInsensitive),
+            "a\nB\nC\n"
+        );
+    }
+
+    #[test]
+    fn numeric_sort_puts_nine_before_ten() {
+        assert_eq!(
+            line_op("10 x\n9 x\n-1 x\nz\n", 0, 3, LineOp::SortNumeric),
+            "-1 x\n9 x\n10 x\nz\n"
+        );
+    }
+
+    #[test]
+    fn a_text_changes_case() {
+        assert_eq!(convert_case("fooBar baz", CaseOp::Snake), "foo_bar_baz");
+        assert_eq!(convert_case("foo_bar", CaseOp::Camel), "fooBar");
+        assert_eq!(convert_case("foo-bar", CaseOp::Pascal), "FooBar");
+        assert_eq!(convert_case("fooBar", CaseOp::Kebab), "foo-bar");
+        assert_eq!(convert_case("HTTPServer", CaseOp::Snake), "http_server");
+        assert_eq!(convert_case("foo bar", CaseOp::ScreamingSnake), "FOO_BAR");
+        assert_eq!(convert_case("hello wORLD", CaseOp::Title), "Hello World");
+        assert_eq!(convert_case("Éa", CaseOp::Lower), "éa");
+    }
+
+    #[test]
+    fn indentation_is_detected() {
+        let spaces = "a\n  b\n    c\n  d\ne\n";
+        assert_eq!(detect_indent(spaces, 4), Some((true, 2)));
+        let tabs = "a\n\tb\n\t\tc\n\td\n";
+        assert_eq!(detect_indent(tabs, 4), Some((false, 4)));
+        assert_eq!(detect_indent("a\nb\n", 4), None);
+        let four = "fn x() {\n    a;\n    if b {\n        c;\n    }\n}\n";
+        assert_eq!(detect_indent(four, 2), Some((true, 4)));
+    }
+
+    #[test]
+    fn indentation_converts_both_ways() {
+        let spaces = "a\n    b\n      c\n";
+        assert_eq!(convert_indent(spaces, false, 4), "a\n\tb\n\t  c\n");
+        assert_eq!(
+            convert_indent("a\n\tb\n\t\t c\n", true, 4),
+            "a\n    b\n         c\n"
+        );
+        assert_eq!(convert_indent("x  y\n", false, 2), "x  y\n");
+    }
+}

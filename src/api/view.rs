@@ -10,7 +10,7 @@ use iced::widget::{
 use iced::{Alignment, Color, Element, Length};
 
 use super::http::{class_of, Class, Kind};
-use super::model::{AuthKind, BodyKind, Item, Method, Pair};
+use super::model::{AuthKind, BodyKind, CheckOp, CheckSource, ExtractSource, Item, Method, Pair};
 use super::{
     Act, ApiMsg, ApiTab, AuthField, Dialog, NameFor, ReqSection, RespSection, SideTab, State, Table,
 };
@@ -474,6 +474,12 @@ fn collection_menu(id: u64, dark: bool) -> Element<'static, Message> {
                 api(ApiMsg::AskRename(id, 0))
             ),
             menu_bar::item(
+                t!("api.run_collection").to_string(),
+                None,
+                dark,
+                api(ApiMsg::RunCollection(id))
+            ),
+            menu_bar::item(
                 t!("api.export").to_string(),
                 None,
                 dark,
@@ -737,6 +743,14 @@ pub fn tab<'a>(
         section(format!("{}{body_mark}", t!("api.body")), ReqSection::Body),
         section(format!("{}{auth_mark}", t!("api.auth")), ReqSection::Auth),
         section(t!("api.settings").to_string(), ReqSection::Settings),
+        section(
+            format!(
+                "{} ({})",
+                t!("api.tests"),
+                tab.request.checks.len() + tab.request.extracts.len()
+            ),
+            ReqSection::Tests
+        ),
     ]
     .spacing(2)
     .padding([0, 12]);
@@ -746,6 +760,7 @@ pub fn tab<'a>(
         ReqSection::Body => body_section(path, tab, dark),
         ReqSection::Auth => auth_section(path, tab, dark),
         ReqSection::Settings => settings_section(path, tab, dark),
+        ReqSection::Tests => tests_section(path, tab, dark),
     };
     let request_part = column![
         upper,
@@ -765,6 +780,152 @@ pub fn tab<'a>(
         .width(Length::Fill)
         .height(Length::Fill)
         .style(se_theme::window(dark))
+        .into()
+}
+
+/// The tests of the answer and the values kept from it.
+fn tests_section<'a>(path: &Path, tab: &'a ApiTab, dark: bool) -> Element<'a, Message> {
+    let muted = se_theme::muted_text(dark);
+    let heading = |label: String| text(label).size(12.5).font(se_theme::UI_SEMIBOLD);
+    let field = |placeholder: String, value: &str, width: u16| {
+        text_input(&placeholder, value)
+            .size(12.5)
+            .padding([3, 6])
+            .font(se_theme::MONO)
+            .width(Length::FillPortion(width))
+            .style(se_theme::Field::new(dark).style())
+    };
+    let select = || se_theme::Select { dark };
+    let mut checks = column![heading(t!("api.checks_title").to_string())].spacing(6);
+    for (i, check) in tab.request.checks.iter().enumerate() {
+        let (p_on, p_src, p_name, p_op, p_exp, p_del) = (
+            path.to_path_buf(),
+            path.to_path_buf(),
+            path.to_path_buf(),
+            path.to_path_buf(),
+            path.to_path_buf(),
+            path.to_path_buf(),
+        );
+        checks = checks.push(
+            row![
+                checkbox(check.enabled)
+                    .size(14)
+                    .on_toggle(move |on| say(&p_on, Act::CheckOn(i, on))),
+                pick_list(CheckSource::ALL.to_vec(), Some(check.source), move |s| {
+                    say(&p_src, Act::CheckSource(i, s))
+                })
+                .text_size(12.5)
+                .padding([3, 8])
+                .width(Length::FillPortion(2))
+                .style(select().style())
+                .menu_style(select().menu_style()),
+                field(t!("api.check_name").to_string(), &check.name, 3)
+                    .on_input(move |t| say(&p_name, Act::CheckName(i, t))),
+                pick_list(CheckOp::ALL.to_vec(), Some(check.op), move |o| {
+                    say(&p_op, Act::CheckOp(i, o))
+                })
+                .text_size(12.5)
+                .padding([3, 8])
+                .width(Length::FillPortion(2))
+                .style(select().style())
+                .menu_style(select().menu_style()),
+                field(t!("api.expected").to_string(), &check.expected, 3)
+                    .on_input(move |t| say(&p_exp, Act::CheckExpected(i, t))),
+                button(text("×").size(14).color(muted))
+                    .padding([0, 7])
+                    .on_press(say(&p_del, Act::CheckDel(i)))
+                    .style(ghost(dark, false)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        );
+    }
+    checks = checks.push(
+        button(text(format!("+ {}", t!("api.add_check"))).size(12.5))
+            .padding([3, 10])
+            .on_press(say(path, Act::CheckAdd))
+            .style((se_theme::Outline { dark }).style()),
+    );
+    let mut keeps = column![heading(t!("api.extracts_title").to_string())].spacing(6);
+    for (i, extract) in tab.request.extracts.iter().enumerate() {
+        let (p_on, p_var, p_src, p_path, p_del) = (
+            path.to_path_buf(),
+            path.to_path_buf(),
+            path.to_path_buf(),
+            path.to_path_buf(),
+            path.to_path_buf(),
+        );
+        keeps = keeps.push(
+            row![
+                checkbox(extract.enabled)
+                    .size(14)
+                    .on_toggle(move |on| say(&p_on, Act::ExtractOn(i, on))),
+                field(t!("api.var_name").to_string(), &extract.variable, 2)
+                    .on_input(move |t| say(&p_var, Act::ExtractVar(i, t))),
+                text("←").size(13).color(muted),
+                pick_list(
+                    ExtractSource::ALL.to_vec(),
+                    Some(extract.source),
+                    move |s| { say(&p_src, Act::ExtractFrom(i, s)) }
+                )
+                .text_size(12.5)
+                .padding([3, 8])
+                .width(Length::FillPortion(2))
+                .style(select().style())
+                .menu_style(select().menu_style()),
+                field(t!("api.extract_path").to_string(), &extract.path, 4)
+                    .on_input(move |t| say(&p_path, Act::ExtractPath(i, t))),
+                button(text("×").size(14).color(muted))
+                    .padding([0, 7])
+                    .on_press(say(&p_del, Act::ExtractDel(i)))
+                    .style(ghost(dark, false)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        );
+    }
+    keeps = keeps.push(
+        button(text(format!("+ {}", t!("api.add_extract"))).size(12.5))
+            .padding([3, 10])
+            .on_press(say(path, Act::ExtractAdd))
+            .style((se_theme::Outline { dark }).style()),
+    );
+    column![checks, keeps].spacing(18).padding([4, 0]).into()
+}
+
+/// How the tests went, one line each.
+fn outcomes_view<'a>(view: &'a super::ResponseView, dark: bool) -> Element<'a, Message> {
+    let p = se_theme::palette(dark);
+    if view.outcomes.is_empty() {
+        return container(
+            text(t!("api.tests_none").to_string())
+                .size(12.5)
+                .color(p.muted),
+        )
+        .padding([0, 12])
+        .into();
+    }
+    let mut list = column![].spacing(4).padding([0, 12]);
+    for outcome in &view.outcomes {
+        let mark = if outcome.passed {
+            text("✓").color(p.accent)
+        } else {
+            text("✗").color(se_theme::error_color(dark))
+        };
+        let mut line = row![mark.size(13), text(outcome.label.clone()).size(12.5)].spacing(8);
+        if !outcome.passed {
+            line = line.push(
+                text(format!("({})", outcome.actual))
+                    .size(12)
+                    .font(se_theme::MONO)
+                    .color(p.muted),
+            );
+        }
+        list = list.push(line);
+    }
+    scrollable(list)
+        .style(se_theme::Scrollbar { dark }.style())
+        .height(Length::Fill)
         .into()
 }
 
@@ -1172,12 +1333,22 @@ fn response_view<'a>(path: &Path, tab: &'a ApiTab, dark: bool) -> Element<'a, Me
             format!("{} ({})", t!("api.cookies"), response.cookies.len()),
             RespSection::Cookies
         ),
+        section(
+            format!(
+                "{} ({}/{})",
+                t!("api.tests"),
+                view.outcomes.iter().filter(|o| o.passed).count(),
+                view.outcomes.len()
+            ),
+            RespSection::Tests
+        ),
     ]
     .spacing(6)
     .padding([8, 12])
     .align_y(Alignment::Center);
     let content: Element<Message> = match tab.resp_section {
         RespSection::Body => body_view(path, view, dark),
+        RespSection::Tests => outcomes_view(view, dark),
         RespSection::Headers => {
             let mut list = column![].spacing(4).padding([0, 12]);
             for (k, v) in &response.headers {

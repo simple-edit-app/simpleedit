@@ -3,6 +3,7 @@
 
 use crate::app::Message;
 use crate::config::Config;
+use crate::text_ops::{CaseOp, LineOp};
 
 /// What a palette entry does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +53,27 @@ pub enum PaletteCommand {
     Shortcuts,
     Changelog,
     Quit,
+    Line(crate::text_ops::LineOp),
+    Case(crate::text_ops::CaseOp),
+    /// The indentation of the file, to spaces (`true`) or to tabs.
+    ConvertIndent(bool),
+    SetEncoding,
+    SetLineEnding,
+    SetIndent,
+    RenameSymbol,
+    UndoRename,
+    NewWindow,
+    RunTask,
+    StopTask,
+    ToggleTasks,
+    Todos,
+    CompareClipboard,
+    CompareDisk,
+    CompareFile,
+    SpellFix,
+    SpellLanguages,
+    OpenRemote,
+    HighContrast,
 }
 
 impl PaletteCommand {
@@ -139,6 +161,9 @@ impl PaletteCommand {
             NavForward => T::NavForward,
             ToggleFold => T::ToggleFold,
             Quit => T::Quit,
+            RenameSymbol => T::RenameSymbol,
+            RunTask => T::RunTask,
+            SpellFix => T::SpellFix,
             _ => return None,
         })
     }
@@ -193,6 +218,30 @@ impl PaletteCommand {
             PaletteCommand::Shortcuts => Message::OpenShortcuts,
             PaletteCommand::Changelog => Message::OpenChangelog,
             PaletteCommand::Quit => Message::Quit,
+            PaletteCommand::Line(op) => Message::LineOp(op),
+            PaletteCommand::Case(op) => Message::CaseOp(op),
+            PaletteCommand::ConvertIndent(spaces) => Message::ConvertIndent(spaces),
+            PaletteCommand::SetEncoding => {
+                Message::OpenTextOptions(crate::app::TextOption::Encoding)
+            }
+            PaletteCommand::SetLineEnding => {
+                Message::OpenTextOptions(crate::app::TextOption::LineEnding)
+            }
+            PaletteCommand::SetIndent => Message::OpenTextOptions(crate::app::TextOption::Indent),
+            PaletteCommand::RenameSymbol => Message::RenameSymbol,
+            PaletteCommand::NewWindow => Message::NewWindow,
+            PaletteCommand::RunTask => Message::OpenTaskPicker,
+            PaletteCommand::Todos => Message::OpenTodos,
+            PaletteCommand::SpellFix => Message::SpellFix,
+            PaletteCommand::OpenRemote => Message::OpenRemote,
+            PaletteCommand::HighContrast => Message::ToggleHighContrast,
+            PaletteCommand::SpellLanguages => Message::OpenSpellLanguages,
+            PaletteCommand::CompareClipboard => Message::AskCompareClipboard,
+            PaletteCommand::CompareDisk => Message::CompareDisk,
+            PaletteCommand::CompareFile => Message::ComparePickFile,
+            PaletteCommand::StopTask => Message::TaskStop,
+            PaletteCommand::ToggleTasks => Message::TaskToggle,
+            PaletteCommand::UndoRename => Message::FindUndoReplace,
         }
     }
 }
@@ -467,6 +516,216 @@ pub fn entries(config: &Config, has_formatter: bool, language_enabled: bool) -> 
         entry(
             PaletteCommand::Shortcuts,
             t!("menu.help_shortcuts").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::HighContrast,
+            t!("palette.high_contrast").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::OpenRemote,
+            t!("palette.open_remote").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::SpellFix,
+            t!("palette.spell_fix").to_string(),
+            Some(sh.spell_fix.display()),
+            true,
+        ),
+        entry(
+            PaletteCommand::SpellLanguages,
+            t!("palette.spell_languages").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::CompareFile,
+            t!("palette.compare_file").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::CompareClipboard,
+            t!("palette.compare_clipboard").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::CompareDisk,
+            t!("palette.compare_disk").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::Todos,
+            t!("palette.todos").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::RunTask,
+            t!("palette.run_task").to_string(),
+            Some(sh.run_task.display()),
+            true,
+        ),
+        entry(
+            PaletteCommand::StopTask,
+            t!("palette.stop_task").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::ToggleTasks,
+            t!("palette.toggle_tasks").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::NewWindow,
+            t!("palette.new_window").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::RenameSymbol,
+            t!("palette.rename").to_string(),
+            Some(sh.rename_symbol.display()),
+            true,
+        ),
+        entry(
+            PaletteCommand::UndoRename,
+            t!("rename.undo").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::SetEncoding,
+            t!("palette.set_encoding").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::SetLineEnding,
+            t!("palette.set_line_ending").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::SetIndent,
+            t!("palette.set_indent").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::ConvertIndent(true),
+            t!("palette.indent_spaces").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::ConvertIndent(false),
+            t!("palette.indent_tabs").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::Line(LineOp::SortAscending),
+            t!("palette.sort_asc").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::Line(LineOp::SortDescending),
+            t!("palette.sort_desc").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::Line(LineOp::SortInsensitive),
+            t!("palette.sort_insensitive").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::Line(LineOp::SortNumeric),
+            t!("palette.sort_numeric").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::Line(LineOp::Unique),
+            t!("palette.unique_lines").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::Line(LineOp::Reverse),
+            t!("palette.reverse_lines").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::Line(LineOp::Join),
+            t!("palette.join_lines").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::Line(LineOp::TrimTrailing),
+            t!("palette.trim_trailing").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::Case(CaseOp::Upper),
+            t!("palette.case_upper").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::Case(CaseOp::Lower),
+            t!("palette.case_lower").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::Case(CaseOp::Title),
+            t!("palette.case_title").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::Case(CaseOp::Camel),
+            t!("palette.case_camel").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::Case(CaseOp::Pascal),
+            t!("palette.case_pascal").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::Case(CaseOp::Snake),
+            t!("palette.case_snake").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::Case(CaseOp::ScreamingSnake),
+            t!("palette.case_screaming").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::Case(CaseOp::Kebab),
+            t!("palette.case_kebab").to_string(),
             None,
             true,
         ),

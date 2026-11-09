@@ -57,6 +57,40 @@ impl SimpleEditApp {
                 self.db.designer = Some(Designer::for_new_table(conn, database, schema));
                 Task::none()
             }
+            DbMsg::ShowDiagram(conn, _database, schema) => {
+                let Some(params) = self.db_params(conn, false) else {
+                    return self.db_ask_password(conn);
+                };
+                Task::perform(database::table_columns(params), move |done| {
+                    Message::Db(DbMsg::DiagramLoaded(schema.clone(), done))
+                })
+            }
+            DbMsg::DiagramLoaded(schema, done) => {
+                match done.result {
+                    Ok(catalog) => {
+                        let diagram = database::diagram::build(&catalog, &schema);
+                        if diagram.tables.is_empty() {
+                            self.set_status(t!("db.diagram_empty"), false);
+                        } else {
+                            self.overlay = crate::app::ActiveOverlay::Diagram(Box::new(
+                                crate::app::DiagramView { schema, diagram },
+                            ));
+                        }
+                    }
+                    Err(error) => self.set_status(error, true),
+                }
+                Task::none()
+            }
+            DbMsg::CopyDiagram => {
+                let text = match &self.overlay {
+                    crate::app::ActiveOverlay::Diagram(view) => {
+                        database::diagram::to_mermaid(&view.diagram)
+                    }
+                    _ => return Task::none(),
+                };
+                self.set_status(t!("db.diagram_copied"), false);
+                iced::clipboard::write(text)
+            }
             DbMsg::NewSchema(conn, database) => {
                 self.db.new_schema = Some(NewSchema {
                     conn,

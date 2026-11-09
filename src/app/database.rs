@@ -6,16 +6,18 @@ use iced::Task;
 
 use super::{ActiveOverlay, Message, SimpleEditApp};
 use crate::database::{
-    self, grid, DbMsg, Dialog, Driver, Field, Params, TableTab, TestState, Tree,
+    self, grid, protocol, DbMsg, Dialog, Driver, Field, Params, TableTab, TestState, Tree,
 };
 
 impl SimpleEditApp {
     /// Finds out whether the driver is installed.
     pub(super) fn db_probe_driver(&mut self) -> Task<Message> {
-        Task::perform(
-            database::probe_driver(self.db.driver_path.clone()),
-            |driver| Message::Db(DbMsg::DriverProbed(driver)),
-        )
+        Task::batch(protocol::Dialect::ALL.map(|dialect| {
+            Task::perform(
+                database::probe_driver_of(dialect, self.db.driver_path.clone()),
+                move |driver| Message::Db(DbMsg::DriverProbed(dialect, driver)),
+            )
+        }))
     }
 
     /// The password of a connection that asks every time serves once.
@@ -749,26 +751,26 @@ impl SimpleEditApp {
                 self.db.dialog = None;
                 Task::none()
             }
-            DbMsg::DriverProbed(driver) => {
+            DbMsg::DriverProbed(dialect, driver) => {
                 // A download in progress is not interrupted by a look.
-                if self.db.driver != Driver::Downloading {
-                    self.db.driver = driver;
+                if *self.db.driver_of(dialect) != Driver::Downloading {
+                    self.db.set_driver(dialect, driver);
                 }
                 Task::none()
             }
-            DbMsg::DownloadDriver => {
-                self.db.driver = Driver::Downloading;
-                Task::perform(database::download_driver(), |result| {
-                    Message::Db(DbMsg::DriverDownloaded(result))
+            DbMsg::DownloadDriver(dialect) => {
+                self.db.set_driver(dialect, Driver::Downloading);
+                Task::perform(database::download_driver_of(dialect), move |result| {
+                    Message::Db(DbMsg::DriverDownloaded(dialect, result))
                 })
             }
-            DbMsg::DriverDownloaded(result) => {
+            DbMsg::DriverDownloaded(dialect, result) => {
                 match result {
                     Ok(()) => {
-                        self.db.driver = Driver::Unknown;
+                        self.db.set_driver(dialect, Driver::Unknown);
                         return self.db_probe_driver();
                     }
-                    Err(error) => self.db.driver = Driver::Failed(error),
+                    Err(error) => self.db.set_driver(dialect, Driver::Failed(error)),
                 }
                 Task::none()
             }
@@ -1370,7 +1372,17 @@ impl SimpleEditApp {
                             .save_file()
                             .await?;
                         let target = file.path().to_string_lossy().to_string();
-                        Some(database::export(live, params, table, query, target, format).await)
+                        Some(match format {
+                            "csv" | "json" => {
+                                database::export(live, params, table, query, target, format).await
+                            }
+                            other => {
+                                database::export_converted(
+                                    live, params, table, query, target, other,
+                                )
+                                .await
+                            }
+                        })
                     },
                     move |done| Message::Db(DbMsg::Exported(path.clone(), done)),
                 )
@@ -1456,6 +1468,9 @@ impl SimpleEditApp {
             | DbMsg::CopySelection(..)
             | DbMsg::ShowLinks(_)
             | DbMsg::CloseLinks
+            | DbMsg::ShowDiagram(..)
+            | DbMsg::DiagramLoaded(..)
+            | DbMsg::CopyDiagram
             | DbMsg::TextClose
             | DbMsg::OpenRelated(..)
             | DbMsg::ResizeStart(..)

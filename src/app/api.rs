@@ -9,8 +9,8 @@ use super::{Message, SimpleEditApp};
 use crate::api::model::{Environment, Folder, Item, Pair, Request, Variable};
 use crate::api::store::HistoryEntry;
 use crate::api::{
-    self, curl, http, postman, Act, ApiMsg, ApiTab, AuthField, Dialog, NameFor, Removal,
-    ResponseView, Table,
+    self, checks, curl, http, openapi, postman, Act, ApiMsg, ApiTab, AuthField, Dialog, NameFor,
+    Removal, ResponseView, Table,
 };
 
 /// The time as the history shows it.
@@ -341,6 +341,72 @@ impl SimpleEditApp {
                 };
                 self.api_import(&path, text)
             }
+            ApiMsg::RunCollection(id) => {
+                let Some(collection) = self.api.collection(id) else {
+                    return Task::none();
+                };
+                fn flat(items: &[api::model::Item], out: &mut Vec<Request>) {
+                    for item in items {
+                        match item {
+                            Item::Request(r) => out.push(r.clone()),
+                            Item::Folder(f) => flat(&f.items, out),
+                        }
+                    }
+                }
+                let mut requests = Vec::new();
+                flat(&collection.items, &mut requests);
+                if requests.is_empty() {
+                    return Task::none();
+                }
+                let name = collection.name.clone();
+                self.set_status(
+                    t!("api.running", name = name.as_str(), n = requests.len()),
+                    false,
+                );
+                Task::perform(
+                    checks::run_all(requests, self.api.variables()),
+                    move |(results, kept)| {
+                        Message::Api(ApiMsg::RunDone(name.clone(), results, kept))
+                    },
+                )
+            }
+            ApiMsg::RunDone(name, results, kept) => {
+                let mut lines = Vec::new();
+                let (mut ok, mut bad) = (0, 0);
+                for r in &results {
+                    let good = r.error.is_none() && r.failed.is_empty();
+                    if good {
+                        ok += 1;
+                    } else {
+                        bad += 1;
+                    }
+                    let mark = if good { "✓" } else { "✗" };
+                    let how = match (&r.error, r.status) {
+                        (Some(e), _) => e.clone(),
+                        (None, Some(s)) => {
+                            format!("{s} · {} ms · {}", r.ms, t!("api.run_tests", n = r.passed))
+                        }
+                        _ => String::new(),
+                    };
+                    lines.push(format!("{mark} {} — {how}", r.name));
+                    for f in &r.failed {
+                        lines.push(format!("      ✗ {f}"));
+                    }
+                }
+                lines.insert(
+                    0,
+                    t!("api.run_summary", name = name.as_str(), ok = ok, bad = bad).to_string(),
+                );
+                let mut changed = false;
+                for (variable, value) in kept {
+                    changed |= self.api.set_variable(&variable, &value);
+                }
+                if changed {
+                    self.api.save_environments();
+                }
+                self.api.dialog = Some(Dialog::Report(lines));
+                Task::none()
+            }
             ApiMsg::ExportCollection(id) => {
                 let Some(collection) = self.api.collection(id) else {
                     return Task::none();
@@ -412,7 +478,12 @@ impl SimpleEditApp {
             }
             return Task::none();
         }
-        match postman::import_collection(&text) {
+        let read = if openapi::is_openapi(&text) {
+            openapi::import(&text)
+        } else {
+            postman::import_collection(&text)
+        };
+        match read {
             Ok(imported) => {
                 let mut collection = imported.collection;
                 collection.id = self.api.new_id();
@@ -684,6 +755,7 @@ impl SimpleEditApp {
                 tab.sending = false;
                 tab.abort = None;
                 let request = tab.request.clone();
+                let mut kept: Vec<(String, Result<String, String>)> = Vec::new();
                 let entry = match *result {
                     Ok(response) => {
                         let entry = HistoryEntry {
@@ -693,7 +765,11 @@ impl SimpleEditApp {
                             ms: response.ms,
                             error: None,
                         };
-                        tab.response = Some(ResponseView::new(response));
+                        let outcomes = checks::evaluate(&tab.request.checks, &response, &variables);
+                        kept = checks::extract(&tab.request.extracts, &response);
+                        let mut view = ResponseView::new(response);
+                        view.outcomes = outcomes;
+                        tab.response = Some(view);
                         tab.error = None;
                         tab.resp_section = api::RespSection::Body;
                         entry
@@ -710,7 +786,93 @@ impl SimpleEditApp {
                         }
                     }
                 };
+                // The values asked for go to the environment that is on.
+                let mut notes: Vec<String> = Vec::new();
+                let mut names: Vec<String> = Vec::new();
+                for (name, found) in kept {
+                    match found {
+                        Ok(value) => {
+                            if self.api.set_variable(&name, &value) {
+                                names.push(name);
+                            } else {
+                                notes.push(
+                                    t!("api.value_not_kept", name = name.as_str()).to_string(),
+                                );
+                            }
+                        }
+                        Err(e) => notes.push(format!("{name}: {e}")),
+                    }
+                }
+                if !names.is_empty() {
+                    self.api.save_environments();
+                    notes.insert(
+                        0,
+                        t!("api.kept", names = names.join(", ").as_str()).to_string(),
+                    );
+                }
+                if !notes.is_empty() {
+                    if let Some(tab) = self.api_tabs.get_mut(&path) {
+                        tab.notice = Some(notes.join(" · "));
+                    }
+                }
                 self.api.remember(entry);
+            }
+            Act::CheckAdd => tab.request.checks.push(api::model::Check::default()),
+            Act::CheckDel(i) => {
+                if i < tab.request.checks.len() {
+                    tab.request.checks.remove(i);
+                }
+            }
+            Act::CheckOn(i, on) => {
+                if let Some(c) = tab.request.checks.get_mut(i) {
+                    c.enabled = on;
+                }
+            }
+            Act::CheckSource(i, source) => {
+                if let Some(c) = tab.request.checks.get_mut(i) {
+                    c.source = source;
+                }
+            }
+            Act::CheckName(i, name) => {
+                if let Some(c) = tab.request.checks.get_mut(i) {
+                    c.name = name;
+                }
+            }
+            Act::CheckOp(i, op) => {
+                if let Some(c) = tab.request.checks.get_mut(i) {
+                    c.op = op;
+                }
+            }
+            Act::CheckExpected(i, expected) => {
+                if let Some(c) = tab.request.checks.get_mut(i) {
+                    c.expected = expected;
+                }
+            }
+            Act::ExtractAdd => tab.request.extracts.push(api::model::Extract::default()),
+            Act::ExtractDel(i) => {
+                if i < tab.request.extracts.len() {
+                    tab.request.extracts.remove(i);
+                }
+            }
+            Act::ExtractOn(i, on) => {
+                if let Some(e) = tab.request.extracts.get_mut(i) {
+                    e.enabled = on;
+                }
+            }
+            Act::ExtractVar(i, variable) => {
+                if let Some(e) = tab.request.extracts.get_mut(i) {
+                    e.variable = variable;
+                }
+            }
+            Act::ExtractFrom(i, source) => {
+                if let Some(e) = tab.request.extracts.get_mut(i) {
+                    e.source = source;
+                }
+            }
+            Act::ExtractPath(i, path) => {
+                if let Some(e) = tab.request.extracts.get_mut(i) {
+                    e.path = path;
+                }
             }
             Act::Resp(section) => tab.resp_section = section,
             Act::Pretty(on) => {

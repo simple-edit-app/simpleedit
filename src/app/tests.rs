@@ -761,6 +761,7 @@ mod behavior_tests {
             dirty: false,
             crlf: false,
             final_newline: true,
+            encoding: String::new(),
             stamp: None,
         };
         fs.set_path(&file);
@@ -2960,6 +2961,111 @@ mod behavior_tests {
     }
 
     #[test]
+    fn the_tests_of_a_request_run_on_the_answer_and_its_values_are_kept() {
+        use crate::api::model::{CheckOp, CheckSource, Environment, ExtractSource};
+        use crate::api::{Act, ApiMsg, RespSection};
+        let (mut app, _guard) = api_app();
+        let env = app.api.new_id();
+        app.api.environments.push(Environment {
+            id: env,
+            name: "dev".into(),
+            vars: Vec::new(),
+        });
+        app.api.active_env = Some(env);
+        let _ = app.update(Message::Api(ApiMsg::NewRequest));
+        let path = api_tab_path(&app);
+        let act = |app: &mut SimpleEditApp, a: Act| {
+            let _ = app.update(Message::Api(ApiMsg::Tab(api_tab_path(app), a)));
+        };
+        act(&mut app, Act::Url("localhost:3000/login".into()));
+        act(&mut app, Act::CheckAdd);
+        act(&mut app, Act::CheckAdd);
+        act(&mut app, Act::CheckSource(1, CheckSource::Json));
+        act(&mut app, Act::CheckName(1, "data.name".into()));
+        act(&mut app, Act::CheckOp(1, CheckOp::Equals));
+        act(&mut app, Act::CheckExpected(1, "nobody".into()));
+        act(&mut app, Act::ExtractAdd);
+        act(&mut app, Act::ExtractVar(0, "token".into()));
+        act(&mut app, Act::ExtractPath(0, "data.token".into()));
+        act(&mut app, Act::ExtractAdd);
+        act(&mut app, Act::ExtractVar(1, "type".into()));
+        act(&mut app, Act::ExtractFrom(1, ExtractSource::Header));
+        act(&mut app, Act::ExtractPath(1, "Content-Type".into()));
+        act(&mut app, Act::Send);
+        let token = app.api_tabs[&path].token;
+        act(
+            &mut app,
+            Act::Sent(
+                token,
+                Box::new(Ok(api_answer(
+                    200,
+                    r#"{"data": {"token": "abc", "name": "ann"}}"#,
+                ))),
+            ),
+        );
+        // The default check (status 200) passes, the one on the name fails.
+        let view = app.api_tabs[&path].response.as_ref().unwrap();
+        let passed: Vec<bool> = view.outcomes.iter().map(|o| o.passed).collect();
+        assert_eq!(passed, vec![true, false]);
+        assert_eq!(view.outcomes[1].actual, "ann");
+        // The values went to the environment that is on, for the next requests.
+        let vars = app.api.variables();
+        assert_eq!(vars.get("token").map(String::as_str), Some("abc"));
+        assert_eq!(
+            vars.get("type").map(String::as_str),
+            Some("application/json")
+        );
+        assert!(app.api_tabs[&path]
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("token"));
+        act(&mut app, Act::Resp(RespSection::Tests));
+        // Another answer changes the value; with no environment on, nothing
+        // is kept and it is said.
+        app.api.active_env = None;
+        act(&mut app, Act::Send);
+        let token = app.api_tabs[&path].token;
+        act(
+            &mut app,
+            Act::Sent(
+                token,
+                Box::new(Ok(api_answer(200, r#"{"data": {"token": "xyz"}}"#))),
+            ),
+        );
+        assert!(app.api_tabs[&path]
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("token"));
+        assert_eq!(app.api.variables().get("token"), None);
+        // A test is removed.
+        act(&mut app, Act::CheckDel(0));
+        assert_eq!(app.api_tabs[&path].request.checks.len(), 1);
+    }
+
+    #[test]
+    fn an_openapi_file_is_imported_as_a_collection() {
+        use crate::api::ApiMsg;
+        let (mut app, _guard) = api_app();
+        let spec = r#"{"openapi": "3.0.0", "info": {"title": "Shop"},
+            "servers": [{"url": "https://shop.test"}],
+            "paths": {"/items": {"get": {"summary": "List"}}}}"#;
+        let before = app.api.collections.len();
+        let _ = app.update(Message::Api(ApiMsg::Imported(Some((
+            PathBuf::from("shop.json"),
+            Ok(spec.into()),
+        )))));
+        assert_eq!(app.api.collections.len(), before + 1);
+        let imported = app.api.collections.last().unwrap();
+        assert_eq!((imported.name.as_str(), imported.count()), ("Shop", 1));
+        assert!(app.api.environments.iter().any(|e| e
+            .vars
+            .iter()
+            .any(|v| v.key == "baseUrl" && v.value == "https://shop.test")));
+    }
+
+    #[test]
     fn a_request_opens_in_a_tab_is_sent_and_its_answer_is_read() {
         use crate::api::{Act, ApiMsg};
         let (mut app, _guard) = api_app();
@@ -4588,5 +4694,536 @@ mod look_tests {
             let _ = app.update(Message::Db(DbMsg::Tab(tab)));
             shoot(&app, name);
         }
+    }
+}
+
+#[cfg(test)]
+mod text_command_tests {
+    use super::*;
+    use crate::tabs::{Encoding, LineEnding};
+    use text_editor::{Action, Edit};
+
+    fn app_with(text: &str) -> SimpleEditApp {
+        let mut app = SimpleEditApp::blank(Config::default());
+        let _ = app.restore_session(crate::session::Session::default());
+        let _ = app.update(Message::TabRead(Ok(Loaded {
+            path: PathBuf::from("/tmp/text-command-tests/a.txt"),
+            text: text.into(),
+            format: TextFormat::default(),
+            stamp: None,
+        })));
+        app
+    }
+
+    fn buffer(app: &SimpleEditApp) -> String {
+        crate::editor::buffer_text(&app.editor.content)
+    }
+
+    #[test]
+    fn lines_are_sorted_from_the_menu_of_actions() {
+        let mut app = app_with("b\na\nc\n");
+        let _ = app.update(Message::LineOp(text_ops::LineOp::SortAscending));
+        assert_eq!(buffer(&app), "a\nb\nc\n");
+        // One Ctrl+Z puts them back.
+        let _ = app.update(Message::Undo);
+        assert_eq!(buffer(&app), "b\na\nc\n");
+    }
+
+    #[test]
+    fn the_word_at_the_cursor_changes_case() {
+        let mut app = app_with("fooBar baz\n");
+        let _ = app.update(Message::CaseOp(text_ops::CaseOp::Snake));
+        assert_eq!(buffer(&app), "foo_bar baz\n");
+    }
+
+    #[test]
+    fn indentation_is_found_when_a_file_opens_and_converted_on_request() {
+        let mut app = app_with("a\n  b\n    c\n  d\ne\n");
+        assert_eq!(app.indent(), (true, 2));
+        assert_eq!(app.tab_text(), "  ");
+        let _ = app.update(Message::ConvertIndent(false));
+        assert_eq!(buffer(&app), "a\n\tb\n\t\tc\n\td\ne\n");
+        assert_eq!(app.indent(), (false, 2));
+        assert_eq!(app.tab_text(), "\t");
+        let _ = app.update(Message::SetIndent(true, 8));
+        assert_eq!(app.indent(), (true, 8));
+    }
+
+    #[test]
+    fn the_encoding_and_line_endings_are_chosen_for_the_next_save() {
+        let mut app = app_with("café\n");
+        assert!(!app.is_dirty);
+        let _ = app.update(Message::SetEncoding(Encoding::Latin1));
+        assert_eq!(app.format.encoding, Encoding::Latin1);
+        assert!(app.is_dirty);
+        let _ = app.update(Message::SetLineEnding(LineEnding::Crlf));
+        assert_eq!(app.format.ending, LineEnding::Crlf);
+        // A character the encoding cannot hold: it stays as it was.
+        let mut app = app_with("€\n");
+        let _ = app.update(Message::SetEncoding(Encoding::Latin1));
+        assert_eq!(app.format.encoding, Encoding::Utf8);
+        assert!(app.status_is_error);
+    }
+
+    #[test]
+    fn a_file_is_read_again_in_another_encoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, [b'c', b'a', b'f', 0xe9, b'\n']).unwrap();
+        let mut app = SimpleEditApp::blank(Config::default());
+        let _ = app.restore_session(crate::session::Session::default());
+        let (raw, encoding) = file_io::read_decoded(&path).unwrap();
+        assert_eq!((raw.as_str(), encoding), ("café\n", Encoding::Windows1252));
+        let (text, mut format) = TextFormat::decode(&raw);
+        format.encoding = encoding;
+        let _ = app.update(Message::TabRead(Ok(Loaded {
+            path: path.clone(),
+            text,
+            format,
+            stamp: DiskStamp::of(&path),
+        })));
+        assert_eq!(buffer(&app), "café\n");
+        let _ = app.update(Message::ReloadEncoding(Encoding::Latin9));
+        assert_eq!(app.format.encoding, Encoding::Latin9);
+        // Not UTF-8: it cannot be read that way.
+        let _ = app.update(Message::ReloadEncoding(Encoding::Utf8));
+        assert_eq!(app.format.encoding, Encoding::Latin9);
+        assert!(app.status_is_error);
+    }
+
+    #[test]
+    fn several_cursors_type_together_and_escape_goes_back_to_one() {
+        let mut app = app_with("foo foo\nfoo\n");
+        let _ = app.update(Message::AddNextOccurrence(false));
+        let _ = app.update(Message::AddNextOccurrence(true));
+        assert_eq!(app.editor.content.cursor_count(), 3);
+        let _ = app.update(Message::EditorAction(Action::Edit(Edit::Insert('x'))));
+        assert_eq!(buffer(&app), "x x\nx\n");
+        let _ = app.update(Message::EscapePressed);
+        assert_eq!(app.editor.content.cursor_count(), 1);
+    }
+
+    #[test]
+    fn a_selection_is_surrounded_and_stays_selected() {
+        let mut app = app_with("foo bar\n");
+        app.config.autocomplete_brackets = false;
+        app.editor.content.select_bytes(0, 0, 3);
+        let _ = app.update(Message::EditorAction(Action::Edit(Edit::Insert('('))));
+        assert_eq!(buffer(&app), "(foo) bar\n");
+        assert_eq!(app.editor.content.selection().as_deref(), Some("foo"));
+        // Again, with a quote around what is still selected.
+        let _ = app.update(Message::EditorAction(Action::Edit(Edit::Insert('"'))));
+        assert_eq!(buffer(&app), "(\"foo\") bar\n");
+        assert_eq!(app.editor.content.selection().as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn the_zoom_changes_the_size_of_the_text_within_its_bounds() {
+        let mut app = app_with("a\n");
+        let size = app.config.font_size;
+        let _ = app.update(Message::Zoom(1));
+        assert_eq!(app.config.font_size, size + 1.0);
+        let _ = app.update(Message::Zoom(0));
+        assert_eq!(app.config.font_size, Config::default().font_size);
+        for _ in 0..40 {
+            let _ = app.update(Message::Zoom(-1));
+        }
+        assert_eq!(app.config.font_size, 8.0);
+    }
+}
+
+#[cfg(test)]
+mod large_file_tests {
+    use super::*;
+
+    fn file_of(lines: usize) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.log");
+        let text: String = (0..lines).map(|i| format!("line {i:05}\n")).collect();
+        std::fs::write(&path, text).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn parts_cover_the_file_on_line_boundaries() {
+        let (_dir, path) = file_of(1000);
+        let size = std::fs::metadata(&path).unwrap().len();
+        let (first, start, end) = file_io::read_window(&path, 0, 1000).unwrap();
+        assert_eq!(start, 0);
+        assert!(first.ends_with('\n') && end <= 1000 && end > 900);
+        // The next one begins where the first stopped.
+        let (second, start2, end2) = file_io::read_window(&path, end, 1000).unwrap();
+        assert_eq!(start2, end);
+        assert!(second.starts_with("line "), "{second:?}");
+        assert!(end2 > end);
+        // The last part ends at the end of the file.
+        let (last, _, end) = file_io::read_window(&path, size - 1000, 1000).unwrap();
+        assert_eq!(end, size);
+        assert!(last.ends_with("line 00999\n"));
+        // Going back from a part gives the part just before it.
+        let (before, s, e) = file_io::read_window_before(&path, start2, 1000).unwrap();
+        assert_eq!(e, start2);
+        assert!(s < e && before.ends_with('\n'));
+    }
+
+    #[test]
+    fn a_window_has_every_line_exactly_once_when_walked_through() {
+        let (_dir, path) = file_of(500);
+        let size = std::fs::metadata(&path).unwrap().len();
+        let mut at = 0;
+        let mut all = String::new();
+        while at < size {
+            let (text, start, end) = file_io::read_window(&path, at, 700).unwrap();
+            assert_eq!(start, at, "no gap");
+            assert!(end > start, "progress");
+            all.push_str(&text);
+            at = end;
+        }
+        assert_eq!(all, std::fs::read_to_string(&path).unwrap());
+    }
+
+    #[test]
+    fn a_large_tab_cannot_be_edited_or_saved() {
+        let (_dir, path) = file_of(10);
+        let mut app = SimpleEditApp::blank(Config::default());
+        let _ = app.restore_session(crate::session::Session::default());
+        let _ = app.update(Message::TabRead(Ok(Loaded {
+            path: path.clone(),
+            text: "line\n".into(),
+            format: TextFormat::default(),
+            stamp: None,
+        })));
+        app.large.insert(
+            path,
+            LargeView {
+                start: 0,
+                end: 5,
+                size: 100 * 1024 * 1024,
+            },
+        );
+        let _ = app.update(Message::EditorAction(text_editor::Action::Edit(
+            text_editor::Edit::Insert('x'),
+        )));
+        assert_eq!(crate::editor::buffer_text(&app.editor.content), "line\n");
+        let _ = app.update(Message::SaveFile);
+        assert!(app.status_is_error);
+        // The next part replaces the text, with nothing to undo.
+        let path = app.current_file.clone().unwrap();
+        let _ = app.update(Message::LargeLoaded(path, Ok(("more\n".into(), 5, 10))));
+        assert_eq!(crate::editor::buffer_text(&app.editor.content), "more\n");
+        assert_eq!(app.large_view().unwrap().start, 5);
+        assert!(!app.is_dirty);
+    }
+}
+
+#[cfg(test)]
+mod language_server_tests {
+    use super::*;
+
+    fn app_with(path: &Path, text: &str) -> SimpleEditApp {
+        let mut app = SimpleEditApp::blank(Config::default());
+        let _ = app.restore_session(crate::session::Session::default());
+        let _ = app.update(Message::TabRead(Ok(Loaded {
+            path: path.to_path_buf(),
+            text: text.into(),
+            format: TextFormat::default(),
+            stamp: DiskStamp::of(path),
+        })));
+        app
+    }
+
+    fn edit(line: usize, col: usize, end_col: usize, text: &str) -> crate::lint::Edit {
+        crate::lint::Edit {
+            line,
+            col,
+            end_line: line,
+            end_col,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn a_rename_changes_the_editor_and_the_other_files_and_is_undone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.rs"), dir.path().join("b.rs"));
+        std::fs::write(&a, "let foo = 1;\nfoo + 1;\n").unwrap();
+        std::fs::write(&b, "use foo;\n").unwrap();
+        let mut app = app_with(&a, "let foo = 1;\nfoo + 1;\n");
+        let source = fingerprint(&crate::editor::buffer_text(&app.editor.content));
+        let _ = app.update(Message::Renamed(
+            source,
+            Ok(vec![
+                crate::lsp::FileEdits {
+                    path: a.clone(),
+                    edits: vec![edit(0, 4, 7, "bar"), edit(1, 0, 3, "bar")],
+                },
+                crate::lsp::FileEdits {
+                    path: b.clone(),
+                    edits: vec![edit(0, 4, 7, "bar")],
+                },
+            ]),
+        ));
+        assert_eq!(
+            crate::editor::buffer_text(&app.editor.content),
+            "let bar = 1;\nbar + 1;\n"
+        );
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "use bar;\n");
+        // The editor takes Ctrl+Z; the other files, the action that undoes.
+        let _ = app.update(Message::FindUndoReplace);
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "use foo;\n");
+        let _ = app.update(Message::Undo);
+        assert_eq!(
+            crate::editor::buffer_text(&app.editor.content),
+            "let foo = 1;\nfoo + 1;\n"
+        );
+    }
+
+    #[test]
+    fn a_rename_is_not_applied_to_a_text_that_changed_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.rs");
+        std::fs::write(&a, "let foo = 1;\n").unwrap();
+        let mut app = app_with(&a, "let foo = 1;\n");
+        let _ = app.update(Message::Renamed(
+            0,
+            Ok(vec![crate::lsp::FileEdits {
+                path: a,
+                edits: vec![edit(0, 4, 7, "bar")],
+            }]),
+        ));
+        assert_eq!(
+            crate::editor::buffer_text(&app.editor.content),
+            "let foo = 1;\n"
+        );
+        assert!(app.status_is_error);
+    }
+
+    #[test]
+    fn a_rename_needs_a_name_and_a_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let txt = dir.path().join("a.txt");
+        std::fs::write(&txt, "foo\n").unwrap();
+        let mut app = app_with(&txt, "foo\n");
+        let _ = app.update(Message::RenameSymbol);
+        assert!(app.status_is_error, "plain text has no server");
+        assert_eq!(app.overlay, ActiveOverlay::None);
+        let rs = dir.path().join("a.rs");
+        std::fs::write(&rs, "  \n").unwrap();
+        let mut app = app_with(&rs, "  \n");
+        let _ = app.update(Message::RenameSymbol);
+        assert!(app.status_is_error, "no name under the cursor");
+        let mut app = app_with(&rs, "let foo = 1;\n");
+        app.editor.content.select_bytes(0, 5, 0);
+        let _ = app.update(Message::RenameSymbol);
+        assert_eq!(app.overlay, ActiveOverlay::Rename("foo".into()));
+        let _ = app.update(Message::RenameInput("bar".into()));
+        assert_eq!(app.overlay, ActiveOverlay::Rename("bar".into()));
+        let _ = app.update(Message::CloseOverlay);
+        assert_eq!(app.overlay, ActiveOverlay::None);
+    }
+
+    #[test]
+    fn saving_formats_first_when_asked_and_then_saves() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.rs");
+        std::fs::write(&a, "fn  main( ){}\n").unwrap();
+        let mut app = app_with(&a, "fn  main( ){}\n");
+        app.config.format_on_save = true;
+        let _ = app.update(Message::SaveFile);
+        assert!(app.is_formatting && app.format_on_save_pending);
+        let job = FormatJob {
+            path: Some(a.clone()),
+            source: fingerprint(&crate::editor::buffer_text(&app.editor.content)),
+        };
+        let _ = app.update(Message::FileFormatted(job, Ok("fn main() {}\n".into())));
+        assert!(!app.format_on_save_pending && !app.is_formatting);
+        assert_eq!(
+            crate::editor::buffer_text(&app.editor.content),
+            "fn main() {}\n"
+        );
+        // The save that followed did not ask for another formatting.
+        assert!(!app.skip_format_once);
+        // Off: the save goes straight.
+        app.config.format_on_save = false;
+        let _ = app.update(Message::SaveFile);
+        assert!(!app.format_on_save_pending);
+    }
+
+    #[test]
+    fn a_hover_answer_that_came_late_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.rs");
+        std::fs::write(&a, "x\n").unwrap();
+        let mut app = app_with(&a, "x\n");
+        let at = iced::Point::new(1.0, 2.0);
+        let token = app.symbol_token;
+        let _ = app.update(Message::SymbolHoverLoaded(
+            token,
+            at,
+            Ok(Some("i32".into())),
+        ));
+        assert_eq!(app.symbol_card.as_ref().map(|c| c.1.as_str()), Some("i32"));
+        // The pointer left, then an old answer comes.
+        let _ = app.update(Message::SymbolHover(None));
+        assert!(app.symbol_card.is_none());
+        let _ = app.update(Message::SymbolHoverLoaded(
+            token,
+            at,
+            Ok(Some("old".into())),
+        ));
+        assert!(app.symbol_card.is_none());
+    }
+}
+
+#[cfg(test)]
+mod command_line_tests {
+    use super::*;
+
+    #[test]
+    fn a_file_named_with_a_line_opens_at_that_line_and_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "one\ntwo é three\nfour\n").unwrap();
+        let mut app = SimpleEditApp::blank(Config::default());
+        let _ = app.restore_session(crate::session::Session::default());
+        let loaded = Loaded {
+            path: path.clone(),
+            text: "one\ntwo é three\nfour\n".into(),
+            format: TextFormat::default(),
+            stamp: DiskStamp::of(&path),
+        };
+        let target = crate::ipc::Target {
+            path: path.clone(),
+            line: Some(2),
+            col: Some(6),
+        };
+        let _ = app.update(Message::TargetOpened(target, Ok(loaded)));
+        assert_eq!(app.current_file.as_ref(), Some(&path));
+        // Column 6 of "two é three": after "two é" (the é is two bytes).
+        assert_eq!(app.editor.content.cursor_position(), (1, 6));
+        // A line past the end goes to the last one.
+        let target = crate::ipc::Target {
+            path: path.clone(),
+            line: Some(99),
+            col: None,
+        };
+        let loaded = Loaded {
+            path: path.clone(),
+            text: "one\ntwo é three\nfour\n".into(),
+            format: TextFormat::default(),
+            stamp: None,
+        };
+        let _ = app.update(Message::TargetOpened(target, Ok(loaded)));
+        assert_eq!(app.editor.content.cursor_position().1, 0);
+    }
+}
+
+#[cfg(test)]
+mod diagram_window_tests {
+    use super::*;
+    use crate::database::protocol::{Catalog, TableColumn};
+    use crate::database::{DbMsg, Done};
+
+    #[test]
+    fn the_diagram_of_a_schema_opens_and_is_copied_as_mermaid() {
+        let mut app = SimpleEditApp::blank(Config::default());
+        let _ = app.restore_session(crate::session::Session::default());
+        let catalog = Catalog {
+            columns: vec![TableColumn {
+                schema: "s".into(),
+                table: "t".into(),
+                name: "id".into(),
+                kind: "integer".into(),
+            }],
+            foreign_keys: Vec::new(),
+        };
+        let _ = app.update(Message::Db(DbMsg::DiagramLoaded(
+            "s".into(),
+            Done::ok(catalog),
+        )));
+        let ActiveOverlay::Diagram(view) = &app.overlay else {
+            panic!("the diagram");
+        };
+        assert_eq!(view.schema, "s");
+        assert_eq!(view.diagram.tables.len(), 1);
+        let _ = app.update(Message::Db(DbMsg::CopyDiagram));
+        assert!(!app.status_is_error);
+        // A schema without tables says so and opens nothing.
+        let mut app = SimpleEditApp::blank(Config::default());
+        let _ = app.update(Message::Db(DbMsg::DiagramLoaded(
+            "empty".into(),
+            Done::ok(Catalog::default()),
+        )));
+        assert_eq!(app.overlay, ActiveOverlay::None);
+    }
+}
+
+#[cfg(test)]
+mod keyboard_list_tests {
+    use super::*;
+    use crate::tasks::TaskSpec;
+
+    fn key(app: &mut SimpleEditApp, name: &str) {
+        let _ = app.update(Message::KeyPressed {
+            key: name.to_string(),
+            ctrl: false,
+            shift: false,
+            alt: false,
+        });
+    }
+
+    fn app() -> SimpleEditApp {
+        let mut app = SimpleEditApp::blank(Config::default());
+        let _ = app.restore_session(crate::session::Session::default());
+        app
+    }
+
+    #[test]
+    fn the_arrows_and_enter_pick_a_row_of_a_small_list() {
+        let mut app = app();
+        app.tasks.choices = ["a", "b", "c"]
+            .iter()
+            .map(|name| TaskSpec {
+                name: name.to_string(),
+                command: "true".into(),
+                dir: PathBuf::from("/tmp"),
+            })
+            .collect();
+        let _ = app.update(Message::OpenTextOptions(TextOption::Indent));
+        app.overlay = ActiveOverlay::TaskPicker;
+        // The window just changed: the first row is the one on.
+        let _ = app.update(Message::CloseMenu);
+        assert_eq!(app.overlay_pick, 0);
+        key(&mut app, "ArrowDown");
+        key(&mut app, "ArrowDown");
+        assert_eq!(app.overlay_pick, 2);
+        key(&mut app, "ArrowDown");
+        assert_eq!(app.overlay_pick, 0, "it wraps around");
+        key(&mut app, "ArrowUp");
+        assert_eq!(app.overlay_pick, 2);
+        key(&mut app, "ArrowUp");
+        key(&mut app, "Return");
+        assert_eq!(app.overlay, ActiveOverlay::None, "the row was taken");
+        assert_eq!(app.tasks.task.as_ref().map(|t| t.name.as_str()), Some("b"));
+    }
+
+    #[test]
+    fn enter_takes_the_row_of_the_indentation_list() {
+        let mut app = app();
+        let _ = app.update(Message::OpenTextOptions(TextOption::LineEnding));
+        let _ = app.update(Message::CloseMenu);
+        key(&mut app, "ArrowDown");
+        key(&mut app, "Return");
+        assert_eq!(app.overlay, ActiveOverlay::None);
+        assert_eq!(app.format.ending, crate::tabs::LineEnding::Crlf);
+    }
+
+    #[test]
+    fn a_window_without_a_list_leaves_the_keys_alone() {
+        let mut app = app();
+        assert!(app.overlay_choices().is_empty());
+        let _ = app.update(Message::RenameInput("x".into()));
+        key(&mut app, "ArrowDown");
+        assert_eq!(app.overlay_pick, 0);
     }
 }

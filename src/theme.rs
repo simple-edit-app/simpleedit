@@ -68,6 +68,42 @@ pub fn font_files() -> Vec<std::borrow::Cow<'static, [u8]>> {
     .collect()
 }
 
+/// The theme of the widgets that follow the toolkit's palette (lists,
+/// fields): the high contrast one when it is on.
+pub fn toolkit_theme(dark: bool) -> Theme {
+    if high_contrast() {
+        let p = contrast_palette(dark);
+        return Theme::custom(
+            if dark {
+                "SimpleEdit High Contrast".to_string()
+            } else {
+                "SimpleEdit High Contrast Light".to_string()
+            },
+            iced::theme::Palette {
+                background: p.bg,
+                text: p.text,
+                primary: p.accent,
+                success: if dark {
+                    rgb(0x7D, 0xFF, 0x9A)
+                } else {
+                    rgb(0x00, 0x62, 0x20)
+                },
+                danger: contrast_error(dark),
+                warning: if dark {
+                    rgb(0xFF, 0xE0, 0x6E)
+                } else {
+                    rgb(0x6B, 0x45, 0x00)
+                },
+            },
+        );
+    }
+    if dark {
+        ink_dark()
+    } else {
+        ink_light()
+    }
+}
+
 pub fn ink_dark() -> Theme {
     Theme::custom(
         "SimpleEdit Nocturne".to_string(),
@@ -140,7 +176,67 @@ pub struct Palette {
     pub tabs: Color,
 }
 
+/// The high contrast themes are on: pure black or white, bright accents and
+/// strong borders (at least 7:1 for the text). One switch for the whole app,
+/// since every widget asks for its colors by `palette(dark)`.
+static HIGH_CONTRAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_high_contrast(on: bool) {
+    HIGH_CONTRAST.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn high_contrast() -> bool {
+    HIGH_CONTRAST.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn contrast_palette(dark: bool) -> Palette {
+    if dark {
+        Palette {
+            bg: rgb(0x00, 0x00, 0x00),
+            surface: rgb(0x00, 0x00, 0x00),
+            panel: rgb(0x00, 0x00, 0x00),
+            elevated: rgb(0x14, 0x14, 0x14),
+            hover: rgba(0xFF, 0xFF, 0xFF, 0.18),
+            border: rgb(0x9A, 0x9A, 0x9A),
+            border_strong: rgb(0xFF, 0xFF, 0xFF),
+            text: rgb(0xFF, 0xFF, 0xFF),
+            muted: rgb(0xD6, 0xD6, 0xD6),
+            gutter: rgb(0xC0, 0xC0, 0xC0),
+            accent: rgb(0xFF, 0xD6, 0x0A),
+            accent_ink: rgb(0x00, 0x00, 0x00),
+            accent_soft: rgba(0xFF, 0xD6, 0x0A, 0.24),
+            current_line: rgba(0xFF, 0xFF, 0xFF, 0.14),
+            search_match: rgba(0xFF, 0xD6, 0x0A, 0.5),
+            scrim: rgba(0x00, 0x00, 0x00, 0.8),
+            tabs: rgb(0x0A, 0x0A, 0x0A),
+        }
+    } else {
+        Palette {
+            bg: rgb(0xFF, 0xFF, 0xFF),
+            surface: rgb(0xFF, 0xFF, 0xFF),
+            panel: rgb(0xFF, 0xFF, 0xFF),
+            elevated: rgb(0xFF, 0xFF, 0xFF),
+            hover: rgba(0x00, 0x00, 0x00, 0.16),
+            border: rgb(0x4A, 0x4A, 0x4A),
+            border_strong: rgb(0x00, 0x00, 0x00),
+            text: rgb(0x00, 0x00, 0x00),
+            muted: rgb(0x33, 0x33, 0x33),
+            gutter: rgb(0x40, 0x40, 0x40),
+            accent: rgb(0x00, 0x33, 0xCC),
+            accent_ink: rgb(0xFF, 0xFF, 0xFF),
+            accent_soft: rgba(0x00, 0x33, 0xCC, 0.14),
+            current_line: rgba(0x00, 0x00, 0x00, 0.10),
+            search_match: rgba(0xFF, 0xC8, 0x00, 0.6),
+            scrim: rgba(0x00, 0x00, 0x00, 0.5),
+            tabs: rgb(0xF0, 0xF0, 0xF0),
+        }
+    }
+}
+
 pub fn palette(dark: bool) -> Palette {
+    if high_contrast() {
+        return contrast_palette(dark);
+    }
     if dark {
         Palette {
             bg: rgb(0x19, 0x1A, 0x1C),
@@ -195,7 +291,32 @@ pub struct Syntax {
     pub type_: Color,
 }
 
+fn contrast_syntax(dark: bool) -> Syntax {
+    if dark {
+        Syntax {
+            keyword: rgb(0xFF, 0xB0, 0x80),
+            string: rgb(0x9E, 0xFF, 0xAE),
+            function: rgb(0x8F, 0xD0, 0xFF),
+            number: rgb(0xFF, 0xE0, 0x6E),
+            comment: rgb(0xC8, 0xC8, 0xC8),
+            type_: rgb(0xD8, 0xBC, 0xFF),
+        }
+    } else {
+        Syntax {
+            keyword: rgb(0x9C, 0x2E, 0x00),
+            string: rgb(0x00, 0x62, 0x20),
+            function: rgb(0x00, 0x30, 0xB0),
+            number: rgb(0x6B, 0x45, 0x00),
+            comment: rgb(0x40, 0x40, 0x40),
+            type_: rgb(0x5A, 0x1E, 0xB0),
+        }
+    }
+}
+
 pub fn syntax(dark: bool) -> Syntax {
+    if high_contrast() {
+        return contrast_syntax(dark);
+    }
     if dark {
         Syntax {
             keyword: rgb(0xFF, 0x9B, 0x6B),
@@ -476,7 +597,18 @@ pub fn error_panel(dark: bool) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
+fn contrast_error(dark: bool) -> Color {
+    if dark {
+        rgb(0xFF, 0x80, 0x80)
+    } else {
+        rgb(0xB0, 0x00, 0x20)
+    }
+}
+
 pub fn error_color(dark: bool) -> Color {
+    if high_contrast() {
+        return contrast_error(dark);
+    }
     if dark {
         rgb(0xFF, 0x6B, 0x6B)
     } else {
@@ -1172,6 +1304,34 @@ mod tests {
             }
             // Line numbers are decorative: WCAG asks 3:1 for those.
             assert!(contrast(p.gutter, p.panel) >= 3.0, "gutter (dark: {dark})");
+        }
+    }
+
+    #[test]
+    fn the_high_contrast_themes_reach_seven_to_one_everywhere_it_matters() {
+        for dark in [true, false] {
+            let (p, s) = (contrast_palette(dark), contrast_syntax(dark));
+            for (name, color) in [
+                ("text", p.text),
+                ("muted", p.muted),
+                ("accent", p.accent),
+                ("gutter", p.gutter),
+                ("keyword", s.keyword),
+                ("string", s.string),
+                ("function", s.function),
+                ("number", s.number),
+                ("comment", s.comment),
+                ("type", s.type_),
+                ("error", contrast_error(dark)),
+            ] {
+                assert!(contrast(color, p.panel) >= 7.0, "{name} (dark: {dark})");
+            }
+            // Borders, and the text on a button that is on.
+            assert!(contrast(p.border, p.panel) >= 3.0, "border (dark: {dark})");
+            assert!(
+                contrast(p.accent_ink, p.accent) >= 7.0,
+                "ink (dark: {dark})"
+            );
         }
     }
 

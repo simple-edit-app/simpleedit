@@ -8,10 +8,59 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped when a request or an answer changes; the app only uses a driver
 /// that answers `--protocol` with the same number.
-pub const PROTOCOL: u32 = 18;
+pub const PROTOCOL: u32 = 19;
 
 pub const DEFAULT_PORT: u16 = 5432;
+pub const DEFAULT_MYSQL_PORT: u16 = 3306;
 pub const DEFAULT_SSH_PORT: u16 = 22;
+
+/// The database system a data source is on: each has its own driver.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Dialect {
+    #[default]
+    Postgres,
+    Sqlite,
+    /// MySQL and MariaDB.
+    Mysql,
+}
+
+impl Dialect {
+    pub const ALL: [Dialect; 3] = [Dialect::Postgres, Dialect::Mysql, Dialect::Sqlite];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Dialect::Postgres => "PostgreSQL",
+            Dialect::Sqlite => "SQLite",
+            Dialect::Mysql => "MySQL / MariaDB",
+        }
+    }
+
+    /// The name of its driver program.
+    pub fn driver_name(self) -> &'static str {
+        match self {
+            Dialect::Postgres => "simpleedit-db-postgres",
+            Dialect::Sqlite => "simpleedit-db-sqlite",
+            Dialect::Mysql => "simpleedit-db-mysql",
+        }
+    }
+
+    pub fn default_port(self) -> u16 {
+        match self {
+            Dialect::Postgres => DEFAULT_PORT,
+            Dialect::Mysql => DEFAULT_MYSQL_PORT,
+            Dialect::Sqlite => 0,
+        }
+    }
+
+    /// A name between the quotes the system uses for them.
+    pub fn quote(self, name: &str) -> String {
+        match self {
+            Dialect::Mysql => format!("`{}`", name.replace('`', "``")),
+            _ => quote_ident(name),
+        }
+    }
+}
 
 /// How the user proves who they are to the database.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +162,7 @@ impl Default for Ssh {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Target {
+    pub dialect: Dialect,
     pub host: String,
     pub port: u16,
     pub database: String,

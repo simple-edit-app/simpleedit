@@ -143,9 +143,40 @@ pub enum BlameOption {
     ShowHidden,
 }
 
+/// The diagram of a schema, as the window shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DiagramView {
+    pub schema: String,
+    pub diagram: crate::database::diagram::Diagram,
+}
+
+/// What the status bar's choice windows are about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextOption {
+    Encoding,
+    LineEnding,
+    Indent,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ActiveOverlay {
     None,
+    /// The encoding, line endings or indentation of the file.
+    TextOptions(TextOption),
+    /// The tasks of the project, to pick one.
+    TaskPicker,
+    /// Two texts side by side (their names).
+    Compare(String, String),
+    /// A misspelled word, and what could replace it.
+    Spelling(Box<spelling::Suggestion>),
+    /// The languages of the dictionaries found.
+    SpellLanguages,
+    /// A folder on another machine, to open a file from.
+    Remote(Box<remote_files::RemoteView>),
+    /// The tables of a schema and the keys between them.
+    Diagram(Box<DiagramView>),
+    /// The new name of the symbol under the cursor, being typed.
+    Rename(String),
     /// Search everywhere (Shift twice).
     Everywhere,
     /// The revisions of a file or a folder.
@@ -275,6 +306,62 @@ pub enum Message {
     FindMask(String),
     FindScope(finder::Scope),
     FindPickDir,
+    ToggleHighContrast,
+    OpenRemote,
+    RemoteHost(String),
+    RemoteDir(String),
+    RemoteConnect,
+    RemoteListed(String, Result<(String, Vec<crate::remote::Entry>), String>),
+    RemotePick(String),
+    RemoteDownloaded(
+        crate::remote::RemoteFile,
+        Result<(Vec<u8>, Option<u64>), String>,
+    ),
+    RemoteSent(PathBuf, Result<Option<u64>, String>),
+    SpellFix,
+    SpellReplace(String),
+    SpellAdd,
+    SpellIgnore,
+    OpenSpellLanguages,
+    SpellLanguage(String),
+    CompareClipboard(Option<String>),
+    CompareDisk,
+    ComparePickFile,
+    CompareFilePicked(Result<(PathBuf, String), String>),
+    AskCompareClipboard,
+    OpenTodos,
+    TodosFound(Result<Vec<finder::Occurrence>, String>),
+    OpenTaskPicker,
+    RunTask(usize),
+    TaskEvent(u64, crate::tasks::Event),
+    TaskStop,
+    TaskRerun,
+    TaskClear,
+    TaskToggle,
+    TaskOpenAt(crate::tasks::Location),
+    IpcPoll,
+    TargetOpened(crate::ipc::Target, Result<Loaded, String>),
+    NewWindow,
+    RenameSymbol,
+    RenameInput(String),
+    RenameConfirm,
+    Renamed(u64, Result<Vec<crate::lsp::FileEdits>, String>),
+    SymbolHover(Option<(usize, usize, iced::Point)>),
+    SymbolHoverLoaded(u64, iced::Point, Result<Option<String>, String>),
+    LargeMove(LargeMove),
+    LargeLoaded(PathBuf, Result<(String, u64, u64), String>),
+    LineOp(text_ops::LineOp),
+    CaseOp(text_ops::CaseOp),
+    ConvertIndent(bool),
+    OpenTextOptions(TextOption),
+    SetEncoding(crate::tabs::Encoding),
+    ReloadEncoding(crate::tabs::Encoding),
+    SetLineEnding(crate::tabs::LineEnding),
+    SetIndent(bool, usize),
+    DetectIndent,
+    AddNextOccurrence(bool),
+    AddCursor(bool),
+    Zoom(i32),
     FindDirText(String),
     FindDirChosen(PathBuf),
     FindPreviewAction(text_editor::Action),
@@ -687,7 +774,7 @@ pub enum Message {
 pub struct Flags {
     pub config: Config,
     /// Files named on the command line.
-    pub files: Vec<PathBuf>,
+    pub files: Vec<crate::ipc::Target>,
 }
 
 pub struct SimpleEditApp {
@@ -836,6 +923,31 @@ pub struct SimpleEditApp {
     session_rev: u64,
     /// How the current file stores its text (line endings, final newline).
     format: TextFormat,
+    /// How each file is indented: what it was found to be, or what was
+    /// chosen (spaces or tabs, columns).
+    indents: HashMap<PathBuf, (bool, usize)>,
+    /// The files too large to open whole, in the part being read.
+    large: HashMap<PathBuf, LargeView>,
+    /// The row of the list of the window in front that the keys are on.
+    overlay_pick: usize,
+    /// Which window `overlay_pick` was for.
+    overlay_seen: Option<std::mem::Discriminant<ActiveOverlay>>,
+    /// Saving waits for the formatting that was started for it.
+    format_on_save_pending: bool,
+    /// The save that follows the formatting does not start another.
+    skip_format_once: bool,
+    /// What the language server says of the name under the pointer, and
+    /// where the card goes.
+    symbol_card: Option<(iced::Point, String)>,
+    /// Changes with the pointer and the typing: an answer from before is stale.
+    symbol_token: u64,
+    /// Other commands hand their files to this window.
+    ipc_listening: bool,
+    tasks: tasks::TaskPanel,
+    spell: spelling::SpellState,
+    /// The local copies of remote files, where they came from and the date
+    /// they had there.
+    remote_files: HashMap<PathBuf, (crate::remote::RemoteFile, Option<u64>)>,
     /// State on disk of the current file when it was last read or written,
     /// to notice edits made by other programs.
     disk_stamp: Option<DiskStamp>,
@@ -898,6 +1010,32 @@ const UNDO_TOTAL_BYTES: usize = 256 * 1024 * 1024;
 const UNDO_MAX_STEPS: usize = 100;
 /// Files larger than this are refused instead of freezing the editor.
 const MAX_OPEN_BYTES: u64 = 64 * 1024 * 1024;
+/// A file larger than that is shown in parts of this size, read only.
+const LARGE_WINDOW: u64 = 8 * 1024 * 1024;
+
+/// The part of a large file in the editor: the bytes it covers and the size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LargeView {
+    pub start: u64,
+    pub end: u64,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LargeMove {
+    First,
+    Previous,
+    Next,
+    Last,
+}
+
+fn megabytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
 /// The same limit for pasted text.
 /// A line longer than this makes layout and typing slow.
 const LONG_LINE_BYTES: usize = 20_000;
@@ -1043,6 +1181,18 @@ impl SimpleEditApp {
             rev: 1,
             session_rev: 0,
             format: TextFormat::default(),
+            indents: HashMap::new(),
+            large: HashMap::new(),
+            overlay_pick: 0,
+            overlay_seen: None,
+            format_on_save_pending: false,
+            skip_format_once: false,
+            symbol_card: None,
+            symbol_token: 0,
+            ipc_listening: false,
+            tasks: Default::default(),
+            spell: Default::default(),
+            remote_files: HashMap::new(),
             disk_stamp: None,
             saved_fp: None,
             pending_open: None,
@@ -1108,9 +1258,11 @@ impl SimpleEditApp {
         }
         app.announce_new_version();
 
+        // This window takes the files that other commands name.
+        app.ipc_listening = owner && crate::ipc::listen();
         // Files given on the command line open on top of the session.
-        for path in flags.files {
-            commands.push(Task::perform(read_file(path, true), Message::FileOpened));
+        for target in flags.files {
+            commands.push(app.open_target(target));
         }
         (app, Task::batch(commands))
     }
@@ -1140,7 +1292,7 @@ impl SimpleEditApp {
             .editor
             .language
             .as_deref()
-            .map(crate::formatter::has_formatter)
+            .map(crate::formatter::can_format)
             .unwrap_or(false);
         let state = crate::native_menu::State {
             config: &self.config,
@@ -1350,6 +1502,11 @@ impl SimpleEditApp {
                 }
             }));
         }
+        if self.ipc_listening {
+            subscriptions.push(
+                iced::time::every(std::time::Duration::from_millis(300)).map(|_| Message::IpcPoll),
+            );
+        }
         if self.sidebar_resizing {
             subscriptions.push(iced::event::listen_with(
                 |event, _status, _window| match event {
@@ -1437,6 +1594,7 @@ impl SimpleEditApp {
 
     pub fn view(&self) -> Element<'_, Message> {
         let dark = self.config.dark_mode;
+        se_theme::set_high_contrast(self.config.high_contrast);
 
         let title_bar = crate::menu_bar::view(&self.config, self.open_menu);
 
@@ -1486,8 +1644,9 @@ impl SimpleEditApp {
             language: self.editor.language.as_deref(),
             selection: selection_info,
             file_size: self.file_size,
-            use_spaces: self.config.use_spaces,
-            tab_width: self.config.tab_width,
+            use_spaces: self.indent().0,
+            tab_width: self.indent().1,
+            encoding: self.format.encoding.label(),
             branch: self
                 .git
                 .status
@@ -1594,6 +1753,9 @@ impl SimpleEditApp {
         if self.results.open && !self.results.tabs.is_empty() {
             panel = panel.push(self.results_view(dark));
         }
+        if self.tasks.open {
+            panel = panel.push(self.tasks_panel(dark));
+        }
         let editor_panel = container(panel.push(status_bar))
             .width(Length::Fill)
             .height(Length::Fill)
@@ -1668,7 +1830,7 @@ impl SimpleEditApp {
                 .editor
                 .language
                 .as_deref()
-                .map(crate::formatter::has_formatter)
+                .map(crate::formatter::can_format)
                 .unwrap_or(false);
             let lang_override_enabled = self.language_picker_enabled();
             let dropdown = crate::menu_bar::dropdown_view(
@@ -1727,6 +1889,13 @@ impl SimpleEditApp {
         };
         let with_dropdown: Element<Message> =
             crate::floating::at_point(with_dropdown, card, card_at.x, card_at.y);
+        // What the language server says of the name under the pointer.
+        let (said_at, said): (iced::Point, Element<Message>) = match self.symbol_card(dark) {
+            Some(open) => open,
+            None => (iced::Point::ORIGIN, Space::new().into()),
+        };
+        let with_dropdown: Element<Message> =
+            crate::floating::at_point(with_dropdown, said, said_at.x, said_at.y);
         // The list of completions, under the word being typed; its layer
         // is always there too, for the same reason.
         let (list_at, list): (iced::Point, Element<Message>) = match self.completion_view(dark) {
@@ -1960,6 +2129,14 @@ impl SimpleEditApp {
                     ),
                     ActiveOverlay::GotoLine => self.view_goto_line_overlay(dark),
                     ActiveOverlay::LanguagePicker => self.view_language_picker_overlay(dark),
+                    ActiveOverlay::TextOptions(which) => self.view_text_options(dark, *which),
+                    ActiveOverlay::Rename(name) => self.view_rename(dark, name),
+                    ActiveOverlay::TaskPicker => self.view_task_picker(dark),
+                    ActiveOverlay::Compare(left, right) => self.view_compare(dark, left, right),
+                    ActiveOverlay::Spelling(found) => self.view_spelling(dark, found),
+                    ActiveOverlay::SpellLanguages => self.view_spell_languages(dark),
+                    ActiveOverlay::Remote(view) => self.view_remote(dark, view),
+                    ActiveOverlay::Diagram(view) => self.view_diagram(dark, view),
                     ActiveOverlay::Shortcuts => self.view_shortcuts_overlay(dark),
                     ActiveOverlay::Conflicts => self.git.conflicts_card(dark),
                     ActiveOverlay::ConfirmOverwrite(path) => {
@@ -2036,11 +2213,8 @@ impl SimpleEditApp {
     }
 
     pub fn theme(&self) -> Theme {
-        if self.config.dark_mode {
-            se_theme::ink_dark()
-        } else {
-            se_theme::ink_light()
-        }
+        se_theme::set_high_contrast(self.config.high_contrast);
+        se_theme::toolkit_theme(self.config.dark_mode)
     }
 }
 
@@ -2053,7 +2227,7 @@ impl Message {
             Message::Git(msg) => msg.is_background(),
             Message::Db(msg) => matches!(
                 msg,
-                crate::database::DbMsg::Scrolled(..) | crate::database::DbMsg::DriverProbed(_)
+                crate::database::DbMsg::Scrolled(..) | crate::database::DbMsg::DriverProbed(..)
             ),
             Message::History(msg) => msg.is_background(),
             Message::BlameLoaded(..) | Message::MarksBase(..) => true,
@@ -2144,6 +2318,8 @@ impl SimpleEditApp {
 
         match message {
             Message::EditorAction(action) => {
+                self.symbol_card = None;
+                self.symbol_token += 1;
                 self.git.typing = false;
                 self.tree_focus = false;
                 self.results.focus = false;
@@ -2155,7 +2331,8 @@ impl SimpleEditApp {
                 }
                 // Without a tab there is nothing to edit (the next one is
                 // still being read).
-                if self.current_file.is_none() && action.is_edit() {
+                if (self.current_file.is_none() || self.large_view().is_some()) && action.is_edit()
+                {
                     return Task::none();
                 }
                 // Lines added or removed by an edit move the bookmarks below.
@@ -2284,6 +2461,10 @@ impl SimpleEditApp {
                 }
                 Task::none()
             }
+            Message::SaveFile if self.large_view().is_some() => {
+                self.set_status(t!("large.read_only"), true);
+                Task::none()
+            }
             Message::SaveFile => {
                 // A request of the API panel is kept in its collection.
                 if let Some(path) = self
@@ -2292,6 +2473,21 @@ impl SimpleEditApp {
                     .filter(|p| self.api_tabs.contains_key(p))
                 {
                     return self.api_message(crate::api::ApiMsg::Tab(path, crate::api::Act::Save));
+                }
+                // Format first, when asked to: the save follows the formatting.
+                let skip_format = std::mem::take(&mut self.skip_format_once);
+                if self.config.format_on_save
+                    && !skip_format
+                    && !self.is_formatting
+                    && self.format_target().is_some()
+                    && self
+                        .editor
+                        .language
+                        .as_deref()
+                        .is_some_and(crate::formatter::can_format)
+                {
+                    self.format_on_save_pending = true;
+                    return self.handle(Message::FormatFile);
                 }
                 self.fix_before_save();
                 if let Some(path) = self.current_file.clone() {
@@ -2415,7 +2611,8 @@ impl SimpleEditApp {
                         } else {
                             Task::none()
                         };
-                        return Task::batch([panel, self.refresh_diff_tabs()]);
+                        let sent = self.remote_send(&path);
+                        return Task::batch([panel, self.refresh_diff_tabs(), sent]);
                     }
                     Err(e) if e == CANCELLED => self.autosaving = false,
                     Err(e) => {
@@ -3202,6 +3399,380 @@ impl SimpleEditApp {
                 self.load_scope_files()
             }
             Message::FindDirText(text) => self.finder_dir_typed(text),
+            Message::OpenRemote => self.open_remote(),
+            Message::RemoteHost(host) => {
+                if let ActiveOverlay::Remote(view) = &mut self.overlay {
+                    view.host = host;
+                }
+                Task::none()
+            }
+            Message::RemoteDir(dir) => {
+                if let ActiveOverlay::Remote(view) = &mut self.overlay {
+                    view.dir = dir;
+                }
+                Task::none()
+            }
+            Message::RemoteConnect => self.remote_connect(),
+            Message::RemoteListed(host, result) => self.remote_listed(host, result),
+            Message::RemotePick(name) => self.remote_pick(name),
+            Message::RemoteDownloaded(file, result) => self.remote_downloaded(file, result),
+            Message::RemoteSent(path, result) => self.remote_sent(path, result),
+            Message::SpellFix => self.open_spell_fix(),
+            Message::SpellReplace(word) => self.spell_replace(word),
+            Message::SpellAdd => self.spell_learn(true),
+            Message::SpellIgnore => self.spell_learn(false),
+            Message::OpenSpellLanguages => self.open_spell_languages(),
+            Message::SpellLanguage(code) => self.spell_set_language(code),
+            Message::AskCompareClipboard => iced::clipboard::read().map(Message::CompareClipboard),
+            Message::CompareClipboard(text) => self.compare_with_clipboard(text),
+            Message::CompareDisk => self.compare_with_disk(),
+            Message::ComparePickFile => self.compare_pick_file(),
+            Message::CompareFilePicked(result) => self.compare_with_file(result),
+            Message::OpenTodos => self.find_todos(),
+            Message::TodosFound(result) => {
+                match result {
+                    Ok(hits) if hits.is_empty() => self.set_status(t!("todo.none"), false),
+                    Ok(hits) => {
+                        let n = hits.len();
+                        let title = t!("todo.title", n = n).to_string();
+                        self.results_add(title, None, hits);
+                        self.set_status(t!("todo.found", n = n), false);
+                    }
+                    Err(e) => self.set_status(format!("{}: {e}", t!("status.error")), true),
+                }
+                Task::none()
+            }
+            Message::OpenTaskPicker => self.open_task_picker(),
+            Message::RunTask(index) => {
+                self.overlay = ActiveOverlay::None;
+                match self.tasks.choices.get(index).cloned() {
+                    Some(task) => self.start_task(task),
+                    None => Task::none(),
+                }
+            }
+            Message::TaskEvent(run, event) => self.task_event(run, event),
+            Message::TaskStop => self.task_stop(),
+            Message::TaskRerun => match self.tasks.task.clone() {
+                Some(task) => self.start_task(task),
+                None => Task::none(),
+            },
+            Message::TaskClear => {
+                self.tasks.lines.clear();
+                Task::none()
+            }
+            Message::TaskToggle => {
+                self.tasks.open = !self.tasks.open && self.tasks.task.is_some();
+                Task::none()
+            }
+            Message::TaskOpenAt(at) => self.task_open_at(at),
+            Message::IpcPoll => {
+                let mut tasks = Vec::new();
+                for batch in crate::ipc::take() {
+                    for target in batch {
+                        tasks.push(self.open_target(target));
+                    }
+                    // The window comes forward for the file it was given.
+                    tasks.push(iced::window::latest().and_then(iced::window::gain_focus));
+                }
+                Task::batch(tasks)
+            }
+            Message::TargetOpened(target, result) => {
+                let opened = result.as_ref().ok().map(|l| l.path.clone());
+                let task = self.handle(Message::FileOpened(result));
+                if let (Some(path), Some(line)) = (opened, target.line) {
+                    if self.current_file.as_ref() == Some(&path) {
+                        let col = target.col.unwrap_or(1).saturating_sub(1);
+                        let row = line
+                            .saturating_sub(1)
+                            .min(self.editor.content.line_count().saturating_sub(1));
+                        let col = self
+                            .editor
+                            .content
+                            .line(row)
+                            .map_or(0, |l| byte_of_char(&l, col));
+                        self.editor.content.select_bytes(row, col, 0);
+                    }
+                }
+                task
+            }
+            Message::NewWindow => {
+                let started = std::env::current_exe()
+                    .and_then(|exe| std::process::Command::new(exe).arg("--new-window").spawn());
+                if let Err(e) = started {
+                    self.set_status(format!("{}: {e}", t!("status.error")), true);
+                }
+                Task::none()
+            }
+            Message::RenameSymbol => {
+                if self
+                    .editor
+                    .language
+                    .as_deref()
+                    .is_none_or(|e| crate::lsp::server_of(e).is_none())
+                {
+                    self.set_status(t!("rename.no_server"), true);
+                    return Task::none();
+                }
+                let word = self.word_at_cursor();
+                if word.is_empty() {
+                    self.set_status(t!("rename.no_name"), true);
+                    return Task::none();
+                }
+                self.overlay = ActiveOverlay::Rename(word);
+                Task::batch([
+                    iced::widget::operation::focus(rename_field_id()),
+                    iced::widget::operation::select_all(rename_field_id()),
+                ])
+            }
+            Message::RenameInput(name) => {
+                if let ActiveOverlay::Rename(current) = &mut self.overlay {
+                    *current = name;
+                }
+                Task::none()
+            }
+            Message::RenameConfirm => {
+                let ActiveOverlay::Rename(name) =
+                    std::mem::replace(&mut self.overlay, ActiveOverlay::None)
+                else {
+                    return Task::none();
+                };
+                let name = name.trim().to_string();
+                let (Some(path), Some(ext)) =
+                    (self.current_file.clone(), self.editor.language.clone())
+                else {
+                    return Task::none();
+                };
+                if name.is_empty() || name == self.word_at_cursor() {
+                    return Task::none();
+                }
+                let text = crate::editor::buffer_text(&self.editor.content);
+                let (line, col) = self.editor.content.cursor_position();
+                let source = fingerprint(&text);
+                self.set_status(t!("rename.title"), false);
+                Task::perform(
+                    async move { crate::lsp::rename(&ext, &path, &text, line, col, &name).await },
+                    move |result| Message::Renamed(source, result),
+                )
+            }
+            Message::Renamed(source, result) => self.renamed(source, result),
+            Message::SymbolHover(over) => {
+                self.symbol_card = None;
+                self.symbol_token += 1;
+                let (Some((line, col, at)), Some(path), Some(ext)) = (
+                    over,
+                    self.current_file.clone().filter(|p| !is_untitled(p)),
+                    self.editor.language.clone(),
+                ) else {
+                    return Task::none();
+                };
+                if !self.lint.hover.is_none()
+                    || self.large_view().is_some()
+                    || crate::lsp::server_of(&ext).is_none()
+                {
+                    return Task::none();
+                }
+                let text = crate::editor::buffer_text(&self.editor.content);
+                let token = self.symbol_token;
+                Task::perform(
+                    async move { crate::lsp::hover(&ext, &path, &text, line, col).await },
+                    move |result| Message::SymbolHoverLoaded(token, at, result),
+                )
+            }
+            Message::SymbolHoverLoaded(token, at, result) => {
+                if let (true, Ok(Some(said))) = (token == self.symbol_token, result) {
+                    self.symbol_card = Some((at, said));
+                }
+                Task::none()
+            }
+            Message::LargeMove(to) => {
+                let (Some(path), Some(view)) = (self.current_file.clone(), self.large_view())
+                else {
+                    return Task::none();
+                };
+                let past_end = view.end >= view.size && to == LargeMove::Next;
+                let before_start = view.start == 0 && to == LargeMove::Previous;
+                if past_end || before_start {
+                    self.set_status(t!("large.err_end"), false);
+                    return Task::none();
+                }
+                Task::perform(
+                    async move {
+                        let moved = path.clone();
+                        let result = tokio::task::spawn_blocking(move || match to {
+                            LargeMove::First => file_io::read_window(&moved, 0, LARGE_WINDOW),
+                            LargeMove::Next => file_io::read_window(&moved, view.end, LARGE_WINDOW),
+                            LargeMove::Previous => {
+                                file_io::read_window_before(&moved, view.start, LARGE_WINDOW)
+                            }
+                            LargeMove::Last => file_io::read_window(
+                                &moved,
+                                view.size.saturating_sub(LARGE_WINDOW),
+                                LARGE_WINDOW,
+                            ),
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()));
+                        (path, result)
+                    },
+                    |(path, result)| Message::LargeLoaded(path, result),
+                )
+            }
+            Message::LargeLoaded(path, result) => {
+                match result {
+                    Ok((text, start, end)) if self.current_file.as_ref() == Some(&path) => {
+                        if let Some(view) = self.large.get_mut(&path) {
+                            view.start = start;
+                            view.end = end;
+                        }
+                        self.replace_buffer_text(&text);
+                        self.restore_cursor(0, 0);
+                        self.undo_stack = History::default();
+                        self.redo_stack = History::default();
+                        self.is_dirty = false;
+                        self.saved_fp = Some(fingerprint(&text));
+                        self.text_rev += 1;
+                    }
+                    Ok(_) => {}
+                    Err(e) => self.set_status(format!("{}: {e}", t!("status.error")), true),
+                }
+                Task::none()
+            }
+            Message::LineOp(op) => {
+                if self.editing_blocked() {
+                    return Task::none();
+                }
+                let text = crate::editor::buffer_text(&self.editor.content);
+                let span = self.selection_span();
+                let (first, last) = self.lines_to_edit(span);
+                let new_text = text_ops::line_op(&text, first, last, op);
+                self.apply_line_edit(&text, new_text, 0, span)
+            }
+            Message::CaseOp(op) => {
+                if self.editing_blocked() {
+                    return Task::none();
+                }
+                if self.editor.content.selection().is_none() {
+                    self.editor.content.perform(text_editor::Action::SelectWord);
+                }
+                let Some(selected) = self.editor.content.selection_all() else {
+                    return Task::none();
+                };
+                let converted = text_ops::convert_case(&selected, op);
+                if converted == selected {
+                    return Task::none();
+                }
+                self.push_undo();
+                self.undo_new_group = true;
+                self.edited(|app| {
+                    app.editor.content.perform(text_editor::Action::Edit(
+                        text_editor::Edit::Paste(std::sync::Arc::new(converted)),
+                    ));
+                });
+                self.is_dirty = true;
+                Task::none()
+            }
+            Message::ConvertIndent(to_spaces) => {
+                if self.editing_blocked() {
+                    return Task::none();
+                }
+                let text = crate::editor::buffer_text(&self.editor.content);
+                let width = self.indent().1;
+                let new_text = text_ops::convert_indent(&text, to_spaces, width);
+                if let Some(path) = self.current_file.clone() {
+                    self.indents.insert(path, (to_spaces, width));
+                }
+                let (line, col) = self.editor.content.cursor_position();
+                self.apply_text_edit(new_text, line, col, None)
+            }
+            Message::OpenTextOptions(which) => {
+                self.overlay = ActiveOverlay::TextOptions(which);
+                Task::none()
+            }
+            Message::SetEncoding(encoding) => {
+                self.overlay = ActiveOverlay::None;
+                let text = crate::editor::buffer_text(&self.editor.content);
+                let mut format = self.format;
+                format.encoding = encoding;
+                if format.encode_bytes(&text).is_none() {
+                    self.set_status(t!("status.err_encoding", name = encoding.label()), true);
+                    return Task::none();
+                }
+                if self.format != format {
+                    self.format = format;
+                    self.is_dirty = true;
+                }
+                Task::none()
+            }
+            Message::ReloadEncoding(encoding) => {
+                self.overlay = ActiveOverlay::None;
+                let Some(path) = self.current_file.clone().filter(|p| p.is_file()) else {
+                    self.set_status(t!("status.err_no_file"), true);
+                    return Task::none();
+                };
+                if self.is_dirty {
+                    self.set_status(t!("status.err_reload_dirty"), true);
+                    return Task::none();
+                }
+                let Some(raw) = std::fs::read(&path)
+                    .ok()
+                    .and_then(|bytes| encoding.decode(&bytes))
+                else {
+                    self.set_status(t!("status.err_decode", name = encoding.label()), true);
+                    return Task::none();
+                };
+                let (text, mut format) = TextFormat::decode(&raw);
+                format.encoding = encoding;
+                self.apply_reload(Loaded {
+                    stamp: DiskStamp::of(&path),
+                    path,
+                    text,
+                    format,
+                });
+                Task::none()
+            }
+            Message::SetLineEnding(ending) => {
+                self.overlay = ActiveOverlay::None;
+                if self.format.ending != ending {
+                    self.format.ending = ending;
+                    self.is_dirty = true;
+                }
+                Task::none()
+            }
+            Message::SetIndent(spaces, width) => {
+                self.overlay = ActiveOverlay::None;
+                if let Some(path) = self.current_file.clone() {
+                    self.indents.insert(path, (spaces, width));
+                }
+                Task::none()
+            }
+            Message::DetectIndent => {
+                self.overlay = ActiveOverlay::None;
+                if let Some(path) = self.current_file.clone() {
+                    let text = crate::editor::buffer_text(&self.editor.content);
+                    match text_ops::detect_indent(&text, self.config.tab_width) {
+                        Some(found) => self.indents.insert(path, found),
+                        None => self.indents.remove(&path),
+                    };
+                }
+                Task::none()
+            }
+            Message::AddNextOccurrence(all) => {
+                self.editor.content.add_next_occurrence(all);
+                Task::none()
+            }
+            Message::AddCursor(down) => {
+                self.editor.content.add_cursor_vertically(down);
+                Task::none()
+            }
+            Message::Zoom(step) => {
+                self.config.font_size = if step == 0 {
+                    Config::default().font_size
+                } else {
+                    (self.config.font_size + step as f32).clamp(8.0, 32.0)
+                };
+                self.config.save();
+                Task::none()
+            }
             Message::FindDirChosen(dir) => {
                 self.finder.menu = None;
                 self.handle(Message::FindDirPicked(Some(dir)))
@@ -3450,6 +4021,12 @@ impl SimpleEditApp {
                 let dark = !self.config.dark_mode;
                 self.handle(Message::ThemeChanged(dark))
             }
+            Message::ToggleHighContrast => {
+                self.config.high_contrast = !self.config.high_contrast;
+                se_theme::set_high_contrast(self.config.high_contrast);
+                self.config.save();
+                Task::none()
+            }
             Message::ThemeChanged(dark) => {
                 self.config.dark_mode = dark;
                 self.config.save();
@@ -3624,6 +4201,11 @@ impl SimpleEditApp {
                     return Task::none();
                 }
                 if let Some(ext) = self.editor.language.clone() {
+                    if !crate::formatter::can_format(&ext) {
+                        self.format_on_save_pending = false;
+                        self.set_status(t!("status.err_no_formatter"), true);
+                        return Task::none();
+                    }
                     self.is_formatting = true;
                     self.set_status(t!("status.formatting"), false);
                     let content = crate::editor::buffer_text(&self.editor.content);
@@ -3632,8 +4214,17 @@ impl SimpleEditApp {
                         source: fingerprint(&content),
                     };
                     let target = self.format_target();
+                    let (spaces, width) = self.indent();
                     Task::perform(
-                        crate::formatter::format(content, ext, target),
+                        async move {
+                            if crate::formatter::has_formatter(&ext) {
+                                crate::formatter::format(content, ext, target).await
+                            } else if let Some(path) = target {
+                                crate::lsp::format(&ext, &path, &content, spaces, width).await
+                            } else {
+                                Err(t!("status.err_no_formatter").to_string())
+                            }
+                        },
                         move |result| Message::FileFormatted(job.clone(), result),
                     )
                 } else {
@@ -3678,27 +4269,14 @@ impl SimpleEditApp {
                 }
             }
             Message::FileFormatted(job, result) => {
-                self.is_formatting = false;
-                // The user moved on, or kept typing: the result describes text
-                // that is no longer there.
-                let current = self.current_file == job.path
-                    && fingerprint(&crate::editor::buffer_text(&self.editor.content)) == job.source;
-                if !current {
-                    self.set_status(t!("status.format_stale"), true);
-                    return Task::none();
+                let save_after = std::mem::take(&mut self.format_on_save_pending);
+                let task = self.file_formatted(job, result);
+                if save_after {
+                    self.skip_format_once = true;
+                    Task::batch([task, self.handle(Message::SaveFile)])
+                } else {
+                    task
                 }
-                match result {
-                    Ok(formatted) => {
-                        let (line, col) = self.editor.content.cursor_position();
-                        self.format_error = None;
-                        self.show_error_panel = false;
-                        self.set_status(t!("status.formatted"), false);
-                        let formatted = TextFormat::decode(&formatted).0;
-                        return self.apply_text_edit(formatted, line, col, None);
-                    }
-                    Err(e) => self.show_format_error(e),
-                }
-                Task::none()
             }
             Message::SelectionFormatted(job, result) => {
                 self.is_formatting = false;
@@ -4074,6 +4652,27 @@ impl SimpleEditApp {
                     }
                     return Task::none();
                 }
+                // The small lists (language, encoding, tasks, spelling…): the
+                // arrows go through them and Enter takes the row.
+                let choices = self.overlay_choices();
+                if !choices.is_empty() && !ctrl && !alt {
+                    match key.as_str() {
+                        "ArrowDown" => {
+                            self.overlay_pick = (self.overlay_pick + 1) % choices.len();
+                            return Task::none();
+                        }
+                        "ArrowUp" => {
+                            self.overlay_pick =
+                                (self.overlay_pick + choices.len() - 1) % choices.len();
+                            return Task::none();
+                        }
+                        "Return" => {
+                            let message = choices[self.overlay_pick.min(choices.len() - 1)].clone();
+                            return self.handle(message);
+                        }
+                        _ => {}
+                    }
+                }
                 // The finder cards: arrows move in the list.
                 if self.overlay == ActiveOverlay::FindInFiles {
                     return match (key.as_str(), ctrl, alt) {
@@ -4206,7 +4805,14 @@ impl SimpleEditApp {
                 };
                 let sh = &self.config.shortcuts;
                 // Order matters: Ctrl+Shift+S must be tried before Ctrl+S.
-                let bindings: [(&ShortcutConfig, Message); 39] = [
+                let bindings: [(&ShortcutConfig, Message); 46] = [
+                    (&sh.spell_fix, Message::SpellFix),
+                    (&sh.run_task, Message::OpenTaskPicker),
+                    (&sh.rename_symbol, Message::RenameSymbol),
+                    (&sh.add_next_occurrence, Message::AddNextOccurrence(false)),
+                    (&sh.select_all_occurrences, Message::AddNextOccurrence(true)),
+                    (&sh.add_cursor_above, Message::AddCursor(false)),
+                    (&sh.add_cursor_below, Message::AddCursor(true)),
                     (&sh.complete, Message::CompletionInvoke),
                     (&sh.parameter_info, Message::HintInvoke),
                     (&sh.toggle_git, Message::ToggleGit),
@@ -4260,6 +4866,13 @@ impl SimpleEditApp {
                     .or_else(|| sc_check(&sh.quit).then_some(Message::Quit));
                 match msg {
                     Some(m) => self.check_search_focus_then(m),
+                    // Ctrl and + / - / 0: the size of the text.
+                    None if ctrl && !alt => match key.as_str() {
+                        "=" | "+" => self.handle(Message::Zoom(1)),
+                        "-" => self.handle(Message::Zoom(-1)),
+                        "0" => self.handle(Message::Zoom(0)),
+                        _ => Task::none(),
+                    },
                     None => Task::none(),
                 }
             }
@@ -4538,7 +5151,7 @@ impl SimpleEditApp {
                     first,
                     last,
                     &self.indent_unit(),
-                    self.config.tab_width,
+                    self.indent().1,
                 );
                 self.apply_line_edit(&text, new_text, 0, span)
             }
@@ -4586,6 +5199,11 @@ impl SimpleEditApp {
             Message::EscapePressed => {
                 // A table cell being typed in, or a date being picked.
                 if self.db_escape() {
+                    return Task::none();
+                }
+                // Several cursors go back to one.
+                if self.overlay == ActiveOverlay::None && self.editor.content.cursor_count() > 1 {
+                    self.editor.content.clear_extras();
                     return Task::none();
                 }
                 // Innermost first: the list of completions, a pending
@@ -4794,8 +5412,16 @@ impl SimpleEditApp {
     /// edit, so editing commands (Tab, line operations) must leave the buffer
     /// alone. A hidden editor (Preview mode) counts: the user can't see what
     /// they would change.
+    /// The large file in front, with the part it shows.
+    fn large_view(&self) -> Option<LargeView> {
+        self.current_file
+            .as_ref()
+            .and_then(|p| self.large.get(p).copied())
+    }
+
     fn editing_blocked(&self) -> bool {
         self.current_file.is_none()
+            || self.large_view().is_some()
             || self.show_preferences
             || !matches!(self.overlay, ActiveOverlay::None)
             || (self.view_mode == ViewMode::Preview && self.preview_kind().is_some())
@@ -4811,10 +5437,19 @@ impl SimpleEditApp {
         }
     }
 
+    /// How the file in front is indented: (spaces, columns of a level).
+    fn indent(&self) -> (bool, usize) {
+        self.current_file
+            .as_ref()
+            .and_then(|p| self.indents.get(p).copied())
+            .unwrap_or((self.config.use_spaces, self.config.tab_width))
+    }
+
     /// One level of indentation, per the tab settings.
     fn indent_unit(&self) -> String {
-        if self.config.use_spaces {
-            " ".repeat(self.config.tab_width)
+        let (spaces, width) = self.indent();
+        if spaces {
+            " ".repeat(width)
         } else {
             "\t".to_string()
         }
@@ -4822,7 +5457,8 @@ impl SimpleEditApp {
 
     /// What the Tab key types: spaces up to the next tab stop, or a tab.
     fn tab_text(&self) -> String {
-        if !self.config.use_spaces {
+        let (spaces, width) = self.indent();
+        if !spaces {
             return "\t".to_string();
         }
         let (line, col) = self.editor.content.cursor_position();
@@ -4832,7 +5468,7 @@ impl SimpleEditApp {
             .line(line)
             .map(|l| l[..floor_boundary(&l, col)].to_string())
             .unwrap_or_default();
-        " ".repeat(text_ops::spaces_to_tab_stop(&before, self.config.tab_width))
+        " ".repeat(text_ops::spaces_to_tab_stop(&before, width))
     }
 
     /// Whether `edit` would change the buffer: Backspace at the very start
@@ -4861,6 +5497,29 @@ impl SimpleEditApp {
     /// then the action itself.
     fn editor_action(&mut self, action: text_editor::Action) -> Task<Message> {
         let is_edit = action.is_edit();
+
+        // With several cursors the edit is done at each (Enter keeps the
+        // indentation, the rest is plain).
+        if self.editor.content.cursor_count() > 1
+            && matches!(
+                action,
+                text_editor::Action::Edit(_)
+                    | text_editor::Action::Move(_)
+                    | text_editor::Action::Select(_)
+            )
+        {
+            if is_edit {
+                self.push_undo();
+                self.undo_new_group = true;
+                self.editor
+                    .content
+                    .perform_multi(action, self.config.auto_indent);
+                self.is_dirty = true;
+            } else {
+                self.editor.content.perform_multi(action, false);
+            }
+            return Task::none();
+        }
 
         if is_edit {
             if let text_editor::Action::Edit(edit) = &action {
@@ -5395,6 +6054,36 @@ impl SimpleEditApp {
         };
         let is_quote = matches!(ch, '"' | '\'' | '`');
         let is_closer = matches!(ch, ')' | ']' | '}');
+        // A selection is surrounded rather than replaced, whether or not the
+        // brackets and quotes complete themselves; the selection stays on the
+        // text. (The undo step was opened by `editor_action`.)
+        let markdown = matches!(self.editor.language.as_deref(), Some("md") | None);
+        let wrap = match ch {
+            '<' => Some('>'),
+            '*' | '_' | '~' if markdown => Some(ch),
+            _ => closer.or(is_quote.then_some(ch)),
+        };
+        if let (Some(close), Some(selected), Some(range)) = (
+            wrap,
+            self.editor.content.selection(),
+            self.editor.content.selection_range(),
+        ) {
+            if !selected.is_empty() && self.editor.content.cursor_count() == 1 {
+                self.pending_closers.clear();
+                self.editor
+                    .content
+                    .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+                        std::sync::Arc::new(format!("{ch}{selected}{close}")),
+                    )));
+                let ((line, col), _) = range;
+                self.editor
+                    .content
+                    .select_bytes(line, col + ch.len_utf8(), selected.len());
+                self.is_dirty = true;
+                return Some(Task::none());
+            }
+        }
+
         let enabled = if is_quote {
             self.config.autocomplete_quotes
         } else {
@@ -5499,6 +6188,62 @@ impl SimpleEditApp {
 
     /// The tick after every message: the marks of the current file follow
     /// the edits and the repository.
+    /// What each row of the small list in front sends, in order (none: the
+    /// window in front has no such list).
+    fn overlay_choices(&self) -> Vec<Message> {
+        use crate::tabs::{Encoding, LineEnding};
+        match &self.overlay {
+            ActiveOverlay::LanguagePicker => {
+                let mut rows = vec![Message::SetLanguage(String::new())];
+                rows.extend(
+                    crate::editor::SUPPORTED_LANGUAGES
+                        .iter()
+                        .map(|(token, _)| Message::SetLanguage(token.to_string())),
+                );
+                rows
+            }
+            ActiveOverlay::TextOptions(TextOption::Encoding) => Encoding::ALL
+                .into_iter()
+                .map(Message::ReloadEncoding)
+                .chain(Encoding::ALL.into_iter().map(Message::SetEncoding))
+                .collect(),
+            ActiveOverlay::TextOptions(TextOption::LineEnding) => vec![
+                Message::SetLineEnding(LineEnding::Lf),
+                Message::SetLineEnding(LineEnding::Crlf),
+            ],
+            ActiveOverlay::TextOptions(TextOption::Indent) => [2, 3, 4, 8]
+                .into_iter()
+                .map(|n| Message::SetIndent(true, n))
+                .chain([2, 4, 8].into_iter().map(|n| Message::SetIndent(false, n)))
+                .chain([
+                    Message::DetectIndent,
+                    Message::ConvertIndent(true),
+                    Message::ConvertIndent(false),
+                ])
+                .collect(),
+            ActiveOverlay::TaskPicker => (0..self.tasks.choices.len())
+                .map(Message::RunTask)
+                .collect(),
+            ActiveOverlay::SpellLanguages => {
+                let mut rows = vec![Message::SpellLanguage(String::new())];
+                rows.extend(
+                    self.spell
+                        .choices
+                        .iter()
+                        .map(|c| Message::SpellLanguage(c.clone())),
+                );
+                rows
+            }
+            ActiveOverlay::Spelling(found) => found
+                .list
+                .iter()
+                .map(|s| Message::SpellReplace(s.clone()))
+                .chain([Message::SpellAdd, Message::SpellIgnore])
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     fn after_message(
         &mut self,
         edited: bool,
@@ -5533,6 +6278,13 @@ impl SimpleEditApp {
         let status_changed = status_before.is_some_and(|before| before != self.git.status);
         if moved || status_changed || git_done {
             return self.refresh_marks_base();
+        }
+        self.refresh_spelling();
+        // A new window starts with its first row.
+        let now = std::mem::discriminant(&self.overlay);
+        if self.overlay_seen != Some(now) {
+            self.overlay_seen = Some(now);
+            self.overlay_pick = 0;
         }
         // Small files follow every keystroke, big ones wait for the tick.
         if edited && self.editor.content.line_count() < 3000 {
@@ -6381,8 +7133,14 @@ impl SimpleEditApp {
             return;
         }
         let content = crate::editor::buffer_text(&self.editor.content);
-        let bytes = self.format.encode(&content);
-        match crate::fsutil::write_atomic(&path, bytes.as_bytes(), false) {
+        let Some(bytes) = self.format.encode_bytes(&content) else {
+            self.set_status(
+                t!("status.err_encoding", name = self.format.encoding.label()),
+                true,
+            );
+            return;
+        };
+        match crate::fsutil::write_atomic(&path, &bytes, false) {
             Ok(()) => {
                 self.is_dirty = false;
                 self.saved_fp = Some(fingerprint(&content));
@@ -6726,6 +7484,30 @@ impl SimpleEditApp {
             self.config.add_recent(&path);
             self.config_dirty = true;
         }
+        // A file too large to open whole came as its first part.
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.is_file() && meta.len() > MAX_OPEN_BYTES {
+                let len = buffer
+                    .content
+                    .as_ref()
+                    .map_or(0, |c| crate::editor::buffer_text(c).len() as u64);
+                self.large.entry(path.clone()).or_insert(LargeView {
+                    start: 0,
+                    end: len,
+                    size: meta.len(),
+                });
+            }
+        }
+        if self.config.detect_indent && !self.indents.contains_key(&path) {
+            let text = buffer
+                .content
+                .as_ref()
+                .map(crate::editor::buffer_text)
+                .unwrap_or_default();
+            if let Some(found) = text_ops::detect_indent(&text, self.config.tab_width) {
+                self.indents.insert(path.clone(), found);
+            }
+        }
         self.load_buffer(path.clone(), buffer);
         if warn_changed {
             self.external_warned = true;
@@ -6920,6 +7702,148 @@ impl SimpleEditApp {
 
     /// The file the formatter should believe it is formatting, so it finds
     /// the project's configuration next to it. `None` for an unsaved buffer.
+    /// The result of formatting the whole file: put in the text if the text
+    /// is still the one that was sent.
+    fn file_formatted(&mut self, job: FormatJob, result: Result<String, String>) -> Task<Message> {
+        self.is_formatting = false;
+        // The user moved on, or kept typing: the result describes text
+        // that is no longer there.
+        let current = self.current_file == job.path
+            && fingerprint(&crate::editor::buffer_text(&self.editor.content)) == job.source;
+        if !current {
+            self.set_status(t!("status.format_stale"), true);
+            return Task::none();
+        }
+        match result {
+            Ok(formatted) => {
+                let (line, col) = self.editor.content.cursor_position();
+                self.format_error = None;
+                self.show_error_panel = false;
+                self.set_status(t!("status.formatted"), false);
+                let formatted = TextFormat::decode(&formatted).0;
+                return self.apply_text_edit(formatted, line, col, None);
+            }
+            Err(e) => self.show_format_error(e),
+        }
+        Task::none()
+    }
+
+    /// Opens a file named on the command line, at its line when it has one.
+    fn open_target(&self, target: crate::ipc::Target) -> Task<Message> {
+        let path = target.path.clone();
+        Task::perform(read_file(path, true), move |result| {
+            Message::TargetOpened(target.clone(), result)
+        })
+    }
+
+    /// The name (letters, digits and `_`) the cursor is in or just after.
+    fn word_at_cursor(&self) -> String {
+        let (line, col) = self.editor.content.cursor_position();
+        let Some(text) = self.editor.content.line(line) else {
+            return String::new();
+        };
+        let col = floor_boundary(&text, col);
+        let word = |c: char| c.is_alphanumeric() || c == '_';
+        let start = text[..col]
+            .char_indices()
+            .rev()
+            .take_while(|(_, c)| word(*c))
+            .last()
+            .map_or(col, |(i, _)| i);
+        let end = text[col..]
+            .char_indices()
+            .take_while(|(_, c)| word(*c))
+            .last()
+            .map_or(col, |(i, c)| col + i + c.len_utf8());
+        text[start..end].to_string()
+    }
+
+    /// The answer to a rename: the edits go into the editor (one Ctrl+Z),
+    /// into the tabs, and on disk for the other files (undone from the
+    /// actions).
+    fn renamed(
+        &mut self,
+        source: u64,
+        result: Result<Vec<crate::lsp::FileEdits>, String>,
+    ) -> Task<Message> {
+        let files = match result {
+            Ok(files) => files,
+            Err(e) => {
+                self.set_status(format!("{}: {e}", t!("status.error")), true);
+                return Task::none();
+            }
+        };
+        let (mut places, mut changed, mut skipped) = (0, 0, 0);
+        let mut written = Vec::new();
+        for file in files {
+            let fix = crate::lint::Fix {
+                title: String::new(),
+                edits: file.edits.clone(),
+                safe: true,
+            };
+            if self.current_file.as_ref() == Some(&file.path) {
+                let old = crate::editor::buffer_text(&self.editor.content);
+                if fingerprint(&old) != source {
+                    skipped += 1;
+                    continue;
+                }
+                let (new, _) = crate::lint::apply(&old, &[&fix]);
+                let (line, col) = self.editor.content.cursor_position();
+                let _ = self.apply_text_edit(new, line, col, None);
+                places += file.edits.len();
+                changed += 1;
+                continue;
+            }
+            let Some((text, holder)) = self.file_text(&file.path) else {
+                continue;
+            };
+            if matches!(holder, finder::Holder::Tab) && self.is_path_dirty(&file.path) {
+                skipped += 1;
+                continue;
+            }
+            let (new, _) = crate::lint::apply(&text, &[&fix]);
+            if new != text && self.put_text(&file.path, &holder, &text, &new) {
+                places += file.edits.len();
+                changed += 1;
+                written.push(finder::Written {
+                    path: file.path.clone(),
+                    before: text,
+                    after: new,
+                });
+            }
+        }
+        if !written.is_empty() {
+            self.finder.undo = written;
+        }
+        let files = finder::files_text(changed);
+        let mut message = t!("rename.done", count = places, files = files.as_str()).to_string();
+        if skipped > 0 {
+            message = format!("{message}. {}", t!("rename.skipped", n = skipped));
+        }
+        self.set_status(message, skipped > 0);
+        Task::none()
+    }
+
+    /// What the language server says of the name under the pointer.
+    fn symbol_card(&self, dark: bool) -> Option<(iced::Point, Element<'_, Message>)> {
+        let (at, said) = self.symbol_card.as_ref()?;
+        let lines: Vec<&str> = said.lines().take(24).collect();
+        let x = at.x.min(self.config.window_width - 600.0).max(4.0);
+        Some((
+            iced::Point::new(x, at.y),
+            container(
+                text(lines.join("\n"))
+                    .size(12.5)
+                    .font(se_theme::MONO)
+                    .shaping(iced::widget::text::Shaping::Advanced),
+            )
+            .padding(10)
+            .max_width(580)
+            .style(se_theme::card(dark))
+            .into(),
+        ))
+    }
+
     fn format_target(&self) -> Option<PathBuf> {
         self.current_file.clone().filter(|p| !is_untitled(p))
     }
@@ -6943,6 +7867,11 @@ fn first_line_of(content: &crate::code_editor::Content) -> String {
 }
 
 /// The largest char boundary of `s` at or before `index`.
+/// The byte index of the `n`th character of `text` (its end if shorter).
+fn byte_of_char(text: &str, n: usize) -> usize {
+    text.char_indices().nth(n).map_or(text.len(), |(i, _)| i)
+}
+
 fn floor_boundary(s: &str, index: usize) -> usize {
     let mut index = index.min(s.len());
     while !s.is_char_boundary(index) {
@@ -7054,11 +7983,12 @@ impl SimpleEditApp {
             self.with_context_menu(
                 self.editor.view(
                     &self.config,
+                    self.indent().1,
                     search,
                     marks,
                     self.blame_annotations(),
                     self.change_paint(),
-                    self.problem_paint(),
+                    self.problem_paint(dark),
                     self.completion_hook(),
                 ),
                 dark,
@@ -7103,9 +8033,48 @@ impl SimpleEditApp {
             .and_then(Path::parent)
             .map(short_dir)
             .unwrap_or_default();
+        // A copy of a remote file says where it comes from.
+        let dir = self
+            .current_file
+            .as_deref()
+            .and_then(|p| self.remote_label(p))
+            .unwrap_or(dir);
 
         let on_diff = self.current_file.as_deref().is_some_and(is_virtual);
+        let large_bar = |view: LargeView| -> Element<'_, Message> {
+            let step = |label: String, to: LargeMove| {
+                button(text(label).size(12))
+                    .padding([2, 8])
+                    .on_press(Message::LargeMove(to))
+                    .style(
+                        (se_theme::GhostButton {
+                            dark,
+                            active: false,
+                        })
+                        .style(),
+                    )
+            };
+            let (from, to, size) = (
+                megabytes(view.start),
+                megabytes(view.end),
+                megabytes(view.size),
+            );
+            let banner = t!("large.banner", from = from, to = to, size = size).to_string();
+            row![
+                text(banner).size(12).color(se_theme::muted_text(dark)),
+                step(t!("large.first").to_string(), LargeMove::First),
+                step(t!("large.prev").to_string(), LargeMove::Previous),
+                step(t!("large.next").to_string(), LargeMove::Next),
+                step(t!("large.last").to_string(), LargeMove::Last),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center)
+            .into()
+        };
         let right: Element<Message> = match kind {
+            _ if self.large_view().is_some() => {
+                large_bar(self.large_view().expect("checked just above"))
+            }
             _ if on_diff => Space::new().into(),
             Some(kind) => crate::preview::segmented(kind, mode, dark),
             None => Space::new().into(),
@@ -7141,6 +8110,8 @@ impl SimpleEditApp {
         let lbl_copy = t!("ctx.copy").to_string();
         let lbl_paste = t!("ctx.paste").to_string();
         let lbl_delete = t!("ctx.delete").to_string();
+        let lbl_rename = t!("ctx.rename").to_string();
+        let sh_rename = self.config.shortcuts.rename_symbol.display();
         let lbl_split_right = t!("menu.view_split_right").to_string();
         let lbl_split_down = t!("menu.view_split_down").to_string();
         let lbl_split_close = t!("menu.view_split_close").to_string();
@@ -7155,7 +8126,7 @@ impl SimpleEditApp {
             .editor
             .language
             .as_deref()
-            .map(crate::formatter::has_formatter)
+            .map(crate::formatter::can_format)
             .unwrap_or(false);
         let has_sel_ctx = self.selection_info.is_some();
         let sh_select_all = self.config.shortcuts.select_all.display();
@@ -7279,6 +8250,12 @@ impl SimpleEditApp {
                     Message::ContextPaste,
                 ),
                 item(lbl_delete.clone(), None, dark, Message::ContextDelete),
+                item(
+                    lbl_rename.clone(),
+                    Some(sh_rename.clone()),
+                    dark,
+                    Message::RenameSymbol,
+                ),
                 item(
                     lbl_history.clone(),
                     None,
@@ -7430,6 +8407,7 @@ use file_io::*;
 mod api;
 #[path = "app/bookmark_panel.rs"]
 mod bookmark_panel;
+mod compare;
 #[path = "app/completion.rs"]
 mod completion;
 mod database;
@@ -7450,13 +8428,16 @@ mod lint;
 mod local_history;
 #[path = "app/project_ops.rs"]
 mod project_ops;
+mod remote_files;
 #[path = "app/results.rs"]
 mod results;
+mod spelling;
 #[path = "app/split.rs"]
 mod split;
 #[path = "app/tab_groups.rs"]
 mod tab_groups;
 mod table_admin;
+mod tasks;
 #[path = "app/views.rs"]
 mod views;
 pub(crate) use views::resize_edge;
@@ -7660,6 +8641,10 @@ async fn patterns(
     .ok()
     .flatten();
     found.map_or(Outcome::NotFound, Outcome::Found)
+}
+
+fn rename_field_id() -> iced::widget::Id {
+    iced::widget::Id::new("rename-field")
 }
 
 fn goto_line_id() -> iced::widget::Id {

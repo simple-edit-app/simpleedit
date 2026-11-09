@@ -34,6 +34,13 @@ pub enum PreferencesMessage {
     AutocompleteQuotesToggled(bool),
     HighlightCurrentLineToggled(bool),
     ShowPageGuideToggled(bool),
+    ShowIndentGuidesToggled(bool),
+    DetectIndentToggled(bool),
+    FormatOnSaveToggled(bool),
+    SpellCheckToggled(bool),
+    HighContrastToggled(bool),
+    ShowWhitespaceToggled(bool),
+    MatchBracketsToggled(bool),
     AutoSaveToggled(bool),
     PageGuideColumnChanged(usize),
     ShowMinimapToggled(bool),
@@ -252,6 +259,27 @@ impl PreferencesState {
             }
             PreferencesMessage::ShowPageGuideToggled(v) => {
                 config.show_page_guide = v;
+            }
+            PreferencesMessage::HighContrastToggled(v) => {
+                config.high_contrast = v;
+            }
+            PreferencesMessage::SpellCheckToggled(v) => {
+                config.spell_check = v;
+            }
+            PreferencesMessage::FormatOnSaveToggled(v) => {
+                config.format_on_save = v;
+            }
+            PreferencesMessage::DetectIndentToggled(v) => {
+                config.detect_indent = v;
+            }
+            PreferencesMessage::ShowIndentGuidesToggled(v) => {
+                config.show_indent_guides = v;
+            }
+            PreferencesMessage::ShowWhitespaceToggled(v) => {
+                config.show_whitespace = v;
+            }
+            PreferencesMessage::MatchBracketsToggled(v) => {
+                config.match_brackets = v;
             }
             PreferencesMessage::AutoSaveToggled(v) => {
                 config.auto_save = v;
@@ -561,6 +589,41 @@ impl PreferencesState {
                 t!("prefs.show_page_guide").to_string(),
                 config.show_page_guide,
                 PreferencesMessage::ShowPageGuideToggled,
+            ),
+            toggle(
+                t!("prefs.high_contrast").to_string(),
+                config.high_contrast,
+                PreferencesMessage::HighContrastToggled,
+            ),
+            toggle(
+                t!("prefs.spell_check").to_string(),
+                config.spell_check,
+                PreferencesMessage::SpellCheckToggled,
+            ),
+            toggle(
+                t!("prefs.format_on_save").to_string(),
+                config.format_on_save,
+                PreferencesMessage::FormatOnSaveToggled,
+            ),
+            toggle(
+                t!("prefs.detect_indent").to_string(),
+                config.detect_indent,
+                PreferencesMessage::DetectIndentToggled,
+            ),
+            toggle(
+                t!("prefs.show_indent_guides").to_string(),
+                config.show_indent_guides,
+                PreferencesMessage::ShowIndentGuidesToggled,
+            ),
+            toggle(
+                t!("prefs.show_whitespace").to_string(),
+                config.show_whitespace,
+                PreferencesMessage::ShowWhitespaceToggled,
+            ),
+            toggle(
+                t!("prefs.match_brackets").to_string(),
+                config.match_brackets,
+                PreferencesMessage::MatchBracketsToggled,
             ),
             setting_row(
                 t!("prefs.page_guide_column").to_string(),
@@ -926,6 +989,41 @@ pub fn shortcuts_list(
             ShortcutTarget::DeleteLine,
             t!("shortcuts.delete_line").to_string(),
             sc.delete_line.display(),
+        ),
+        (
+            ShortcutTarget::SpellFix,
+            t!("shortcuts.spell_fix").to_string(),
+            sc.spell_fix.display(),
+        ),
+        (
+            ShortcutTarget::RunTask,
+            t!("shortcuts.run_task").to_string(),
+            sc.run_task.display(),
+        ),
+        (
+            ShortcutTarget::RenameSymbol,
+            t!("shortcuts.rename_symbol").to_string(),
+            sc.rename_symbol.display(),
+        ),
+        (
+            ShortcutTarget::AddNextOccurrence,
+            t!("shortcuts.add_next_occurrence").to_string(),
+            sc.add_next_occurrence.display(),
+        ),
+        (
+            ShortcutTarget::SelectAllOccurrences,
+            t!("shortcuts.select_all_occurrences").to_string(),
+            sc.select_all_occurrences.display(),
+        ),
+        (
+            ShortcutTarget::AddCursorAbove,
+            t!("shortcuts.add_cursor_above").to_string(),
+            sc.add_cursor_above.display(),
+        ),
+        (
+            ShortcutTarget::AddCursorBelow,
+            t!("shortcuts.add_cursor_below").to_string(),
+            sc.add_cursor_below.display(),
         ),
         (
             ShortcutTarget::ToggleBookmark,

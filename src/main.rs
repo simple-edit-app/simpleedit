@@ -32,6 +32,7 @@ mod git;
 mod git_panel;
 mod history;
 mod i18n;
+mod ipc;
 mod lint;
 mod local_history;
 mod lsp;
@@ -44,12 +45,15 @@ mod pointer_area;
 mod preferences;
 mod preview;
 mod projects;
+mod remote;
 mod scratch;
 mod search;
 mod session;
 mod sidebar;
+mod spell;
 mod tab_strip;
 mod tabs;
+mod tasks;
 mod terminal;
 mod text_ops;
 mod theme;
@@ -57,20 +61,26 @@ mod updater;
 
 i18n!("src/i18n");
 
-/// The files named on the command line. Names need not be valid UTF-8, and
-/// anything after `--` is a file even if it starts with a dash; other options
-/// (`--something`) are ignored.
-fn file_args(args: impl Iterator<Item = std::ffi::OsString>) -> Vec<std::path::PathBuf> {
+/// The files named on the command line (`file`, `file:line`, `file:line:col`).
+/// Names need not be valid UTF-8, and anything after `--` is a file even if
+/// it starts with a dash; other options (`--something`) are ignored.
+fn file_args(args: impl Iterator<Item = std::ffi::OsString>) -> Vec<ipc::Target> {
     let mut files = Vec::new();
     let mut only_files = false;
     for arg in args {
         if !only_files && arg == "--" {
             only_files = true;
         } else if only_files || !arg.to_string_lossy().starts_with('-') {
-            files.push(std::path::PathBuf::from(arg));
+            files.push(ipc::Target::parse(&arg));
         }
     }
     files
+}
+
+/// `--new-window` (or `-n`): the files open in a window of their own.
+fn wants_new_window(args: impl Iterator<Item = std::ffi::OsString>) -> bool {
+    args.take_while(|a| a != "--")
+        .any(|a| a == "--new-window" || a == "-n")
 }
 
 fn main() -> iced::Result {
@@ -80,6 +90,10 @@ fn main() -> iced::Result {
     rust_i18n::set_locale(&config.locale);
 
     let files = file_args(std::env::args_os().skip(1));
+    // Files named while a window runs open there; the window comes forward.
+    if !files.is_empty() && !wants_new_window(std::env::args_os().skip(1)) && ipc::send(&files) {
+        return Ok(());
+    }
 
     // winit clears the launcher's startup token when it creates its event
     // loop; keep a copy so the window can be activated with it (iced_winit).
@@ -144,6 +158,25 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<std::path::PathBuf> {
         file_args(list.iter().map(OsString::from))
+            .into_iter()
+            .map(|t| t.path)
+            .collect()
+    }
+
+    #[test]
+    fn a_new_window_is_asked_for_by_an_option_not_a_file() {
+        let asked = |list: &[&str]| wants_new_window(list.iter().map(OsString::from));
+        assert!(asked(&["--new-window", "a"]));
+        assert!(asked(&["a", "-n"]));
+        assert!(!asked(&["a"]));
+        assert!(!asked(&["--", "-n"]));
+    }
+
+    #[test]
+    fn a_place_follows_a_file_name() {
+        let found = file_args([OsString::from("zzz-none.rs:7:2")].into_iter());
+        assert_eq!(found[0].path, std::path::PathBuf::from("zzz-none.rs"));
+        assert_eq!((found[0].line, found[0].col), (Some(7), Some(2)));
     }
 
     #[test]
@@ -163,7 +196,7 @@ mod tests {
         let odd = OsString::from_vec(b"caf\xe9.txt".to_vec());
         assert_eq!(
             file_args(std::iter::once(odd.clone())),
-            vec![std::path::PathBuf::from(odd)]
+            vec![ipc::Target::file(std::path::PathBuf::from(odd))]
         );
     }
 }

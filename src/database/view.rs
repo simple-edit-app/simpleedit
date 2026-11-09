@@ -223,6 +223,7 @@ fn connection_rows<'a>(
             // The databases only show when there are several.
             let several = databases.len() > 1;
             let needle = state.tree_filter.trim().to_lowercase();
+            let dialect = state.connection(id).map(|c| c.dialect).unwrap_or_default();
             let filtering = !needle.is_empty();
             let hit = |name: &str| !filtering || name.to_lowercase().contains(&needle);
             let is_open = |key: &str| filtering || state.open.contains(key);
@@ -272,7 +273,7 @@ fn connection_rows<'a>(
                     let (conn, db_name, schema_name) =
                         (id, database.name.clone(), schema.name.clone());
                     out = out.push(crate::pointer_area::context_menu(line, move || {
-                        schema_menu(conn, db_name.clone(), schema_name.clone(), dark)
+                        schema_menu(conn, db_name.clone(), schema_name.clone(), dialect, dark)
                     }));
                     if !schema_open {
                         continue;
@@ -310,7 +311,7 @@ fn connection_rows<'a>(
                         let target = table_key.clone();
                         let kind = table.kind;
                         let menu = crate::pointer_area::context_menu(open, move || {
-                            table_menu(target.clone(), kind, dark)
+                            table_menu(target.clone(), kind, dialect, dark)
                         });
                         let arrow = button(
                             text(if expanded { "▾" } else { "▸" })
@@ -507,8 +508,25 @@ fn schema_menu(
     conn: u64,
     database: String,
     schema: String,
+    dialect: protocol::Dialect,
     dark: bool,
 ) -> Element<'static, Message> {
+    // Making tables and schemas, the health, the backups: PostgreSQL's.
+    if dialect != protocol::Dialect::Postgres {
+        return container(
+            column![menu_bar::item(
+                t!("db.diagram").to_string(),
+                None,
+                dark,
+                Message::Db(DbMsg::ShowDiagram(conn, database, schema)),
+            )]
+            .spacing(1)
+            .padding(6)
+            .width(230),
+        )
+        .style(se_theme::card(dark))
+        .into();
+    }
     let items: Vec<Element<'static, Message>> = vec![
         menu_bar::item(
             t!("db.new_table").to_string(),
@@ -521,6 +539,12 @@ fn schema_menu(
             None,
             dark,
             Message::Db(DbMsg::NewSchema(conn, database.clone())),
+        ),
+        menu_bar::item(
+            t!("db.diagram").to_string(),
+            None,
+            dark,
+            Message::Db(DbMsg::ShowDiagram(conn, database.clone(), schema.clone())),
         ),
         menu_bar::item(
             t!("db.health").to_string(),
@@ -759,7 +783,7 @@ pub fn dialog<'a>(state: &'a State, dialog: &'a Dialog, dark: bool) -> Element<'
         DialogTab::Driver => driver_tab(state, dialog, dark),
     };
 
-    let driver_ready = state.driver == Driver::Ready;
+    let driver_ready = *state.driver_of(dialog.draft.dialect) == Driver::Ready;
     let can_test = driver_ready && dialog.valid() && dialog.test != TestState::Running;
     let test_line: Element<Message> = match &dialog.test {
         TestState::Idle => Space::new().into(),
@@ -865,6 +889,32 @@ fn general_tab<'a>(state: &'a State, dialog: &'a Dialog, dark: bool) -> Element<
             dark,
         ))
         .push(labeled(
+            t!("db.dialect").to_string(),
+            pick(
+                protocol::Dialect::ALL
+                    .iter()
+                    .map(|k| (*k, k.label().to_string()))
+                    .collect(),
+                d.dialect,
+                Choice::Dialect,
+                dark,
+            ),
+            dark,
+        ));
+    // A SQLite database is a file: nothing else is asked.
+    if d.dialect == protocol::Dialect::Sqlite {
+        return form
+            .push(labeled(
+                t!("db.field_file").to_string(),
+                file_input(&d.database, Field::Database, dark),
+                dark,
+            ))
+            .push(hint(t!("db.file_hint").to_string(), dark))
+            .push(driver_line(state, d.dialect, dark))
+            .into();
+    }
+    if d.dialect == protocol::Dialect::Postgres {
+        form = form.push(labeled(
             t!("db.conn_type").to_string(),
             pick(
                 vec![
@@ -877,6 +927,7 @@ fn general_tab<'a>(state: &'a State, dialog: &'a Dialog, dark: bool) -> Element<
             ),
             dark,
         ));
+    }
     if d.url_only {
         form = form.push(labeled(
             t!("db.field_url").to_string(),
@@ -906,6 +957,7 @@ fn general_tab<'a>(state: &'a State, dialog: &'a Dialog, dark: bool) -> Element<
         pick(
             Auth::ALL
                 .iter()
+                .filter(|a| d.dialect == protocol::Dialect::Postgres || **a != Auth::Pgpass)
                 .map(|a| {
                     (
                         *a,
@@ -974,26 +1026,31 @@ fn general_tab<'a>(state: &'a State, dialog: &'a Dialog, dark: bool) -> Element<
             dark,
         ));
     }
-    form.push(driver_line(state, dark)).into()
+    form.push(driver_line(state, d.dialect, dark)).into()
 }
 
 /// The state of the driver and what to do about it.
-fn driver_line<'a>(state: &'a State, dark: bool) -> Element<'a, Message> {
+fn driver_line<'a>(
+    state: &'a State,
+    dialect: protocol::Dialect,
+    dark: bool,
+) -> Element<'a, Message> {
     let p = se_theme::palette(dark);
-    let (label, color, action): (String, iced::Color, Option<String>) = match &state.driver {
-        Driver::Ready => (t!("db.driver_ready").to_string(), p.muted, None),
-        Driver::Downloading => (t!("db.driver_downloading").to_string(), p.muted, None),
-        Driver::Failed(error) => (
-            t!("db.driver_failed", error = error.as_str()).to_string(),
-            se_theme::error_color(dark),
-            Some(t!("db.driver_download").to_string()),
-        ),
-        Driver::Missing | Driver::Unknown => (
-            t!("db.driver_missing").to_string(),
-            se_theme::error_color(dark),
-            Some(t!("db.driver_download").to_string()),
-        ),
-    };
+    let (label, color, action): (String, iced::Color, Option<String>) =
+        match state.driver_of(dialect) {
+            Driver::Ready => (t!("db.driver_ready").to_string(), p.muted, None),
+            Driver::Downloading => (t!("db.driver_downloading").to_string(), p.muted, None),
+            Driver::Failed(error) => (
+                t!("db.driver_failed", error = error.as_str()).to_string(),
+                se_theme::error_color(dark),
+                Some(t!("db.driver_download").to_string()),
+            ),
+            Driver::Missing | Driver::Unknown => (
+                t!("db.driver_missing").to_string(),
+                se_theme::error_color(dark),
+                Some(t!("db.driver_download").to_string()),
+            ),
+        };
     let mut line = row![text(label).size(12).color(color)]
         .spacing(10)
         .align_y(Alignment::Center);
@@ -1001,7 +1058,7 @@ fn driver_line<'a>(state: &'a State, dark: bool) -> Element<'a, Message> {
         line = line.push(
             button(text(action).size(12.5))
                 .padding([4, 12])
-                .on_press(Message::Db(DbMsg::DownloadDriver))
+                .on_press(Message::Db(DbMsg::DownloadDriver(dialect)))
                 .style((se_theme::Outline { dark }).style()),
         );
     }
@@ -1280,8 +1337,9 @@ fn advanced_tab<'a>(dialog: &'a Dialog, dark: bool) -> Element<'a, Message> {
 
 fn driver_tab<'a>(state: &'a State, dialog: &'a Dialog, dark: bool) -> Element<'a, Message> {
     let p = se_theme::palette(dark);
+    let dialect = dialog.draft.dialect;
     let mut form = column![
-        driver_line(state, dark),
+        driver_line(state, dialect, dark),
         labeled(
             t!("db.driver_protocol").to_string(),
             text(super::DRIVER_PROTOCOL.to_string()).size(12.5),
@@ -1289,7 +1347,7 @@ fn driver_tab<'a>(state: &'a State, dialog: &'a Dialog, dark: bool) -> Element<'
         ),
         labeled(
             t!("db.driver_location").to_string(),
-            text(super::downloaded_driver().display().to_string())
+            text(super::downloaded_driver_of(dialect).display().to_string())
                 .size(12)
                 .font(se_theme::MONO)
                 .color(p.muted),
@@ -1297,11 +1355,11 @@ fn driver_tab<'a>(state: &'a State, dialog: &'a Dialog, dark: bool) -> Element<'
         ),
     ]
     .spacing(10);
-    if matches!(state.driver, Driver::Ready) {
+    if matches!(state.driver_of(dialect), Driver::Ready) {
         form = form.push(
             button(text(t!("db.driver_redownload").to_string()).size(12.5))
                 .padding([5, 12])
-                .on_press(Message::Db(DbMsg::DownloadDriver))
+                .on_press(Message::Db(DbMsg::DownloadDriver(dialect)))
                 .style((se_theme::Outline { dark }).style()),
         );
     }
@@ -1487,6 +1545,21 @@ pub fn table<'a>(path: &'a Path, tab: &'a TableTab, dark: bool) -> Element<'a, M
                 "JSON",
                 t!("db.export_json").to_string(),
                 ready.then(|| Message::Db(DbMsg::Export(owned(), "json"))),
+            ))
+            .push(nav(
+                "SQL",
+                t!("db.export_sql").to_string(),
+                ready.then(|| Message::Db(DbMsg::Export(owned(), "sql"))),
+            ))
+            .push(nav(
+                "XLSX",
+                t!("db.export_xlsx").to_string(),
+                ready.then(|| Message::Db(DbMsg::Export(owned(), "xlsx"))),
+            ))
+            .push(nav(
+                "MD",
+                t!("db.export_md").to_string(),
+                ready.then(|| Message::Db(DbMsg::Export(owned(), "md"))),
             ));
     }
 
@@ -3084,9 +3157,40 @@ fn log_menu(at: usize, has_error: bool, dark: bool) -> Element<'static, Message>
 fn table_menu(
     target: (u64, String, String, String),
     kind: Kind,
+    dialect: protocol::Dialect,
     dark: bool,
 ) -> Element<'static, Message> {
     let (id, database, schema, table) = target;
+    // The designer, the import, the backups, dropping and emptying write
+    // PostgreSQL; for the others the table opens and its definition shows.
+    if dialect != protocol::Dialect::Postgres {
+        return container(
+            column![
+                menu_bar::item(
+                    t!("db.table_open").to_string(),
+                    None,
+                    dark,
+                    Message::Db(DbMsg::OpenTable(
+                        id,
+                        database.clone(),
+                        schema.clone(),
+                        table.clone()
+                    )),
+                ),
+                menu_bar::item(
+                    t!("db.table_ddl").to_string(),
+                    None,
+                    dark,
+                    Message::Db(DbMsg::ShowDefinition(id, database, schema, table, kind)),
+                ),
+            ]
+            .spacing(1)
+            .padding(6)
+            .width(230),
+        )
+        .style(se_theme::card(dark))
+        .into();
+    }
     let mut items: Vec<Element<'static, Message>> = vec![menu_bar::item(
         t!("db.table_open").to_string(),
         None,

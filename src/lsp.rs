@@ -833,6 +833,251 @@ pub async fn code_actions(
     fixes_of(&server, &uri, text, params).await
 }
 
+// ---- Rename, hover, formatting -----------------------------------------------
+
+/// What a rename changes in one file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEdits {
+    pub path: PathBuf,
+    pub edits: Vec<crate::lint::Edit>,
+}
+
+/// Text edits (`TextEdit[]`) of a file, as edits in bytes.
+fn text_edit_list(list: &[Value], text: &str) -> Vec<crate::lint::Edit> {
+    list.iter()
+        .filter_map(|e| {
+            let range = e.get("range")?;
+            let at = |side: &str| {
+                let p = range.get(side)?;
+                let line = p.get("line")?.as_u64()? as usize;
+                let character = p.get("character")?.as_u64()? as usize;
+                let line_text = text.split('\n').nth(line).unwrap_or("");
+                Some((line, byte_col(line_text, character)))
+            };
+            let (from, to) = (at("start")?, at("end")?);
+            Some(crate::lint::Edit {
+                line: from.0,
+                col: from.1,
+                end_line: to.0,
+                end_col: to.1,
+                text: e.get("newText")?.as_str()?.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// The files a `WorkspaceEdit` changes, with their edits. The text of
+/// `uri` is `text` (what the server was told), the others are read from
+/// disk. Creating, renaming or deleting files is not supported.
+fn workspace_files(edit: &Value, uri: &str, text: &str) -> Result<Vec<FileEdits>, String> {
+    let mut by_uri: Vec<(String, Vec<Value>)> = Vec::new();
+    if let Some(changes) = edit.get("changes").and_then(Value::as_object) {
+        for (u, list) in changes {
+            by_uri.push((u.clone(), list.as_array().cloned().unwrap_or_default()));
+        }
+    }
+    for change in edit
+        .get("documentChanges")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if change.get("kind").is_some() {
+            return Err("the language server also asks to create, rename or delete files".into());
+        }
+        if let (Some(u), Some(list)) = (
+            change["textDocument"]["uri"].as_str(),
+            change.get("edits").and_then(Value::as_array),
+        ) {
+            by_uri.push((u.to_string(), list.clone()));
+        }
+    }
+    let mut files = Vec::new();
+    for (u, list) in by_uri {
+        let Some(path) = uri_to_path(&u) else {
+            continue;
+        };
+        let file_text = if u == uri {
+            text.to_string()
+        } else {
+            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?
+        };
+        let edits = text_edit_list(&list, &file_text);
+        if !edits.is_empty() {
+            files.push(FileEdits { path, edits });
+        }
+    }
+    Ok(files)
+}
+
+/// A request retried while the server says its answer would be stale.
+async fn request_retrying(server: &Server, method: &str, params: Value) -> Result<Value, String> {
+    let mut tries = 0;
+    loop {
+        match server.request(method, params.clone()).await {
+            Ok(value) => return Ok(value),
+            Err(e) if (e.code == CONTENT_MODIFIED || e.code == SERVER_CANCELLED) && tries < 5 => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_millis(60)).await;
+            }
+            Err(e) => return Err(e.message),
+        }
+    }
+}
+
+fn position_params(uri: &str, text: &str, line: usize, col: usize) -> Value {
+    json!({
+        "textDocument": { "uri": uri },
+        "position": { "line": line, "character": utf16_col(text, line, col) },
+    })
+}
+
+/// Renames the name at (`line`, byte `col`) of `text`, the content of
+/// `path`, to `new_name` everywhere: the edits of every file.
+pub async fn rename(
+    ext: &str,
+    path: &Path,
+    text: &str,
+    line: usize,
+    col: usize,
+    new_name: &str,
+) -> Result<Vec<FileEdits>, String> {
+    let (server, language_id, _) = connect(ext, path).await?;
+    rename_on(&server, language_id, path, text, line, col, new_name).await
+}
+
+async fn rename_on(
+    server: &Server,
+    language_id: &str,
+    path: &Path,
+    text: &str,
+    line: usize,
+    col: usize,
+    new_name: &str,
+) -> Result<Vec<FileEdits>, String> {
+    let provider = server.capability(&["renameProvider"]);
+    if provider.is_null() || provider == json!(false) {
+        return Err("this language server cannot rename".into());
+    }
+    let uri = path_to_uri(path);
+    server.sync(&uri, language_id, text).await?;
+    let mut params = position_params(&uri, text, line, col);
+    params["newName"] = json!(new_name);
+    let answer = request_retrying(server, "textDocument/rename", params).await?;
+    if answer.is_null() {
+        return Err("there is no name to rename here".into());
+    }
+    workspace_files(&answer, &uri, text)
+}
+
+/// The text of a hover answer (`contents`: a string, a `MarkedString`, a
+/// `MarkupContent` or a list of those), without the code fences.
+fn hover_text(answer: &Value) -> String {
+    fn piece(v: &Value) -> String {
+        match v {
+            Value::String(s) => s.clone(),
+            Value::Object(o) => o
+                .get("value")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            Value::Array(list) => list.iter().map(piece).collect::<Vec<_>>().join("\n\n"),
+            _ => String::new(),
+        }
+    }
+    piece(&answer["contents"])
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("```"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+/// What the language server says about the name at (`line`, byte `col`):
+/// its type and its documentation. `None` when it says nothing.
+pub async fn hover(
+    ext: &str,
+    path: &Path,
+    text: &str,
+    line: usize,
+    col: usize,
+) -> Result<Option<String>, String> {
+    let (server, language_id, _) = connect(ext, path).await?;
+    hover_on(&server, language_id, path, text, line, col).await
+}
+
+async fn hover_on(
+    server: &Server,
+    language_id: &str,
+    path: &Path,
+    text: &str,
+    line: usize,
+    col: usize,
+) -> Result<Option<String>, String> {
+    let provider = server.capability(&["hoverProvider"]);
+    if provider.is_null() || provider == json!(false) {
+        return Ok(None);
+    }
+    let uri = path_to_uri(path);
+    server.sync(&uri, language_id, text).await?;
+    let answer = request_retrying(
+        server,
+        "textDocument/hover",
+        position_params(&uri, text, line, col),
+    )
+    .await?;
+    let shown = hover_text(&answer);
+    Ok((!shown.is_empty()).then_some(shown))
+}
+
+/// `text`, the content of `path`, laid out by the language server.
+pub async fn format(
+    ext: &str,
+    path: &Path,
+    text: &str,
+    spaces: bool,
+    width: usize,
+) -> Result<String, String> {
+    let (server, language_id, _) = connect(ext, path).await?;
+    format_on(&server, language_id, path, text, spaces, width).await
+}
+
+async fn format_on(
+    server: &Server,
+    language_id: &str,
+    path: &Path,
+    text: &str,
+    spaces: bool,
+    width: usize,
+) -> Result<String, String> {
+    let provider = server.capability(&["documentFormattingProvider"]);
+    if provider.is_null() || provider == json!(false) {
+        return Err("this language server cannot format".into());
+    }
+    let uri = path_to_uri(path);
+    server.sync(&uri, language_id, text).await?;
+    let params = json!({
+        "textDocument": { "uri": uri },
+        "options": {
+            "tabSize": width,
+            "insertSpaces": spaces,
+            "trimTrailingWhitespace": true,
+            "insertFinalNewline": true,
+        },
+    });
+    let answer = request_retrying(server, "textDocument/formatting", params).await?;
+    let Some(list) = answer.as_array() else {
+        return Ok(text.to_string());
+    };
+    let fix = crate::lint::Fix {
+        title: String::new(),
+        edits: text_edit_list(list, text),
+        safe: true,
+    };
+    Ok(crate::lint::apply(text, &[&fix]).0)
+}
+
 // ---- Completion -----------------------------------------------------------
 
 /// What a server proposes at a place of a file.
@@ -1318,6 +1563,9 @@ impl Server {
                         ] },
                     },
                     "definition": { "linkSupport": true },
+                    "rename": { "prepareSupport": false },
+                    "hover": { "contentFormat": ["markdown", "plaintext"] },
+                    "formatting": {},
                     "publishDiagnostics": { "versionSupport": true },
                     "codeAction": {
                         "codeActionLiteralSupport": { "codeActionKind": { "valueSet": [
@@ -2050,6 +2298,115 @@ while True:
                 .unwrap();
             assert_eq!(resolved["documentation"]["value"], "resolved");
         });
+    }
+
+    /// A server that renames, hovers and formats.
+    const FAKE_EDIT_SERVER: &str = r#"
+import json, sys
+def read():
+    n = 0
+    while True:
+        h = sys.stdin.buffer.readline()
+        if not h: return None
+        h = h.strip()
+        if not h: break
+        if h.lower().startswith(b"content-length:"): n = int(h.split(b":")[1])
+    return json.loads(sys.stdin.buffer.read(n))
+def send(m):
+    b = json.dumps(m).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(b) + b)
+    sys.stdout.buffer.flush()
+docs = {}
+while True:
+    m = read()
+    if m is None: break
+    meth = m.get("method")
+    if meth == "initialize":
+        send({"jsonrpc": "2.0", "id": m["id"], "result": {"capabilities": {
+            "renameProvider": True, "hoverProvider": True, "documentFormattingProvider": True}}})
+    elif meth == "textDocument/didOpen":
+        d = m["params"]["textDocument"]; docs[d["uri"]] = d["text"]
+    elif meth == "textDocument/didChange":
+        docs[m["params"]["textDocument"]["uri"]] = m["params"]["contentChanges"][0]["text"]
+    elif meth == "textDocument/rename":
+        p = m["params"]; uri = p["textDocument"]["uri"]
+        other = uri.replace("m.txt", "o.txt")
+        edit = lambda l, a, b: {"range": {"start": {"line": l, "character": a}, "end": {"line": l, "character": b}}, "newText": p["newName"]}
+        if p["position"]["line"] == 9:
+            send({"jsonrpc": "2.0", "id": m["id"], "result": None})
+        else:
+            send({"jsonrpc": "2.0", "id": m["id"], "result": {"changes": {
+                uri: [edit(0, 4, 7), edit(1, 0, 3)], other: [edit(0, 0, 3)]}}})
+    elif meth == "textDocument/hover":
+        send({"jsonrpc": "2.0", "id": m["id"], "result": {"contents": {"kind": "markdown",
+            "value": "```rust\nfn foo()\n```\n\nDoes foo."}}})
+    elif meth == "textDocument/formatting":
+        uri = m["params"]["textDocument"]["uri"]
+        lines = docs[uri].split("\n")
+        send({"jsonrpc": "2.0", "id": m["id"], "result": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": len(lines[0])}},
+             "newText": lines[0].strip()}]})
+"#;
+
+    #[test]
+    fn a_server_renames_hovers_and_formats() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake.py");
+        std::fs::write(&script, FAKE_EDIT_SERVER).unwrap();
+        let file = dir.path().join("m.txt");
+        let other = dir.path().join("o.txt");
+        std::fs::write(&other, "foo = 1\n").unwrap();
+        let script = script.to_string_lossy().into_owned();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let server = server_for(Path::new(PYTHON), &[script.as_str()], dir.path())
+                .await
+                .unwrap();
+            let text = "let foo = 1\nfoo + 1\n";
+            let files = rename_on(&server, "plaintext", &file, text, 0, 4, "bar")
+                .await
+                .unwrap();
+            assert_eq!(files.len(), 2);
+            assert_eq!(files[0].edits.len() + files[1].edits.len(), 3);
+            let here = files.iter().find(|f| f.path == file).unwrap();
+            let fix = crate::lint::Fix {
+                title: String::new(),
+                edits: here.edits.clone(),
+                safe: true,
+            };
+            assert_eq!(
+                crate::lint::apply(text, &[&fix]).0,
+                "let bar = 1\nbar + 1\n"
+            );
+            // Nothing to rename on that line.
+            let none = rename_on(&server, "plaintext", &file, text, 9, 0, "bar").await;
+            assert!(none.is_err());
+            let said = hover_on(&server, "plaintext", &file, text, 0, 4)
+                .await
+                .unwrap();
+            assert_eq!(said.as_deref(), Some("fn foo()\n\nDoes foo."));
+            let laid_out = format_on(&server, "plaintext", &file, "   x   \ny\n", true, 4)
+                .await
+                .unwrap();
+            assert_eq!(laid_out, "x\ny\n");
+        });
+    }
+
+    #[test]
+    fn hover_answers_come_in_every_shape() {
+        assert_eq!(hover_text(&json!({"contents": "plain"})), "plain");
+        assert_eq!(
+            hover_text(&json!({"contents": {"language": "rs", "value": "```rs\nx\n```"}})),
+            "x"
+        );
+        assert_eq!(
+            hover_text(&json!({"contents": ["a", {"value": "b"}]})),
+            "a\n\nb"
+        );
+        assert_eq!(hover_text(&json!({"contents": ""})), "");
     }
 
     /// Waits until the server has loaded the project, then asks.

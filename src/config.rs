@@ -44,6 +44,13 @@ pub enum ShortcutTarget {
     ParameterInfo,
     GotoClass,
     GotoSymbol,
+    RunTask,
+    RenameSymbol,
+    AddNextOccurrence,
+    SpellFix,
+    SelectAllOccurrences,
+    AddCursorAbove,
+    AddCursorBelow,
 }
 
 /// How a key is named to the user.
@@ -235,6 +242,13 @@ pub struct Shortcuts {
     pub goto_class: ShortcutConfig,
     /// Search everywhere, on its Symbols tab.
     pub goto_symbol: ShortcutConfig,
+    pub run_task: ShortcutConfig,
+    pub rename_symbol: ShortcutConfig,
+    pub add_next_occurrence: ShortcutConfig,
+    pub spell_fix: ShortcutConfig,
+    pub select_all_occurrences: ShortcutConfig,
+    pub add_cursor_above: ShortcutConfig,
+    pub add_cursor_below: ShortcutConfig,
 }
 
 /// Back and forward, as the IDEs do: Ctrl+Alt+←/→ on Windows, ⌘[ / ⌘] on
@@ -342,6 +356,13 @@ shortcut_slots! {
     ParameterInfo => parameter_info,
     GotoClass => goto_class,
     GotoSymbol => goto_symbol,
+    RunTask => run_task,
+    RenameSymbol => rename_symbol,
+    AddNextOccurrence => add_next_occurrence,
+    SpellFix => spell_fix,
+    SelectAllOccurrences => select_all_occurrences,
+    AddCursorAbove => add_cursor_above,
+    AddCursorBelow => add_cursor_below,
 }
 
 impl Shortcuts {
@@ -411,6 +432,13 @@ impl Default for Shortcuts {
             // IntelliJ's Ctrl+N is New file here.
             goto_class: ShortcutConfig::ctrl_alt("n"),
             goto_symbol: ShortcutConfig::ctrl_alt_shift("n"),
+            run_task: ShortcutConfig::ctrl_alt("r"),
+            rename_symbol: ShortcutConfig::shift("F6"),
+            add_next_occurrence: ShortcutConfig::alt("j"),
+            spell_fix: ShortcutConfig::ctrl_alt("s"),
+            select_all_occurrences: ShortcutConfig::ctrl_alt_shift("j"),
+            add_cursor_above: ShortcutConfig::ctrl_alt("ArrowUp"),
+            add_cursor_below: ShortcutConfig::ctrl_alt("ArrowDown"),
         }
     }
 }
@@ -472,6 +500,8 @@ pub struct Config {
     pub font_size: f32,
     pub tab_width: usize,
     pub use_spaces: bool,
+    /// Each file is indented as it already is.
+    pub detect_indent: bool,
     pub show_line_numbers: bool,
     pub auto_indent: bool,
     pub autocomplete_brackets: bool,
@@ -480,6 +510,22 @@ pub struct Config {
     pub highlight_current_line: bool,
     /// A vertical guide at `page_guide_column`.
     pub show_page_guide: bool,
+    /// Black or white, bright accents, strong borders.
+    pub high_contrast: bool,
+    /// The machines opened over SSH, the last first.
+    pub remote_hosts: Vec<String>,
+    /// Misspelled words are underlined (prose, and the comments of programs).
+    pub spell_check: bool,
+    /// The dictionary: `fr`, `en_US`… (empty: the language of the interface).
+    pub spell_language: String,
+    /// Files are formatted when they are saved.
+    pub format_on_save: bool,
+    /// Vertical lines at each indent step.
+    pub show_indent_guides: bool,
+    /// Dots for spaces and a line for tabs.
+    pub show_whitespace: bool,
+    /// A box around the bracket at the cursor and its mate.
+    pub match_brackets: bool,
     pub page_guide_column: usize,
     /// A miniature of the whole file along the editor's right edge.
     pub show_minimap: bool,
@@ -583,12 +629,21 @@ impl Default for Config {
             font_size: 14.0,
             tab_width: 4,
             use_spaces: true,
+            detect_indent: true,
             show_line_numbers: true,
             auto_indent: true,
             autocomplete_brackets: true,
             autocomplete_quotes: true,
             highlight_current_line: true,
             show_page_guide: false,
+            high_contrast: false,
+            remote_hosts: Vec::new(),
+            spell_check: true,
+            spell_language: String::new(),
+            format_on_save: false,
+            show_indent_guides: true,
+            show_whitespace: false,
+            match_brackets: true,
             page_guide_column: 80,
             show_minimap: true,
             word_wrap: true,

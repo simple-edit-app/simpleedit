@@ -192,6 +192,161 @@ impl Default for Settings {
     }
 }
 
+/// What a check looks at in the answer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckSource {
+    #[default]
+    Status,
+    /// A header, named.
+    Header,
+    Body,
+    /// A place of the JSON body, as `data.items[0].id`.
+    Json,
+    /// How long it took, in milliseconds.
+    Time,
+}
+
+impl CheckSource {
+    pub const ALL: [CheckSource; 5] = [
+        CheckSource::Status,
+        CheckSource::Header,
+        CheckSource::Body,
+        CheckSource::Json,
+        CheckSource::Time,
+    ];
+}
+
+impl std::fmt::Display for CheckSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&match self {
+            CheckSource::Status => t!("api.check_status"),
+            CheckSource::Header => t!("api.check_header"),
+            CheckSource::Body => t!("api.check_body"),
+            CheckSource::Json => t!("api.check_json"),
+            CheckSource::Time => t!("api.check_time"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckOp {
+    #[default]
+    Equals,
+    NotEquals,
+    Contains,
+    NotContains,
+    Less,
+    Greater,
+    Exists,
+    /// A regular expression.
+    Matches,
+}
+
+impl CheckOp {
+    pub const ALL: [CheckOp; 8] = [
+        CheckOp::Equals,
+        CheckOp::NotEquals,
+        CheckOp::Contains,
+        CheckOp::NotContains,
+        CheckOp::Less,
+        CheckOp::Greater,
+        CheckOp::Exists,
+        CheckOp::Matches,
+    ];
+}
+
+impl std::fmt::Display for CheckOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&match self {
+            CheckOp::Equals => t!("api.op_equals"),
+            CheckOp::NotEquals => t!("api.op_not_equals"),
+            CheckOp::Contains => t!("api.op_contains"),
+            CheckOp::NotContains => t!("api.op_not_contains"),
+            CheckOp::Less => t!("api.op_less"),
+            CheckOp::Greater => t!("api.op_greater"),
+            CheckOp::Exists => t!("api.op_exists"),
+            CheckOp::Matches => t!("api.op_matches"),
+        })
+    }
+}
+
+/// A test of the answer: what it looks at, how, and what it expects (the
+/// `{{variables}}` are filled in).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Check {
+    pub enabled: bool,
+    pub source: CheckSource,
+    /// The header or the place in the JSON.
+    pub name: String,
+    pub op: CheckOp,
+    pub expected: String,
+}
+
+impl Default for Check {
+    fn default() -> Self {
+        Check {
+            enabled: true,
+            source: CheckSource::Status,
+            name: String::new(),
+            op: CheckOp::Equals,
+            expected: "200".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtractSource {
+    #[default]
+    Json,
+    Header,
+    /// A regular expression on the body: its first group, or all of it.
+    Body,
+}
+
+impl ExtractSource {
+    pub const ALL: [ExtractSource; 3] = [
+        ExtractSource::Json,
+        ExtractSource::Header,
+        ExtractSource::Body,
+    ];
+}
+
+impl std::fmt::Display for ExtractSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&match self {
+            ExtractSource::Json => t!("api.check_json"),
+            ExtractSource::Header => t!("api.check_header"),
+            ExtractSource::Body => t!("api.extract_regex"),
+        })
+    }
+}
+
+/// A value of the answer kept in a variable of the environment, for the
+/// requests that follow (a token, an id).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Extract {
+    pub enabled: bool,
+    pub variable: String,
+    pub source: ExtractSource,
+    pub path: String,
+}
+
+impl Default for Extract {
+    fn default() -> Self {
+        Extract {
+            enabled: true,
+            variable: String::new(),
+            source: ExtractSource::Json,
+            path: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Request {
@@ -204,6 +359,10 @@ pub struct Request {
     pub body: Body,
     pub auth: Auth,
     pub settings: Settings,
+    /// Tests of the answer.
+    pub checks: Vec<Check>,
+    /// Values of the answer kept for the next requests.
+    pub extracts: Vec<Extract>,
 }
 
 impl Request {

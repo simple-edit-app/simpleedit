@@ -49,6 +49,12 @@ pub fn has_formatter(token: &str) -> bool {
     command_for(token, "file").is_some()
 }
 
+/// Whether something can format a file of this language: a program of the
+/// list, or else the language server.
+pub fn can_format(token: &str) -> bool {
+    has_formatter(token) || crate::lsp::server_of(token).is_some()
+}
+
 /// Longest a formatter may run before it is killed.
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 

@@ -20,6 +20,15 @@ path = "src/main.rs"
 name = "simpleedit-db-postgres"
 path = "drivers/postgres/main.rs"
 
+# The SQLite and MySQL / MariaDB drivers: the same, for those databases.
+[[bin]]
+name = "simpleedit-db-sqlite"
+path = "drivers/sqlite/main.rs"
+
+[[bin]]
+name = "simpleedit-db-mysql"
+path = "drivers/mysql/main.rs"
+
 [dependencies]
 iced = { version = "0.14", features = ["advanced", "tokio", "lazy", "selector", "canvas"] }
 iced_aw = { version = "0.14", default-features = false, features = ["context_menu", "wrap"] }
@@ -50,6 +59,11 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio-postgres-rustls = "0.14.0"
 rustls-native-certs = "0.8.5"
 sqlformat = "0.5.0"
+spellbook = "0.4"
+rust_xlsxwriter = "0.102.0"
+serde_yaml = "0.9"
+rusqlite = { version = "0.41", features = ["bundled"] }
+mysql = { version = "28", default-features = false, features = ["minimal-rust", "rustls-tls-ring"] }
 
 # The system menu bar on macOS (File, Edit, View and Help up there).
 [target.'cfg(target_os = "macos")'.dependencies]

@@ -258,16 +258,18 @@ impl SimpleEditApp {
     }
 
     /// The problems as the editor draws them.
-    pub(super) fn problem_paint(&self) -> Option<crate::code_editor::DiagPaint> {
+    pub(super) fn problem_paint(&self, dark: bool) -> Option<crate::code_editor::DiagPaint> {
+        let spelling = self.spell_marks(dark);
         if !self.config.lint_enabled
             || !self.config.lint_highlight
             || self.lint.diagnostics.is_empty()
             || self.lint.file != self.current_file
         {
-            return None;
+            return (!spelling.is_empty())
+                .then_some(crate::code_editor::DiagPaint { marks: spelling });
         }
         use lint::Marking;
-        let marks = self
+        let mut marks: Vec<crate::code_editor::DiagMark> = self
             .visible_problems()
             .into_iter()
             .map(|i| {
@@ -290,6 +292,7 @@ impl SimpleEditApp {
                 }
             })
             .collect();
+        marks.extend(spelling);
         Some(crate::code_editor::DiagPaint { marks })
     }
 
@@ -684,7 +687,7 @@ mod tests {
             ),
         );
         assert_eq!(app.lint.diagnostics.len(), 2);
-        let paint = app.problem_paint().expect("something to draw");
+        let paint = app.problem_paint(true).expect("something to draw");
         assert_eq!(paint.marks.len(), 2);
         let counts = app.problem_counts().unwrap();
         assert_eq!((counts.errors, counts.warnings), (1, 1));
@@ -697,9 +700,9 @@ mod tests {
         assert_eq!(app.lint.diagnostics.len(), 2);
         // The level hides what is below it.
         app.config.lint_level = lint::Level::Errors;
-        assert_eq!(app.problem_paint().unwrap().marks.len(), 1);
+        assert_eq!(app.problem_paint(true).unwrap().marks.len(), 1);
         app.config.lint_highlight = false;
-        assert!(app.problem_paint().is_none());
+        assert!(app.problem_paint(true).is_none());
         // The fix goes into the text, as one step that can be undone.
         app.config.lint_highlight = true;
         // Sorted by position: the warning is first, the error with its fix second.
@@ -800,7 +803,7 @@ mod tests {
             Severity::Warning,
             "#0000ff".into(),
         )));
-        let marks = app.problem_paint().unwrap().marks;
+        let marks = app.problem_paint(true).unwrap().marks;
         let (error, warning) = (&marks[0], &marks[1]);
         assert!(error.wash.is_some() && !error.wavy && !error.straight);
         assert!(warning.straight && warning.wash.is_none() && !warning.wavy);

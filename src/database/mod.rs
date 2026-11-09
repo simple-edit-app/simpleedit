@@ -8,8 +8,10 @@
 pub mod admin_view;
 pub mod completion;
 pub mod console;
+pub mod convert;
 pub mod ddl;
 pub mod designer;
+pub mod diagram;
 pub mod grid;
 pub mod import;
 // The driver uses parts of it that the app does not.
@@ -41,7 +43,6 @@ pub const DRIVER_PROTOCOL: u32 = protocol::PROTOCOL;
 pub const DEFAULT_PAGE_SIZE: u64 = 500;
 pub const PAGE_SIZES: [u64; 6] = [50, 100, 200, 500, 1000, 5000];
 
-const DRIVER_NAME: &str = "simpleedit-db-postgres";
 /// Longest wait for the driver to answer (a tunnel takes a while to come up).
 const CALL_TIMEOUT: Duration = Duration::from_secs(45);
 /// The driver is a few megabytes.
@@ -74,9 +75,9 @@ pub enum DbMsg {
     Duplicate(u64),
     /// Removes the connection being edited.
     Delete,
-    DriverProbed(Driver),
-    DownloadDriver,
-    DriverDownloaded(Result<(), String>),
+    DriverProbed(protocol::Dialect, Driver),
+    DownloadDriver(protocol::Dialect),
+    DriverDownloaded(protocol::Dialect, Result<(), String>),
     /// Forgets the driver file picked by hand.
     UseDownloadedDriver,
     /// Opens or folds a node of the tree.
@@ -173,6 +174,10 @@ pub enum DbMsg {
     /// A schema's menu: a new table, a new schema in its database.
     NewTable(u64, String, String),
     NewSchema(u64, String),
+    /// A schema's menu: the diagram of its tables; what the catalog gave.
+    ShowDiagram(u64, String, String),
+    DiagramLoaded(String, Done<protocol::Catalog>),
+    CopyDiagram,
     SchemaName(String),
     SchemaCreate,
     SchemaClose,
@@ -595,6 +600,7 @@ pub enum Choice {
     Remember(Remember),
     SslMode(SslMode),
     SshAuth(SshAuth),
+    Dialect(protocol::Dialect),
 }
 
 /// What is done with the password once it is typed, as in the
@@ -621,6 +627,9 @@ impl Remember {
 #[serde(default)]
 pub struct Connection {
     pub id: u64,
+    /// The database system: each has its own driver.
+    #[serde(default)]
+    pub dialect: protocol::Dialect,
     pub name: String,
     pub comment: String,
     /// Only the URL is given (host, port and database come out of it).
@@ -653,6 +662,7 @@ impl Default for Connection {
     fn default() -> Self {
         Connection {
             id: 0,
+            dialect: protocol::Dialect::default(),
             name: String::new(),
             comment: String::new(),
             url_only: false,
@@ -703,6 +713,7 @@ impl Connection {
     /// What the driver is given; the secrets come from outside.
     fn target(&self, password: String, ssh_secret: String) -> Target {
         Target {
+            dialect: self.dialect,
             host: self.host.clone(),
             port: self.port,
             database: self.database.clone(),
@@ -830,35 +841,42 @@ pub enum Driver {
 /// Where the driver is looked for: the file picked by hand, a developer's
 /// override, next to the app (a build from source), then the folder the app
 /// downloads it to.
-fn driver_candidates(picked: &str) -> Vec<PathBuf> {
+fn driver_candidates(picked: &str, dialect: protocol::Dialect) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    if !picked.trim().is_empty() {
+    // The file picked by hand is the PostgreSQL driver's: the others are
+    // found where the app puts them.
+    if dialect == protocol::Dialect::Postgres && !picked.trim().is_empty() {
         found.push(PathBuf::from(picked.trim()));
     }
-    if let Some(path) = std::env::var_os("SIMPLEEDIT_DB_DRIVER") {
+    let variable = match dialect {
+        protocol::Dialect::Postgres => "SIMPLEEDIT_DB_DRIVER",
+        protocol::Dialect::Sqlite => "SIMPLEEDIT_DB_DRIVER_SQLITE",
+        protocol::Dialect::Mysql => "SIMPLEEDIT_DB_DRIVER_MYSQL",
+    };
+    if let Some(path) = std::env::var_os(variable) {
         found.push(PathBuf::from(path));
     }
     if let Some(dir) = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf))
     {
-        found.push(dir.join(DRIVER_NAME));
+        found.push(dir.join(dialect.driver_name()));
     }
-    found.push(downloaded_driver());
+    found.push(downloaded_driver_of(dialect));
     found
 }
 
-/// Where a driver is downloaded to.
-pub fn downloaded_driver() -> PathBuf {
+/// Where the driver of a system is downloaded to.
+pub fn downloaded_driver_of(dialect: protocol::Dialect) -> PathBuf {
     crate::fsutil::data_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("simpleedit")
         .join("drivers")
-        .join(DRIVER_NAME)
+        .join(dialect.driver_name())
 }
 
 /// The asset of a release that holds the driver for this system.
-fn driver_asset(version: &str) -> Option<String> {
+fn driver_asset(version: &str, dialect: protocol::Dialect) -> Option<String> {
     let target = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         "aarch64-apple-darwin"
     } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
@@ -866,12 +884,12 @@ fn driver_asset(version: &str) -> Option<String> {
     } else {
         return None;
     };
-    Some(format!("{DRIVER_NAME}-v{version}-{target}"))
+    Some(format!("{}-v{version}-{target}", dialect.driver_name()))
 }
 
-/// The first driver that is there and speaks the right protocol.
-pub async fn find_driver(picked: &str) -> Option<PathBuf> {
-    for path in driver_candidates(picked) {
+/// The same for the driver of a system.
+pub async fn find_driver_for(dialect: protocol::Dialect, picked: &str) -> Option<PathBuf> {
+    for path in driver_candidates(picked, dialect) {
         if !path.is_file() {
             continue;
         }
@@ -893,8 +911,8 @@ pub async fn find_driver(picked: &str) -> Option<PathBuf> {
     None
 }
 
-pub async fn probe_driver(picked: String) -> Driver {
-    if find_driver(&picked).await.is_some() {
+pub async fn probe_driver_of(dialect: protocol::Dialect, picked: String) -> Driver {
+    if find_driver_for(dialect, &picked).await.is_some() {
         Driver::Ready
     } else {
         Driver::Missing
@@ -903,13 +921,13 @@ pub async fn probe_driver(picked: String) -> Driver {
 
 /// Downloads the driver of this version of the app, checked against the
 /// signed `SHA256SUMS` of its release, and keeps it in the data folder.
-pub async fn download_driver() -> Result<(), String> {
+pub async fn download_driver_of(dialect: protocol::Dialect) -> Result<(), String> {
     let version = env!("CARGO_PKG_VERSION");
-    let asset = driver_asset(version).ok_or_else(|| t!("db.err_platform").to_string())?;
+    let asset = driver_asset(version, dialect).ok_or_else(|| t!("db.err_platform").to_string())?;
     let bytes =
         crate::updater::download_verified(version, &asset, MAX_DRIVER, Duration::from_secs(120))
             .await?;
-    let dest = downloaded_driver();
+    let dest = downloaded_driver_of(dialect);
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         if let Some(dir) = dest.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -1024,7 +1042,7 @@ async fn call_inner(
     picked: String,
     request: protocol::Request,
 ) -> Result<Done<serde_json::Value>, String> {
-    let path = find_driver(&picked)
+    let path = find_driver_for(request.target.dialect, &picked)
         .await
         .ok_or_else(|| t!("db.err_driver_missing").to_string())?;
     let mut child = tokio::process::Command::new(path)
@@ -1091,7 +1109,7 @@ async fn call_live(
     request: protocol::Request,
 ) -> Result<Done<serde_json::Value>, String> {
     use tokio::io::AsyncBufReadExt;
-    let path = find_driver(&picked)
+    let path = find_driver_for(request.target.dialect, &picked)
         .await
         .ok_or_else(|| t!("db.err_driver_missing").to_string())?;
     let pid_cell = live.1.clone();
@@ -1570,10 +1588,10 @@ pub async fn function_definition(
 /// The SQL that makes a view or a materialized view.
 pub async fn definition(params: Params, table: TableRef, kind: Kind) -> Done<String> {
     let mut request = table_request(&params, "definition", &table);
-    request.object = if kind == Kind::Matview {
-        "matview"
-    } else {
-        "view"
+    request.object = match kind {
+        Kind::Matview => "matview",
+        Kind::Table => "table",
+        _ => "view",
     }
     .to_string();
     call_with(params.browse.clone(), params.driver.clone(), request)
@@ -1667,6 +1685,65 @@ pub async fn export(
     call_with(live, params.driver.clone(), request)
         .await
         .map(|answer| Ok(answer["path"].as_str().unwrap_or_default().to_string()))
+}
+
+/// Writes the rows as `sql` (INSERT statements), `md` (a Markdown table) or
+/// `xlsx` (an Excel sheet): the driver writes a CSV, which is read and
+/// written again in the format.
+pub async fn export_converted(
+    live: Option<Live>,
+    params: Params,
+    table: TableRef,
+    query: Query,
+    path: String,
+    format: &str,
+) -> Done<String> {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let temp = std::env::temp_dir().join(format!(
+        "simpleedit-export-{}-{}.csv",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let name = if query.sql.is_some() || table.table.is_empty() {
+        "result".to_string()
+    } else {
+        format!(
+            "{}.{}",
+            protocol::quote_ident(&table.schema),
+            protocol::quote_ident(&table.table)
+        )
+    };
+    let mut done = export(
+        live,
+        params,
+        table,
+        query,
+        temp.to_string_lossy().into_owned(),
+        "csv",
+    )
+    .await;
+    if done.result.is_ok() {
+        let format = format.to_string();
+        let target = path.clone();
+        let source = temp.clone();
+        let converted = tokio::task::spawn_blocking(move || -> Result<String, String> {
+            let text = std::fs::read_to_string(&source).map_err(|e| e.to_string())?;
+            let rows = convert::parse_csv(&text);
+            match format.as_str() {
+                "sql" => std::fs::write(&target, convert::to_inserts(&name, &rows)),
+                "md" => std::fs::write(&target, convert::to_markdown(&rows)),
+                "xlsx" => return convert::write_xlsx(Path::new(&target), &rows).map(|_| target),
+                other => return Err(format!("no format {other}")),
+            }
+            .map(|_| target.clone())
+            .map_err(|e| format!("{target}: {e}"))
+        })
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+        done.result = converted;
+    }
+    let _ = std::fs::remove_file(&temp);
+    done
 }
 
 /// The rows a statement gave, as a page; its place is the first one.
@@ -2161,6 +2238,26 @@ impl Dialog {
             Choice::Remember(remember) => d.remember = remember,
             Choice::SslMode(mode) => d.ssl.mode = mode,
             Choice::SshAuth(auth) => d.ssh.auth = auth,
+            Choice::Dialect(dialect) => {
+                // The port follows, unless it was typed by hand.
+                if self.port.trim() == d.dialect.default_port().to_string()
+                    || self.port.trim().is_empty()
+                    || self.port.trim() == "0"
+                {
+                    let port = dialect.default_port();
+                    d.port = port;
+                    self.port = if port == 0 {
+                        String::new()
+                    } else {
+                        port.to_string()
+                    };
+                }
+                if dialect == protocol::Dialect::Sqlite {
+                    d.url_only = false;
+                    d.ssh.enabled = false;
+                }
+                d.dialect = dialect;
+            }
         }
         self.test = TestState::Idle;
     }
@@ -2174,6 +2271,10 @@ impl Dialog {
     /// What it takes to connect.
     pub fn valid(&self) -> bool {
         let d = &self.draft;
+        if d.dialect == protocol::Dialect::Sqlite {
+            // A file is all it takes.
+            return !d.database.trim().is_empty();
+        }
         let url_ok = !d.url_only || protocol::parse_url(&d.url).is_some();
         !d.host.trim().is_empty()
             && self.port.trim().parse::<u16>().is_ok_and(|p| p > 0)
@@ -2233,6 +2334,8 @@ pub struct State {
     pub open: HashSet<String>,
     pub dialog: Option<Dialog>,
     pub driver: Driver,
+    /// The state of the drivers of the other systems.
+    pub other_drivers: HashMap<protocol::Dialect, Driver>,
     /// A driver file picked by hand.
     pub driver_path: String,
     /// Rows in a page of a table, for the tables that are opened.
@@ -2294,6 +2397,7 @@ impl State {
             open: HashSet::new(),
             dialog: None,
             driver: Driver::Unknown,
+            other_drivers: HashMap::new(),
             driver_path: stored.driver_path,
             page_size: if stored.page_size == 0 {
                 DEFAULT_PAGE_SIZE
@@ -2400,6 +2504,23 @@ impl State {
 
     pub fn persist(&self) {
         save_stored(&self.connections, &self.driver_path, self.page_size);
+    }
+
+    /// How the driver of a system is doing.
+    pub fn driver_of(&self, dialect: protocol::Dialect) -> &Driver {
+        if dialect == protocol::Dialect::Postgres {
+            &self.driver
+        } else {
+            self.other_drivers.get(&dialect).unwrap_or(&Driver::Unknown)
+        }
+    }
+
+    pub fn set_driver(&mut self, dialect: protocol::Dialect, driver: Driver) {
+        if dialect == protocol::Dialect::Postgres {
+            self.driver = driver;
+        } else {
+            self.other_drivers.insert(dialect, driver);
+        }
     }
 
     /// Adds or replaces the connection the dialog describes; its id.
@@ -2792,7 +2913,7 @@ mod tests {
 
     #[test]
     fn the_asset_is_named_after_the_version_and_the_system() {
-        if let Some(asset) = driver_asset("1.18.0") {
+        if let Some(asset) = driver_asset("1.18.0", protocol::Dialect::Postgres) {
             assert!(asset.starts_with("simpleedit-db-postgres-v1.18.0-"));
         }
     }
@@ -3193,7 +3314,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            assert_eq!(probe_driver(String::new()).await, Driver::Ready);
+            assert_eq!(probe_driver_of(protocol::Dialect::Postgres, String::new()).await, Driver::Ready);
             let version = test(params.clone()).await.result.unwrap();
             assert!(version.starts_with("PostgreSQL"), "{version}");
             let databases = tree(params.clone()).await.result.unwrap();
@@ -3963,5 +4084,157 @@ mod tests {
             tls.target.ssl.mode = SslMode::Require;
             assert!(test(tls).await.result.is_err());
         });
+    }
+}
+
+#[cfg(test)]
+mod other_systems_tests {
+    use super::*;
+
+    /// The SQLite driver, built by Cargo next to the test program.
+    fn sqlite_driver() -> Option<PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        let built = exe.parent()?.parent()?.join("simpleedit-db-sqlite");
+        built.is_file().then_some(built)
+    }
+
+    #[test]
+    fn a_sqlite_file_is_read_changed_and_exported_through_the_apps_own_calls() {
+        let Some(driver) = sqlite_driver() else {
+            eprintln!("the SQLite driver is not built: skipped");
+            return;
+        };
+        std::env::set_var("SIMPLEEDIT_DB_DRIVER_SQLITE", &driver);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("shop.db");
+        let conn = rusqlite::Connection::open(&file).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE pets (id INTEGER PRIMARY KEY, name TEXT, note TEXT);
+             INSERT INTO pets VALUES (1, 'Rex', NULL), (2, 'O''Neil', '');",
+        )
+        .unwrap();
+        let connection = Connection {
+            dialect: protocol::Dialect::Sqlite,
+            database: file.to_string_lossy().into_owned(),
+            ..Connection::default()
+        };
+        let params = Params {
+            target: connection.target(String::new(), String::new()),
+            scope: connection.scope.clone(),
+            driver: String::new(),
+            browse: None,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            assert_eq!(
+                probe_driver_of(protocol::Dialect::Sqlite, String::new()).await,
+                Driver::Ready,
+                "the driver answers the protocol of the app"
+            );
+            let version = test(params.clone()).await;
+            assert!(version.result.unwrap().starts_with("SQLite 3."));
+            let databases = tree(params.clone()).await.result.unwrap();
+            assert_eq!(databases[0].schemas[0].tables[0].name, "pets");
+            let at = |offset| Query {
+                offset,
+                limit: 10,
+                filter: String::new(),
+                order: Vec::new(),
+                sql: None,
+            };
+            let table = TableRef {
+                database: String::new(),
+                schema: "main".into(),
+                table: "pets".into(),
+            };
+            let page = rows(params.clone(), table.clone(), at(0))
+                .await
+                .result
+                .unwrap();
+            assert_eq!(page.rows[1][1].as_deref(), Some("O'Neil"));
+            assert!(page.editable && page.primary_key == vec!["id".to_string()]);
+            let done = apply(
+                params.clone(),
+                table.clone(),
+                vec![protocol::Change {
+                    kind: protocol::ChangeKind::Update,
+                    key: vec![("id".into(), "1".into())],
+                    set: vec![("note".into(), Some("changed".into()))],
+                    original: Vec::new(),
+                }],
+            )
+            .await;
+            assert_eq!(done.result.unwrap(), 1);
+            // The conversions of the app work on what any driver exports.
+            let out = dir.path().join("pets.sql").to_string_lossy().into_owned();
+            let exported = export_converted(
+                None,
+                params.clone(),
+                table.clone(),
+                at(0),
+                out.clone(),
+                "sql",
+            )
+            .await;
+            assert!(exported.result.is_ok(), "{:?}", exported.result);
+            let sql = std::fs::read_to_string(&out).unwrap();
+            assert!(sql.contains("('1', 'Rex', 'changed')"), "{sql}");
+            assert!(sql.contains("('2', 'O''Neil', '')"), "{sql}");
+            let ddl = definition(params.clone(), table, Kind::Table)
+                .await
+                .result
+                .unwrap();
+            assert!(ddl.starts_with("CREATE TABLE pets"), "{ddl}");
+        });
+    }
+
+    #[test]
+    fn each_system_has_its_own_driver_name_port_and_quotes() {
+        use protocol::Dialect::*;
+        assert_eq!(Postgres.driver_name(), "simpleedit-db-postgres");
+        assert_eq!((Sqlite.default_port(), Mysql.default_port()), (0, 3306));
+        assert_eq!(Mysql.quote("a`b"), "`a``b`");
+        assert_eq!(Sqlite.quote("a\"b"), "\"a\"\"b\"");
+        let candidates = driver_candidates("/picked/pg-driver", Sqlite);
+        assert!(
+            !candidates.iter().any(|p| p.ends_with("pg-driver")),
+            "the picked file is PostgreSQL's"
+        );
+        assert!(candidates
+            .last()
+            .unwrap()
+            .ends_with("drivers/simpleedit-db-sqlite"));
+        assert!(driver_candidates("/picked/pg-driver", Postgres)[0].ends_with("pg-driver"));
+        assert_eq!(
+            driver_asset("1.2.3", Mysql)
+                .as_deref()
+                .map(|a| a.starts_with("simpleedit-db-mysql-v1.2.3-")),
+            driver_asset("1.2.3", Mysql).map(|_| true)
+        );
+    }
+
+    #[test]
+    fn the_form_asks_for_a_file_for_sqlite_and_the_port_follows_the_system() {
+        let mut d = Dialog::new();
+        d.choose(Choice::Dialect(protocol::Dialect::Mysql));
+        assert_eq!(d.port, "3306");
+        d.choose(Choice::Dialect(protocol::Dialect::Sqlite));
+        assert!(!d.valid(), "a file is needed");
+        d.set(Field::Database, "/tmp/a.db".into());
+        assert!(d.valid(), "a file is all that is needed");
+        assert_eq!(d.connection(1).dialect, protocol::Dialect::Sqlite);
+        assert_eq!(d.target().dialect, protocol::Dialect::Sqlite);
+        // A port typed by hand stays when the system changes.
+        let mut d = Dialog::new();
+        d.set(Field::Port, "5999".into());
+        d.choose(Choice::Dialect(protocol::Dialect::Mysql));
+        assert_eq!(d.port, "5999");
+        // A connection saved before the systems existed is PostgreSQL.
+        let old: Connection =
+            serde_json::from_str(r#"{"id": 1, "name": "x", "host": "h"}"#).unwrap();
+        assert_eq!(old.dialect, protocol::Dialect::Postgres);
     }
 }

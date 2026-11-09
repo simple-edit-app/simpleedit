@@ -233,6 +233,7 @@ impl EditorState {
     pub fn view<'a>(
         &'a self,
         config: &Config,
+        tab_width: usize,
         search: Option<&SearchState>,
         bookmarks: &[usize],
         blame: Option<crate::code_editor::Annotations>,
@@ -284,6 +285,20 @@ impl EditorState {
         if config.show_page_guide {
             editor = editor.page_guide(config.page_guide_column, p.border);
         }
+        editor = editor
+            .marks(crate::code_editor::ViewMarks {
+                indent_guides: config.show_indent_guides.then_some(iced::Color {
+                    a: 0.35,
+                    ..p.border
+                }),
+                whitespace: config
+                    .show_whitespace
+                    .then_some(iced::Color { a: 0.55, ..p.muted }),
+                bracket: config.match_brackets.then_some(p.accent),
+                tab_width,
+            })
+            .on_zoom(Message::Zoom)
+            .on_symbol_hover(Message::SymbolHover);
         if let Some(changes) = changes {
             editor = editor.changes(changes).revertible(
                 Message::ChangeBar,
@@ -500,6 +515,7 @@ pub mod statusbar {
         pub file_size: Option<u64>,
         pub use_spaces: bool,
         pub tab_width: usize,
+        pub encoding: &'a str,
         /// The Git branch (name, commits ahead, behind): a click opens the
         /// switcher.
         pub branch: Option<(String, u32, u32)>,
@@ -560,7 +576,21 @@ pub mod statusbar {
             p.accent
         };
 
-        let mut right = row![].spacing(18).align_y(Alignment::Center);
+        // The indentation, line endings and encoding: a click changes them.
+        let choice = |label: String, which: crate::app::TextOption| -> Element<'a, Message> {
+            button(text(label).size(11.5).color(muted))
+                .padding([1, 6])
+                .on_press(Message::OpenTextOptions(which))
+                .style(
+                    (theme::GhostButton {
+                        dark,
+                        active: false,
+                    })
+                    .style(),
+                )
+                .into()
+        };
+        let mut right = row![].spacing(10).align_y(Alignment::Center);
         if let Some(hint) = info.lint_hint {
             right = right.push(
                 button(text(hint).size(11.5).color(muted))
@@ -637,9 +667,15 @@ pub mod statusbar {
                     .size(11.5)
                     .color(muted),
             )
-            .push(text(indent).size(11.5).color(muted))
-            .push(text(info.line_ending).size(11.5).color(muted))
-            .push(text("UTF-8").size(11.5).color(muted))
+            .push(choice(indent, crate::app::TextOption::Indent))
+            .push(choice(
+                info.line_ending.to_string(),
+                crate::app::TextOption::LineEnding,
+            ))
+            .push(choice(
+                info.encoding.to_string(),
+                crate::app::TextOption::Encoding,
+            ))
             .push(text(lang_label).size(11.5).color(p.text));
 
         let message: Element<'a, Message> = match info.offer {
