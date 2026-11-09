@@ -1,5 +1,18 @@
 # Journal des modifications
 
+## [1.24.0] - 2026-11-09
+
+### Ajouté
+- Chercher dans les fichiers : le dossier est un champ avec les dossiers déjà parcourus et un bouton pour en choisir un, comme dans IntelliJ.
+- Chercher dans les fichiers : Entrée ouvre la correspondance choisie dans la liste, comme un double clic.
+
+### Modifié
+- Chercher dans les fichiers : l'aperçu d'une correspondance est un éditeur, avec les couleurs du langage, un menu clic droit (couper, copier, coller, supprimer, tout sélectionner), et ce qui y est tapé va dans le fichier.
+- Chercher dans les fichiers : un double clic sur une correspondance ouvre le fichier à l'endroit du mot.
+
+### Corrigé
+- Chercher dans les fichiers : les options de « Dans » passent à la ligne au lieu de sortir de la fenêtre.
+
 ## [1.23.0] - 2026-11-09
 
 ### Ajouté

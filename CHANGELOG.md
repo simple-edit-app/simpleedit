@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.24.0] - 2026-11-09
+
+### Added
+- Find in files: the folder is a field with the folders already looked in and a button to pick one, as in IntelliJ.
+- Find in files: Enter opens the match picked in the list, as a double click does.
+
+### Changed
+- Find in files: the preview of a match is an editor, with the colours of the language, a right-click menu (cut, copy, paste, delete, select all), and what is typed there goes into the file.
+- Find in files: a double click on a match opens the file where the word is.
+
+### Fixed
+- Find in files: the options of "Where" wrap onto a second line instead of leaving the window.
+
 ## [1.23.0] - 2026-11-09
 
 ### Added
