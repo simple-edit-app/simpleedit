@@ -1,5 +1,24 @@
 # Journal des modifications
 
+## [1.25.0] - 2026-11-09
+
+### Ajouté
+- Éditeur : plusieurs curseurs (Alt+clic, Alt+J pour l'occurrence suivante, Ctrl+Alt+Maj+J pour toutes, Ctrl+Alt+Haut/Bas, Échap), sélection en colonne (Alt+Maj+glisser), la parenthèse jumelle de celle du curseur, guides d'indentation et espaces visibles (Préférences), zoom (Ctrl+molette, Ctrl +/-/0).
+- Fichiers : encodages (UTF-8 avec BOM, UTF-16, Windows-1252, ISO-8859-1/15) détectés, relus et choisis pour l'enregistrement ; fins de ligne et indentation choisies dans la barre d'état, indentation de chaque fichier détectée, et convertie entre espaces et tabulations.
+- Commandes de texte : trier, supprimer les doublons, inverser et joindre les lignes, supprimer les espaces en fin de ligne, changer la casse (camel, snake, kebab…) ; taper une parenthèse ou un guillemet autour d'une sélection l'entoure.
+- Les fichiers trop gros pour être ouverts d'un bloc sont montrés par parties, en lecture seule.
+- Serveurs de langage : renommer un symbole (Maj+F6), infobulle au survol, formatage par le serveur et « formater à l'enregistrement ».
+- Ligne de commande : `simpleedit fichier:ligne:col` ouvre dans la fenêtre qui tourne (`--new-window` pour une autre) ; commande « Nouvelle fenêtre ».
+- Tâches d'un projet (Cargo, npm, Make, Go, `.simpleedit/tasks.json`) avec leur sortie et des erreurs cliquables (Ctrl+Alt+R) ; les commentaires TODO / FIXME dans le panneau Résultats.
+- Comparer le texte avec le presse-papiers, le fichier sur le disque ou un autre fichier ; orthographe avec les dictionnaires Hunspell du système (Ctrl+Alt+S pour corriger un mot) ; ouvrir des fichiers par SSH.
+- Bases de données : sources SQLite et MySQL / MariaDB, chacune avec son pilote ; export des lignes en instructions INSERT, en Excel ou en Markdown ; diagramme des tables d'un schéma (copié en texte Mermaid).
+- API : tests sur la réponse, valeurs gardées dans l'environnement pour les requêtes suivantes, import OpenAPI / Swagger, « Lancer toutes les requêtes » d'une collection avec un rapport.
+- Thèmes à fort contraste (Préférences) ; flèches et Entrée dans les petites listes.
+
+### Modifié
+- Chercher dans les fichiers : l'aperçu est un éditeur, Entrée et un double clic ouvrent la correspondance, le dossier est un champ avec son historique.
+- Le protocole des pilotes est maintenant 19 : le pilote PostgreSQL est téléchargé de nouveau à la première utilisation.
+
 ## [1.24.0] - 2026-11-09
 
 ### Ajouté

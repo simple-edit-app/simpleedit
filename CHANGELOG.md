@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.25.0] - 2026-11-09
+
+### Added
+- Editor: several cursors (Alt+click, Alt+J for the next occurrence, Ctrl+Alt+Shift+J for all, Ctrl+Alt+Up/Down, Esc), block selection (Alt+Shift+drag), the bracket that matches the one at the cursor, indent guides and visible whitespace (Preferences), zoom (Ctrl+wheel, Ctrl +/-/0).
+- Files: encodings (UTF-8 with BOM, UTF-16, Windows-1252, ISO-8859-1/15) detected, read again and chosen for saving; line endings and indentation chosen from the status bar, the indentation of each file detected, and converted between spaces and tabs.
+- Text commands: sort, remove duplicates, reverse and join lines, trim trailing whitespace, change case (camel, snake, kebab…); typing a bracket or a quote around a selection surrounds it.
+- Files too large to open whole are shown in parts, read only.
+- Language servers: rename a symbol (Shift+F6), hover information, formatting by the server and "format when saving".
+- Command line: `simpleedit file:line:col` opens in the window that runs (`--new-window` for another); "New window" command.
+- Tasks of a project (Cargo, npm, Make, Go, `.simpleedit/tasks.json`) with their output and clickable errors (Ctrl+Alt+R); the TODO / FIXME comments in the Results panel.
+- Compare the text with the clipboard, the file on disk or another file; spell checking with the system's Hunspell dictionaries (Ctrl+Alt+S to fix a word); open files over SSH.
+- Databases: SQLite and MySQL / MariaDB data sources, each with its own driver; export of rows as INSERT statements, Excel or Markdown; diagram of the tables of a schema (copied as Mermaid).
+- API: tests on the answer, values kept in the environment for the next requests, import of OpenAPI / Swagger, "Run all the requests" of a collection with a report.
+- High contrast themes (Preferences); arrows and Enter in the small lists.
+
+### Changed
+- Find in files: the preview is an editor, Enter and a double click open the match, the folder is a field with its history.
+- The driver protocol is now 19: the PostgreSQL driver is downloaded again at the first use.
+
 ## [1.24.0] - 2026-11-09
 
 ### Added
