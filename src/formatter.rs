@@ -11,7 +11,7 @@ fn command_for(token: &str, name: &str) -> Option<(String, Vec<String>)> {
                 vec!["--stdin-filepath".into(), name.to_string()],
             ))
         }
-        "rs" => Some(("rustfmt".into(), vec!["--edition".into(), "2021".into()])),
+        "rs" => Some(("rustfmt".into(), vec![])),
         "go" => Some(("gofmt".into(), vec![])),
         "py" => Some(("black".into(), vec!["-".into(), "--quiet".into()])),
         "sh" => Some(("shfmt".into(), vec![])),
@@ -107,8 +107,11 @@ pub async fn format(
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".to_string());
     let name = format!("{stem}.{}", extension_for(&token));
-    let (cmd, args) =
+    let (cmd, mut args) =
         command_for(&token, &name).ok_or_else(|| t!("format.no_formatter").to_string())?;
+    if token == "rs" {
+        args.extend(rust_edition_args(target.as_deref()));
+    }
 
     let mut child = spawn(&cmd, &args, dir.as_deref())
         .map_err(|_| t!("format.not_found", tool = cmd.as_str()).to_string())?;
@@ -144,6 +147,41 @@ pub async fn format(
     }
 }
 
+/// `--edition` for rustfmt: the one of the nearest `Cargo.toml` (2021 when it
+/// says none), nothing when a `rustfmt.toml` sets it.
+fn rust_edition_args(target: Option<&std::path::Path>) -> Vec<String> {
+    let mut edition = None;
+    for dir in target
+        .and_then(std::path::Path::parent)
+        .into_iter()
+        .flat_map(|d| d.ancestors())
+    {
+        for name in ["rustfmt.toml", ".rustfmt.toml"] {
+            if let Ok(text) = std::fs::read_to_string(dir.join(name)) {
+                if text.contains("edition") {
+                    return vec![];
+                }
+            }
+        }
+        if let Ok(text) = std::fs::read_to_string(dir.join("Cargo.toml")) {
+            edition = text.lines().find_map(|l| {
+                let rest = l
+                    .trim()
+                    .strip_prefix("edition")?
+                    .trim_start()
+                    .strip_prefix('=')?;
+                let year = rest.trim().trim_matches('"');
+                (year.len() == 4 && year.chars().all(|c| c.is_ascii_digit()))
+                    .then(|| year.to_string())
+            });
+            if edition.is_some() {
+                break;
+            }
+        }
+    }
+    vec!["--edition".into(), edition.unwrap_or_else(|| "2021".into())]
+}
+
 /// An empty result for a non-empty input is a formatter that printed nothing
 /// (it checked instead of formatting, or failed quietly): applying it would
 /// wipe the buffer.
@@ -177,6 +215,20 @@ pub fn short_error(err: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rust_edition_follows_cargo_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        let file = dir.path().join("a.rs");
+        assert_eq!(rust_edition_args(Some(&file)), vec!["--edition", "2024"]);
+        std::fs::write(dir.path().join("rustfmt.toml"), "edition = \"2018\"\n").unwrap();
+        assert!(rust_edition_args(Some(&file)).is_empty());
+    }
 
     #[test]
     fn ktlint_is_asked_to_format_not_just_to_check() {

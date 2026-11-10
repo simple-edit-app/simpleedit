@@ -146,6 +146,10 @@ fn base_url(root: &Value) -> String {
                 url = url.replace(&format!("{{{name}}}"), default);
             }
         }
+        // A relative address (`/v1`) is relative to where the file came from.
+        if url.starts_with('/') {
+            url = format!("http://localhost{url}");
+        }
         return url.trim_end_matches('/').to_string();
     }
     let host = root["host"].as_str().unwrap_or("");
@@ -523,6 +527,12 @@ paths:
         assert_eq!(r.body.kind, BodyKind::Json);
         assert!(r.body.text.contains("\"n\": 0"));
         assert_eq!(imported.variables[0].value, "http://example.org/api");
+    }
+
+    #[test]
+    fn a_relative_server_url_gets_a_host() {
+        let spec = r#"{"openapi": "3.0.0", "servers": [{"url": "/v1"}], "paths": {}}"#;
+        assert_eq!(base_url(&parse(spec).unwrap()), "http://localhost/v1");
     }
 
     #[test]

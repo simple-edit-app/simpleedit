@@ -369,16 +369,17 @@ pub fn restart() -> Result<(), String> {
 
     // A package manager (dpkg, etc.) replaces the binary file in place while
     // this process is still running it. On Linux that makes current_exe()
-    // report something like "/usr/bin/simpleedit (deleted)": the kernel's
-    // way of saying the path this process was loaded from no longer has a
-    // directory entry, even though a freshly installed file now sits at
-    // that same path. Command::new() on that literal string can't find
-    // anything there, so fall back to the bare name and let PATH resolve
-    // the new file instead.
+    // report something like "/usr/bin/simpleedit (deleted)", even though a
+    // freshly installed file now sits at that same path. Strip the suffix
+    // rather than resolving the bare name through PATH, which could pick up
+    // an older copy (e.g. in ~/.local/bin).
     let exe = if exe.exists() {
         exe
     } else {
-        PathBuf::from("simpleedit")
+        match exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+            Some(path) => PathBuf::from(path),
+            None => exe,
+        }
     };
 
     std::process::Command::new(&exe)

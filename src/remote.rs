@@ -36,6 +36,14 @@ pub fn parse(spec: &str) -> Option<RemoteFile> {
     let spec = spec.trim();
     let (host, path) = if let Some(rest) = spec.strip_prefix("ssh://") {
         let (host, path) = rest.split_once('/')?;
+        // ssh takes `ssh://user@host:port` as a destination itself.
+        if host.contains(':') {
+            let host = format!("ssh://{host}");
+            return valid_host(&host).then(|| RemoteFile {
+                host,
+                path: format!("/{path}"),
+            });
+        }
         (host, format!("/{path}"))
     } else {
         let (host, path) = spec.split_once(':')?;
@@ -72,6 +80,10 @@ pub fn local_copy(file: &RemoteFile) -> Option<PathBuf> {
         .join("simpleedit")
         .join("remote")
         .join(file.host.replace(['/', '\\', ':'], "_"));
+    // A path from the home folder is not the one of the same name from `/`.
+    if !file.path.starts_with('/') {
+        path.push("~");
+    }
     for part in file.path.split('/').filter(|p| !p.is_empty() && *p != "..") {
         path.push(part);
     }
@@ -94,6 +106,8 @@ async fn run(
             "BatchMode=yes",
             "-o",
             "ConnectTimeout=10",
+            "-o",
+            "ServerAliveInterval=15",
             host,
             command,
         ])
@@ -107,15 +121,16 @@ async fn run(
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("ssh: {e}"))?;
-    if let (Some(bytes), Some(mut stdin)) = (input, child.stdin.take()) {
-        stdin
-            .write_all(&bytes)
-            .await
-            .map_err(|e| format!("ssh: {e}"))?;
-        drop(stdin);
-    }
     let mut stdout = child.stdout.take().ok_or("no output")?;
     let mut stderr = child.stderr.take().ok_or("no output")?;
+    let mut stdin = child.stdin.take();
+    let write_in = async {
+        if let (Some(bytes), Some(stdin)) = (input, stdin.as_mut()) {
+            stdin.write_all(&bytes).await?;
+        }
+        drop(stdin.take());
+        Ok::<(), std::io::Error>(())
+    };
     let read_out = async {
         let mut out = Vec::new();
         (&mut stdout)
@@ -128,11 +143,12 @@ async fn run(
         let mut err = Vec::new();
         stderr.read_to_end(&mut err).await.map(|_| err)
     };
-    let (out, err) = tokio::time::timeout(std::time::Duration::from_secs(120), async {
-        tokio::join!(read_out, read_err)
+    let (sent, out, err) = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        tokio::join!(write_in, read_out, read_err)
     })
     .await
     .map_err(|_| "the server did not answer in time".to_string())?;
+    sent.map_err(|e| format!("ssh: {e}"))?;
     let (out, err) = (out.map_err(|e| e.to_string())?, err.unwrap_or_default());
     if out.len() > limit {
         return Err("the file is too large".to_string());
@@ -226,7 +242,11 @@ pub async fn upload(
     }
     run(
         &file.host,
-        &format!("cat > {}", quote(&file.path)),
+        &format!(
+            "t={tmp}; p={path}; cat > \"$t\" && {{ chmod --reference=\"$p\" \"$t\" 2>/dev/null || chmod $(stat -f %Lp \"$p\") \"$t\" 2>/dev/null; true; }} && mv -f -- \"$t\" \"$p\" || {{ rm -f -- \"$t\"; exit 1; }}",
+            tmp = quote(&format!("{}.simpleedit-tmp", file.path)),
+            path = quote(&file.path)
+        ),
         Some(bytes),
         64,
     )
@@ -248,7 +268,7 @@ mod tests {
         let script = dir.join("fake-ssh");
         std::fs::write(
             &script,
-            "#!/bin/sh\n# ssh -o a -o b host command\nshift 4\nhost=\"$1\"\nshift\nif [ \"$host\" = down ]; then echo 'no route' >&2; exit 255; fi\nexec sh -c \"$1\"\n",
+            "#!/bin/sh\n# ssh -o a -o b host command\nshift 6\nhost=\"$1\"\nshift\nif [ \"$host\" = down ]; then echo 'no route' >&2; exit 255; fi\nexec sh -c \"$1\"\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -279,6 +299,10 @@ mod tests {
             Some(("me@box".into(), "/srv/a.txt".into()))
         );
         assert_eq!(f("-oProxyCommand=x:/a"), None, "an option is not a host");
+        assert_eq!(
+            f("ssh://me@box:2222/srv/a.txt"),
+            Some(("ssh://me@box:2222".into(), "/srv/a.txt".into()))
+        );
         assert_eq!(f("no path"), None);
         assert_eq!(f("box:"), None);
     }
@@ -297,6 +321,11 @@ mod tests {
         };
         let copy = local_copy(&file).unwrap();
         assert!(copy.ends_with("me@box/srv/etc/a.txt"), "{copy:?}");
+        let rel = |path: &str| RemoteFile {
+            host: "me@box".into(),
+            path: path.into(),
+        };
+        assert_ne!(local_copy(&rel("a.txt")), local_copy(&rel("/a.txt")));
     }
 
     #[cfg(unix)]

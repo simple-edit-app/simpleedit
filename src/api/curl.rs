@@ -140,7 +140,7 @@ pub fn pairs_of(query: &str, plus_is_space: bool) -> Vec<Pair> {
 }
 
 /// Which options of curl take a value that follows, and mean nothing here.
-const SKIPPED_WITH_VALUE: [&str; 14] = [
+const SKIPPED_WITH_VALUE: &[&str] = &[
     "-o",
     "--output",
     "-w",
@@ -155,6 +155,48 @@ const SKIPPED_WITH_VALUE: [&str; 14] = [
     "-E",
     "--resolve",
     "--interface",
+    "-c",
+    "--cookie-jar",
+    "-D",
+    "--dump-header",
+    "-T",
+    "--upload-file",
+    "-r",
+    "--range",
+    "--max-redirs",
+    "--proxy-user",
+    "-U",
+    "--retry-delay",
+    "--retry-max-time",
+    "--capath",
+    "--cert-type",
+    "--key-type",
+    "--limit-rate",
+    "--keepalive-time",
+    "--dns-servers",
+    "--output-dir",
+    "--stderr",
+    "--trace",
+    "--trace-ascii",
+    "--noproxy",
+    "--proxy-header",
+    "--expect100-timeout",
+    "--max-filesize",
+    "-K",
+    "--config",
+    "-z",
+    "--time-cond",
+    "-C",
+    "--continue-at",
+    "-Y",
+    "--speed-limit",
+    "-y",
+    "--speed-time",
+    "--connect-to",
+    "--unix-socket",
+    "--pinnedpubkey",
+    "--ciphers",
+    "--tls-max",
 ];
 
 /// Reads a `curl` command into a request.
@@ -334,7 +376,14 @@ pub fn parse(command: &str) -> Result<Request, String> {
             ..Body::default()
         };
     } else if !urlencoded.is_empty()
-        || (!data.is_empty() && content_type.contains("x-www-form-urlencoded"))
+        || (!data.is_empty()
+            && (content_type.contains("x-www-form-urlencoded")
+                // curl sends `-d` as a form when nothing else is said.
+                || (content_type.is_empty()
+                    && !json_flag
+                    && data.iter().all(|d| {
+                        d.contains('=') && !d.trim_start().starts_with(['{', '['])
+                    }))))
     {
         let mut form = urlencoded;
         for text in &data {
@@ -519,8 +568,15 @@ mod tests {
     fn data_makes_a_post_a_form_or_a_get_with_parameters() {
         let r = parse("curl https://x -d a=1 -d 'b=two words'").unwrap();
         assert_eq!(r.method, Method::Post);
+        assert_eq!(r.body.kind, BodyKind::Form);
+        assert_eq!(
+            r.body.form,
+            vec![Pair::new("a", "1"), Pair::new("b", "two words")]
+        );
+        let r = parse("curl https://x -d hello").unwrap();
         assert_eq!(r.body.kind, BodyKind::Text);
-        assert_eq!(r.body.text, "a=1&b=two words");
+        let r = parse("curl -c jar.txt -r 0-9 --max-redirs 3 https://x/y").unwrap();
+        assert_eq!(r.url, "https://x/y");
         let r = parse("curl https://x -H 'Content-Type: application/x-www-form-urlencoded' -d 'a=1&b=two+words'").unwrap();
         assert_eq!(r.body.kind, BodyKind::Form);
         assert_eq!(

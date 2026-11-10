@@ -151,10 +151,11 @@ impl SimpleEditApp {
 
     /// A click on a place of the output.
     pub(super) fn task_open_at(&mut self, at: Location) -> Task<Message> {
+        let col = crate::tasks::byte_col(&at.path, at.line, at.col);
         self.jump_to(crate::definition::Hit {
             path: at.path,
             line: at.line.saturating_sub(1),
-            col: at.col.saturating_sub(1),
+            col: col.saturating_sub(1),
             len: 0,
         })
     }

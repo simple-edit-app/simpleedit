@@ -128,6 +128,7 @@ pub fn load() -> Stored {
     let Some(root) = dir() else {
         return stored;
     };
+    let mut unreadable_id = 0;
     if let Ok(entries) = std::fs::read_dir(root.join("collections")) {
         let mut files: Vec<PathBuf> = entries
             .flatten()
@@ -142,6 +143,16 @@ pub fn load() -> Stored {
             {
                 restore_auth_from_keychain(&mut collection);
                 stored.collections.push(collection);
+            } else {
+                // Unreadable: kept aside, and its number stays taken.
+                if let Some(id) = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    unreadable_id = unreadable_id.max(id);
+                }
+                let _ = crate::fsutil::set_aside(&path);
             }
         }
     }
@@ -179,7 +190,8 @@ pub fn load() -> Stored {
         .map(Collection::max_id)
         .chain(stored.environments.iter().map(|e| e.id))
         .max()
-        .unwrap_or(0);
+        .unwrap_or(0)
+        .max(unreadable_id);
     stored.next_id = stored.next_id.max(used);
     stored
 }

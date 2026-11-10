@@ -382,9 +382,11 @@ pub fn find_occurrences_until(
     Ok(hits)
 }
 
-/// Every place `query` is in `files` (a regular expression if `regex`).
+/// Every place `query` is in `files` (a regular expression if `regex`); the
+/// texts of the open files (`open`) are read instead of what is on disk.
 pub fn search(
     files: &[PathBuf],
+    open: &std::collections::HashMap<PathBuf, String>,
     query: &str,
     case_sensitive: bool,
     regex: bool,
@@ -403,17 +405,22 @@ pub fn search(
         .map_err(|e| e.to_string())?;
     let mut hits = Vec::new();
     for path in files {
-        if std::fs::metadata(path).map_or(true, |m| m.len() > MAX_SIZE) {
-            continue;
-        }
-        let Ok(bytes) = std::fs::read(path) else {
-            continue;
+        let text = match open.get(path) {
+            Some(text) => std::borrow::Cow::Borrowed(text.as_str()),
+            None => {
+                if std::fs::metadata(path).map_or(true, |m| m.len() > MAX_SIZE) {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(path) else {
+                    continue;
+                };
+                // Not text.
+                if bytes.iter().take(8000).any(|b| *b == 0) {
+                    continue;
+                }
+                std::borrow::Cow::Owned(String::from_utf8_lossy(&bytes).into_owned())
+            }
         };
-        // Not text.
-        if bytes.iter().take(8000).any(|b| *b == 0) {
-            continue;
-        }
-        let text = String::from_utf8_lossy(&bytes);
         let mut stamp = None;
         for (n, line) in text.lines().enumerate() {
             for m in re.find_iter(line) {
@@ -570,7 +577,14 @@ mod tests {
         let without: Vec<PathBuf> = list_files(root, &[], false);
         assert_eq!(without, vec![root.join(".gitignore"), root.join("a.rs")]);
         // Looked into like the others.
-        let hits = search(&list_files(root, &[], true), "neon", false, false).unwrap();
+        let hits = search(
+            &list_files(root, &[], true),
+            &Default::default(),
+            "neon",
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(hits.len(), 1);
     }
 
@@ -642,6 +656,20 @@ mod tests {
     }
 
     #[test]
+    fn an_open_unsaved_text_is_searched_instead_of_the_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.rs");
+        std::fs::write(&a, "old\n").unwrap();
+        let open = std::collections::HashMap::from([(a.clone(), "x\nnew\n".to_string())]);
+        let files = vec![a];
+        assert!(search(&files, &open, "old", false, false)
+            .unwrap()
+            .is_empty());
+        let hits = search(&files, &open, "new", false, false).unwrap();
+        assert_eq!((hits.len(), hits[0].line), (1, 1));
+    }
+
+    #[test]
     fn a_text_is_found_in_every_file_with_its_line() {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a.rs");
@@ -651,7 +679,7 @@ mod tests {
         std::fs::write(&b, "total: 3\nnothing\ntotal again total\n").unwrap();
         std::fs::write(&bin, b"total\0\0").unwrap();
         let files = vec![a.clone(), b.clone(), bin];
-        let hits = search(&files, "total", false, false).unwrap();
+        let hits = search(&files, &Default::default(), "total", false, false).unwrap();
         assert_eq!(hits.len(), 4, "{hits:?}");
         assert_eq!(
             (hits[0].path.clone(), hits[0].line, hits[0].col),
@@ -663,15 +691,29 @@ mod tests {
             "Total"
         );
         // The case, when it counts.
-        assert_eq!(search(&files, "Total", true, false).unwrap().len(), 1);
-        // A regular expression, and one that is not.
         assert_eq!(
-            search(&files, r"total\s+\w+", false, true).unwrap().len(),
+            search(&files, &Default::default(), "Total", true, false)
+                .unwrap()
+                .len(),
             1
         );
-        assert!(search(&files, "(", false, true).is_err());
-        assert_eq!(search(&files, "(", false, false).unwrap().len(), 1);
-        assert!(search(&files, "", false, false).unwrap().is_empty());
+        // A regular expression, and one that is not.
+        assert_eq!(
+            search(&files, &Default::default(), r"total\s+\w+", false, true)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(search(&files, &Default::default(), "(", false, true).is_err());
+        assert_eq!(
+            search(&files, &Default::default(), "(", false, false)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(search(&files, &Default::default(), "", false, false)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

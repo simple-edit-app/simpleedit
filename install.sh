@@ -138,8 +138,9 @@ case "$OS" in
             verify "$TMP/$TARBALL" "$TARBALL"
             tar -xz -C "$TMP" -f "$TMP/$TARBALL"
             info "Installing binary to /usr/local/bin (requires sudo)…"
-            sudo mv "$TMP/simpleedit" /usr/local/bin/simpleedit
-            sudo chmod +x /usr/local/bin/simpleedit
+            # install(1), not mv: the binary must end up owned by root, not by
+            # the user who unpacked it.
+            sudo install -m 0755 -o root -g 0 "$TMP/simpleedit" /usr/local/bin/simpleedit
             rm -rf "$TMP"
         fi
         ;;
@@ -167,8 +168,9 @@ case "$OS" in
             verify "$TMP/$TARBALL" "$TARBALL"
             tar -xz -C "$TMP" -f "$TMP/$TARBALL"
             info "Installing binary to /usr/local/bin (requires sudo)…"
-            sudo mv "$TMP/simpleedit" /usr/local/bin/simpleedit
-            sudo chmod +x /usr/local/bin/simpleedit
+            # install(1), not mv: the binary must end up owned by root, not by
+            # the user who unpacked it.
+            sudo install -m 0755 -o root -g 0 "$TMP/simpleedit" /usr/local/bin/simpleedit
             rm -rf "$TMP"
         fi
         ;;

@@ -569,10 +569,11 @@ impl SimpleEditApp {
             (true, false) => (format!(r"\b{}\b", regex::escape(&query)), true),
             (false, r) => (query, r),
         };
+        let open = self.open_texts();
         Task::perform(
             async move {
                 tokio::task::spawn_blocking(move || {
-                    crate::finder::search(&files, &pattern, case, as_regex)
+                    crate::finder::search(&files, &open, &pattern, case, as_regex)
                 })
                 .await
                 .unwrap_or_else(|e| Err(e.to_string()))
@@ -1370,10 +1371,14 @@ impl SimpleEditApp {
                     name((setting.label)()),
                     Space::new().width(Length::Fill),
                     container(
-                        text(if on { "ON" } else { "OFF" })
-                            .size(11)
-                            .font(se_theme::UI_MEDIUM)
-                            .color(if on { p.accent } else { p.muted }),
+                        text(if on {
+                            t!("everywhere.on").to_string()
+                        } else {
+                            t!("everywhere.off").to_string()
+                        })
+                        .size(11)
+                        .font(se_theme::UI_MEDIUM)
+                        .color(if on { p.accent } else { p.muted }),
                     )
                     .padding([2, 8])
                     .style(se_theme::badge(dark)),
@@ -2099,7 +2104,7 @@ mod tests {
             .iter()
             .map(|(p, _)| p.clone())
             .collect();
-        let found = crate::finder::search(&files, "run", false, false);
+        let found = crate::finder::search(&files, &Default::default(), "run", false, false);
         let generation = app.everywhere.text_generation;
         let _ = app.update(Message::EverywhereText(generation, found));
         assert_eq!(
@@ -2276,7 +2281,7 @@ mod tests {
             .iter()
             .map(|(p, _)| p.clone())
             .collect();
-        let found = crate::finder::search(&files, "run", false, false);
+        let found = crate::finder::search(&files, &Default::default(), "run", false, false);
         let generation = app.everywhere.text_generation;
         let _ = app.update(Message::EverywhereText(generation, found));
         let settings = iced::Settings {

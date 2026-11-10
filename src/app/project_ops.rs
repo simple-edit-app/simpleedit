@@ -128,7 +128,13 @@ impl SimpleEditApp {
             NameFor::File(dir) | NameFor::Folder(dir) => dir.join(&name),
             NameFor::Rename(path) | NameFor::Duplicate(path) => path.with_file_name(&name),
         };
-        if target.exists() {
+        // Case-only rename on a case-insensitive filesystem: `target` "exists" but is the file itself.
+        let case_only_rename = matches!(&dialog.purpose, NameFor::Rename(path)
+        if path.file_name().is_some_and(|n| {
+            let old = n.to_string_lossy();
+            old != name && old.to_lowercase() == name.to_lowercase()
+        }));
+        if target.exists() && !case_only_rename {
             self.set_status(t!("projects.exists", name = name.as_str()), true);
             return Task::none();
         }

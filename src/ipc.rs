@@ -63,23 +63,48 @@ pub fn take() -> Vec<Vec<Target>> {
         .unwrap_or_default()
 }
 
+/// A path as raw bytes, so that names that are not UTF-8 survive the trip.
+fn path_bytes(path: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
+fn path_from_bytes(bytes: Vec<u8>) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(std::ffi::OsString::from_vec(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
 fn encode(targets: &[Target]) -> String {
-    let rows: Vec<(String, Option<usize>, Option<usize>)> = targets
+    let rows: Vec<(Vec<u8>, Option<usize>, Option<usize>)> = targets
         .iter()
         .map(|t| {
             let path = std::path::absolute(&t.path).unwrap_or_else(|_| t.path.clone());
-            (path.to_string_lossy().into_owned(), t.line, t.col)
+            (path_bytes(&path), t.line, t.col)
         })
         .collect();
     serde_json::to_string(&rows).unwrap_or_default()
 }
 
 fn decode(text: &str) -> Vec<Target> {
-    serde_json::from_str::<Vec<(String, Option<usize>, Option<usize>)>>(text)
+    serde_json::from_str::<Vec<(Vec<u8>, Option<usize>, Option<usize>)>>(text)
         .unwrap_or_default()
         .into_iter()
         .map(|(path, line, col)| Target {
-            path: PathBuf::from(path),
+            path: path_from_bytes(path),
             line,
             col,
         })
@@ -104,9 +129,11 @@ pub fn send(targets: &[Target]) -> bool {
 #[cfg(unix)]
 fn listen_at(path: &Path) -> bool {
     use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
     }
     // The lock of the session says this window is the one: what is left
     // of an earlier one goes.
@@ -114,11 +141,13 @@ fn listen_at(path: &Path) -> bool {
     let Ok(listener) = UnixListener::bind(path) else {
         return false;
     };
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     std::thread::spawn(move || {
-        for mut stream in listener.incoming().flatten() {
+        for stream in listener.incoming().flatten() {
             let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            // Never more than 64 KiB.
             let mut text = String::new();
-            if stream.read_to_string(&mut text).is_ok() {
+            if stream.take(64 * 1024).read_to_string(&mut text).is_ok() {
                 let targets = decode(&text);
                 if !targets.is_empty() {
                     if let Ok(mut inbox) = INBOX.lock() {
@@ -182,6 +211,15 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_name_that_is_not_utf8_survives_the_trip() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = PathBuf::from(std::ffi::OsStr::from_bytes(b"/tmp/\xff\xfe.rs"));
+        let got = decode(&encode(&[Target::file(path.clone())]));
+        assert_eq!(got[0].path, path);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_window_receives_what_a_second_command_sends() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("i.sock");
@@ -195,6 +233,12 @@ mod tests {
             line: Some(3),
             col: Some(2),
         };
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&socket), 0o600);
+            assert_eq!(mode(dir.path()), 0o700);
+        }
         assert!(send_to(&socket, std::slice::from_ref(&target)));
         let mut got = Vec::new();
         for _ in 0..100 {

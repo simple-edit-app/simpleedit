@@ -183,6 +183,16 @@ pub(super) fn find_field_id() -> iced::widget::Id {
     iced::widget::Id::new("find-in-files")
 }
 
+/// `~` or `~/…` typed in a folder field: the home folder.
+fn expand_home(text: &str) -> PathBuf {
+    if text == "~" || text.starts_with("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(text.trim_start_matches('~').trim_start_matches('/'));
+        }
+    }
+    PathBuf::from(text)
+}
+
 fn replace_field_id() -> iced::widget::Id {
     iced::widget::Id::new("replace-in-files")
 }
@@ -415,7 +425,7 @@ impl SimpleEditApp {
 
     /// The folder field typed in: a folder that exists is looked in.
     pub(super) fn finder_dir_typed(&mut self, text: String) -> Task<Message> {
-        let dir = PathBuf::from(text.trim());
+        let dir = expand_home(text.trim());
         let valid = !text.trim().is_empty() && dir.is_dir();
         self.finder.dir_text = text;
         if !valid || self.finder.dir.as_ref() == Some(&dir) {
@@ -1616,7 +1626,14 @@ impl SimpleEditApp {
                     f.hits.iter().filter(|o| !o.excluded).cloned().collect();
                 let (n, files) = counts(&left);
                 let (matches, files) = (matches_text(n), files_text(files));
-                let question = t!("findrep.confirm", matches = matches, files = files);
+                let max = crate::finder::MAX_HITS;
+                let cut = f.hits.len() >= max;
+                #[rustfmt::skip]
+                let question = if cut {
+                    t!("findrep.confirm_cut", matches = matches, files = files, n = max)
+                } else {
+                    t!("findrep.confirm", matches = matches, files = files)
+                };
                 actions = actions
                     .push(text(question.to_string()).size(12.5).color(p.accent))
                     .push(

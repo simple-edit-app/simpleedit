@@ -3,7 +3,7 @@
 
 use serde_json::{json, Map, Value};
 
-use super::curl::pairs_of;
+use super::curl::{pairs_of, percent_decode};
 use super::model::{
     Auth, AuthKind, Body, BodyKind, Collection, Environment, Folder, Item, Method, Pair, Request,
     Variable,
@@ -115,7 +115,13 @@ fn read_request(item: &Value, inherited: &Option<Auth>, warnings: &mut Vec<Strin
                     format!("{scheme}://{host}/{path}")
                 }
             };
-            (raw, key_values(&url["query"]))
+            // The values of `query` are already encoded.
+            let mut query = key_values(&url["query"]);
+            for pair in &mut query {
+                pair.key = percent_decode(&pair.key, false);
+                pair.value = percent_decode(&pair.value, false);
+            }
+            (raw, query)
         }
         _ => (String::new(), Vec::new()),
     };
@@ -637,5 +643,18 @@ mod tests {
         };
         assert_eq!(r.body.kind, BodyKind::Json);
         assert!(r.body.text.contains("me { id }") && r.body.text.contains("\"a\": 1"));
+    }
+
+    #[test]
+    fn the_query_values_are_decoded_once() {
+        let got = import_collection(
+            r#"{"info": {"name": "c"}, "item": [{"name": "r", "request": {"method": "GET",
+            "url": {"raw": "http://x/p?a=a%20b", "query": [{"key": "a", "value": "a%20b"}]}}}]}"#,
+        )
+        .unwrap();
+        let Item::Request(r) = &got.collection.items[0] else {
+            panic!()
+        };
+        assert_eq!(r.params[0].value, "a b");
     }
 }

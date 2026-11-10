@@ -146,6 +146,11 @@ pub fn location(line: &str, dir: &Path) -> Option<Location> {
         regex::Regex::new(r#"([^\s:()"'<>|]+\.[A-Za-z0-9_]+)(?::|\()(\d+)(?:[:,](\d+))?"#)
             .expect("a valid pattern")
     });
+    static SPACED: OnceLock<regex::Regex> = OnceLock::new();
+    let spaced = SPACED.get_or_init(|| {
+        regex::Regex::new(r#"(/[^:()"'<>|]+\.[A-Za-z0-9_]+)(?::|\()(\d+)(?:[:,](\d+))?"#)
+            .expect("a valid pattern")
+    });
     let resolve = |path: &str| {
         let path = PathBuf::from(path);
         let full = if path.is_absolute() {
@@ -171,6 +176,20 @@ pub fn location(line: &str, dir: &Path) -> Option<Location> {
             line: c[2].parse().ok()?,
             col: c.get(3).and_then(|m| m.as_str().parse().ok()).unwrap_or(1),
         });
+    }
+    // An absolute path with spaces: the longest tail that is a file.
+    for c in spaced.captures_iter(line) {
+        let whole = &c[1];
+        let starts = whole.match_indices('/').map(|(i, _)| i);
+        for start in starts {
+            if let Some(path) = resolve(&whole[start..]) {
+                return Some(Location {
+                    path,
+                    line: c[2].parse().ok()?,
+                    col: c.get(3).and_then(|m| m.as_str().parse().ok()).unwrap_or(1),
+                });
+            }
+        }
     }
     None
 }
@@ -341,10 +360,38 @@ pub fn stop_all() {
     }
 }
 
+/// The byte column of the `col`-th character (1-based, as compilers count)
+/// of `line` (1-based) in the file; `col` itself when the file is unreadable.
+pub fn byte_col(path: &Path, line: usize, col: usize) -> usize {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return col;
+    };
+    let Some(text) = text.lines().nth(line.saturating_sub(1)) else {
+        return col;
+    };
+    match text.char_indices().nth(col.saturating_sub(1)) {
+        Some((i, _)) => i + 1,
+        None => text.len() + 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use iced::futures::StreamExt;
+
+    #[test]
+    fn a_path_with_spaces_and_a_character_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("Mon Projet");
+        std::fs::create_dir_all(&sub).unwrap();
+        let file = sub.join("a.rs");
+        std::fs::write(&file, "é = 1;\n").unwrap();
+        let line = format!("--> {}:1:3", file.display());
+        let at = location(&line, dir.path()).unwrap();
+        assert_eq!(at.path, file);
+        assert_eq!(byte_col(&at.path, 1, at.col), 4);
+    }
 
     #[test]
     fn the_tasks_of_a_project_come_from_its_files_and_its_own_list() {
