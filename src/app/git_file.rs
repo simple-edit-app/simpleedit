@@ -716,6 +716,7 @@ mod tests {
         app.git.tab = Tab::Log;
         app.git.log.filters_shown = true;
         let _ = app.update(Message::Git(GitMsg::LogLoaded(
+            app.git.log.request,
             "HEAD".into(),
             Ok((
                 vec![commit("0123456789", "feat: a new thing")],
@@ -724,6 +725,7 @@ mod tests {
         )));
         app.git.log.shown = Some("HEAD".into());
         let _ = app.update(Message::Git(GitMsg::LogLoaded(
+            app.git.log.request,
             "HEAD".into(),
             Ok((
                 vec![commit("0123456789", "feat: a new thing")],

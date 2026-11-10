@@ -619,6 +619,20 @@ impl Viewer {
     }
 }
 
+/// Where "Initialize a repository" creates one for the folder `dir`: the
+/// project it is in, else the folder itself. Never the home folder or above
+/// it, which would put every project under it in one repository.
+fn init_target(dir: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
+    let target = roots
+        .iter()
+        .filter(|r| dir.starts_with(r))
+        .max_by_key(|r| r.components().count())
+        .cloned()
+        .unwrap_or_else(|| dir.to_path_buf());
+    let above_home = dirs::home_dir().is_some_and(|home| home.starts_with(&target));
+    (!above_home).then_some(target)
+}
+
 /// The Git panel.
 pub struct Panel {
     pub open: bool,
@@ -628,6 +642,8 @@ pub struct Panel {
     pub(super) probed: Option<PathBuf>,
     /// Whether that folder is in a repository (false: offer `git init`).
     pub searched: bool,
+    /// Where `git init` would create the repository, shown on its button.
+    pub(super) init_dir: Option<PathBuf>,
     pub status: Option<Status>,
     pub viewer: Viewer,
     pub stash: stash::State,
@@ -665,6 +681,7 @@ impl Default for Panel {
             tab: Tab::Commit,
             repo: None,
             probed: None,
+            init_dir: None,
             searched: false,
             status: None,
             viewer: Viewer::default(),
@@ -694,6 +711,8 @@ impl Default for Panel {
 pub enum Pending {
     /// Throw away a staged file that also has changes that are not staged.
     Rollback(String),
+    /// Delete a file from the disk (and from git).
+    Delete(String),
     StashDrop(usize),
     Abort,
     /// Take back a commit that is already on the remote.
@@ -748,7 +767,8 @@ pub enum GitMsg {
     /// A file was saved: look again at once.
     Refresh,
     Detected(Option<PathBuf>, Option<PathBuf>),
-    StatusLoaded(Result<Status, String>),
+    /// The answer of a repository: one that is no longer shown is dropped.
+    StatusLoaded(PathBuf, Result<Status, String>),
     SelectTab(Tab),
     // The diff pane
     SelectFile(usize),
@@ -851,7 +871,7 @@ pub enum GitMsg {
     Done(Result<String, String>),
     DismissNotice,
     // Stash
-    StashesLoaded(Result<Vec<git::history::Stash>, String>),
+    StashesLoaded(PathBuf, Result<Vec<git::history::Stash>, String>),
     SelectStash(usize),
     StashFilesLoaded(usize, Result<Vec<Change>, String>),
     StashApply(usize),
@@ -860,11 +880,12 @@ pub enum GitMsg {
     StashMessage(String),
     StashPush,
     // Log
-    RefsLoaded(Result<git::history::Refs, String>),
+    RefsLoaded(PathBuf, Result<git::history::Refs, String>),
     BranchClicked(String),
     ToggleGroup(String),
     BranchFilter(String),
     LogLoaded(
+        u64,
         String,
         Result<(Vec<git::graph::Commit>, std::collections::HashSet<String>), String>,
     ),
@@ -907,16 +928,16 @@ impl GitMsg {
             GitMsg::Tick
                 | GitMsg::Refresh
                 | GitMsg::Detected(..)
-                | GitMsg::StatusLoaded(_)
+                | GitMsg::StatusLoaded(..)
                 | GitMsg::DiffLoaded(..)
                 | GitMsg::DiffScrolled(..)
                 | GitMsg::AutoFetched(_)
                 | GitMsg::RebasePlanReady(..)
                 | GitMsg::Noop
                 | GitMsg::LogScrolled(..)
-                | GitMsg::StashesLoaded(_)
+                | GitMsg::StashesLoaded(..)
                 | GitMsg::StashFilesLoaded(..)
-                | GitMsg::RefsLoaded(_)
+                | GitMsg::RefsLoaded(..)
                 | GitMsg::LogLoaded(..)
                 | GitMsg::CommitFilesLoaded(..)
                 | GitMsg::CommitInfoLoaded(..)
@@ -977,7 +998,7 @@ impl Panel {
                     .map(Path::to_path_buf)
             })
             .or_else(|| self.probed.clone())
-            .or_else(dirs::home_dir);
+            .or_else(|| ctx.roots.first().cloned());
         let Some(dir) = dir else {
             return Task::none();
         };
@@ -1001,9 +1022,10 @@ impl Panel {
         // Closed, the panel only watches for conflicts: listing every
         // untracked file of a big folder would be wasted.
         let untracked = self.open;
+        let asked = repo.clone();
         Task::perform(
             async move { git::status(&repo, untracked).await },
-            |status| Message::Git(GitMsg::StatusLoaded(status)),
+            move |status| Message::Git(GitMsg::StatusLoaded(asked.clone(), status)),
         )
     }
 
@@ -1155,6 +1177,7 @@ impl Panel {
             && !matches!(
                 msg,
                 GitMsg::Rollback(_)
+                    | GitMsg::Delete(_)
                     | GitMsg::StashDrop(_)
                     | GitMsg::AbortOperation
                     | GitMsg::UndoCommit
@@ -1175,6 +1198,7 @@ impl Panel {
             }
             GitMsg::Refresh => self.look_again(ctx),
             GitMsg::Detected(dir, root) => {
+                self.init_dir = dir.as_deref().and_then(|d| init_target(d, ctx.roots));
                 self.probed = dir;
                 self.searched = true;
                 if root != self.repo {
@@ -1183,7 +1207,9 @@ impl Panel {
                 self.repo = root;
                 self.load_status()
             }
-            GitMsg::StatusLoaded(result) => {
+            // Another repository's answer, late: not for this one.
+            GitMsg::StatusLoaded(repo, _) if self.repo.as_ref() != Some(&repo) => Task::none(),
+            GitMsg::StatusLoaded(_, result) => {
                 match result {
                     Ok(status) => {
                         if self.status.as_ref() != Some(&status) {
@@ -1350,19 +1376,26 @@ impl Panel {
                 let Some(entry) = self.viewer.entries.get(index).cloned() else {
                     return Task::none();
                 };
-                // Rolling back what is staged also takes the file back to
-                // HEAD on disk: changes not staged would go with it.
+                // Rolling back throws the changes away for good: a file that
+                // is not tracked yet is deleted, a staged one also goes back
+                // to HEAD on disk (changes not staged go with it).
                 let also_unstaged = entry.staged
                     && self
                         .status
                         .as_ref()
                         .is_some_and(|s| s.unstaged.iter().any(|c| c.path == entry.change.path));
-                if also_unstaged
-                    && !self.confirmed(
-                        Pending::Rollback(entry.change.path.clone()),
-                        t!("git.confirm_rollback_both").to_string(),
-                    )
-                {
+                let name = entry.change.path.as_str();
+                let message = if entry.change.kind == Kind::Untracked {
+                    t!("git.confirm_rollback_untracked", name = name)
+                } else if also_unstaged {
+                    t!("git.confirm_rollback_both")
+                } else {
+                    t!("git.confirm_rollback", name = entry.change.path.as_str())
+                };
+                if !self.confirmed(
+                    Pending::Rollback(entry.change.path.clone()),
+                    message.to_string(),
+                ) {
                     return Task::none();
                 }
                 self.act(move |repo| async move {
@@ -1374,6 +1407,12 @@ impl Panel {
                 let Some(entry) = self.viewer.entries.get(index).cloned() else {
                     return Task::none();
                 };
+                if !self.confirmed(
+                    Pending::Delete(entry.change.path.clone()),
+                    t!("git.confirm_delete", name = entry.change.path.as_str()).to_string(),
+                ) {
+                    return Task::none();
+                }
                 self.act(move |repo| async move {
                     git::delete(&repo, &entry.change).await?;
                     Ok(String::new())
@@ -1766,12 +1805,7 @@ impl Panel {
                 self.show_log(&rev)
             }
             GitMsg::Init => {
-                let dir = self.probed.clone().or_else(|| {
-                    ctx.current_file
-                        .and_then(Path::parent)
-                        .map(Path::to_path_buf)
-                });
-                let Some(dir) = dir else {
+                let Some(dir) = self.init_dir.clone() else {
                     return Task::none();
                 };
                 self.busy = true;
@@ -1887,7 +1921,12 @@ impl Panel {
                 let dialog = opened.map_or_else(Task::none, Task::done);
                 Task::batch([self.load_status(), more, dialog])
             }
-            GitMsg::StashesLoaded(result) => self.stashes_loaded(result),
+            GitMsg::StashesLoaded(repo, _) | GitMsg::RefsLoaded(repo, _)
+                if self.repo.as_ref() != Some(&repo) =>
+            {
+                Task::none()
+            }
+            GitMsg::StashesLoaded(_, result) => self.stashes_loaded(result),
             GitMsg::SelectStash(index) => self.select_stash(index),
             GitMsg::StashFilesLoaded(index, result) => self.stash_files_loaded(index, result),
             GitMsg::StashApply(index) => self.stash_action(index, stash::StashAction::Apply),
@@ -1907,7 +1946,7 @@ impl Panel {
                 Task::none()
             }
             GitMsg::StashPush => self.stash_push(),
-            GitMsg::RefsLoaded(result) => self.refs_loaded(result),
+            GitMsg::RefsLoaded(_, result) => self.refs_loaded(result),
             GitMsg::BranchClicked(name) => self.branch_clicked(name),
             GitMsg::ToggleGroup(key) => {
                 if !self.log.folded.remove(&key) {
@@ -1920,7 +1959,7 @@ impl Panel {
                 self.log.filter = text;
                 Task::none()
             }
-            GitMsg::LogLoaded(rev, result) => self.log_loaded(rev, result),
+            GitMsg::LogLoaded(token, rev, result) => self.log_loaded(token, rev, result),
             GitMsg::SelectCommit(index) => self.select_commit(index, ctx.ctrl, ctx.shift),
             GitMsg::SelectForMenu(index) => self.select_for_menu(index),
             GitMsg::CommitFilesLoaded(sha, result) => self.commit_files_loaded(sha, result),
@@ -2181,6 +2220,30 @@ mod tests {
     }
 
     #[test]
+    fn a_repository_is_made_in_the_project_and_never_in_the_home_folder() {
+        let home = dirs::home_dir().unwrap();
+        let project = home.join("work/app");
+        let roots = [project.clone()];
+        // A file deep in the project: the project, not its folder.
+        assert_eq!(
+            init_target(&project.join("src/ui"), &roots),
+            Some(project.clone())
+        );
+        assert_eq!(
+            init_target(Path::new("/srv/site"), &[]),
+            Some("/srv/site".into())
+        );
+        // Nothing open: the home folder, or above it, is never offered.
+        assert_eq!(init_target(&home, &roots), None);
+        assert_eq!(init_target(Path::new("/"), &[]), None);
+        let mut panel = Panel::default();
+        let _ = panel.update(GitMsg::Detected(Some(home), None), &ctx());
+        assert!(panel.init_dir.is_none());
+        let _ = panel.update(GitMsg::Init, &ctx());
+        assert!(!panel.busy, "nothing to run");
+    }
+
+    #[test]
     fn a_second_click_on_the_one_picked_gives_it_up() {
         use branches::Ref;
         let mut panel = panel_with_branches();
@@ -2240,13 +2303,26 @@ mod tests {
         assert!(!panel.busy);
         let _ = panel.update(GitMsg::Rollback(0), &ctx());
         assert!(panel.busy);
-        // A file that is only staged goes at once.
+        // A file that is only staged asks too, and so does an untracked one.
         let mut panel = panel_with_branches();
         let mut status = panel.status.clone().unwrap();
         status.staged = vec![change(Kind::Modified)];
         panel.viewer.entries = Panel::commit_entries(&status);
         panel.status = Some(status);
         let _ = panel.update(GitMsg::Rollback(0), &ctx());
+        assert!(!panel.busy);
+        assert_eq!(panel.pending, Some(Pending::Rollback("a.txt".into())));
+        let _ = panel.update(GitMsg::Rollback(0), &ctx());
+        assert!(panel.busy);
+        let mut panel = panel_with_branches();
+        let mut status = panel.status.clone().unwrap();
+        status.unstaged = vec![change(Kind::Untracked)];
+        panel.viewer.entries = Panel::commit_entries(&status);
+        panel.status = Some(status);
+        let _ = panel.update(GitMsg::Delete(0), &ctx());
+        assert!(!panel.busy);
+        assert_eq!(panel.pending, Some(Pending::Delete("a.txt".into())));
+        let _ = panel.update(GitMsg::Delete(0), &ctx());
         assert!(panel.busy);
     }
 

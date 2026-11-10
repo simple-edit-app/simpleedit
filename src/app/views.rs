@@ -190,6 +190,7 @@ impl SimpleEditApp {
             | ActiveOverlay::ConfirmClose(_)
             | ActiveOverlay::ConfirmCloseMany(..)
             | ActiveOverlay::ConfirmQuit(_)
+            | ActiveOverlay::ConfirmTrust(_)
             | ActiveOverlay::ConfirmScratchDelete(_)
             | ActiveOverlay::ConfirmFileDelete(..)
             | ActiveOverlay::ProjectName(_)
@@ -1049,8 +1050,39 @@ impl SimpleEditApp {
             })
             .collect();
 
+        // The requests changed and not kept, without their credentials.
+        let bare = |request: &crate::api::model::Request| {
+            let mut request = request.clone();
+            for value in [
+                &mut request.auth.token,
+                &mut request.auth.password,
+                &mut request.auth.key_value,
+            ] {
+                if !value.contains("{{") {
+                    value.clear();
+                }
+            }
+            request
+        };
+        let mut api_tabs: Vec<(&PathBuf, crate::session::ApiSession)> = self
+            .api_tabs
+            .iter()
+            .filter(|(_, tab)| tab.changed())
+            .map(|(path, tab)| {
+                (
+                    path,
+                    crate::session::ApiSession {
+                        request: bare(&tab.request),
+                        kept: bare(&tab.kept),
+                        origin: tab.origin,
+                    },
+                )
+            })
+            .collect();
+        api_tabs.sort_by(|a, b| a.0.cmp(b.0));
         Session {
             files,
+            api_tabs: api_tabs.into_iter().map(|(_, s)| s).collect(),
             active_file: self
                 .current_file
                 .as_ref()
@@ -1095,9 +1127,11 @@ impl SimpleEditApp {
             return None;
         }
         self.last_session = print;
+        self.session_writes += 1;
+        let number = self.session_writes;
         Some(async move {
             tokio::task::spawn_blocking(move || {
-                crate::session::Session::write(&json).map_err(|e| e.to_string())
+                crate::session::Session::write_numbered(&json, number).map_err(|e| e.to_string())
             })
             .await
             .map_err(|e| e.to_string())?
@@ -1124,14 +1158,18 @@ impl SimpleEditApp {
                     .find(|e| e.label() == fs.encoding)
                     .unwrap_or_default(),
             };
+            // A partial view of a huge file is never written back.
+            let fs_dirty = fs.dirty
+                && !std::fs::metadata(&path)
+                    .is_ok_and(|m| m.is_file() && m.len() > super::MAX_OPEN_BYTES);
             let buffer = match &fs.content {
                 Some(text) => CachedBuffer {
                     content: Some(crate::code_editor::Content::with_text(text)),
                     language: fs.language.clone(),
-                    dirty: fs.dirty,
+                    dirty: fs_dirty,
                     stamp: fs.stamp,
                     format,
-                    saved_fp: (!fs.dirty).then(|| fingerprint(text)),
+                    saved_fp: (!fs_dirty).then(|| fingerprint(text)),
                     view_mode: ViewMode::Raw,
                 },
                 // A file deleted since the last run is dropped, not shown empty.
@@ -1153,6 +1191,22 @@ impl SimpleEditApp {
             };
             self.sidebar.add_file(path.clone());
             self.file_cache.insert(path, buffer);
+        }
+
+        // The requests that were changed and not kept come back as tabs.
+        for saved in session.api_tabs {
+            self.api.counter += 1;
+            let title = saved.request.title();
+            let title = if title.is_empty() {
+                t!("api.untitled").to_string()
+            } else {
+                title
+            };
+            let path = PathBuf::from(format!("api://{}/{}", self.api.counter, title));
+            let mut tab = crate::api::ApiTab::new(saved.request, saved.origin);
+            tab.kept = saved.kept;
+            self.api_tabs.insert(path.clone(), tab);
+            self.sidebar.add_file(path);
         }
 
         if self.sidebar.files().is_empty() {

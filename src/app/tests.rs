@@ -752,6 +752,7 @@ mod behavior_tests {
             files: vec![],
             active_file: None,
             untitled_counter: 1,
+            api_tabs: vec![],
         };
         let mut fs = crate::session::FileSession {
             path: String::new(),
@@ -1409,7 +1410,7 @@ mod behavior_tests {
     }
 
     #[test]
-    fn the_cross_beside_a_file_closes_it_without_asking_even_when_modified() {
+    fn the_cross_beside_a_file_asks_first_when_it_is_modified() {
         let mut app = app();
         type_text(&mut app, "unsaved work");
         let path = app.current_file.clone().unwrap();
@@ -1417,10 +1418,13 @@ mod behavior_tests {
         let _ = app.handle(Message::Sidebar(crate::sidebar::SidebarMessage::CloseNow(
             path.clone(),
         )));
-        assert!(matches!(app.overlay, ActiveOverlay::None));
-        // The work is gone; the last tab is replaced by a blank one.
-        assert!(!app.is_dirty);
-        assert_eq!(crate::editor::buffer_text(&app.editor.content), "");
+        assert!(matches!(app.overlay, ActiveOverlay::ConfirmClose(_)));
+        // The work is still there until it is confirmed.
+        assert!(app.is_dirty);
+        assert_eq!(
+            crate::editor::buffer_text(&app.editor.content),
+            "unsaved work\n"
+        );
     }
 
     #[test]
@@ -1570,7 +1574,10 @@ mod behavior_tests {
         assert!(app.open_menu.is_some());
         // What the open panel does by itself every two seconds.
         let _ = app.update(Message::Git(GitMsg::Tick));
-        let _ = app.update(Message::Git(GitMsg::StatusLoaded(Ok(Default::default()))));
+        let _ = app.update(Message::Git(GitMsg::StatusLoaded(
+            PathBuf::new(),
+            Ok(Default::default()),
+        )));
         let _ = app.update(Message::Git(GitMsg::Done(Ok(String::new()))));
         assert!(app.open_menu.is_some());
         // A click on the panel is the user's: it closes the menu.
@@ -2504,6 +2511,41 @@ mod behavior_tests {
     }
 
     #[test]
+    fn the_console_runs_only_on_the_connection_chosen() {
+        use crate::database::{DbMsg, Dialog, Field};
+        let (mut app, _) = db_app(true);
+        let first = app.db.connections[0].id;
+        let mut form = Dialog::new();
+        form.set(Field::User, "staging".into());
+        let second = app.db.apply(&form).unwrap();
+        let _ = app.update(Message::Db(DbMsg::ConsoleConnection(second)));
+        // A transaction open there: the console stays on it.
+        app.db.console.in_transaction = true;
+        let _ = app.update(Message::Db(DbMsg::ConsoleConnection(first)));
+        assert_eq!(app.db.console.connection, Some(second));
+        assert_eq!(
+            app.db.console.last,
+            Some((false, t!("db.console_busy_transaction").to_string()))
+        );
+        // Nor while a query runs.
+        app.db.console.in_transaction = false;
+        app.db.console.running = true;
+        let _ = app.update(Message::Db(DbMsg::ConsoleConnection(first)));
+        assert_eq!(app.db.console.connection, Some(second));
+        app.db.console.running = false;
+        // Its connection removed, the console runs on none, not on the first.
+        app.db.remove(second);
+        assert_eq!(app.db.console.connection, None);
+        app.db.console.append_query("DELETE FROM t WHERE id = 1");
+        let _ = app.update(Message::Db(DbMsg::Run(true)));
+        assert!(!app.db.console.running);
+        assert_eq!(
+            app.db.console.last,
+            Some((false, t!("db.console_choose_connection").to_string()))
+        );
+    }
+
+    #[test]
     fn a_failed_query_shows_the_log_and_says_which_statement() {
         use crate::database::console::ConsoleTab;
         use crate::database::{DbMsg, Executed, Ran};
@@ -2545,6 +2587,8 @@ mod behavior_tests {
         assert_eq!(app.db.console.last.as_ref().map(|l| l.0), Some(false));
         assert!(!app.db.console.running);
         let (mut app, _) = db_app(true);
+        // Opened, the console runs on the first data source.
+        let _ = app.update(Message::Db(DbMsg::ToggleConsole));
         app.db.console.editor = iced::widget::text_editor::Content::with_text("  \n ");
         let _ = app.update(Message::Db(DbMsg::Run(false)));
         assert_eq!(app.db.console.last.as_ref().map(|l| l.0), Some(false));
@@ -2559,6 +2603,7 @@ mod behavior_tests {
     fn a_risky_statement_waits_for_a_yes_before_it_runs() {
         use crate::database::DbMsg;
         let (mut app, _) = db_app(true);
+        let _ = app.update(Message::Db(DbMsg::ToggleConsole));
         app.db.console.editor = iced::widget::text_editor::Content::with_text("DELETE FROM t");
         let _ = app.update(Message::Db(DbMsg::Run(false)));
         assert!(!app.db.console.running);
@@ -2576,6 +2621,7 @@ mod behavior_tests {
     fn on_a_production_source_a_change_with_a_where_waits_too() {
         use crate::database::DbMsg;
         let (mut app, _) = db_app(true);
+        let _ = app.update(Message::Db(DbMsg::ToggleConsole));
         app.db.console.editor =
             iced::widget::text_editor::Content::with_text("UPDATE t SET a = 1 WHERE id = 2");
         let _ = app.update(Message::Db(DbMsg::Run(false)));
@@ -2598,6 +2644,10 @@ mod behavior_tests {
         let _ = app.update(Message::Db(DbMsg::RunFile));
         assert!(!app.db.console.running);
         app.editor.language = Some("sql".into());
+        // No data source chosen for the console: none is guessed.
+        let _ = app.update(Message::Db(DbMsg::RunFile));
+        assert!(!app.db.console.running && app.db.console.open);
+        app.db.console.connection = Some(app.db.connections[0].id);
         let _ = app.update(Message::Db(DbMsg::RunFile));
         assert!(app.db.console.running && app.db.console.open);
         assert_eq!(app.db.console.running_sql, vec!["SELECT 1", "SELECT 2"]);
@@ -4730,6 +4780,52 @@ mod text_command_tests {
     }
 
     #[test]
+    fn a_selection_made_upwards_is_the_one_line_commands_act_on() {
+        // Line 10 is empty: guessed from the text, the selection was lines 7
+        // to 9.
+        let text: String = (0..15)
+            .map(|i| {
+                if i == 10 {
+                    "\n".into()
+                } else {
+                    format!("l{i}\n")
+                }
+            })
+            .collect();
+        let mut app = app_with(&text);
+        let content = &mut app.editor.content;
+        content.perform(Action::Move(text_editor::Motion::DocumentStart));
+        for _ in 0..13 {
+            content.perform(Action::Move(text_editor::Motion::Down));
+        }
+        for _ in 0..3 {
+            content.perform(Action::Select(text_editor::Motion::Up));
+        }
+        assert_eq!(app.lines_to_edit(app.selection_span()), (10, 12));
+        let _ = app.update(Message::LineOp(text_ops::LineOp::Reverse));
+        let text = buffer(&app);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(&lines[7..14], ["l7", "l8", "l9", "l12", "l11", "", "l13"]);
+    }
+
+    #[test]
+    fn each_cursor_changes_the_case_of_its_own_selection() {
+        // The empty line gives a cursor with nothing selected.
+        let mut app = app_with("abcd\n\nefgh\n");
+        app.editor.content.column_select((0, 1), (2, 3));
+        let _ = app.update(Message::CaseOp(text_ops::CaseOp::Upper));
+        assert_eq!(buffer(&app), "aBCd\n\neFGh\n");
+        // The selections are still there, each on its own text.
+        assert_eq!(
+            app.editor.content.selection_all().as_deref(),
+            Some("BC\nFG")
+        );
+        // One Ctrl+Z puts it back.
+        let _ = app.update(Message::Undo);
+        assert_eq!(buffer(&app), "abcd\n\nefgh\n");
+    }
+
+    #[test]
     fn the_word_at_the_cursor_changes_case() {
         let mut app = app_with("fooBar baz\n");
         let _ = app.update(Message::CaseOp(text_ops::CaseOp::Snake));
@@ -4763,6 +4859,22 @@ mod text_command_tests {
         let _ = app.update(Message::SetEncoding(Encoding::Latin1));
         assert_eq!(app.format.encoding, Encoding::Utf8);
         assert!(app.status_is_error);
+    }
+
+    #[test]
+    fn a_binary_file_is_not_opened_as_text() {
+        let dir = tempfile::tempdir().unwrap();
+        // A PNG: its header holds a lone `\r`, which a save would change.
+        let png = dir.path().join("a.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR").unwrap();
+        assert_eq!(
+            file_io::read_decoded(&png).unwrap_err(),
+            t!("status.err_binary").to_string()
+        );
+        // UTF-16 with its mark holds NULs too, and is text.
+        let utf16 = dir.path().join("a.txt");
+        std::fs::write(&utf16, [0xff, 0xfe, b'h', 0, b'i', 0]).unwrap();
+        assert_eq!(file_io::read_decoded(&utf16).unwrap().0, "hi");
     }
 
     #[test]
@@ -5187,6 +5299,7 @@ mod keyboard_list_tests {
                 name: name.to_string(),
                 command: "true".into(),
                 dir: PathBuf::from("/tmp"),
+                custom: None,
             })
             .collect();
         let _ = app.update(Message::OpenTextOptions(TextOption::Indent));
@@ -5225,5 +5338,139 @@ mod keyboard_list_tests {
         let _ = app.update(Message::RenameInput("x".into()));
         key(&mut app, "ArrowDown");
         assert_eq!(app.overlay_pick, 0);
+    }
+}
+
+#[cfg(test)]
+mod large_file_write_guards {
+    use super::*;
+
+    #[test]
+    fn a_large_tab_never_becomes_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.log");
+        std::fs::write(&path, "line\n").unwrap();
+        let mut app = SimpleEditApp::blank(Config::default());
+        let _ = app.restore_session(crate::session::Session::default());
+        let _ = app.update(Message::TabRead(Ok(Loaded {
+            path: path.clone(),
+            text: "line\n".into(),
+            format: TextFormat::default(),
+            stamp: None,
+        })));
+        app.large.insert(
+            path,
+            LargeView {
+                start: 0,
+                end: 5,
+                size: 100 * 1024 * 1024,
+            },
+        );
+        let _ = app.update(Message::SetLineEnding(crate::tabs::LineEnding::Crlf));
+        let _ = app.update(Message::SetEncoding(crate::tabs::Encoding::ALL[1]));
+        let _ = app.update(Message::Search(SearchMessage::ReplaceAll));
+        assert!(!app.is_dirty);
+    }
+}
+
+#[cfg(test)]
+mod close_guards {
+    use super::*;
+
+    #[test]
+    fn a_changed_api_request_asks_before_closing_and_a_second_window_before_quitting() {
+        let mut app = SimpleEditApp::blank(Config::default());
+        let _ = app.restore_session(crate::session::Session::default());
+        let path = PathBuf::from("/api/request-1");
+        let request = crate::api::model::Request::default();
+        let mut tab = crate::api::ApiTab::new(request, None);
+        app.api_tabs.insert(path.clone(), tab_clone(&tab));
+        app.sidebar.add_file(path.clone());
+        assert!(!app.is_path_dirty(&path));
+        tab.request.url = "https://example.test".into();
+        app.api_tabs.insert(path.clone(), tab);
+        assert!(app.is_path_dirty(&path));
+        let _ = app.request_close(path.clone());
+        assert!(matches!(app.overlay, ActiveOverlay::ConfirmClose(_)));
+        assert!(app.api_tabs.contains_key(&path));
+
+        app.overlay = ActiveOverlay::None;
+        app.session_owner = false;
+        let _ = app.update(Message::Quit);
+        assert!(matches!(app.overlay, ActiveOverlay::ConfirmQuit(_)));
+    }
+
+    fn tab_clone(tab: &crate::api::ApiTab) -> crate::api::ApiTab {
+        crate::api::ApiTab::new(tab.request.clone(), None)
+    }
+}
+
+#[cfg(test)]
+mod terminal_paste {
+    #[test]
+    fn a_paste_cannot_close_the_bracketed_paste() {
+        let safe = super::paste_text_safe("ls\x1b[201~\nrm -rf x\x03\tok\r\n");
+        assert_eq!(safe, "ls[201~\nrm -rf x\tok\r\n");
+        assert!(!safe.contains('\x1b'));
+    }
+}
+
+#[cfg(test)]
+mod api_session {
+    use super::*;
+
+    #[test]
+    fn a_changed_api_request_comes_back_without_its_credentials() {
+        let mut app = SimpleEditApp::blank(Config::default());
+        let _ = app.restore_session(crate::session::Session::default());
+        let mut request = crate::api::model::Request::default();
+        request.auth.token = "tok-s3cret".into();
+        let mut tab = crate::api::ApiTab::new(request, None);
+        tab.request.url = "https://example.test".into();
+        let path = PathBuf::from("api://9/x");
+        app.api_tabs.insert(path.clone(), tab);
+        app.sidebar.add_file(path);
+        let session = app.build_session();
+        assert_eq!(session.api_tabs.len(), 1);
+        let json = session.to_json().unwrap();
+        assert!(!json.contains("tok-s3cret"));
+
+        let mut other = SimpleEditApp::blank(Config::default());
+        let _ = other.restore_session(serde_json::from_str(&json).unwrap());
+        assert_eq!(other.api_tabs.len(), 1);
+        let back = other.api_tabs.values().next().unwrap();
+        assert_eq!(back.request.url, "https://example.test");
+        assert!(back.changed());
+    }
+}
+
+#[cfg(test)]
+mod late_answers {
+    use super::*;
+    use crate::database::{AnswerFor, DbMsg};
+
+    #[test]
+    fn an_answer_for_a_window_that_is_not_the_open_one_is_dropped() {
+        let mut app = SimpleEditApp::blank(Config::default());
+        let _ = app.restore_session(crate::session::Session::default());
+        app.db.designer = Some(crate::database::designer::Designer::new(
+            1,
+            "d".into(),
+            "public".into(),
+            "b".into(),
+        ));
+        // The structure of "a" arrives while the designer of "b" is open.
+        let late = DbMsg::Answer(
+            AnswerFor::Designer(1, "public".into(), "a".into()),
+            Box::new(DbMsg::Designer(crate::database::DesignerMsg::Close)),
+        );
+        let _ = app.update(Message::Db(late));
+        assert!(app.db.designer.is_some(), "not taken for the open one");
+        let on_time = DbMsg::Answer(
+            AnswerFor::Designer(1, "public".into(), "b".into()),
+            Box::new(DbMsg::Designer(crate::database::DesignerMsg::Close)),
+        );
+        let _ = app.update(Message::Db(on_time));
+        assert!(app.db.designer.is_none());
     }
 }

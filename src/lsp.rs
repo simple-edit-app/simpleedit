@@ -136,8 +136,13 @@ fn family(exe: &Path) -> &'static str {
 }
 
 /// rust-analyzer's completion settings.
-fn rust_settings() -> Value {
-    json!({ "completion": {
+fn rust_settings(trusted: bool) -> Value {
+    json!({
+        // Build scripts and procedural macros are programs of the project: they
+        // run only in a folder that is trusted.
+        "cargo": { "buildScripts": { "enable": trusted } },
+        "procMacro": { "enable": trusted },
+        "completion": {
         "autoimport": { "enable": option("rust.auto_import") },
         "postfix": { "enable": option("rust.postfix") },
         "callable": { "snippets": if option("rust.call_arguments") {
@@ -149,10 +154,10 @@ fn rust_settings() -> Value {
 }
 
 /// What a server asks with `workspace/configuration`, for one section.
-fn configuration(family: &str, section: &str) -> Value {
+fn configuration(family: &str, section: &str, trusted: bool) -> Value {
     let auto_import = option("python.auto_import");
     match (family, section) {
-        ("rust", "rust-analyzer") => rust_settings(),
+        ("rust", "rust-analyzer") => rust_settings(trusted),
         ("python", "python") => json!({ "analysis": { "autoImportCompletions": auto_import } }),
         ("python", "python.analysis") => json!({ "autoImportCompletions": auto_import }),
         _ => Value::Null,
@@ -166,11 +171,8 @@ pub async fn restart_servers() {
         return;
     };
     let mut servers = servers.lock().await;
-    for server in servers.values() {
-        server.alive.store(false, Ordering::SeqCst);
-        if let Ok(mut child) = server._child.lock() {
-            let _ = child.start_kill();
-        }
+    for server in servers.values().filter_map(|cell| cell.get()) {
+        server.kill();
     }
     servers.clear();
 }
@@ -182,7 +184,7 @@ pub async fn restart_servers() {
 fn init_options(exe: &Path, root: &Path) -> Value {
     match family(exe) {
         "typescript" => typescript_options(root),
-        "rust" => rust_settings(),
+        "rust" => rust_settings(crate::trust::is_trusted(root)),
         _ => json!({}),
     }
 }
@@ -960,6 +962,7 @@ async fn rename_on(
         return Err("this language server cannot rename".into());
     }
     let uri = path_to_uri(path);
+    server.close_others(&uri).await?;
     server.sync(&uri, language_id, text).await?;
     let mut params = position_params(&uri, text, line, col);
     params["newName"] = json!(new_name);
@@ -1466,24 +1469,53 @@ struct Server {
     completing: AtomicI64,
     /// Which family of server it is, for its settings.
     family: &'static str,
+    /// The folder was trusted when the server started.
+    trusted: bool,
     /// Kept so the process dies with the program.
     _child: StdMutex<Child>,
 }
 
-type Servers = Mutex<HashMap<(PathBuf, PathBuf), Arc<Server>>>;
+/// The server of each program and project, once it has started.
+type Servers = Mutex<HashMap<(PathBuf, PathBuf), Arc<tokio::sync::OnceCell<Arc<Server>>>>>;
 
 static SERVERS: OnceLock<Servers> = OnceLock::new();
 
+/// How long an answer is waited for: a server that never gives one must not
+/// leave what asked (Format, a rename, a completion…) waiting for ever.
+const ANSWER_WAIT: Duration = Duration::from_secs(30);
+/// Starting takes longer: some servers read the whole project first.
+const START_WAIT: Duration = Duration::from_secs(120);
+
 /// The running server for this program and project, started if need be.
+/// The table is only held to find the server's place: a slow start keeps
+/// waiting only those who want that server, not the other languages.
 async fn server_for(exe: &Path, args: &[&str], root: &Path) -> Result<Arc<Server>, String> {
-    let mut servers = SERVERS.get_or_init(Default::default).lock().await;
-    let key = (exe.to_path_buf(), root.to_path_buf());
-    if let Some(server) = servers.get(&key).filter(|s| s.alive.load(Ordering::SeqCst)) {
-        return Ok(server.clone());
+    let cell = {
+        let mut servers = SERVERS.get_or_init(Default::default).lock().await;
+        let key = (exe.to_path_buf(), root.to_path_buf());
+        let cell = servers.entry(key).or_default();
+        // One that died is started again.
+        if cell.get().is_some_and(|s| !s.alive.load(Ordering::SeqCst)) {
+            *cell = Default::default();
+        }
+        cell.clone()
+    };
+    cell.get_or_try_init(|| Server::start(exe, args, root))
+        .await
+        .cloned()
+}
+
+/// Stops a server whose start did not go to the end (it failed, or whoever
+/// waited for it gave up): nothing would ever stop it otherwise, since the
+/// task reading its answers keeps it.
+struct StartGuard(Option<Arc<Server>>);
+
+impl Drop for StartGuard {
+    fn drop(&mut self) {
+        if let Some(server) = self.0.take() {
+            server.kill();
+        }
     }
-    let server = Server::start(exe, args, root).await?;
-    servers.insert(key, server.clone());
-    Ok(server)
 }
 
 impl Server {
@@ -1511,9 +1543,11 @@ impl Server {
             capabilities: StdMutex::new(Value::Null),
             completing: AtomicI64::new(0),
             family: family(exe),
+            trusted: crate::trust::is_trusted(root),
             _child: StdMutex::new(child),
         });
         tokio::spawn(read_loop(server.clone(), stdout));
+        let mut guard = StartGuard(Some(server.clone()));
 
         let root_uri = path_to_uri(root);
         let name = root.file_name().map_or_else(
@@ -1588,7 +1622,43 @@ impl Server {
                 "jsonrpc": "2.0", "method": "initialized", "params": {}
             }))
             .await?;
+        guard.0 = None;
         Ok(server)
+    }
+
+    /// The process is stopped, and the server no longer used.
+    fn kill(&self) {
+        self.alive.store(false, Ordering::SeqCst);
+        if let Ok(mut child) = self._child.lock() {
+            let _ = child.start_kill();
+        }
+    }
+
+    /// The answer to request `id`, or an error once `wait` has passed (the
+    /// server is then told to give up the request).
+    async fn answer(
+        &self,
+        id: i64,
+        rx: oneshot::Receiver<Result<Value, RpcError>>,
+        wait: Duration,
+    ) -> Result<Value, RpcError> {
+        match tokio::time::timeout(wait, rx).await {
+            Ok(answer) => answer.unwrap_or_else(|_| Err(stopped())),
+            Err(_) => {
+                if let Ok(mut pending) = self.pending.lock() {
+                    pending.remove(&id);
+                }
+                let _ = self
+                    .send(&json!({
+                        "jsonrpc": "2.0", "method": "$/cancelRequest", "params": { "id": id }
+                    }))
+                    .await;
+                Err(RpcError {
+                    code: -1,
+                    message: t!("lsp.no_answer").to_string(),
+                })
+            }
+        }
     }
 
     fn is_busy(&self) -> bool {
@@ -1619,7 +1689,12 @@ impl Server {
         if let Err(message) = self.send(&message).await {
             return Err(RpcError { code: -1, message });
         }
-        rx.await.unwrap_or_else(|_| Err(stopped()))
+        let wait = if method == "initialize" {
+            START_WAIT
+        } else {
+            ANSWER_WAIT
+        };
+        self.answer(id, rx, wait).await
     }
 
     /// A completion request; the one still running before it is cancelled:
@@ -1646,7 +1721,7 @@ impl Server {
         if let Err(message) = self.send(&message).await {
             return Err(RpcError { code: -1, message });
         }
-        rx.await.unwrap_or_else(|_| Err(stopped()))
+        self.answer(id, rx, ANSWER_WAIT).await
     }
 
     /// How the server wants changes: 2 for the changed part only, else the
@@ -1710,6 +1785,27 @@ impl Server {
         Ok(true)
     }
 
+    /// Closes every document but `keep` (`didClose`): the server then reads
+    /// those from the disk again, instead of from the text it was told long
+    /// ago, which is what a multi-file edit (a rename) is computed on.
+    async fn close_others(&self, keep: &str) -> Result<(), String> {
+        let mut docs = self.docs.lock().await;
+        let stale: Vec<String> = docs
+            .keys()
+            .filter(|u| u.as_str() != keep)
+            .cloned()
+            .collect();
+        for uri in stale {
+            docs.remove(&uri);
+            self.send(&json!({
+                "jsonrpc": "2.0", "method": "textDocument/didClose",
+                "params": { "textDocument": { "uri": uri } },
+            }))
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Reacts to a message of the server.
     async fn handle(&self, message: Value) {
         let id = message.get("id").cloned();
@@ -1744,7 +1840,11 @@ impl Server {
                         items
                             .iter()
                             .map(|i| {
-                                configuration(self.family, i["section"].as_str().unwrap_or(""))
+                                configuration(
+                                    self.family,
+                                    i["section"].as_str().unwrap_or(""),
+                                    self.trusted,
+                                )
                             })
                             .collect(),
                     )
@@ -2003,6 +2103,47 @@ while True:
     /// The interpreter that runs the fake server (`python3` isn't a command on Windows).
     const PYTHON: &str = if cfg!(windows) { "python" } else { "python3" };
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_server_that_fails_to_start_does_not_stay_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        // It refuses `initialize`, then would wait for ever.
+        let script = FAKE_SERVER
+            .replace(
+                "import sys, json",
+                &format!("import sys, json, os\nopen({:?}, 'w').write(str(os.getpid()))", pid_file),
+            )
+            .replace(
+                r#"send({"jsonrpc": "2.0", "id": m["id"], "result": {"capabilities": {}}})"#,
+                r#"send({"jsonrpc": "2.0", "id": m["id"], "error": {"code": -32603, "message": "no"}})"#,
+            );
+        let path = dir.path().join("fake.py");
+        std::fs::write(&path, script).unwrap();
+        let path = path.to_string_lossy().into_owned();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let started = runtime.block_on(server_for(Path::new(PYTHON), &[path.as_str()], dir.path()));
+        assert!(started.is_err());
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        // Gone, or a zombie waiting to be reaped: it no longer runs.
+        let running = || {
+            std::fs::read_to_string(format!("/proc/{pid}/status"))
+                .unwrap_or_default()
+                .lines()
+                .any(|l| l.starts_with("State:") && !l.contains('Z'))
+        };
+        for _ in 0..50 {
+            if !running() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("the server process {pid} still runs");
+    }
+
     #[test]
     fn a_server_answers_a_definition_request() {
         let dir = tempfile::tempdir().unwrap();
@@ -2138,11 +2279,11 @@ while True:
             false
         );
         assert_eq!(
-            configuration("python", "python.analysis")["autoImportCompletions"],
+            configuration("python", "python.analysis", false)["autoImportCompletions"],
             false
         );
-        assert_eq!(configuration("rust", "rust-analyzer"), rust);
-        assert_eq!(configuration("", "anything"), Value::Null);
+        assert_eq!(configuration("rust", "rust-analyzer", false), rust);
+        assert_eq!(configuration("", "anything", false), Value::Null);
         assert_eq!(
             init_options(Path::new("/x/gopls"), Path::new("/p")),
             json!({})

@@ -289,8 +289,8 @@ impl SimpleEditApp {
                 let table = tab.table_ref();
                 let name = format!(
                     "{}.{}",
-                    database::protocol::quote_ident(&table.schema),
-                    database::protocol::quote_ident(&table.table)
+                    database::protocol::quote_ident_in(tab.dialect, &table.schema),
+                    database::protocol::quote_ident_in(tab.dialect, &table.table)
                 );
                 iced::clipboard::write(database::grid::block_text(
                     page,
@@ -299,6 +299,7 @@ impl SimpleEditApp {
                     to,
                     format,
                     &name,
+                    tab.dialect,
                 ))
             }
             DbMsg::TextCopy => match &self.db.text {

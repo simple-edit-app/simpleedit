@@ -156,12 +156,20 @@ impl SimpleEditApp {
         };
         let hits: Vec<crate::finder::TextHit> =
             chosen.iter().map(|i| tab.hits[*i].hit.clone()).collect();
-        let (count, files) = self.replace_found(&search, &hits);
+        let (count, files, done) = self.replace_found(&search, &hits);
+        // Only what was replaced leaves the list.
+        let left = chosen.len() - done.len();
         if let Some(tab) = self.results_tab() {
-            for i in chosen.into_iter().rev() {
+            let mut gone: Vec<usize> = done.into_iter().map(|d| chosen[d]).collect();
+            gone.sort_unstable();
+            for i in gone.into_iter().rev() {
                 tab.hits.remove(i);
             }
             tab.selected = tab.selected.min(tab.hits.len().saturating_sub(1));
+        }
+        if left > 0 {
+            self.set_status(t!("results.not_replaced", n = left), true);
+            return Task::none();
         }
         let (matches, files) = (matches_text(count), files_text(files));
         let done = t!("findrep.replaced", matches = matches, files = files);
@@ -235,7 +243,7 @@ impl SimpleEditApp {
                 };
                 self.results.generation += 1;
                 let generation = self.results.generation;
-                self.run_search(search, false, move |found| {
+                self.run_search(search, false, Default::default(), move |found| {
                     Message::Results(ResultsMsg::Rerun_(generation, found))
                 })
             }
@@ -632,6 +640,7 @@ mod tests {
                 len: 3,
                 preview: "run".into(),
                 preview_at: (0, 3),
+                stamp: 0,
             },
             replacement: None,
             excluded: false,
@@ -699,6 +708,50 @@ mod tests {
         assert_eq!(app.results.tabs[0].selected, 0);
         assert_eq!(app.pending_open.as_deref(), Some(Path::new("/x/a.rs")));
         assert!(app.results_text().contains("b.rs:2:1: run"));
+    }
+
+    #[test]
+    fn a_file_changed_since_the_search_is_not_replaced_and_its_matches_stay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "top\nfoo 1\nfoo 2\n").unwrap();
+        let mut app = app();
+        let _ = app.update(Message::OpenReplaceInFiles);
+        let _ = app.update(Message::FindQuery("foo".into()));
+        let _ = app.update(Message::FindReplaceText("bar".into()));
+        let search = app.finder_search();
+        let found = crate::finder::find_occurrences(
+            std::slice::from_ref(&path),
+            &HashMap::new(),
+            &search.options,
+            search.replace.as_ref(),
+        )
+        .unwrap();
+        let hits: Vec<Occurrence> = found
+            .into_iter()
+            .map(|(hit, replacement)| Occurrence {
+                hit,
+                replacement,
+                excluded: false,
+            })
+            .collect();
+        app.results_add("r".into(), Some(search), hits);
+        // The second match is left out, then a line goes above: the one
+        // left out is now where the chosen one was.
+        app.results.tabs[0].hits[1].excluded = true;
+        std::fs::write(&path, "foo 1\nfoo 2\n").unwrap();
+        let _ = app.update(Message::Results(ResultsMsg::ReplaceAll));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "foo 1\nfoo 2\n");
+        assert_eq!(app.results.tabs[0].hits.len(), 2, "nothing left the list");
+        assert!(app.status_is_error);
+        // Found again: the chosen one goes, and only it.
+        std::fs::write(&path, "top\nfoo 1\nfoo 2\n").unwrap();
+        let _ = app.update(Message::Results(ResultsMsg::ReplaceAll));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "top\nbar 1\nfoo 2\n"
+        );
+        assert_eq!(app.results.tabs[0].hits.len(), 1);
     }
 
     /// Draws the window then the panel, to look at them without a screen:

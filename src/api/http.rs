@@ -72,42 +72,89 @@ pub async fn send(request: Resolved) -> Result<Response, String> {
             parsed.scheme()
         ));
     }
+    // Redirects are followed here, not by the client: the headers of the
+    // request (`X-API-Key`, tokens of any name) must not go along to another
+    // site.
     let mut client = reqwest::Client::builder()
-        .redirect(if request.settings.follow_redirects {
-            reqwest::redirect::Policy::limited(10)
-        } else {
-            reqwest::redirect::Policy::none()
-        })
+        .redirect(reqwest::redirect::Policy::none())
         .danger_accept_invalid_certs(!request.settings.verify_tls);
     if request.settings.timeout_secs > 0 {
         client = client.timeout(Duration::from_secs(request.settings.timeout_secs));
     }
     let client = client.build().map_err(|e| e.to_string())?;
-    let method = reqwest::Method::from_bytes(request.method.as_str().as_bytes())
+    let mut method = reqwest::Method::from_bytes(request.method.as_str().as_bytes())
         .map_err(|e| e.to_string())?;
-    let mut builder = client.request(method, parsed);
+    let mut headers_out: Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)> =
+        Vec::new();
     for (shown, value) in &request.headers {
         let name = reqwest::header::HeaderName::from_bytes(shown.as_bytes())
             .map_err(|_| format!("The header name \"{shown}\" is not valid."))?;
         let value = reqwest::header::HeaderValue::from_str(value)
             .map_err(|_| format!("The value of the header {shown} is not valid."))?;
-        builder = builder.header(name, value);
+        headers_out.push((name, value));
     }
-    builder = match request.body {
-        ResolvedBody::None => builder,
-        ResolvedBody::Bytes(bytes) => builder.body(bytes),
-        ResolvedBody::File(path) => {
-            let bytes = tokio::fs::read(&path)
-                .await
-                .map_err(|e| format!("{path}: {e}"))?;
-            builder.body(bytes)
+    let mut body: Option<Vec<u8>> = match request.body {
+        ResolvedBody::None => None,
+        ResolvedBody::Bytes(bytes) => Some(bytes),
+        ResolvedBody::File(path) if path.trim().is_empty() => {
+            return Err("The file to send is not chosen.".to_string());
         }
+        ResolvedBody::File(path) => Some(
+            tokio::fs::read(&path)
+                .await
+                .map_err(|e| format!("{path}: {e}"))?,
+        ),
     };
     let started = Instant::now();
-    let mut response = builder
-        .send()
-        .await
-        .map_err(|e| explain(&e, &request.settings))?;
+    let mut target = parsed;
+    let mut hops = 0;
+    let mut response = loop {
+        let mut builder = client.request(method.clone(), target.clone());
+        for (name, value) in &headers_out {
+            builder = builder.header(name.clone(), value.clone());
+        }
+        if let Some(bytes) = &body {
+            builder = builder.body(bytes.clone());
+        }
+        let response = builder
+            .send()
+            .await
+            .map_err(|e| explain(&e, &request.settings))?;
+        let status = response.status();
+        let next = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|l| target.join(l).ok());
+        let (true, true, Some(next)) = (
+            request.settings.follow_redirects,
+            status.is_redirection(),
+            next,
+        ) else {
+            break response;
+        };
+        hops += 1;
+        if hops > 10 || !matches!(next.scheme(), "http" | "https") {
+            return Err("Too many redirects.".to_string());
+        }
+        // Like a browser: 303 (and 301/302 for a POST) turn into a GET.
+        if status == reqwest::StatusCode::SEE_OTHER
+            || (matches!(status.as_u16(), 301 | 302) && method == reqwest::Method::POST)
+        {
+            if method != reqwest::Method::HEAD {
+                method = reqwest::Method::GET;
+            }
+            body = None;
+            headers_out.retain(|(n, _)| !n.as_str().starts_with("content-"));
+        }
+        if !same_origin(&target, &next) {
+            headers_out.retain(|(n, _)| safe_across_sites(n.as_str()));
+            if body.is_some() && !matches!(status.as_u16(), 307 | 308) {
+                body = None;
+            }
+        }
+        target = next;
+    };
     let status = response.status();
     let version = format!("{:?}", response.version());
     let final_url = response.url().to_string();
@@ -148,6 +195,28 @@ pub async fn send(request: Resolved) -> Result<Response, String> {
         ms: started.elapsed().as_millis() as u64,
         url: final_url,
     })
+}
+
+/// Whether two addresses have the same scheme, host and port.
+fn same_origin(a: &reqwest::Url, b: &reqwest::Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str() == b.host_str()
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
+/// The headers that follow a redirect to another site: those that say what
+/// is wanted, never those that say who asks.
+fn safe_across_sites(name: &str) -> bool {
+    matches!(
+        name,
+        "accept"
+            | "accept-language"
+            | "accept-encoding"
+            | "user-agent"
+            | "content-type"
+            | "content-length"
+            | "content-language"
+    )
 }
 
 /// What went wrong, in words that say what to do.
@@ -579,6 +648,29 @@ mod tests {
         )))
         .unwrap_err();
         assert!(error.starts_with("Could not connect"), "{error}");
+    }
+
+    #[test]
+    fn a_redirect_to_another_site_does_not_carry_the_custom_headers() {
+        let (port_b, seen_b) = serve(|_| vec![answer("200 OK", &[], "there")]);
+        let (port_a, seen_a) = serve(|_| {
+            vec![answer(
+                "302 Found",
+                &[&format!("Location: http://localhost:{port_b}/next")],
+                "",
+            )]
+        });
+        let mut request = resolved(Method::Get, format!("http://127.0.0.1:{port_a}/"));
+        request.headers.push(("X-API-Key".into(), "secret".into()));
+        request.settings.follow_redirects = true;
+        let response = run(send(request)).unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            seen_a.lock().unwrap()[0].header("X-API-Key"),
+            Some("secret")
+        );
+        let b = seen_b.lock().unwrap();
+        assert!(b[0].header("X-API-Key").is_none() && b[0].header("X-Test").is_none());
     }
 
     #[test]

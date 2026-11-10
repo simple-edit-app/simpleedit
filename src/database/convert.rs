@@ -5,6 +5,8 @@
 
 use std::path::Path;
 
+use super::protocol::Dialect;
+
 /// The rows of a CSV text as `Some(text)` or `None` for a NULL. The first
 /// row is the header.
 pub fn parse_csv(text: &str) -> Vec<Vec<Option<String>>> {
@@ -61,22 +63,22 @@ pub fn parse_csv(text: &str) -> Vec<Vec<Option<String>>> {
     rows
 }
 
-fn sql_literal(value: &Option<String>) -> String {
+fn sql_literal(value: &Option<String>, dialect: Dialect) -> String {
     match value {
         None => "NULL".to_string(),
-        Some(text) => format!("'{}'", text.replace('\'', "''")),
+        Some(text) => super::protocol::quote_literal_in(dialect, text),
     }
 }
 
 /// `INSERT` statements for the rows (the first of `rows` names the
 /// columns), a hundred rows to a statement.
-pub fn to_inserts(table: &str, rows: &[Vec<Option<String>>]) -> String {
+pub fn to_inserts(table: &str, rows: &[Vec<Option<String>>], dialect: Dialect) -> String {
     let Some((header, body)) = rows.split_first() else {
         return String::new();
     };
     let columns = header
         .iter()
-        .map(|c| super::protocol::quote_ident(c.as_deref().unwrap_or("")))
+        .map(|c| super::protocol::quote_ident_in(dialect, c.as_deref().unwrap_or("")))
         .collect::<Vec<_>>()
         .join(", ");
     let mut out = String::new();
@@ -85,7 +87,7 @@ pub fn to_inserts(table: &str, rows: &[Vec<Option<String>>]) -> String {
         let lines: Vec<String> = chunk
             .iter()
             .map(|row| {
-                let values: Vec<String> = row.iter().map(sql_literal).collect();
+                let values: Vec<String> = row.iter().map(|v| sql_literal(v, dialect)).collect();
                 format!("  ({})", values.join(", "))
             })
             .collect();
@@ -190,7 +192,7 @@ mod tests {
                 if i == 1 { None } else { some("it's") },
             ]);
         }
-        let sql = to_inserts("\"public\".\"t\"", &rows);
+        let sql = to_inserts("\"public\".\"t\"", &rows, Dialect::Postgres);
         assert!(sql.starts_with("INSERT INTO \"public\".\"t\" (\"id\", \"na\"\"me\") VALUES\n  ('0', 'it''s'),\n  ('1', NULL)"));
         assert_eq!(
             sql.matches("INSERT INTO").count(),
@@ -198,7 +200,15 @@ mod tests {
             "a hundred rows to a statement"
         );
         assert!(sql.trim_end().ends_with("('100', 'it''s');"));
-        assert_eq!(to_inserts("t", &[]), "");
+        assert_eq!(to_inserts("t", &[], Dialect::Postgres), "");
+        assert_eq!(
+            to_inserts(
+                "`t`",
+                &[vec![Some("a".into())], vec![Some("C:\\x".into())]],
+                Dialect::Mysql
+            ),
+            "INSERT INTO `t` (`a`) VALUES\n  ('C:\\\\x');\n"
+        );
     }
 
     #[test]

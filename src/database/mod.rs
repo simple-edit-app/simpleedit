@@ -50,8 +50,22 @@ const MAX_DRIVER: usize = 64 * 1024 * 1024;
 
 // ---------------------------------------------------------------- messages
 
+/// The window an answer is for: when another one (or none) is open by the
+/// time it comes, it is dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnswerFor {
+    /// A table in the designer: connection, schema, table.
+    Designer(u64, String, String),
+    /// The health window: connection, database.
+    Health(u64, String),
+    /// The import window: connection, schema, table.
+    Import(u64, String, String),
+}
+
 #[derive(Debug, Clone)]
 pub enum DbMsg {
+    /// An answer that goes on only if its window is still the one asked.
+    Answer(AnswerFor, Box<DbMsg>),
     /// Opens the dialog: a new connection, or the one with this id.
     OpenDialog(Option<u64>),
     CloseDialog,
@@ -88,6 +102,8 @@ pub enum DbMsg {
     OpenTable(u64, String, String, String),
     /// A page of a table: its tab, then the page.
     Rows(PathBuf, Done<Page>),
+    /// The same, for the loading numbered so (an older answer is dropped).
+    RowsFor(PathBuf, u64, Done<Page>),
     /// Moves a table tab by this many pages.
     Turn(PathBuf, i64),
     Refresh(PathBuf),
@@ -1704,13 +1720,14 @@ pub async fn export_converted(
         std::process::id(),
         COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
+    let dialect = params.target.dialect;
     let name = if query.sql.is_some() || table.table.is_empty() {
         "result".to_string()
     } else {
         format!(
             "{}.{}",
-            protocol::quote_ident(&table.schema),
-            protocol::quote_ident(&table.table)
+            protocol::quote_ident_in(dialect, &table.schema),
+            protocol::quote_ident_in(dialect, &table.table)
         )
     };
     let mut done = export(
@@ -1730,7 +1747,7 @@ pub async fn export_converted(
             let text = std::fs::read_to_string(&source).map_err(|e| e.to_string())?;
             let rows = convert::parse_csv(&text);
             match format.as_str() {
-                "sql" => std::fs::write(&target, convert::to_inserts(&name, &rows)),
+                "sql" => std::fs::write(&target, convert::to_inserts(&name, &rows, dialect)),
                 "md" => std::fs::write(&target, convert::to_markdown(&rows)),
                 "xlsx" => return convert::write_xlsx(Path::new(&target), &rows).map(|_| target),
                 other => return Err(format!("no format {other}")),
@@ -1783,11 +1800,15 @@ pub enum Tree {
 #[derive(Debug, Clone)]
 pub struct TableTab {
     pub conn: u64,
+    /// The SQL of the connection: its quotes, its text search.
+    pub dialect: protocol::Dialect,
     pub database: String,
     pub schema: String,
     pub table: String,
     pub page: Option<Page>,
     pub loading: bool,
+    /// The number of the last loading asked for: only its answer counts.
+    pub load_no: u64,
     pub error: Option<String>,
     /// What the grid shows: the offset and the height of its viewport.
     pub scroll: (f32, f32),
@@ -1875,11 +1896,13 @@ impl TableTab {
     pub fn new(conn: u64, database: String, schema: String, table: String, page_size: u64) -> Self {
         TableTab {
             conn,
+            dialect: protocol::Dialect::default(),
             database,
             schema,
             table,
             page: None,
             loading: true,
+            load_no: 0,
             error: None,
             scroll: (0.0, 900.0),
             widths: Vec::new(),
@@ -1945,11 +1968,11 @@ impl TableTab {
         if !self.filter.trim().is_empty() {
             parts.push(format!("({})", self.filter.trim()));
         }
-        if let Some(search) = protocol::search_condition(&columns, &self.search) {
+        if let Some(search) = protocol::search_condition(self.dialect, &columns, &self.search) {
             parts.push(format!("({search})"));
         }
         for (column, text) in &self.column_filters {
-            if let Some(condition) = protocol::column_condition(column, text) {
+            if let Some(condition) = protocol::column_condition(self.dialect, column, text) {
                 parts.push(format!("({condition})"));
             }
         }
@@ -2427,7 +2450,10 @@ impl State {
     /// What the completion knows of a connection: its tables, and the
     /// columns when they have been read.
     pub fn known(&self, id: u64) -> completion::Known {
-        let mut known = completion::Known::default();
+        let mut known = completion::Known {
+            dialect: self.connection(id).map(|c| c.dialect).unwrap_or_default(),
+            ..completion::Known::default()
+        };
         if let Some(Tree::Loaded(databases)) = self.trees.get(&id) {
             // The tables of the database the connection is on.
             let current = databases.iter().find(|d| d.current).or(databases.first());
@@ -2470,6 +2496,15 @@ impl State {
 
     pub fn connection(&self, id: u64) -> Option<&Connection> {
         self.connections.iter().find(|c| c.id == id)
+    }
+
+    /// The console runs on this connection (and speaks its SQL).
+    pub fn use_console_connection(&mut self, id: Option<u64>) {
+        self.console.connection = id;
+        self.console.dialect = id
+            .and_then(|id| self.connection(id))
+            .map(|c| c.dialect)
+            .unwrap_or_default();
     }
 
     /// The password and the ssh secret to connect with, if they are known.
@@ -2578,6 +2613,12 @@ impl State {
 
     pub fn remove(&mut self, id: u64) {
         self.connections.retain(|c| c.id != id);
+        // The console no longer has a connection: it waits to be given one.
+        if self.console.connection == Some(id) {
+            self.use_console_connection(None);
+            self.console.database.clear();
+            self.console.in_transaction = false;
+        }
         secrets::forget(id);
         self.passwords.remove(&id);
         self.once.remove(&id);

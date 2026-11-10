@@ -167,6 +167,8 @@ pub struct Everywhere {
     symbols_waiting: bool,
     symbols_generation: u64,
     text: Vec<TextHit>,
+    /// The query `text` was found for.
+    text_for: String,
     text_error: Option<String>,
     text_waiting: bool,
     text_generation: u64,
@@ -293,6 +295,10 @@ impl SimpleEditApp {
 
     pub(super) fn everywhere_typed(&mut self, query: String) -> Task<Message> {
         self.everywhere.query = query;
+        // What was found for another text must not be taken for this one's.
+        if self.everywhere.text_for != self.everywhere.query.trim() {
+            self.everywhere.text.clear();
+        }
         self.everywhere_refresh();
         self.everywhere_searches()
     }
@@ -583,6 +589,7 @@ impl SimpleEditApp {
         match found {
             Ok(hits) => {
                 self.everywhere.text = hits;
+                self.everywhere.text_for = self.everywhere.query.trim().to_string();
                 self.everywhere.text_error = None;
             }
             Err(e) => {
@@ -1157,6 +1164,7 @@ impl SimpleEditApp {
                     len: 0,
                     preview: shown,
                     preview_at: (0, 0),
+                    stamp: 0,
                 },
                 Row::Symbol(h) => {
                     let preview = match &h.container {
@@ -1170,6 +1178,7 @@ impl SimpleEditApp {
                         line: h.line,
                         col: h.col,
                         preview,
+                        stamp: 0,
                     }
                 }
                 Row::Text(hit) => hit,

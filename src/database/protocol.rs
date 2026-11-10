@@ -758,10 +758,17 @@ pub struct Token {
     pub end: usize,
 }
 
+/// Whether the quote at `at` opens an `E'…'` string (where `\` escapes).
+fn is_escape_string(bytes: &[u8], at: usize) -> bool {
+    at > 0
+        && matches!(bytes[at - 1], b'e' | b'E')
+        && (at < 2 || !(bytes[at - 2].is_ascii_alphanumeric() || bytes[at - 2] == b'_'))
+}
+
 /// Cuts SQL into tokens, in order, with their places (blanks are left out).
 /// A string, a quoted name, a comment or a `$tag$` block is one token, even
 /// if it holds a `;` or a keyword.
-pub fn sql_tokens(sql: &str) -> Vec<Token> {
+pub fn sql_tokens(sql: &str, dialect: Dialect) -> Vec<Token> {
     let bytes = sql.as_bytes();
     let mut tokens = Vec::new();
     let mut i = 0;
@@ -774,9 +781,20 @@ pub fn sql_tokens(sql: &str) -> Vec<Token> {
                 i += 1;
                 continue;
             }
-            b'\'' | b'"' => {
+            b'\'' | b'"' | b'`' if b != b'`' || dialect != Dialect::Postgres => {
+                // A backslash escapes the next character in MySQL's strings
+                // and in PostgreSQL's `E'…'`.
+                let escapes = match dialect {
+                    Dialect::Mysql => b != b'`',
+                    Dialect::Postgres => b == b'\'' && is_escape_string(bytes, start),
+                    Dialect::Sqlite => false,
+                };
                 i += 1;
                 while i < bytes.len() {
+                    if escapes && bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
                     if bytes[i] == b {
                         // A doubled quote is a quote in the text.
                         if bytes.get(i + 1) == Some(&b) {
@@ -788,13 +806,32 @@ pub fn sql_tokens(sql: &str) -> Vec<Token> {
                     }
                     i += 1;
                 }
-                if b == b'"' {
-                    TokenKind::Quoted
-                } else {
+                if b == b'\'' {
                     TokenKind::Text
+                } else {
+                    TokenKind::Quoted
                 }
             }
-            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+            b'[' if dialect == Dialect::Sqlite => {
+                while i < bytes.len() && bytes[i] != b']' {
+                    i += 1;
+                }
+                i += 1;
+                TokenKind::Quoted
+            }
+            b'#' if dialect == Dialect::Mysql => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                TokenKind::Comment
+            }
+            // MySQL wants a blank after the two dashes.
+            b'-' if bytes.get(i + 1) == Some(&b'-')
+                && (dialect != Dialect::Mysql
+                    || bytes
+                        .get(i + 2)
+                        .is_none_or(|c| c.is_ascii_whitespace() || c.is_ascii_control())) =>
+            {
                 while i < bytes.len() && bytes[i] != b'\n' {
                     i += 1;
                 }
@@ -805,7 +842,10 @@ pub fn sql_tokens(sql: &str) -> Vec<Token> {
                 let mut depth = 1;
                 i += 2;
                 while i < bytes.len() && depth > 0 {
-                    if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                    if dialect == Dialect::Postgres
+                        && bytes[i] == b'/'
+                        && bytes.get(i + 1) == Some(&b'*')
+                    {
                         depth += 1;
                         i += 2;
                     } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
@@ -817,7 +857,7 @@ pub fn sql_tokens(sql: &str) -> Vec<Token> {
                 }
                 TokenKind::Comment
             }
-            b'$' => {
+            b'$' if dialect == Dialect::Postgres => {
                 // `$$` or `$tag$`, up to the same again; else a parameter.
                 let tag_len = sql[i + 1..].find('$').filter(|n| {
                     sql[i + 1..i + 1 + n]
@@ -876,8 +916,8 @@ pub fn sql_tokens(sql: &str) -> Vec<Token> {
 
 /// The keywords and names of a statement, in capitals, without what is in a
 /// string, a quoted name or a comment.
-pub fn sql_words(sql: &str) -> Vec<String> {
-    sql_tokens(sql)
+pub fn sql_words(sql: &str, dialect: Dialect) -> Vec<String> {
+    sql_tokens(sql, dialect)
         .into_iter()
         .filter(|t| t.kind == TokenKind::Word)
         .map(|t| sql[t.start..t.end].to_uppercase())
@@ -895,8 +935,8 @@ pub enum Risk {
 
 /// What is risky in a statement. `production`: the source is one where every
 /// change is asked about.
-pub fn risk_of(sql: &str, production: bool) -> Option<Risk> {
-    let words = sql_words(sql);
+pub fn risk_of(sql: &str, production: bool, dialect: Dialect) -> Option<Risk> {
+    let words = sql_words(sql, dialect);
     let first = words.first().map(String::as_str)?;
     // `EXPLAIN` without `ANALYZE` and the like do not run what they describe.
     if first == "EXPLAIN" && !words.iter().any(|w| w == "ANALYZE") {
@@ -920,7 +960,7 @@ pub fn risk_of(sql: &str, production: bool) -> Option<Risk> {
             | "SET"
             | "RESET"
     );
-    (production && !control && !reads_only(sql)).then_some(Risk::Writes)
+    (production && !control && !reads_only(sql, dialect)).then_some(Risk::Writes)
 }
 
 /// A text as the inside of a `LIKE`: what it holds of `%`, `_` and `\` is
@@ -931,15 +971,48 @@ fn like_text(text: &str) -> String {
         .replace('_', "\\_")
 }
 
+/// A name between the quotes of `dialect`.
+pub fn quote_ident_in(dialect: Dialect, name: &str) -> String {
+    dialect.quote(name)
+}
+
+/// A text as a literal of `dialect`: MySQL also reads `\` as an escape.
+pub fn quote_literal_in(dialect: Dialect, value: &str) -> String {
+    match dialect {
+        Dialect::Mysql => format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''")),
+        _ => quote_literal(value),
+    }
+}
+
+/// `name` as text, for a search inside the values of any type.
+fn as_text(dialect: Dialect, name: &str) -> String {
+    match dialect {
+        Dialect::Postgres => format!("{name}::text"),
+        Dialect::Mysql => format!("CAST({name} AS CHAR)"),
+        Dialect::Sqlite => format!("CAST({name} AS TEXT)"),
+    }
+}
+
+/// `LIKE` of the dialect, with the `\` this code escapes with.
+fn like_clause(dialect: Dialect, name: &str, pattern: &str) -> String {
+    let pattern = quote_literal_in(dialect, pattern);
+    match dialect {
+        Dialect::Postgres => format!("{} ILIKE {pattern}", as_text(dialect, name)),
+        Dialect::Mysql => format!("{} LIKE {pattern}", as_text(dialect, name)),
+        // SQLite has no escape character unless told.
+        Dialect::Sqlite => format!("{} LIKE {pattern} ESCAPE '\\'", as_text(dialect, name)),
+    }
+}
+
 /// The condition a text typed under a column makes: `> 10`, `= abc`, `<> x`,
 /// `~ regex`, `null`, `!null`; anything else is looked for inside the value,
 /// whatever the case.
-pub fn column_condition(column: &str, text: &str) -> Option<String> {
+pub fn column_condition(dialect: Dialect, column: &str, text: &str) -> Option<String> {
     let text = text.trim();
     if text.is_empty() {
         return None;
     }
-    let name = quote_ident(column);
+    let name = quote_ident_in(dialect, column);
     match text.to_lowercase().as_str() {
         "null" | "is null" => return Some(format!("{name} IS NULL")),
         "!null" | "not null" | "is not null" => return Some(format!("{name} IS NOT NULL")),
@@ -959,32 +1032,46 @@ pub fn column_condition(column: &str, text: &str) -> Option<String> {
             if value.is_empty() {
                 return None;
             }
-            return Some(format!("{name} {operator} {}", quote_literal(value)));
+            return Some(format!(
+                "{name} {operator} {}",
+                quote_literal_in(dialect, value)
+            ));
         }
     }
-    if let Some(rest) = text.strip_prefix('~') {
+    // SQLite has no regular expression operator of its own.
+    if let (Some(rest), true) = (text.strip_prefix('~'), dialect != Dialect::Sqlite) {
         let pattern = rest.trim();
         if pattern.is_empty() {
             return None;
         }
-        return Some(format!("{name}::text ~ {}", quote_literal(pattern)));
+        let operator = if dialect == Dialect::Mysql {
+            "REGEXP"
+        } else {
+            "~"
+        };
+        return Some(format!(
+            "{} {operator} {}",
+            as_text(dialect, &name),
+            quote_literal_in(dialect, pattern)
+        ));
     }
-    Some(format!(
-        "{name}::text ILIKE {}",
-        quote_literal(&format!("%{}%", like_text(text)))
+    Some(like_clause(
+        dialect,
+        &name,
+        &format!("%{}%", like_text(text)),
     ))
 }
 
 /// The condition that keeps the rows with a text in any of the columns.
-pub fn search_condition(columns: &[&str], text: &str) -> Option<String> {
+pub fn search_condition(dialect: Dialect, columns: &[&str], text: &str) -> Option<String> {
     let text = text.trim();
     if text.is_empty() || columns.is_empty() {
         return None;
     }
-    let pattern = quote_literal(&format!("%{}%", like_text(text)));
+    let pattern = format!("%{}%", like_text(text));
     let parts: Vec<String> = columns
         .iter()
-        .map(|c| format!("{}::text ILIKE {pattern}", quote_ident(c)))
+        .map(|c| like_clause(dialect, &quote_ident_in(dialect, c), &pattern))
         .collect();
     Some(parts.join(" OR "))
 }
@@ -993,8 +1080,12 @@ pub fn search_condition(columns: &[&str], text: &str) -> Option<String> {
 /// session is also read-only on the server's side, but a session can undo
 /// that, so the statements that could are refused (transaction control, `SET`,
 /// `RESET`, and anything that is not a plain reading statement).
-pub fn reads_only(sql: &str) -> bool {
-    let words = sql_words(sql);
+pub fn reads_only(sql: &str, dialect: Dialect) -> bool {
+    // MySQL runs what is in `/*! … */`: a comment that is code.
+    if dialect == Dialect::Mysql && (sql.contains("/*!") || sql.contains("/*M!")) {
+        return false;
+    }
+    let words = sql_words(sql, dialect);
     let Some(first) = words.first().map(String::as_str) else {
         return true;
     };
@@ -1017,15 +1108,16 @@ pub fn reads_only(sql: &str) -> bool {
         }),
         // Plans are fine, but ANALYZE runs the statement.
         "EXPLAIN" => {
-            !words.iter().any(|w| w == "ANALYZE" || w == "ANALYSE") && reads_only(&explained(sql))
+            !words.iter().any(|w| w == "ANALYZE" || w == "ANALYSE")
+                && reads_only(&explained(sql, dialect), dialect)
         }
         _ => false,
     }
 }
 
 /// The statement an `EXPLAIN` is about.
-fn explained(sql: &str) -> String {
-    let tokens = sql_tokens(sql);
+fn explained(sql: &str, dialect: Dialect) -> String {
+    let tokens = sql_tokens(sql, dialect);
     // Skip `EXPLAIN` and an option list in parentheses.
     let mut i = 1;
     if tokens.get(i).is_some_and(|t| &sql[t.start..t.end] == "(") {
@@ -1050,8 +1142,8 @@ fn explained(sql: &str) -> String {
 
 /// Whether the text holds several commands (a `;` followed by more than
 /// comments): the server cannot prepare it, it can only run it.
-pub fn is_multiple(sql: &str) -> bool {
-    let tokens = sql_tokens(sql);
+pub fn is_multiple(sql: &str, dialect: Dialect) -> bool {
+    let tokens = sql_tokens(sql, dialect);
     tokens.iter().enumerate().any(|(i, t)| {
         t.kind == TokenKind::Punct
             && &sql[t.start..t.end] == ";"
@@ -1063,8 +1155,8 @@ pub fn is_multiple(sql: &str) -> bool {
 
 /// Whether a condition typed in a filter holds a `;` of its own: it would
 /// start another statement.
-pub fn has_semicolon(sql: &str) -> bool {
-    sql_tokens(sql)
+pub fn has_semicolon(sql: &str, dialect: Dialect) -> bool {
+    sql_tokens(sql, dialect)
         .iter()
         .any(|t| t.kind == TokenKind::Punct && &sql[t.start..t.end] == ";")
 }
@@ -1072,8 +1164,11 @@ pub fn has_semicolon(sql: &str) -> bool {
 /// Whether a statement can be the inside of `SELECT * FROM (…) AS q`, so that
 /// its rows can be sorted, filtered and paged: it only reads (a SELECT, a
 /// WITH that only reads, VALUES or TABLE).
-pub fn wrappable(sql: &str) -> bool {
-    let words = sql_words(sql);
+pub fn wrappable(sql: &str, dialect: Dialect) -> bool {
+    if dialect == Dialect::Mysql && (sql.contains("/*!") || sql.contains("/*M!")) {
+        return false;
+    }
+    let words = sql_words(sql, dialect);
     if !matches!(
         words.first().map(String::as_str),
         Some("SELECT" | "WITH" | "VALUES" | "TABLE")
@@ -1091,6 +1186,85 @@ pub fn wrappable(sql: &str) -> bool {
                 | "NEXTVAL" | "SETVAL" | "SET_CONFIG"
         )
     })
+}
+
+/// The names of the functions a statement calls (a name followed by `(`), as
+/// the server knows them: unquoted names in lower case, quoted ones as they
+/// are. Keywords that take parentheses are left out.
+pub fn called_functions(sql: &str, dialect: Dialect) -> Vec<String> {
+    let tokens = sql_tokens(sql, dialect);
+    let mut names: Vec<String> = Vec::new();
+    for (i, t) in tokens.iter().enumerate() {
+        let opens = tokens
+            .get(i + 1)
+            .is_some_and(|n| &sql[n.start..n.end] == "(");
+        if !opens {
+            continue;
+        }
+        let text = &sql[t.start..t.end];
+        let name = match t.kind {
+            TokenKind::Word => {
+                let upper = text.to_uppercase();
+                if matches!(
+                    upper.as_str(),
+                    "IN" | "EXISTS"
+                        | "VALUES"
+                        | "AS"
+                        | "ANY"
+                        | "ALL"
+                        | "SOME"
+                        | "OVER"
+                        | "FILTER"
+                        | "USING"
+                        | "ON"
+                        | "FROM"
+                        | "JOIN"
+                        | "AND"
+                        | "OR"
+                        | "NOT"
+                        | "WHERE"
+                        | "SELECT"
+                        | "WITH"
+                ) {
+                    continue;
+                }
+                text.to_lowercase()
+            }
+            TokenKind::Quoted if text.len() >= 2 => {
+                let quote = &text[..1];
+                text[1..text.len() - 1].replace(&quote.repeat(2), quote)
+            }
+            _ => continue,
+        };
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// Whether a reading statement of a batch may be left to the tab that pages
+/// it, which runs it again for each page, sort and refresh: not when a later
+/// statement of the batch writes (the rows must be read before it), and not
+/// when it calls a function that may write (`may_write`, asked of the server).
+pub fn deferrable(
+    statements: &[String],
+    index: usize,
+    dialect: Dialect,
+    may_write: impl FnOnce(&[String]) -> bool,
+) -> bool {
+    let sql = &statements[index];
+    if !wrappable(sql, dialect) {
+        return false;
+    }
+    if statements[index + 1..]
+        .iter()
+        .any(|later| !reads_only(later, dialect))
+    {
+        return false;
+    }
+    let names = called_functions(sql, dialect);
+    names.is_empty() || !may_write(&names)
 }
 
 // ------------------------------------------------------------------- urls
@@ -1275,7 +1449,7 @@ mod tests {
     #[test]
     fn sql_is_cut_into_tokens() {
         let sql = "SELECT 'a;b', \"Col\" -- note\nFROM t WHERE x = $1 AND y > 2.5";
-        let kinds: Vec<(TokenKind, &str)> = sql_tokens(sql)
+        let kinds: Vec<(TokenKind, &str)> = sql_tokens(sql, Dialect::Postgres)
             .into_iter()
             .map(|t| (t.kind, &sql[t.start..t.end]))
             .collect();
@@ -1288,63 +1462,119 @@ mod tests {
         assert!(kinds.contains(&(TokenKind::Number, "2.5")));
         // A dollar block is one piece, with what is inside.
         let block = "DO $$ BEGIN PERFORM 1; END $$";
-        assert_eq!(sql_words(block), vec!["DO"]);
+        assert_eq!(sql_words(block, Dialect::Postgres), vec!["DO"]);
         assert_eq!(
-            sql_words("select a.b from \"X\" /* from */"),
+            sql_words("select a.b from \"X\" /* from */", Dialect::Postgres),
             vec!["SELECT", "A", "B", "FROM"]
         );
     }
 
     #[test]
+    fn a_reading_statement_is_deferred_only_when_nothing_after_it_writes() {
+        let batch = |sqls: &[&str]| sqls.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let never = |_: &[String]| false;
+        // Read later, the rows would be the ones after the UPDATE.
+        let statements = batch(&[
+            "SELECT * FROM jobs WHERE status = 'pending'",
+            "UPDATE jobs SET status = 'done' WHERE status = 'pending'",
+        ]);
+        assert!(!deferrable(&statements, 0, Dialect::Postgres, never));
+        // The last one, or one followed by reads only, is paged.
+        assert!(deferrable(&statements[..1], 0, Dialect::Postgres, never));
+        let statements = batch(&["SELECT 1", "SELECT 2"]);
+        assert!(deferrable(&statements, 0, Dialect::Mysql, never));
+        // A function the server says may write is run once, at once.
+        let statements = batch(&["SELECT \"Log\"(id), count(*) FROM t WHERE id IN (1)"]);
+        let mut asked = Vec::new();
+        assert!(!deferrable(&statements, 0, Dialect::Postgres, |names| {
+            asked = names.to_vec();
+            true
+        }));
+        assert_eq!(asked, ["Log", "count"]);
+        // No call, no question.
+        let statements = batch(&["SELECT * FROM t"]);
+        assert!(deferrable(&statements, 0, Dialect::Sqlite, |_| panic!()));
+    }
+
+    #[test]
     fn only_a_reading_statement_can_be_wrapped() {
-        assert!(wrappable("SELECT * FROM t WHERE a = 'delete'"));
-        assert!(wrappable("with x as (select 1) select * from x"));
-        assert!(wrappable("VALUES (1), (2)"));
-        assert!(wrappable("TABLE t"));
-        assert!(!wrappable("SELECT * INTO u FROM t"));
-        assert!(!wrappable("SELECT * FROM t FOR UPDATE"));
-        assert!(!wrappable(
-            "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d"
+        assert!(wrappable(
+            "SELECT * FROM t WHERE a = 'delete'",
+            Dialect::Postgres
         ));
-        assert!(!wrappable("INSERT INTO t VALUES (1) RETURNING id"));
-        assert!(!wrappable("EXPLAIN SELECT 1"));
-        assert!(!wrappable("SHOW search_path"));
-        assert!(!wrappable(""));
-        assert!(!wrappable("SELECT nextval('s')"));
+        assert!(wrappable(
+            "with x as (select 1) select * from x",
+            Dialect::Postgres
+        ));
+        assert!(wrappable("VALUES (1), (2)", Dialect::Postgres));
+        assert!(wrappable("TABLE t", Dialect::Postgres));
+        assert!(!wrappable("SELECT * INTO u FROM t", Dialect::Postgres));
+        assert!(!wrappable("SELECT * FROM t FOR UPDATE", Dialect::Postgres));
+        assert!(!wrappable(
+            "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d",
+            Dialect::Postgres,
+        ));
+        assert!(!wrappable(
+            "INSERT INTO t VALUES (1) RETURNING id",
+            Dialect::Postgres
+        ));
+        assert!(!wrappable("EXPLAIN SELECT 1", Dialect::Postgres));
+        assert!(!wrappable("SHOW search_path", Dialect::Postgres));
+        assert!(!wrappable("", Dialect::Postgres));
+        assert!(!wrappable("SELECT nextval('s')", Dialect::Postgres));
     }
 
     #[test]
     fn a_read_only_source_refuses_what_could_write_or_undo_it() {
-        assert!(reads_only("SELECT 1"));
-        assert!(reads_only("  with x as (select 1) select * from x"));
-        assert!(reads_only("SHOW search_path"));
-        assert!(reads_only("EXPLAIN SELECT 1"));
-        assert!(reads_only("EXPLAIN (COSTS off) SELECT 1"));
-        assert!(!reads_only("EXPLAIN ANALYZE DELETE FROM t"));
-        assert!(!reads_only("EXPLAIN (ANALYZE) SELECT 1"));
-        assert!(!reads_only("SET default_transaction_read_only = off"));
-        assert!(!reads_only("BEGIN READ WRITE"));
-        assert!(!reads_only("COMMIT"));
-        assert!(!reads_only("DELETE FROM t"));
-        assert!(!reads_only("SELECT * INTO u FROM t"));
-        assert!(!reads_only(
-            "SELECT set_config('default_transaction_read_only','off',false)"
+        assert!(reads_only("SELECT 1", Dialect::Postgres));
+        assert!(reads_only(
+            "  with x as (select 1) select * from x",
+            Dialect::Postgres
         ));
-        assert!(!reads_only("CREATE TABLE t()"));
+        assert!(reads_only("SHOW search_path", Dialect::Postgres));
+        assert!(reads_only("EXPLAIN SELECT 1", Dialect::Postgres));
+        assert!(reads_only(
+            "EXPLAIN (COSTS off) SELECT 1",
+            Dialect::Postgres
+        ));
+        assert!(!reads_only(
+            "EXPLAIN ANALYZE DELETE FROM t",
+            Dialect::Postgres
+        ));
+        assert!(!reads_only("EXPLAIN (ANALYZE) SELECT 1", Dialect::Postgres));
+        assert!(!reads_only(
+            "SET default_transaction_read_only = off",
+            Dialect::Postgres
+        ));
+        assert!(!reads_only("BEGIN READ WRITE", Dialect::Postgres));
+        assert!(!reads_only("COMMIT", Dialect::Postgres));
+        assert!(!reads_only("DELETE FROM t", Dialect::Postgres));
+        assert!(!reads_only("SELECT * INTO u FROM t", Dialect::Postgres));
+        assert!(!reads_only(
+            "SELECT set_config('default_transaction_read_only','off',false)",
+            Dialect::Postgres,
+        ));
+        assert!(!reads_only("CREATE TABLE t()", Dialect::Postgres));
     }
 
     #[test]
     fn several_commands_are_told_from_one() {
-        assert!(is_multiple("DROP TABLE a; DROP TABLE b"));
-        assert!(!is_multiple("SELECT 1;"));
-        assert!(!is_multiple("SELECT 'a;b' -- x; y"));
-        assert!(!is_multiple("SELECT 1; -- done"));
+        assert!(is_multiple("DROP TABLE a; DROP TABLE b", Dialect::Postgres));
+        assert!(!is_multiple("SELECT 1;", Dialect::Postgres));
+        assert!(!is_multiple("SELECT 'a;b' -- x; y", Dialect::Postgres));
+        assert!(!is_multiple("SELECT 1; -- done", Dialect::Postgres));
     }
 
     #[test]
     fn a_semicolon_outside_a_string_is_found() {
-        assert!(has_semicolon("a = 1); DELETE FROM t; --"));
-        assert!(!has_semicolon("a = 'x;y' AND b = \"c;d\""));
+        assert!(has_semicolon(
+            "a = 1); DELETE FROM t; --",
+            Dialect::Postgres
+        ));
+        assert!(!has_semicolon(
+            "a = 'x;y' AND b = \"c;d\"",
+            Dialect::Postgres
+        ));
     }
 
     #[test]
@@ -1419,38 +1649,59 @@ mod tests {
 
     #[test]
     fn an_update_or_a_delete_without_where_is_risky() {
-        assert_eq!(risk_of("UPDATE t SET a = 1", false), Some(Risk::NoWhere));
-        assert_eq!(risk_of("delete from t", false), Some(Risk::NoWhere));
-        assert_eq!(risk_of("DELETE FROM t WHERE id = 1", false), None);
-        // A `WHERE` in a string or a comment is not one.
         assert_eq!(
-            risk_of("DELETE FROM t -- WHERE id = 1", false),
+            risk_of("UPDATE t SET a = 1", false, Dialect::Postgres),
             Some(Risk::NoWhere)
         );
-        assert_eq!(risk_of("SELECT * FROM t", false), None);
-        assert_eq!(risk_of("EXPLAIN DELETE FROM t", false), None);
+        assert_eq!(
+            risk_of("delete from t", false, Dialect::Postgres),
+            Some(Risk::NoWhere)
+        );
+        assert_eq!(
+            risk_of("DELETE FROM t WHERE id = 1", false, Dialect::Postgres),
+            None
+        );
+        // A `WHERE` in a string or a comment is not one.
+        assert_eq!(
+            risk_of("DELETE FROM t -- WHERE id = 1", false, Dialect::Postgres),
+            Some(Risk::NoWhere)
+        );
+        assert_eq!(risk_of("SELECT * FROM t", false, Dialect::Postgres), None);
+        assert_eq!(
+            risk_of("EXPLAIN DELETE FROM t", false, Dialect::Postgres),
+            None
+        );
     }
 
     #[test]
     fn on_a_production_source_every_change_is_risky() {
         assert_eq!(
-            risk_of("INSERT INTO t VALUES (1)", true),
+            risk_of("INSERT INTO t VALUES (1)", true, Dialect::Postgres),
             Some(Risk::Writes)
         );
-        assert_eq!(risk_of("DROP TABLE t", true), Some(Risk::Writes));
         assert_eq!(
-            risk_of("UPDATE t SET a = 1 WHERE b", true),
+            risk_of("DROP TABLE t", true, Dialect::Postgres),
             Some(Risk::Writes)
         );
-        assert_eq!(risk_of("SELECT 1", true), None);
-        assert_eq!(risk_of("BEGIN", true), None);
-        assert_eq!(risk_of("SET search_path = a", true), None);
-        assert_eq!(risk_of("INSERT INTO t VALUES (1)", false), None);
+        assert_eq!(
+            risk_of("UPDATE t SET a = 1 WHERE b", true, Dialect::Postgres),
+            Some(Risk::Writes)
+        );
+        assert_eq!(risk_of("SELECT 1", true, Dialect::Postgres), None);
+        assert_eq!(risk_of("BEGIN", true, Dialect::Postgres), None);
+        assert_eq!(
+            risk_of("SET search_path = a", true, Dialect::Postgres),
+            None
+        );
+        assert_eq!(
+            risk_of("INSERT INTO t VALUES (1)", false, Dialect::Postgres),
+            None
+        );
     }
 
     #[test]
     fn a_column_filter_reads_an_operator_or_looks_inside() {
-        let c = |t: &str| column_condition("age", t);
+        let c = |t: &str| column_condition(Dialect::Postgres, "age", t);
         assert_eq!(c(""), None);
         assert_eq!(c("  "), None);
         assert_eq!(c("> 30").as_deref(), Some("\"age\" > '30'"));
@@ -1469,17 +1720,17 @@ mod tests {
         );
         // A column with a quote in its name stays one name.
         assert_eq!(
-            column_condition("a\"b", "x").as_deref(),
+            column_condition(Dialect::Postgres, "a\"b", "x").as_deref(),
             Some("\"a\"\"b\"::text ILIKE '%x%'")
         );
     }
 
     #[test]
     fn a_search_looks_in_every_column() {
-        assert_eq!(search_condition(&["a", "b"], ""), None);
-        assert_eq!(search_condition(&[], "x"), None);
+        assert_eq!(search_condition(Dialect::Postgres, &["a", "b"], ""), None);
+        assert_eq!(search_condition(Dialect::Postgres, &[], "x"), None);
         assert_eq!(
-            search_condition(&["a", "b c"], " Foo ").as_deref(),
+            search_condition(Dialect::Postgres, &["a", "b c"], " Foo ").as_deref(),
             Some("\"a\"::text ILIKE '%Foo%' OR \"b c\"::text ILIKE '%Foo%'")
         );
     }
@@ -1508,5 +1759,53 @@ mod tests {
         assert!(!index(3, false, false).unused());
         assert!(!index(0, true, false).unused());
         assert!(!index(0, false, true).unused());
+    }
+
+    #[test]
+    fn mysql_reads_its_backslashes_its_hash_comments_and_its_backticks() {
+        let my = Dialect::Mysql;
+        // `\'` does not end the string: the `;` is inside it.
+        assert!(!is_multiple("SELECT 'it\\'s; fine'", my));
+        assert!(is_multiple("SELECT 'it\\'s; fine'", Dialect::Postgres));
+        // A hash comment hides what follows it, a backtick name is one piece.
+        assert_eq!(sql_words("SELECT 1 # DELETE FROM t", my), vec!["SELECT"]);
+        assert_eq!(sql_words("SELECT `from;x`", my), vec!["SELECT"]);
+        // The trick that would pass a write for a read.
+        assert!(reads_only("SELECT 1", my));
+        assert!(
+            !reads_only("SELECT 1; DELETE FROM t", my)
+                || is_multiple("SELECT 1; DELETE FROM t", my)
+        );
+        assert!(!reads_only("SELECT 1 /*! INTO OUTFILE '/tmp/x' */", my));
+        assert_eq!(risk_of("DELETE FROM t", false, my), Some(Risk::NoWhere));
+        assert_eq!(risk_of("DELETE FROM t -- c\n WHERE a = 1", false, my), None);
+        // Two dashes without a blank are not a comment in MySQL.
+        assert_eq!(sql_words("SELECT 1--1", my), vec!["SELECT"]);
+        assert!(!has_semicolon("a = 'x\\'; y'", my));
+    }
+
+    #[test]
+    fn the_filters_speak_the_sql_of_their_connection() {
+        let my = Dialect::Mysql;
+        assert_eq!(
+            column_condition(my, "age", "> 30").as_deref(),
+            Some("`age` > '30'")
+        );
+        assert_eq!(
+            column_condition(my, "name", "o'b\\").as_deref(),
+            Some("CAST(`name` AS CHAR) LIKE '%o''b\\\\\\\\%'")
+        );
+        assert_eq!(
+            column_condition(my, "a", "~ ^x").as_deref(),
+            Some("CAST(`a` AS CHAR) REGEXP '^x'")
+        );
+        assert_eq!(
+            search_condition(Dialect::Sqlite, &["a"], "50%").as_deref(),
+            Some("CAST(\"a\" AS TEXT) LIKE '%50\\%%' ESCAPE '\\'")
+        );
+        // No regular expression operator in SQLite: it is a text search.
+        assert!(column_condition(Dialect::Sqlite, "a", "~ x")
+            .unwrap()
+            .contains("LIKE"));
     }
 }

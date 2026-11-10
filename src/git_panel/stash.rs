@@ -41,8 +41,9 @@ impl Panel {
         let Some(repo) = self.repo.clone() else {
             return Task::none();
         };
-        Task::perform(async move { history::stashes(&repo).await }, |list| {
-            Message::Git(GitMsg::StashesLoaded(list))
+        let asked = repo.clone();
+        Task::perform(async move { history::stashes(&repo).await }, move |list| {
+            Message::Git(GitMsg::StashesLoaded(asked.clone(), list))
         })
     }
 

@@ -588,6 +588,8 @@ pub struct Config {
     /// Find in files: the files Git ignores one by one too.
     pub find_ignored: bool,
     pub find_history: Vec<String>,
+    /// Folders whose own programs (`node_modules/.bin`…) may run by themselves.
+    pub trusted_folders: Vec<String>,
     pub replace_history: Vec<String>,
     pub lint_trigger: crate::lint::Trigger,
     pub lint_level: crate::lint::Level,
@@ -676,6 +678,7 @@ impl Default for Config {
             project_colors: std::collections::BTreeMap::new(),
             find_ignored: true,
             find_history: Vec::new(),
+            trusted_folders: Vec::new(),
             replace_history: Vec::new(),
             lint_trigger: crate::lint::Trigger::default(),
             lint_level: crate::lint::Level::default(),

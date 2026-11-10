@@ -126,6 +126,8 @@ pub struct FinderState {
     /// The preview was typed in: the list keeps its place when it is looked
     /// at again, and the preview its cursor.
     preview_edited: bool,
+    /// Set to stop the search that is running.
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The last row clicked, to tell a double click.
     last_click: Option<(usize, std::time::Instant)>,
     /// The folder as typed in its field (it may not be one yet).
@@ -166,6 +168,7 @@ impl Default for FinderState {
             undo: Vec::new(),
             preview: None,
             preview_edited: false,
+            cancel: Default::default(),
             last_click: None,
             dir_text: String::new(),
             dir_history: Vec::new(),
@@ -538,6 +541,7 @@ impl SimpleEditApp {
         &self,
         search: Search,
         wait: bool,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
         on_done: impl Fn(Result<Vec<Occurrence>, String>) -> Message + Send + 'static,
     ) -> Task<Message> {
         let files = self.files_of(&search);
@@ -547,12 +551,17 @@ impl SimpleEditApp {
                 if wait {
                     tokio::time::sleep(std::time::Duration::from_millis(220)).await;
                 }
+                // Given up before it began, if typing went on.
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Ok(Vec::new());
+                }
                 tokio::task::spawn_blocking(move || {
-                    crate::finder::find_occurrences(
+                    crate::finder::find_occurrences_until(
                         &files,
                         &open,
                         &search.options,
                         search.replace.as_ref(),
+                        &cancel,
                     )
                     .map(|found| {
                         found
@@ -608,7 +617,35 @@ impl SimpleEditApp {
         self.finder.searching = true;
         let search = self.finder_search();
         self.finder.searched = Some(search.clone());
-        self.run_search(search, wait, move |result| {
+        // The search still running is for what was typed before: it stops.
+        self.finder
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.finder.cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancel = self.finder.cancel.clone();
+        if wait {
+            return Task::perform(
+                async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(220)).await;
+                    generation
+                },
+                Message::FindDue,
+            );
+        }
+        self.run_search(search, false, cancel, move |result| {
+            Message::FindResults(generation, result)
+        })
+    }
+
+    /// The pause after the last key is over: the search starts if it still is
+    /// the one asked for.
+    pub(super) fn find_due(&mut self, generation: u64) -> Task<Message> {
+        if generation != self.finder.generation || self.overlay != ActiveOverlay::FindInFiles {
+            return Task::none();
+        }
+        let search = self.finder_search();
+        let cancel = self.finder.cancel.clone();
+        self.run_search(search, false, cancel, move |result| {
             Message::FindResults(generation, result)
         })
     }
@@ -780,6 +817,9 @@ impl SimpleEditApp {
         let Some((path, content)) = self.finder.preview.as_mut() else {
             return Task::none();
         };
+        // What the preview showed before this key: the file must still be
+        // that, or the write would erase what changed elsewhere.
+        let shown = crate::editor::buffer_text(content);
         content.perform(action);
         if !edited {
             return Task::none();
@@ -788,6 +828,19 @@ impl SimpleEditApp {
         let new = crate::editor::buffer_text(content);
         let Some((old, holder)) = self.file_text(&path) else {
             return Task::none();
+        };
+        let unix = |s: &str| s.replace("\r\n", "\n");
+        if unix(&old) != shown {
+            self.finder.preview = Some((path, crate::code_editor::Content::with_text(&unix(&old))));
+            self.finder.preview_edited = false;
+            self.set_status(t!("finder.preview_changed"), true);
+            return self.search_files(true);
+        }
+        // A file with Windows line endings keeps them.
+        let new = if matches!(holder, Holder::Disk) && old.contains("\r\n") {
+            unix(&new).replace('\n', "\r\n")
+        } else {
+            new
         };
         if old != new && self.put_text(&path, &holder, &old, &new) {
             self.finder.preview_edited = true;
@@ -832,28 +885,43 @@ impl SimpleEditApp {
     /// that are still there: in the editor and the tabs (undone with
     /// Ctrl+Z), in the other files on disk (undone with "Undo the
     /// replacement"). Gives how many matches, in how many files.
-    pub(super) fn replace_found(&mut self, search: &Search, chosen: &[TextHit]) -> (usize, usize) {
+    /// Gives how many matches, in how many files, and which of `chosen` (by
+    /// index) were replaced: not those of a text changed since they were
+    /// found, whose places no longer say which matches were chosen.
+    pub(super) fn replace_found(
+        &mut self,
+        search: &Search,
+        chosen: &[TextHit],
+    ) -> (usize, usize, Vec<usize>) {
         let Some(replace) = &search.replace else {
-            return (0, 0);
+            return (0, 0, Vec::new());
         };
         let Ok(re) = crate::find_replace::compile(&search.options) else {
-            return (0, 0);
+            return (0, 0, Vec::new());
         };
-        let mut by_file: Vec<(PathBuf, HashSet<(usize, usize)>)> = Vec::new();
-        for hit in chosen {
+        let mut by_file: Vec<(PathBuf, Vec<usize>)> = Vec::new();
+        for (i, hit) in chosen.iter().enumerate() {
             match by_file.iter_mut().find(|(p, _)| *p == hit.path) {
-                Some((_, places)) => {
-                    places.insert((hit.line, hit.col));
-                }
-                None => by_file.push((hit.path.clone(), HashSet::from([(hit.line, hit.col)]))),
+                Some((_, indices)) => indices.push(i),
+                None => by_file.push((hit.path.clone(), vec![i])),
             }
         }
         let (mut count, mut files) = (0, 0);
+        let mut done = Vec::new();
         let mut written = Vec::new();
-        for (path, places) in by_file {
+        for (path, indices) in by_file {
             let Some((text, holder)) = self.file_text(&path) else {
                 continue;
             };
+            let stamp = crate::finder::text_stamp(&text);
+            let places: HashMap<(usize, usize), usize> = indices
+                .into_iter()
+                .filter(|&i| chosen[i].stamp == 0 || chosen[i].stamp == stamp)
+                .map(|i| ((chosen[i].line, chosen[i].col), i))
+                .collect();
+            if places.is_empty() {
+                continue;
+            }
             let ext = path
                 .extension()
                 .map(|e| e.to_string_lossy().to_ascii_lowercase())
@@ -869,7 +937,7 @@ impl SimpleEditApp {
                 Some(replace),
             )
             .into_iter()
-            .filter(|f| places.contains(&(f.line, f.col)))
+            .filter(|f| places.contains_key(&(f.line, f.col)))
             .collect();
             if kept.is_empty() {
                 continue;
@@ -885,6 +953,10 @@ impl SimpleEditApp {
             self.history_record(&path, &new);
             count += kept.len();
             files += 1;
+            done.extend(
+                kept.iter()
+                    .filter_map(|f| places.get(&(f.line, f.col)).copied()),
+            );
             written.push(Written {
                 path,
                 before: text,
@@ -894,7 +966,7 @@ impl SimpleEditApp {
         if !written.is_empty() {
             self.finder.undo = written;
         }
-        (count, files)
+        (count, files, done)
     }
 
     /// A file's text becomes `new`, where it is held: undone with Ctrl+Z in
@@ -922,7 +994,7 @@ impl SimpleEditApp {
                 redo.clear();
             }
             Holder::Disk => {
-                if std::fs::write(path, new).is_err() {
+                if crate::fsutil::write_atomic(path, new.as_bytes(), false).is_err() {
                     return false;
                 }
                 self.bookmarks.remap(path, text, new);
@@ -959,7 +1031,7 @@ impl SimpleEditApp {
                     self.bookmarks.remap(&w.path, &w.after, &w.before);
                 }
                 Holder::Disk => {
-                    if std::fs::write(&w.path, &w.before).is_err() {
+                    if crate::fsutil::write_atomic(&w.path, w.before.as_bytes(), false).is_err() {
                         continue;
                     }
                     self.bookmarks.remap(&w.path, &w.after, &w.before);
@@ -984,10 +1056,23 @@ impl SimpleEditApp {
         remember(&mut self.config.find_history, &search.options.query);
         remember(&mut self.config.replace_history, &replace);
         self.config_dirty = true;
-        let (count, _) = self.replace_found(&search, std::slice::from_ref(&occurrence.hit));
+        let (count, _, _) = self.replace_found(&search, std::slice::from_ref(&occurrence.hit));
         if count > 0 {
             let index = self.finder.selected;
             self.finder.hits.remove(index);
+            // The other matches of the file were found in the text before
+            // this replacement, which left their places as they were.
+            let path = occurrence.hit.path;
+            if let Some(stamp) = self
+                .file_text(&path)
+                .map(|(text, _)| crate::finder::text_stamp(&text))
+            {
+                for o in self.finder.hits.iter_mut().filter(|o| o.hit.path == path) {
+                    if o.hit.stamp == occurrence.hit.stamp {
+                        o.hit.stamp = stamp;
+                    }
+                }
+            }
             self.finder.selected = index.min(self.finder.hits.len().saturating_sub(1));
             self.finder.preview = None;
             self.refresh_finder_preview();
@@ -1012,7 +1097,7 @@ impl SimpleEditApp {
             .filter(|o| !o.excluded)
             .map(|o| o.hit.clone())
             .collect();
-        let (count, files) = self.replace_found(&search, &chosen);
+        let (count, files, _) = self.replace_found(&search, &chosen);
         let (matches, files) = (matches_text(count), files_text(files));
         let done = t!("findrep.replaced", matches = matches, files = files);
         self.set_status(done, false);
@@ -1712,6 +1797,32 @@ mod tests {
     }
 
     #[test]
+    fn the_preview_never_writes_over_a_file_changed_elsewhere_and_keeps_crlf() {
+        let dir = project();
+        let mut app = app_on(dir.path());
+        listed(&mut app, dir.path());
+        let _ = app.update(Message::OpenFindInFiles);
+        let _ = app.update(Message::FindQuery("run".into()));
+        searched(&mut app);
+        let path = app.finder.hits[app.finder.selected].hit.path.clone();
+        let paste = |s: &str| {
+            Message::FindPreviewAction(text_editor::Action::Edit(text_editor::Edit::Paste(
+                std::sync::Arc::new(s.into()),
+            )))
+        };
+        // Changed on the disk after the preview was read.
+        std::fs::write(&path, "pub fn run() {}\r\n// elsewhere\r\n").unwrap();
+        let _ = app.update(paste("X"));
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(on_disk, "pub fn run() {}\r\n// elsewhere\r\n", "untouched");
+        // Shown again, the next key goes through and keeps the CRLF.
+        let _ = app.update(paste("Y"));
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(on_disk.contains('Y') && on_disk.contains("// elsewhere\r\n"));
+        assert!(!on_disk.replace("\r\n", "").contains('\n'), "{on_disk:?}");
+    }
+
+    #[test]
     fn a_folder_its_subfolders_or_not_and_a_mask() {
         let dir = project();
         let mut app = app_on(dir.path());
@@ -1875,6 +1986,7 @@ mod tests {
                 len: 1,
                 preview: String::new(),
                 preview_at: (0, 0),
+                stamp: 0,
             },
             replacement: None,
             excluded: false,

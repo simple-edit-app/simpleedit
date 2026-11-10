@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use super::model::{Collection, Environment, Request};
+use super::model::{Collection, Environment, Item, Request};
 
 /// Most requests kept in the history.
 pub const MAX_HISTORY: usize = 200;
@@ -61,6 +61,68 @@ fn secret_name(key: &str) -> String {
     format!("api:{key}")
 }
 
+/// The credentials of a request's Auth, by the name they have in the
+/// keychain.
+fn auth_secrets(request: &mut Request) -> [(&'static str, &mut String); 3] {
+    [
+        ("apiauth:token", &mut request.auth.token),
+        ("apiauth:password", &mut request.auth.password),
+        ("apiauth:key", &mut request.auth.key_value),
+    ]
+}
+
+/// A value that is only variables (`{{token}}`) holds no secret by itself.
+fn only_variables(value: &str) -> bool {
+    let rest = value.trim();
+    !rest.is_empty()
+        && rest.split("{{").enumerate().all(|(i, part)| {
+            (i == 0 && part.is_empty()) || part.matches("}}").count() == 1 && part.ends_with("}}")
+        })
+}
+
+fn each_request(items: &mut [Item], f: &mut impl FnMut(&mut Request)) {
+    for item in items {
+        match item {
+            Item::Request(r) => f(r),
+            Item::Folder(folder) => each_request(&mut folder.items, f),
+        }
+    }
+}
+
+/// Takes the Auth credentials of the requests out of a collection about to
+/// be written (the file is meant to be shared, even versioned): they go to
+/// the keychain, and stay in the file only where there is none.
+fn move_auth_to_keychain(collection: &mut Collection) {
+    each_request(&mut collection.items, &mut |request| {
+        let id = request.id;
+        if id == 0 {
+            return;
+        }
+        for (name, value) in auth_secrets(request) {
+            if value.is_empty() || only_variables(value) {
+                // Nothing to hide; an older secret is not to come back.
+                let _ = crate::database::secrets::save(id, name, "");
+            } else if crate::database::secrets::save(id, name, value) {
+                value.clear();
+            }
+        }
+    });
+}
+
+/// The reverse, for a collection just read.
+fn restore_auth_from_keychain(collection: &mut Collection) {
+    each_request(&mut collection.items, &mut |request| {
+        let id = request.id;
+        for (name, value) in auth_secrets(request) {
+            if id != 0 && value.is_empty() {
+                if let Some(secret) = crate::database::secrets::load(id, name) {
+                    *value = secret;
+                }
+            }
+        }
+    });
+}
+
 pub fn load() -> Stored {
     let mut stored = Stored::default();
     let Some(root) = dir() else {
@@ -74,10 +136,11 @@ pub fn load() -> Stored {
             .collect();
         files.sort();
         for path in files {
-            if let Some(collection) = std::fs::read_to_string(&path)
+            if let Some(mut collection) = std::fs::read_to_string(&path)
                 .ok()
                 .and_then(|t| serde_json::from_str::<Collection>(&t).ok())
             {
+                restore_auth_from_keychain(&mut collection);
                 stored.collections.push(collection);
             }
         }
@@ -123,7 +186,9 @@ pub fn load() -> Stored {
 
 pub fn save_collection(collection: &Collection) {
     if let Some(dir) = collections_dir() {
-        if let Ok(text) = serde_json::to_string_pretty(collection) {
+        let mut kept = collection.clone();
+        move_auth_to_keychain(&mut kept);
+        if let Ok(text) = serde_json::to_string_pretty(&kept) {
             write(&dir.join(format!("{}.json", collection.id)), &text);
         }
     }
@@ -131,6 +196,18 @@ pub fn save_collection(collection: &Collection) {
 
 pub fn delete_collection(id: u64) {
     if let Some(dir) = collections_dir() {
+        // Its credentials leave the keychain with it.
+        if let Some(mut collection) = std::fs::read_to_string(dir.join(format!("{id}.json")))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Collection>(&t).ok())
+        {
+            each_request(&mut collection.items, &mut |request| {
+                let rid = request.id;
+                for (name, _) in auth_secrets(request) {
+                    let _ = crate::database::secrets::save(rid, name, "");
+                }
+            });
+        }
         let _ = std::fs::remove_file(dir.join(format!("{id}.json")));
     }
 }
@@ -169,7 +246,16 @@ pub fn forget_secrets(env: &Environment) {
 
 pub fn save_history(history: &[HistoryEntry]) {
     let Some(root) = dir() else { return };
-    if let Ok(text) = serde_json::to_string(&history[..history.len().min(MAX_HISTORY)]) {
+    // The history is a record of what was sent, not a place for credentials.
+    let mut kept: Vec<HistoryEntry> = history[..history.len().min(MAX_HISTORY)].to_vec();
+    for entry in &mut kept {
+        for (_, value) in auth_secrets(&mut entry.request) {
+            if !only_variables(value) {
+                value.clear();
+            }
+        }
+    }
+    if let Ok(text) = serde_json::to_string(&kept) {
         write(&root.join("history.json"), &text);
     }
 }
@@ -260,6 +346,35 @@ mod tests {
         forget_secrets(&env);
         let gone = crate::database::secrets::load(7, "api:token");
         assert!(gone.is_none() || gone.as_deref() == Some(""));
+    }
+
+    #[test]
+    fn the_credentials_of_a_request_stay_out_of_the_files() {
+        let _guard = lock();
+        let mut request = Request::new("login");
+        request.id = 77;
+        request.auth.kind = crate::api::model::AuthKind::Bearer;
+        request.auth.token = "tok-s3cret".into();
+        request.auth.password = "{{pass}}".into();
+        let collection = Collection {
+            id: 8,
+            name: "auth".into(),
+            items: vec![Item::Request(request.clone())],
+        };
+        save_collection(&collection);
+        save_history(&[HistoryEntry {
+            request,
+            ..HistoryEntry::default()
+        }]);
+        let root = dir().unwrap();
+        let file = std::fs::read_to_string(root.join("collections/8.json")).unwrap();
+        let history = std::fs::read_to_string(root.join("history.json")).unwrap();
+        assert!(!file.contains("tok-s3cret") && !history.contains("tok-s3cret"));
+        assert!(file.contains("{{pass}}") && history.contains("{{pass}}"));
+        // It comes back from the keychain.
+        assert_eq!(load().collections, vec![collection]);
+        delete_collection(8);
+        assert!(crate::database::secrets::load(77, "apiauth:token").is_none());
     }
 
     #[test]

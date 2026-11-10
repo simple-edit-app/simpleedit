@@ -2236,7 +2236,7 @@ fn grid<'a>(path: &'a Path, tab: &'a TableTab, dark: bool) -> Element<'a, Messag
             schema: tab.schema.clone(),
             links: match (&tab.structure, new_row, page.rows.get(i)) {
                 (Some(structure), false, Some(values)) if tab.query.is_none() => {
-                    ddl::links(&tab.schema, structure, &page.columns, values)
+                    ddl::links(&tab.schema, structure, &page.columns, values, tab.dialect)
                 }
                 _ => Vec::new(),
             },
@@ -2619,7 +2619,7 @@ pub fn console<'a>(state: &'a State, dark: bool) -> Element<'a, Message> {
                     );
                 }
             }
-            let ready = !c.running && state.driver == Driver::Ready;
+            let ready = !c.running && *state.driver_of(c.dialect) == Driver::Ready;
             if c.in_transaction {
                 header = header
                     .push(

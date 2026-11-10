@@ -167,6 +167,15 @@ impl SimpleEditApp {
             tab.structure = None;
         }
         for path in tabs {
+            // Changes waiting for Commit are not thrown away with the tab.
+            if let Some(tab) = self
+                .db_tabs
+                .get_mut(&path)
+                .filter(|t| !t.pending.is_empty() || t.editing.is_some())
+            {
+                tab.notice = Some(t!("db.page_kept_edits").to_string());
+                continue;
+            }
             if close {
                 tasks.push(self.close_path(path));
             } else {
@@ -199,6 +208,7 @@ impl SimpleEditApp {
             self.db.designer = None;
             return self.db_ask_password(conn);
         };
+        let window = database::AnswerFor::Designer(conn, schema.clone(), table.clone());
         Task::perform(
             database::structure(
                 params,
@@ -208,7 +218,12 @@ impl SimpleEditApp {
                     table,
                 },
             ),
-            |done| Message::Db(DbMsg::Designer(DesignerMsg::Loaded(done))),
+            move |done| {
+                Message::Db(DbMsg::Answer(
+                    window.clone(),
+                    Box::new(DbMsg::Designer(DesignerMsg::Loaded(done))),
+                ))
+            },
         )
     }
 

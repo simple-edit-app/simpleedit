@@ -2,7 +2,10 @@
 //! foreign keys.
 
 use super::designer::{list, parse_constraint};
-use super::protocol::{quote_ident, quote_literal, Column, ConstraintKind, Reference, Structure};
+use super::protocol::{
+    quote_ident, quote_ident_in, quote_literal, quote_literal_in, Column, ConstraintKind, Dialect,
+    Reference, Structure,
+};
 
 /// The statements that make the table as it is: the table with its columns
 /// and constraints, its indexes, its comments.
@@ -164,7 +167,7 @@ pub fn copy_statements(schema: &str, table: &str, s: &Structure) -> Vec<String> 
         quote_ident(schema)
     )];
     out.extend(
-        super::console::split_statements(&text)
+        super::console::split_statements(&text, super::protocol::Dialect::Postgres)
             .into_iter()
             .map(|span| text[span.start..span.end].to_string()),
     );
@@ -266,11 +269,17 @@ fn qualified(text: &str) -> (Option<String>, String) {
 }
 
 /// The condition on `columns` of a table that the values `values` make.
-fn condition(columns: &[String], values: &[String]) -> String {
+fn condition(columns: &[String], values: &[String], dialect: Dialect) -> String {
     columns
         .iter()
         .zip(values)
-        .map(|(c, v)| format!("{} = {}", quote_ident(c), quote_literal(v)))
+        .map(|(c, v)| {
+            format!(
+                "{} = {}",
+                quote_ident_in(dialect, c),
+                quote_literal_in(dialect, v)
+            )
+        })
         .collect::<Vec<_>>()
         .join(" AND ")
 }
@@ -288,7 +297,13 @@ fn values_of(names: &[String], columns: &[Column], row: &[Option<String>]) -> Op
 
 /// The rows a row is linked to: the ones its foreign keys point to, and the
 /// ones whose foreign keys point to it.
-pub fn links(schema: &str, s: &Structure, columns: &[Column], row: &[Option<String>]) -> Vec<Link> {
+pub fn links(
+    schema: &str,
+    s: &Structure,
+    columns: &[Column],
+    row: &[Option<String>],
+    dialect: Dialect,
+) -> Vec<Link> {
     let mut out = Vec::new();
     for c in s
         .constraints
@@ -310,8 +325,8 @@ pub fn links(schema: &str, s: &Structure, columns: &[Column], row: &[Option<Stri
             outgoing: true,
             schema: target_schema.unwrap_or_else(|| schema.to_string()),
             table,
-            filter: condition(&theirs, &values),
-            label: condition(&own, &values),
+            filter: condition(&theirs, &values, dialect),
+            label: condition(&own, &values, dialect),
         });
     }
     for Reference {
@@ -336,8 +351,8 @@ pub fn links(schema: &str, s: &Structure, columns: &[Column], row: &[Option<Stri
             outgoing: false,
             schema: from_schema.clone(),
             table: table.clone(),
-            filter: condition(&theirs, &values),
-            label: condition(&own, &values),
+            filter: condition(&theirs, &values, dialect),
+            label: condition(&own, &values, dialect),
         });
     }
     out
@@ -472,7 +487,7 @@ mod tests {
             Some("9.50".to_string()),
             None,
         ];
-        let found = links("public", &s, &columns, &row);
+        let found = links("public", &s, &columns, &row, Dialect::Postgres);
         assert_eq!(found.len(), 2);
         assert_eq!(
             found[0],
@@ -498,7 +513,7 @@ mod tests {
         // A null key links to nothing.
         let mut row = row;
         row[1] = None;
-        let found = links("public", &s, &columns, &row);
+        let found = links("public", &s, &columns, &row, Dialect::Postgres);
         assert_eq!(found.len(), 1);
         assert!(!found[0].outgoing);
     }

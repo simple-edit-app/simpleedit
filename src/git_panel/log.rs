@@ -112,6 +112,8 @@ pub struct State {
     /// The commits of HEAD, to know what can be rewritten.
     pub head_set: HashSet<String>,
     pub limit: usize,
+    /// The number of the last listing asked for: an older answer is dropped.
+    pub request: u64,
     /// The files of the commit when exactly one is selected.
     pub files: Vec<Change>,
     pub files_for: Option<String>,
@@ -230,8 +232,9 @@ impl Panel {
         let Some(repo) = self.repo.clone() else {
             return Task::none();
         };
-        Task::perform(async move { history::refs(&repo).await }, |refs| {
-            Message::Git(GitMsg::RefsLoaded(refs))
+        let asked = repo.clone();
+        Task::perform(async move { history::refs(&repo).await }, move |refs| {
+            Message::Git(GitMsg::RefsLoaded(asked.clone(), refs))
         })
     }
 
@@ -260,6 +263,8 @@ impl Panel {
             self.log.limit = PAGE;
         }
         self.log.shown = Some(rev.to_string());
+        self.log.request += 1;
+        let token = self.log.request;
         let rev = rev.to_string();
         let asked = rev.clone();
         let limit = self.log.limit;
@@ -281,17 +286,19 @@ impl Panel {
                 );
                 Ok::<_, String>((commits?, head.unwrap_or_default()))
             },
-            move |result| Message::Git(GitMsg::LogLoaded(asked.clone(), result)),
+            move |result| Message::Git(GitMsg::LogLoaded(token, asked.clone(), result)),
         )
     }
 
     pub(super) fn log_loaded(
         &mut self,
+        token: u64,
         rev: String,
         result: Result<(Vec<Commit>, HashSet<String>), String>,
     ) -> Task<Message> {
-        // The answer of a branch that is no longer the one shown.
-        if self.log.shown.as_deref() != Some(rev.as_str()) {
+        // The answer of a branch, a filter or a search that is no longer the
+        // one shown.
+        if token != self.log.request || self.log.shown.as_deref() != Some(rev.as_str()) {
             return Task::none();
         }
         match result {

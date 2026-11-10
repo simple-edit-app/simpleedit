@@ -35,6 +35,7 @@ pub fn block_text(
     to: (usize, usize),
     format: CopyFormat,
     table: &str,
+    dialect: super::protocol::Dialect,
 ) -> String {
     let (from, to) = block(from, to);
     let last_col = to.1.min(page.columns.len().saturating_sub(1));
@@ -107,14 +108,14 @@ pub fn block_text(
         CopyFormat::Insert => {
             let columns: Vec<String> = names
                 .iter()
-                .map(|n| super::protocol::quote_ident(n))
+                .map(|n| super::protocol::quote_ident_in(dialect, n))
                 .collect();
             rows.iter()
                 .map(|row| {
                     let values: Vec<String> = row
                         .iter()
                         .map(|c| match c {
-                            Cell::Value(v) => super::protocol::quote_literal(v),
+                            Cell::Value(v) => super::protocol::quote_literal_in(dialect, v),
                             Cell::Null => "NULL".to_string(),
                             Cell::Default => "DEFAULT".to_string(),
                         })
@@ -867,7 +868,17 @@ mod tests {
         let page = page();
         let mut p = Pending::default();
         p.set(&page, 0, 1, Some("a,\"q\"".into()));
-        let text = |format| block_text(&page, &p, (0, 1), (1, 2), format, "\"public\".\"t\"");
+        let text = |format| {
+            block_text(
+                &page,
+                &p,
+                (0, 1),
+                (1, 2),
+                format,
+                "\"public\".\"t\"",
+                crate::database::protocol::Dialect::Postgres,
+            )
+        };
         // NULL is an empty cell for a spreadsheet.
         assert_eq!(text(CopyFormat::Tsv), "a,\"q\"\t\nb\tx");
         assert_eq!(text(CopyFormat::Csv), "name,note\n\"a,\"\"q\"\"\",\nb,x");
@@ -883,7 +894,15 @@ mod tests {
         );
         // A block past the rows and columns is cut to what exists.
         assert_eq!(
-            block_text(&page, &p, (2, 2), (9, 9), CopyFormat::Tsv, "t"),
+            block_text(
+                &page,
+                &p,
+                (2, 2),
+                (9, 9),
+                CopyFormat::Tsv,
+                "t",
+                crate::database::protocol::Dialect::Postgres
+            ),
             "".to_string()
         );
     }

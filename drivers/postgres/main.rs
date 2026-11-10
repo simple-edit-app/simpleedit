@@ -17,11 +17,10 @@ mod protocol;
 
 use std::cell::RefCell;
 use std::io::{BufRead, Read, Write};
-use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use postgres::config::SslMode as PgSslMode;
 use postgres::{Client, Config, NoTls};
@@ -36,7 +35,7 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 
 use protocol::{
     Auth, Change, ChangeKind, Column, Database, Executed, Kind, QueryResult, Request, Schema,
-    Scope, SshAuth, SslMode, Table, Target, MAX_RESULT_ROWS, PROTOCOL,
+    Scope, SslMode, Table, Target, MAX_RESULT_ROWS, PROTOCOL,
 };
 
 fn main() {
@@ -182,19 +181,12 @@ fn run(input: &str, slot: &mut Option<(String, Session)>, serving: bool) -> Resu
             Ok(json!({ "version": row.get::<_, String>(0) }))
         }
         "tree" => tree(session, &request),
-        "rows" => {
-            limit(client, &request.target)?;
-            guarded(client, &request.target, |c| rows(c, &request))
-        }
-        "export" => {
-            limit(client, &request.target)?;
-            guarded(client, &request.target, |c| export(c, &request))
-        }
+        "rows" => guarded(client, &request.target, |c| rows(c, &request)),
+        "export" => guarded(client, &request.target, |c| export(c, &request)),
         "apply" => {
             if request.target.read_only {
                 return Err("this data source is read-only".to_string());
             }
-            limit(client, &request.target)?;
             apply(client, &request)
         }
         "dump" => dump(&request, tunnel_port),
@@ -208,11 +200,9 @@ fn run(input: &str, slot: &mut Option<(String, Session)>, serving: bool) -> Resu
             if request.target.read_only {
                 return Err("this data source is read-only".to_string());
             }
-            limit(client, &request.target)?;
             import(client, &request)
         }
         "query" => {
-            limit(client, &request.target)?;
             let mut answer = guarded(client, &request.target, |c| query(c, &request))?;
             if serving {
                 answer["in_transaction"] = json!(in_transaction(client));
@@ -270,6 +260,11 @@ fn guarded<T>(
 /// is still there: when the app gives up on a query (the user cancelled it),
 /// the driver is gone and the server stops the query within a second
 /// (PostgreSQL 14 and later; older servers ignore the setting).
+///
+/// Both are session settings, said once when the session opens: said before
+/// each request, the second one fails inside an open transaction on older
+/// servers, which aborts it, and the first one keeps a ROLLBACK from running
+/// in a transaction that already failed.
 fn limit(client: &mut Client, target: &Target) -> Result<(), String> {
     if target.query_timeout > 0 {
         client
@@ -360,6 +355,7 @@ impl Session {
                 ))
                 .map_err(clean)?;
         }
+        limit(&mut client, target)?;
         if !target.startup_script.trim().is_empty() {
             let started = Instant::now();
             client
@@ -586,144 +582,9 @@ fn tls_config(target: &Target) -> Result<rustls::ClientConfig, String> {
 
 // --------------------------------------------------------------------- SSH
 
-/// `ssh -L`, started for the length of the operation.
-struct Tunnel {
-    child: Child,
-    port: u16,
-    askpass: Option<PathBuf>,
-}
-
-impl Tunnel {
-    fn open(target: &Target) -> Result<Tunnel, String> {
-        let ssh = &target.ssh;
-        if ssh.host.trim().is_empty() {
-            return Err("SSH: no host".to_string());
-        }
-        let local = match ssh.local_port.trim() {
-            "" => free_port()?,
-            port => port
-                .parse::<u16>()
-                .map_err(|_| format!("SSH: bad local port {port}"))?,
-        };
-        let destination = if ssh.user.trim().is_empty() {
-            ssh.host.trim().to_string()
-        } else {
-            format!("{}@{}", ssh.user.trim(), ssh.host.trim())
-        };
-        let mut command = Command::new("ssh");
-        command
-            .arg("-N")
-            .args([
-                "-L",
-                &format!("127.0.0.1:{local}:{}:{}", target.host, target.port),
-            ])
-            .args(["-p", &ssh.port.to_string()])
-            .args(["-o", "ExitOnForwardFailure=yes"])
-            .args(["-o", "ConnectTimeout=10"])
-            .args(["-o", "StrictHostKeyChecking=accept-new"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-        let mut askpass = None;
-        match ssh.auth {
-            SshAuth::Agent => {
-                command.args(["-o", "BatchMode=yes"]);
-            }
-            SshAuth::KeyPair => {
-                if !ssh.key_file.trim().is_empty() {
-                    command.args(["-i", ssh.key_file.trim(), "-o", "IdentitiesOnly=yes"]);
-                }
-                askpass = Some(secret_script(&mut command, &target.ssh_secret)?);
-            }
-            SshAuth::Password => {
-                command.args([
-                    "-o",
-                    "PreferredAuthentications=password,keyboard-interactive",
-                    "-o",
-                    "PubkeyAuthentication=no",
-                ]);
-                askpass = Some(secret_script(&mut command, &target.ssh_secret)?);
-            }
-        }
-        command.arg(&destination);
-        let child = command
-            .spawn()
-            .map_err(|e| format!("SSH: cannot run ssh: {e}"))?;
-        let mut tunnel = Tunnel {
-            child,
-            port: local,
-            askpass,
-        };
-        // Wait until the local end accepts connections.
-        let deadline = Instant::now() + Duration::from_secs(15);
-        loop {
-            if let Some(status) = tunnel.child.try_wait().map_err(|e| e.to_string())? {
-                let mut said = String::new();
-                if let Some(mut err) = tunnel.child.stderr.take() {
-                    let _ = err.read_to_string(&mut said);
-                }
-                let said = said.trim().lines().last().unwrap_or("").to_string();
-                return Err(format!("SSH: {status}: {said}"));
-            }
-            if TcpStream::connect_timeout(
-                &([127, 0, 0, 1], local).into(),
-                Duration::from_millis(200),
-            )
-            .is_ok()
-            {
-                return Ok(tunnel);
-            }
-            if Instant::now() > deadline {
-                return Err("SSH: the tunnel did not come up in time".to_string());
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-}
-
-/// A script `ssh` runs to ask for the password: it prints the secret, which
-/// reaches it through the environment (never the command line).
-fn secret_script(command: &mut Command, secret: &str) -> Result<PathBuf, String> {
-    let path = std::env::temp_dir().join(format!("simpleedit-askpass-{}", std::process::id()));
-    std::fs::write(
-        &path,
-        "#!/bin/sh\nprintf '%s\\n' \"$SIMPLEEDIT_SSH_SECRET\"\n",
-    )
-    .map_err(|e| e.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| e.to_string())?;
-    }
-    command
-        .env("SSH_ASKPASS", &path)
-        .env("SSH_ASKPASS_REQUIRE", "force")
-        .env("SIMPLEEDIT_SSH_SECRET", secret)
-        .env(
-            "DISPLAY",
-            std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into()),
-        );
-    Ok(path)
-}
-
-fn free_port() -> Result<u16, String> {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?;
-    listener
-        .local_addr()
-        .map(|a| a.port())
-        .map_err(|e| e.to_string())
-}
-
-impl Drop for Tunnel {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        if let Some(path) = &self.askpass {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
+#[path = "../common/tunnel.rs"]
+mod tunnel;
+use tunnel::Tunnel;
 
 // ------------------------------------------------------------------ pgpass
 
@@ -1047,6 +908,27 @@ fn schemas_of(
 }
 
 /// A name between double quotes, quotes doubled.
+/// A column's type without its modifier: `character varying(20)` becomes
+/// `character varying`. An explicit cast to `varchar(20)` cuts a longer text
+/// without a word; cast to the bare type, the value then goes into the column,
+/// and the database refuses what does not fit.
+fn bare_type(kind: &str) -> String {
+    let (mut out, mut depth, mut quoted) = (String::new(), 0, false);
+    for c in kind.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                out.push(c);
+            }
+            '(' if !quoted => depth += 1,
+            ')' if !quoted && depth > 0 => depth -= 1,
+            _ if depth == 0 || quoted => out.push(c),
+            _ => {}
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
@@ -1117,7 +999,7 @@ fn clauses(
     qualifier: &str,
 ) -> Result<String, String> {
     let mut sql = String::new();
-    if protocol::has_semicolon(&request.filter) {
+    if protocol::has_semicolon(&request.filter, protocol::Dialect::Postgres) {
         return Err("the condition cannot hold a `;`".to_string());
     }
     if !request.filter.trim().is_empty() {
@@ -1251,7 +1133,7 @@ fn rows(client: &mut Client, request: &Request) -> Result<Value, String> {
 /// the rows can be changed.
 fn result_rows(client: &mut Client, request: &Request) -> Result<Value, String> {
     let sql = request.sql.trim().trim_end_matches(';').trim().to_string();
-    if !protocol::wrappable(&sql) {
+    if !protocol::wrappable(&sql, protocol::Dialect::Postgres) {
         return Err("this query cannot be paged".to_string());
     }
     let limit = request.limit.max(1);
@@ -1374,12 +1256,12 @@ fn statement(
     table: &str,
     shape: &Shape,
 ) -> Result<(String, Vec<Option<String>>), String> {
-    let kind_of = |name: &str| -> Result<&str, String> {
+    let kind_of = |name: &str| -> Result<String, String> {
         shape
             .columns
             .iter()
             .find(|c| c.name == name)
-            .map(|c| c.kind.as_str())
+            .map(|c| bare_type(&c.kind))
             .ok_or_else(|| format!("no column {name}"))
     };
     let mut params: Vec<Option<String>> = Vec::new();
@@ -1822,7 +1704,7 @@ fn import(client: &mut Client, request: &Request) -> Result<Value, String> {
                     "(e.j {} {})::{}",
                     if json { "->" } else { "->>" },
                     protocol::quote_literal(&m.key),
-                    m.kind
+                    bare_type(&m.kind)
                 )
             })
             .collect();
@@ -1878,9 +1760,9 @@ fn import(client: &mut Client, request: &Request) -> Result<Value, String> {
             .map(|m| {
                 let name = format!("c{}", m.index);
                 if spec.empty_null {
-                    format!("NULLIF({name}, '')::{}", m.kind)
+                    format!("NULLIF({name}, '')::{}", bare_type(&m.kind))
                 } else {
-                    format!("{name}::{}", m.kind)
+                    format!("{name}::{}", bare_type(&m.kind))
                 }
             })
             .collect();
@@ -2131,6 +2013,40 @@ fn dump(request: &Request, tunnel_port: Option<u16>) -> Result<Value, String> {
 
 /// How a backup file is made: `pg_restore` reads the custom and tar formats,
 /// `psql` the SQL ones.
+/// A `psql` meta-command of a dump that runs a program of the machine
+/// (`\!`, a pipe, `\copy … program`): the first line that does.
+fn runs_a_program(line: &str) -> bool {
+    let line = line.trim_start();
+    let Some(command) = line.strip_prefix('\\') else {
+        return false;
+    };
+    let lower = command.to_ascii_lowercase();
+    let name: String = lower
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic() || *c == '!')
+        .collect();
+    let rest = lower[name.len()..].trim_start().to_string();
+    match name.as_str() {
+        "!" | "setenv" | "cd" => true,
+        "o" | "out" | "g" | "gx" | "w" | "write" | "copy" | "e" | "edit" | "ef" | "ev" => {
+            rest.starts_with('|') || rest.contains(" program ") || name.starts_with('e')
+        }
+        _ => lower.starts_with('!'),
+    }
+}
+
+/// Reads a SQL dump for the meta-commands that would run programs.
+fn dump_runs_programs(path: &str) -> Result<Option<usize>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+    for (n, line) in std::io::BufReader::new(file).split(b'\n').enumerate() {
+        let line = line.map_err(|e| e.to_string())?;
+        if runs_a_program(&String::from_utf8_lossy(&line)) {
+            return Ok(Some(n + 1));
+        }
+    }
+    Ok(None)
+}
+
 fn backup_kind(path: &str) -> Result<&'static str, String> {
     let mut file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
     let mut head = [0u8; 512];
@@ -2153,6 +2069,12 @@ fn restore(request: &Request, tunnel_port: Option<u16>) -> Result<Value, String>
     let kind = backup_kind(&request.path)?;
     let env = tool_environment(&request.target, &request.database, tunnel_port);
     let (program, version, args) = if kind == "sql" {
+        // A dump is not trusted to run commands of this machine.
+        if let Some(line) = dump_runs_programs(&request.path)? {
+            return Err(format!(
+                "line {line} of the file runs a program (a psql meta-command); it is not restored"
+            ));
+        }
         let (program, version) = find_tool("psql")?;
         let mut args: Vec<String> = vec![
             "--no-password".into(),
@@ -2345,6 +2267,19 @@ fn choices(client: &mut Client, request: &Request) -> Result<Value, String> {
     Ok(json!({ "choices": out }))
 }
 
+/// Whether one of the functions named may change something when it runs: a
+/// volatile one (the default for a function of one's own). When the server
+/// can't say, it may.
+fn may_write(client: &mut Client, names: &[String]) -> bool {
+    let sql = "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_proc \
+               WHERE proname = ANY($1) AND provolatile = 'v')";
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    internal_query(client, sql, &[&names])
+        .ok()
+        .and_then(|rows| rows.first().map(|r| r.get::<_, bool>(0)))
+        .unwrap_or(true)
+}
+
 /// Runs the statements one after the other, in one session: the rows they
 /// give (up to a limit), or how many rows they touched. Stops at the first
 /// that fails and says which.
@@ -2359,7 +2294,7 @@ fn query(client: &mut Client, request: &Request) -> Result<Value, String> {
         record_internal("BEGIN", started, None, None);
     }
     for (index, sql) in request.statements.iter().enumerate() {
-        if request.target.read_only && !protocol::reads_only(sql) {
+        if request.target.read_only && !protocol::reads_only(sql, protocol::Dialect::Postgres) {
             let message = "this data source is read-only".to_string();
             record(sql, Instant::now(), None, Some(message.clone()));
             failed = Some(json!({ "index": index, "error": message }));
@@ -2371,7 +2306,7 @@ fn query(client: &mut Client, request: &Request) -> Result<Value, String> {
         // transaction would only answer that it is aborted).
         let started = Instant::now();
         // Several commands in one text can't be prepared, only run.
-        let statement = if protocol::is_multiple(sql) {
+        let statement = if protocol::is_multiple(sql, protocol::Dialect::Postgres) {
             None
         } else {
             match client.prepare(sql) {
@@ -2386,9 +2321,15 @@ fn query(client: &mut Client, request: &Request) -> Result<Value, String> {
                 }
             }
         };
-        if let Some(statement) =
-            statement.filter(|s| !s.columns().is_empty() && protocol::wrappable(sql))
-        {
+        if let Some(statement) = statement.filter(|s| {
+            !s.columns().is_empty()
+                && protocol::deferrable(
+                    &request.statements,
+                    index,
+                    protocol::Dialect::Postgres,
+                    |names| may_write(client, names),
+                )
+        }) {
             results.push(QueryResult {
                 sql: sql.clone(),
                 ms: 0,
@@ -2504,7 +2445,7 @@ fn export(client: &mut Client, request: &Request) -> Result<Value, String> {
         )
     } else {
         let sql = request.sql.trim().trim_end_matches(';').trim().to_string();
-        if !protocol::wrappable(&sql) {
+        if !protocol::wrappable(&sql, protocol::Dialect::Postgres) {
             return Err("this query cannot be exported".to_string());
         }
         let statement = client.prepare(&sql).map_err(clean)?;
@@ -2571,6 +2512,30 @@ fn export(client: &mut Client, request: &Request) -> Result<Value, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_type_loses_its_modifier_so_a_long_text_is_refused_not_cut() {
+        assert_eq!(bare_type("character varying(20)"), "character varying");
+        assert_eq!(bare_type("numeric(10,2)"), "numeric");
+        assert_eq!(bare_type("character varying(20)[]"), "character varying[]");
+        assert_eq!(
+            bare_type("timestamp(3) with time zone"),
+            "timestamp with time zone"
+        );
+        assert_eq!(bare_type("integer"), "integer");
+        assert_eq!(bare_type("\"my(type)\""), "\"my(type)\"");
+    }
+
+    #[test]
+    fn a_dump_that_runs_a_program_is_recognised() {
+        assert!(runs_a_program("\\! rm -rf ~"));
+        assert!(runs_a_program("  \\o | sh"));
+        assert!(runs_a_program("\\copy t to program 'x'"));
+        assert!(runs_a_program("\\setenv A b"));
+        assert!(!runs_a_program("\\connect shop"));
+        assert!(!runs_a_program("\\copy t from 'a.csv'"));
+        assert!(!runs_a_program("SELECT 1; -- \\! not at the start"));
+    }
 
     #[test]
     fn the_pgpass_line_that_matches_gives_its_password() {

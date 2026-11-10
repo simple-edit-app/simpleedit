@@ -320,7 +320,12 @@ pub fn offset_of(text: &str, line: usize, col: usize) -> usize {
         }
     }
     let end = text[start..].find('\n').map_or(text.len(), |i| start + i);
-    (start + col).min(end)
+    // Never inside a character: a position from older text could land there.
+    let mut at = (start + col).min(end);
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
 }
 
 /// The (line, byte column) of byte `offset` in `text`.

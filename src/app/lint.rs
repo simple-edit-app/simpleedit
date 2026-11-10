@@ -138,6 +138,14 @@ impl SimpleEditApp {
             return Task::none();
         }
         if opened {
+            // Its own programs wait for a yes (the system's run meanwhile).
+            if let Some(root) = crate::trust::untrusted_root(&key.0) {
+                if matches!(self.overlay, ActiveOverlay::None)
+                    && self.trust_asked.insert(root.clone())
+                {
+                    self.overlay = ActiveOverlay::ConfirmTrust(root);
+                }
+            }
             self.lint.diagnostics.clear();
             self.lint.key = None;
             self.lint.hover = None;
@@ -194,12 +202,18 @@ impl SimpleEditApp {
         }
         let (mut found, failed, skipped, ran) = outcome;
         // What the tools left out keeps showing until they run again.
+        // Their fixes were made for an older text: only the marks stay.
         found.extend(
             self.lint
                 .diagnostics
                 .iter()
                 .filter(|d| skipped.contains(&d.source))
-                .cloned(),
+                .cloned()
+                .map(|mut d| {
+                    d.fixes.clear();
+                    d.raw = None;
+                    d
+                }),
         );
         found.sort_by_key(|d| (d.line, d.col));
         self.lint.diagnostics = found;
@@ -450,7 +464,12 @@ impl SimpleEditApp {
         else {
             return Task::none();
         };
-        let (plan, ext) = self.lint_plan(&key.0);
+        let (mut plan, ext) = self.lint_plan(&key.0);
+        // The tools that read the disk know nothing of text not saved yet:
+        // their positions would land on the wrong text.
+        if self.is_dirty {
+            plan.tools.retain(|(tool, _)| tool.stdin);
+        }
         let text = crate::editor::buffer_text(&self.editor.content);
         let path = key.0.clone();
         let level = self.config.lint_fix_level;
@@ -618,7 +637,7 @@ mod tests {
     use super::*;
     use crate::lint::{Edit, Severity};
 
-    fn fix(line: usize, col: usize, end_col: usize, text: &str) -> Fix {
+    pub fn fix(line: usize, col: usize, end_col: usize, text: &str) -> Fix {
         Fix {
             title: "Fix".into(),
             safe: true,
@@ -1028,5 +1047,44 @@ mod tests {
             crate::editor::buffer_text(&app.editor.content),
             "{\"a\": 1}\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod stale_fix_tests {
+    use super::*;
+    use crate::lint::{Fix, Severity};
+
+    #[test]
+    fn the_fixes_of_a_kept_problem_do_not_survive_a_new_look() {
+        let mut app = SimpleEditApp::blank(crate::config::Config::default());
+        let _ = app.restore_session(crate::session::Session::default());
+        let path = std::env::temp_dir().join("se-lint-stale.json");
+        std::fs::write(&path, "{}\n").unwrap();
+        let _ = app.update(Message::TabRead(Ok(Loaded {
+            path,
+            text: "{}\n".into(),
+            format: TextFormat::default(),
+            stamp: None,
+        })));
+        let key = app.lint_key().unwrap();
+        app.lint.generation += 1;
+        let mut d = tests::problem(0, 0, 1, Severity::Error);
+        d.source = "kept".into();
+        d.fixes.push(Fix {
+            title: "Fix".into(),
+            safe: true,
+            edits: vec![],
+        });
+        app.lint.diagnostics = vec![d];
+        let g = app.lint.generation;
+        app.lint_done(g, key, (vec![], vec![], vec!["kept".into()], vec![]));
+        assert_eq!(app.lint.diagnostics.len(), 1);
+        assert!(app.lint.diagnostics[0].fixes.is_empty());
+    }
+
+    #[test]
+    fn an_old_position_in_the_middle_of_a_letter_does_not_cut_it() {
+        assert_eq!(crate::lint::offset_of("é\n", 0, 1), 0);
     }
 }

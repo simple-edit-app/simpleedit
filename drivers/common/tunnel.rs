@@ -25,9 +25,16 @@ impl Tunnel {
         }
         let local = match ssh.local_port.trim() {
             "" => free_port()?,
-            port => port
-                .parse::<u16>()
-                .map_err(|_| format!("SSH: bad local port {port}"))?,
+            port => {
+                let port = port
+                    .parse::<u16>()
+                    .map_err(|_| format!("SSH: bad local port {port}"))?;
+                // Whatever answers on that port must be our tunnel, never a
+                // service that was already there.
+                TcpListener::bind(("127.0.0.1", port))
+                    .map_err(|e| format!("SSH: the local port {port} is in use: {e}"))?;
+                port
+            }
         };
         let destination = if ssh.user.trim().is_empty() {
             ssh.host.trim().to_string()
@@ -48,6 +55,7 @@ impl Tunnel {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
+        die_with_parent(&mut command);
         let mut askpass = None;
         match ssh.auth {
             SshAuth::Agent => {
@@ -95,6 +103,16 @@ impl Tunnel {
             )
             .is_ok()
             {
+                // Only ssh can be behind that port; if it is gone, it was
+                // not ssh that answered.
+                if tunnel
+                    .child
+                    .try_wait()
+                    .map_err(|e| e.to_string())?
+                    .is_some()
+                {
+                    return Err("SSH: the tunnel stopped as it came up".to_string());
+                }
                 return Ok(tunnel);
             }
             if Instant::now() > deadline {
@@ -131,6 +149,25 @@ fn secret_script(command: &mut Command, secret: &str) -> Result<PathBuf, String>
     Ok(path)
 }
 
+/// `ssh` must not outlive the driver, even if the driver is killed: it is
+/// told to die with its parent (Linux).
+fn die_with_parent(command: &mut Command) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: only `prctl`, which is async-signal-safe, runs between the
+        // fork and the exec.
+        unsafe {
+            command.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = command;
+}
+
 fn free_port() -> Result<u16, String> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(|e| e.to_string())?;
     listener
@@ -146,5 +183,20 @@ impl Drop for Tunnel {
         if let Some(path) = &self.askpass {
             let _ = std::fs::remove_file(path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_local_port_already_in_use_is_refused_before_ssh_is_run() {
+        let taken = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut target = Target::default();
+        target.ssh.host = "unused.invalid".into();
+        target.ssh.local_port = taken.local_addr().unwrap().port().to_string();
+        let error = Tunnel::open(&target).err().expect("refused");
+        assert!(error.contains("in use"), "{error}");
     }
 }

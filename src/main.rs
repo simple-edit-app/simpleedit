@@ -57,6 +57,7 @@ mod tasks;
 mod terminal;
 mod text_ops;
 mod theme;
+mod trust;
 mod updater;
 
 i18n!("src/i18n");

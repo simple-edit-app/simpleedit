@@ -208,6 +208,8 @@ pub enum ActiveOverlay {
     ConfirmCloseMany(Vec<PathBuf>, usize),
     /// The session couldn't be written: quitting would lose unsaved buffers.
     ConfirmQuit(String),
+    /// A folder has programs of its own (`node_modules/.bin`…): may they run?
+    ConfirmTrust(PathBuf),
     /// Saving would overwrite changes made to the file outside the editor.
     ConfirmOverwrite(PathBuf),
     /// A scratch file is about to be deleted for good.
@@ -319,6 +321,7 @@ pub enum Message {
     ),
     RemoteSent(PathBuf, Result<Option<u64>, String>),
     SpellFix,
+    SpellChecked(Option<spelling::SpellChecked>),
     SpellReplace(String),
     SpellAdd,
     SpellIgnore,
@@ -342,6 +345,8 @@ pub enum Message {
     IpcPoll,
     TargetOpened(crate::ipc::Target, Result<Loaded, String>),
     NewWindow,
+    /// The folder may run its own programs.
+    TrustFolder(PathBuf),
     RenameSymbol,
     RenameInput(String),
     RenameConfirm,
@@ -381,6 +386,8 @@ pub enum Message {
     Results(results::ResultsMsg),
     /// What a search found (its generation, the places or what went wrong).
     FindResults(u64, Result<Vec<finder::Occurrence>, String>),
+    /// The pause after the last key is over: the search for `generation` may start.
+    FindDue(u64),
     FindOpen(Option<usize>),
     /// Looks in this folder only (from the tree's menu).
     FindInFolder(PathBuf),
@@ -779,6 +786,12 @@ pub struct Flags {
 
 pub struct SimpleEditApp {
     config: Config,
+    /// Folders asked about trust in this run (once each).
+    trust_asked: HashSet<PathBuf>,
+    /// How many session writes were started (they land in this order).
+    session_writes: u64,
+    /// Tabs whose read was overtaken by another switch: their answer is dropped.
+    abandoned_reads: HashSet<PathBuf>,
     /// Marked lines of every file, saved between runs.
     bookmarks: crate::bookmarks::Bookmarks,
     editor: EditorState,
@@ -1072,6 +1085,7 @@ enum PreviewDoc {
 impl SimpleEditApp {
     /// An app with one empty untitled tab, reading nothing from disk.
     fn blank(config: Config) -> Self {
+        crate::trust::set_all(&config.trusted_folders);
         crate::lsp::set_completion_options(&config.completion_options);
         Self {
             bookmarks: crate::bookmarks::Bookmarks::default(),
@@ -1121,6 +1135,9 @@ impl SimpleEditApp {
             db_counter: 0,
             api: crate::api::State::load(),
             api_tabs: HashMap::new(),
+            trust_asked: HashSet::new(),
+            session_writes: 0,
+            abandoned_reads: HashSet::new(),
             sidebar_width: config.sidebar_width.clamp(SIDEBAR_MIN, SIDEBAR_MAX),
             sidebar_resizing: false,
             panel_height: PANEL_HEIGHT,
@@ -1339,7 +1356,7 @@ impl SimpleEditApp {
         }
         let status_before = matches!(
             &message,
-            Message::Git(crate::git_panel::GitMsg::StatusLoaded(_))
+            Message::Git(crate::git_panel::GitMsg::StatusLoaded(..))
         )
         .then(|| self.git.status.clone());
         let git_done = matches!(&message, Message::Git(crate::git_panel::GitMsg::Done(_)));
@@ -2192,10 +2209,24 @@ impl SimpleEditApp {
                     ActiveOverlay::ConfirmCloseMany(paths, modified) => {
                         self.view_confirm_many_overlay(dark, paths, *modified)
                     }
+                    ActiveOverlay::ConfirmTrust(root) => {
+                        let folder = root.display().to_string();
+                        confirm_card(
+                            dark,
+                            t!("trust.title").to_string(),
+                            t!("trust.message", folder = folder.as_str()).to_string(),
+                            t!("trust.confirm").to_string(),
+                            Message::TrustFolder(root.clone()),
+                        )
+                    }
                     ActiveOverlay::ConfirmQuit(error) => confirm_card(
                         dark,
                         t!("quit.title").to_string(),
-                        t!("quit.message", error = error.as_str()).to_string(),
+                        if error == t!("quit.unsaved").as_ref() {
+                            t!("quit.message_unsaved").to_string()
+                        } else {
+                            t!("quit.message", error = error.as_str()).to_string()
+                        },
                         t!("quit.confirm").to_string(),
                         Message::QuitAnyway,
                     ),
@@ -2230,7 +2261,7 @@ impl Message {
                 crate::database::DbMsg::Scrolled(..) | crate::database::DbMsg::DriverProbed(..)
             ),
             Message::History(msg) => msg.is_background(),
-            Message::BlameLoaded(..) | Message::MarksBase(..) => true,
+            Message::BlameLoaded(..) | Message::MarksBase(..) | Message::SpellChecked(_) => true,
             // What comes by itself (answers, timers) or from the pointer
             // merely passing over something: an open menu stays open.
             Message::FileStates(_)
@@ -2241,6 +2272,7 @@ impl Message {
             | Message::LintCardHover(_)
             | Message::FinderFiles(_)
             | Message::FindResults(..)
+            | Message::FindDue(_)
             | Message::TreeScrolled(..)
             | Message::TreeHover(_)
             | Message::EverywhereFiles(..)
@@ -2430,6 +2462,8 @@ impl SimpleEditApp {
                             .pending_open
                             .as_ref()
                             .is_some_and(|p| *p != loaded.path) => {}
+                    // The user went elsewhere in the meantime.
+                    Ok(loaded) if self.abandoned_reads.remove(&loaded.path) => {}
                     Ok(loaded) => {
                         self.history_record(&loaded.path, &loaded.text);
                         self.open_loaded(loaded);
@@ -2508,6 +2542,11 @@ impl SimpleEditApp {
             }
             Message::SaveFileAs => self.start_save_as(self.current_file.clone()),
             Message::SaveAsChosen(origin, result) => match result {
+                // The buffer only holds part of a large file.
+                Ok(_) if origin.as_ref().is_some_and(|o| self.large.contains_key(o)) => {
+                    self.set_status(t!("large.read_only"), true);
+                    Task::none()
+                }
                 Ok(path) => {
                     // Another tab holds unsaved work for that file: writing
                     // over the file would silently drop it.
@@ -2979,6 +3018,9 @@ impl SimpleEditApp {
             Message::TerminalCopy(text) => iced::clipboard::write(text),
             Message::TerminalPaste => iced::clipboard::read().map(Message::TerminalPasteText),
             Message::TerminalPasteText(text) => {
+                // No escape sequence may come from a paste: `ESC[201~` would
+                // end the bracketed paste and what follows would run.
+                let text = text.map(|t| paste_text_safe(&t));
                 if let (Some(text), Some(session)) = (text, self.terminal.active_session()) {
                     let bracketed = session
                         .with_screen(|screen| screen.bracketed_paste())
@@ -3326,6 +3368,7 @@ impl SimpleEditApp {
                 self.finder.regex = !self.finder.regex;
                 self.search_files(false)
             }
+            Message::FindDue(generation) => self.find_due(generation),
             Message::FindResults(generation, result) => {
                 self.find_results(generation, result);
                 Task::none()
@@ -3418,6 +3461,10 @@ impl SimpleEditApp {
             Message::RemoteDownloaded(file, result) => self.remote_downloaded(file, result),
             Message::RemoteSent(path, result) => self.remote_sent(path, result),
             Message::SpellFix => self.open_spell_fix(),
+            Message::SpellChecked(done) => {
+                self.spell_checked(done);
+                Task::none()
+            }
             Message::SpellReplace(word) => self.spell_replace(word),
             Message::SpellAdd => self.spell_learn(true),
             Message::SpellIgnore => self.spell_learn(false),
@@ -3494,6 +3541,21 @@ impl SimpleEditApp {
                     }
                 }
                 task
+            }
+            Message::TrustFolder(root) => {
+                crate::trust::add(&root);
+                let list = &mut self.config.trusted_folders;
+                let text = root.to_string_lossy().into_owned();
+                if !list.contains(&text) {
+                    list.push(text);
+                }
+                self.config_dirty = true;
+                self.overlay = ActiveOverlay::None;
+                // The servers start again, now with their build scripts.
+                Task::batch([
+                    self.lint_now(),
+                    Task::future(crate::lsp::restart_servers()).discard(),
+                ])
             }
             Message::NewWindow => {
                 let started = std::env::current_exe()
@@ -3663,10 +3725,12 @@ impl SimpleEditApp {
                 }
                 self.push_undo();
                 self.undo_new_group = true;
+                // Each selection converted on its own: one cursor's text never
+                // lands at another.
                 self.edited(|app| {
-                    app.editor.content.perform(text_editor::Action::Edit(
-                        text_editor::Edit::Paste(std::sync::Arc::new(converted)),
-                    ));
+                    app.editor
+                        .content
+                        .map_selections(|text| text_ops::convert_case(text, op));
                 });
                 self.is_dirty = true;
                 Task::none()
@@ -3689,6 +3753,11 @@ impl SimpleEditApp {
                 Task::none()
             }
             Message::SetEncoding(encoding) => {
+                if self.large_view().is_some() {
+                    self.overlay = ActiveOverlay::None;
+                    self.set_status(t!("large.read_only"), true);
+                    return Task::none();
+                }
                 self.overlay = ActiveOverlay::None;
                 let text = crate::editor::buffer_text(&self.editor.content);
                 let mut format = self.format;
@@ -3731,6 +3800,11 @@ impl SimpleEditApp {
                 Task::none()
             }
             Message::SetLineEnding(ending) => {
+                if self.large_view().is_some() {
+                    self.overlay = ActiveOverlay::None;
+                    self.set_status(t!("large.read_only"), true);
+                    return Task::none();
+                }
                 self.overlay = ActiveOverlay::None;
                 if self.format.ending != ending {
                     self.format.ending = ending;
@@ -4035,13 +4109,18 @@ impl SimpleEditApp {
             Message::Sidebar(msg) => match self.sidebar.update(msg) {
                 SidebarAction::OpenFile(path) => self.activate(path),
                 SidebarAction::CloseFile(path) => self.request_close(path),
-                // The cross asks nothing, even with unsaved changes.
-                SidebarAction::CloseNow(path) => self.close_path(path),
+                SidebarAction::CloseNow(path) => self.request_close(path),
                 // Only offered for the active file.
                 SidebarAction::SaveFile => self.handle(Message::SaveFile),
                 SidebarAction::SaveFileAs => self.start_save_as(self.current_file.clone()),
                 SidebarAction::None => Task::none(),
             },
+            Message::Search(SearchMessage::ReplaceAll | SearchMessage::Replace)
+                if self.large_view().is_some() =>
+            {
+                self.set_status(t!("large.read_only"), true);
+                Task::none()
+            }
             Message::Search(SearchMessage::ReplaceAll) => {
                 let old = crate::editor::buffer_text(&self.editor.content);
                 match self.search.replace_all(&old) {
@@ -4108,6 +4187,15 @@ impl SimpleEditApp {
             }
             Message::About => {
                 self.overlay = ActiveOverlay::About;
+                Task::none()
+            }
+            // A second window doesn't keep the session: its unsaved work
+            // would be gone.
+            Message::Quit
+                if !self.session_owner
+                    && self.sidebar.files().iter().any(|p| self.is_path_dirty(p)) =>
+            {
+                self.overlay = ActiveOverlay::ConfirmQuit(t!("quit.unsaved").to_string());
                 Task::none()
             }
             Message::Quit => match self.save_session_now() {
@@ -4194,6 +4282,11 @@ impl SimpleEditApp {
                         .perform(text_editor::Action::Edit(text_editor::Edit::Delete));
                 });
                 self.is_dirty = true;
+                Task::none()
+            }
+            Message::FormatFile | Message::FormatSelection if self.large_view().is_some() => {
+                self.format_on_save_pending = false;
+                self.set_status(t!("large.read_only"), true);
                 Task::none()
             }
             Message::FormatFile => {
@@ -5974,46 +6067,11 @@ impl SimpleEditApp {
         len_of(span.start.0).saturating_sub(span.start.1) + 1 + middle + span.end.1
     }
 
-    /// The span of a selection running over several lines. (`text_editor`
-    /// exposes the selected text and the cursor, not the anchor, so the start
-    /// is inferred by checking which end of the selection the cursor is on
-    /// against the buffer's actual lines.)
+    /// The span of a selection running over several lines, from its anchor
+    /// and its cursor.
     fn selection_span(&self) -> Option<Span> {
-        let selected = self.editor.content.selection()?;
-        let n = selected.split('\n').count();
-        if n < 2 {
-            return None;
-        }
-        let first = selected.split('\n').next()?;
-        let last = selected.rsplit('\n').next()?;
-        let (cursor_line, cursor_col) = self.editor.content.cursor_position();
-        let fits = |start: usize| -> bool {
-            let (Some(a), Some(b)) = (
-                self.editor.content.line(start),
-                self.editor.content.line(start + n - 1),
-            ) else {
-                return false;
-            };
-            a.ends_with(first) && b.starts_with(last)
-        };
-        // Cursor at the end of the selection (the usual drag direction)...
-        if cursor_line + 1 >= n && cursor_col == last.len() && fits(cursor_line + 1 - n) {
-            let start_line = cursor_line + 1 - n;
-            let start_col = self
-                .editor
-                .content
-                .line(start_line)
-                .map_or(0, |l| l.len().saturating_sub(first.len()));
-            return Some(Span {
-                start: (start_line, start_col),
-                end: (cursor_line, cursor_col),
-            });
-        }
-        // ...or at its start.
-        fits(cursor_line).then_some(Span {
-            start: (cursor_line, cursor_col),
-            end: (cursor_line + n - 1, last.len()),
-        })
+        let (start, end) = self.editor.content.selection_range()?;
+        (start.0 != end.0).then_some(Span { start, end })
     }
 
     /// The lines a line command applies to: the selected ones, else the
@@ -6169,6 +6227,19 @@ impl SimpleEditApp {
 
     /// Whether the tab for `path` holds unsaved changes.
     fn is_path_dirty(&self, path: &Path) -> bool {
+        // Tables with edits waiting for Commit and API requests that were
+        // changed hold their work outside the text buffers.
+        if self
+            .db_tabs
+            .get(path)
+            .is_some_and(|t| !t.pending.is_empty())
+            || self.api_tabs.get(path).is_some_and(|t| t.changed())
+        {
+            return true;
+        }
+        if self.db_tabs.contains_key(path) || self.api_tabs.contains_key(path) {
+            return false;
+        }
         if self.current_file.as_deref() == Some(path) {
             self.is_dirty
         } else {
@@ -6279,7 +6350,7 @@ impl SimpleEditApp {
         if moved || status_changed || git_done {
             return self.refresh_marks_base();
         }
-        self.refresh_spelling();
+        let spelling = self.refresh_spelling();
         // A new window starts with its first row.
         let now = std::mem::discriminant(&self.overlay);
         if self.overlay_seen != Some(now) {
@@ -6290,7 +6361,7 @@ impl SimpleEditApp {
         if edited && self.editor.content.line_count() < 3000 {
             self.refresh_marks_now();
         }
-        Task::none()
+        spelling
     }
 
     /// Asks git what HEAD has of the current file.
@@ -6403,7 +6474,11 @@ impl SimpleEditApp {
             return Task::none();
         }
         let mut tasks = Vec::new();
-        if let Some(path) = self.current_file.clone().filter(|p| !is_untitled(p)) {
+        if let Some(path) = self
+            .current_file
+            .clone()
+            .filter(|p| !is_untitled(p) && !self.large.contains_key(p))
+        {
             if self.is_dirty && !self.external_warned && !self.changed_on_disk(&path) {
                 let content = crate::editor::buffer_text(&self.editor.content);
                 tasks.push(save_command(
@@ -6416,6 +6491,7 @@ impl SimpleEditApp {
         for (path, entry) in &self.file_cache {
             if entry.dirty
                 && !is_untitled(path)
+                && !self.large.contains_key(path)
                 && entry.stamp.is_some()
                 && DiskStamp::of(path) == entry.stamp
             {
@@ -7570,6 +7646,12 @@ impl SimpleEditApp {
         if self.current_file.as_ref() == Some(&path) {
             return Task::none();
         }
+        // A read still on its way for another tab is abandoned: when it
+        // arrives it must not take the user there.
+        if let Some(previous) = self.pending_open.take().filter(|p| *p != path) {
+            self.abandoned_reads.insert(previous);
+        }
+        self.abandoned_reads.remove(&path);
         self.pending_open = Some(path.clone());
         let cached = self.file_cache.get(&path);
         if let Some(entry) = cached.filter(|e| e.content.is_some()) {
@@ -7856,6 +7938,14 @@ impl SimpleEditApp {
             Message::SaveAsChosen(origin.clone(), result)
         })
     }
+}
+
+/// A text to paste in a terminal without its control characters (the escape
+/// that would close a bracketed paste, Ctrl+C…): only tab and line breaks stay.
+fn paste_text_safe(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_control() || matches!(c, '\t' | '\n' | '\r'))
+        .collect()
 }
 
 /// The first line of the buffer (capped), to recognize a `#!` script.

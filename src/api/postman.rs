@@ -181,9 +181,17 @@ fn read_request(item: &Value, inherited: &Option<Auth>, warnings: &mut Vec<Strin
             };
         }
         Some("file") => {
+            // A collection from elsewhere does not get to pick a file of this
+            // machine to send: it is chosen again, by hand.
+            let src = text(&body["file"]["src"]);
+            if !src.is_empty() {
+                warnings.push(format!(
+                    "{name}: the file {src} of the body was not kept, choose it again."
+                ));
+            }
             request.body = Body {
                 kind: BodyKind::File,
-                file: text(&body["file"]["src"]),
+                file: String::new(),
                 ..Body::default()
             };
         }

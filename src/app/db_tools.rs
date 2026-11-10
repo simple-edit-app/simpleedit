@@ -120,6 +120,7 @@ impl SimpleEditApp {
                     error: None,
                     imported: None,
                 });
+                let window = database::AnswerFor::Import(conn, schema.clone(), table.clone());
                 Task::perform(
                     database::structure(
                         params,
@@ -129,7 +130,12 @@ impl SimpleEditApp {
                             table,
                         },
                     ),
-                    |done| Message::Db(DbMsg::ImportStructure(done)),
+                    move |done| {
+                        Message::Db(DbMsg::Answer(
+                            window.clone(),
+                            Box::new(DbMsg::ImportStructure(done)),
+                        ))
+                    },
                 )
             }
             DbMsg::ImportStructure(done) => {
@@ -602,8 +608,12 @@ impl SimpleEditApp {
         if let Some(view) = self.db.health.as_mut() {
             view.loading = true;
         }
-        Task::perform(database::health(params, database), |done| {
-            Message::Db(DbMsg::HealthLoaded(done))
+        let window = database::AnswerFor::Health(conn, database.clone());
+        Task::perform(database::health(params, database), move |done| {
+            Message::Db(DbMsg::Answer(
+                window.clone(),
+                Box::new(DbMsg::HealthLoaded(done)),
+            ))
         })
     }
 }

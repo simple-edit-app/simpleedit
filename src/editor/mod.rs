@@ -130,13 +130,15 @@ pub fn replace_text(content: &mut crate::code_editor::Content, old: &str, new_te
         return;
     };
     if change.old_text.len() <= 100_000 {
+        content.clear_extras();
         content.select_bytes(change.first_line, 0, change.old_text.len());
         let last_line = change.first_line + change.old_text.matches('\n').count();
         // Belt and braces: never paste unless exactly the old lines are selected.
         let positioned = content.cursor_position().0 == last_line
             && content.selection().unwrap_or_default() == change.old_text;
         if positioned {
-            content.perform(Action::Edit(Edit::Paste(std::sync::Arc::new(
+            // Not `perform`: with several cursors it would paste at each.
+            content.perform_one(Action::Edit(Edit::Paste(std::sync::Arc::new(
                 change.new_text,
             ))));
             return;

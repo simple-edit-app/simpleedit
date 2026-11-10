@@ -508,16 +508,20 @@ pub fn program_path(tool: &Tool, near: &Path, chosen: Option<&str>) -> Option<Pa
         let path = PathBuf::from(path);
         return path.is_file().then_some(path);
     }
-    let dirs = near
-        .ancestors()
-        .skip(1)
-        .take(12)
-        .flat_map(|d| {
-            ["node_modules/.bin", ".venv/bin", "venv/bin", "vendor/bin"]
-                .into_iter()
-                .map(move |sub| d.join(sub).join(tool.program))
-        })
-        .collect::<Vec<_>>();
+    // The project's own programs run only in a folder that is trusted.
+    let dirs = if crate::trust::is_trusted(near) {
+        near.ancestors()
+            .skip(1)
+            .take(12)
+            .flat_map(|d| {
+                crate::trust::LOCAL_BINS
+                    .into_iter()
+                    .map(move |sub| d.join(sub).join(tool.program))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     dirs.into_iter()
         .find(|p| p.is_file())
         .or_else(|| crate::lsp::find_executable(tool.program))
@@ -622,6 +626,7 @@ mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::write(bin.join("eslint"), "").unwrap();
         let file = dir.path().join("src/a.ts");
+        crate::trust::add(dir.path());
         let eslint = tool_by_id("eslint").unwrap();
         let none = std::collections::BTreeMap::new();
         // The project's own program is found, but it has no configuration.

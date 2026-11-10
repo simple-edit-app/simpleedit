@@ -10,6 +10,9 @@ pub struct TaskSpec {
     pub name: String,
     pub command: String,
     pub dir: PathBuf,
+    /// Written in a project's own `tasks.json`: the project, which must be
+    /// trusted for it to run (not its `cwd`, which the file chooses).
+    pub custom: Option<PathBuf>,
 }
 
 /// A place an output line names.
@@ -35,6 +38,7 @@ fn spec(name: &str, command: &str, dir: &Path) -> TaskSpec {
         name: name.to_string(),
         command: command.to_string(),
         dir: dir.to_path_buf(),
+        custom: None,
     }
 }
 
@@ -76,7 +80,10 @@ pub fn detect(root: &Path) -> Vec<TaskSpec> {
                 let dir = item["cwd"]
                     .as_str()
                     .map_or_else(|| root.to_path_buf(), |c| root.join(c));
-                tasks.push(spec(name, command, &dir));
+                tasks.push(TaskSpec {
+                    custom: Some(root.to_path_buf()),
+                    ..spec(name, command, &dir)
+                });
             }
         }
     }
@@ -285,6 +292,9 @@ mod tests {
         }
         assert!(!names.iter().any(|n| n.contains('%') || n.contains("CC")));
         assert_eq!(detect(root)[0].dir, root.join("web"));
+        // What must be trusted is the project, whatever folder it runs in.
+        assert_eq!(detect(root)[0].custom.as_deref(), Some(root));
+        assert!(detect(root).iter().skip(1).all(|t| t.custom.is_none()));
         assert!(detect(&root.join("empty")).is_empty());
     }
 

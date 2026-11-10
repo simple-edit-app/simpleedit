@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use super::protocol::{sql_tokens, ForeignKey, Kind, Token, TokenKind};
+use super::protocol::{sql_tokens, Dialect, ForeignKey, Kind, Token, TokenKind};
 
 /// What a connection is known to hold, for the completion.
 #[derive(Debug, Clone, Default)]
@@ -16,6 +16,8 @@ pub struct Known {
     pub foreign_keys: Vec<ForeignKey>,
     /// The functions and procedures of the schemas: schema, name, arguments.
     pub routines: Vec<(String, String, String)>,
+    /// The SQL of the connection: how names are quoted.
+    pub dialect: Dialect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +154,29 @@ const KEYWORDS: &[&str] = &[
     "WHERE",
     "WINDOW",
     "WITH",
+    "USER",
+    "TO",
+    "FOR",
+    "ONLY",
+    "ARRAY",
+    "DO",
+    "CURRENT_USER",
+    "SESSION_USER",
+    "ANALYSE",
+    "ANALYZE",
+    "BOTH",
+    "CAST",
+    "COLLATE",
+    "CURRENT_TIME",
+    "INITIALLY",
+    "LEADING",
+    "LOCALTIME",
+    "LOCALTIMESTAMP",
+    "PLACING",
+    "SOME",
+    "SYMMETRIC",
+    "TRAILING",
+    "VARIADIC",
 ];
 
 const FUNCTIONS: &[&str] = &[
@@ -252,9 +277,9 @@ pub fn needs_quotes(name: &str) -> bool {
     !plain || KEYWORDS.contains(&name.to_uppercase().as_str())
 }
 
-pub fn quoted(name: &str) -> String {
+pub fn quoted(name: &str, dialect: Dialect) -> String {
     if needs_quotes(name) {
-        super::protocol::quote_ident(name)
+        super::protocol::quote_ident_in(dialect, name)
     } else {
         name.to_string()
     }
@@ -267,7 +292,7 @@ pub fn suggest(text: &str, caret: usize, known: &Known, force: bool) -> Option<S
     if !text.is_char_boundary(caret) {
         return None;
     }
-    let tokens = sql_tokens(text);
+    let tokens = sql_tokens(text, known.dialect);
     // Not in a string, a comment or a quoted name.
     if tokens.iter().any(|t| {
         matches!(
@@ -313,7 +338,7 @@ pub fn suggest(text: &str, caret: usize, known: &Known, force: bool) -> Option<S
                 if matches(name) {
                     items.push(Item {
                         label: name.clone(),
-                        insert: quoted(name),
+                        insert: quoted(name, known.dialect),
                         detail: format!("{} · {kind}", key.1),
                         kind: ItemKind::Column,
                     });
@@ -324,7 +349,7 @@ pub fn suggest(text: &str, caret: usize, known: &Known, force: bool) -> Option<S
             let schema = prefix.last().map(|s| s.to_lowercase()).unwrap_or_default();
             for (s, table, kind) in &known.tables {
                 if s.to_lowercase() == schema && matches(table) {
-                    items.push(table_item(s, table, *kind, false));
+                    items.push(table_item(s, table, *kind, false, known.dialect));
                 }
             }
         }
@@ -336,7 +361,7 @@ pub fn suggest(text: &str, caret: usize, known: &Known, force: bool) -> Option<S
             let mut out = Vec::new();
             for (schema, table, kind) in &known.tables {
                 if matches(table) {
-                    out.push(table_item(schema, table, *kind, true));
+                    out.push(table_item(schema, table, *kind, true, known.dialect));
                 }
             }
             let mut schemas: Vec<&String> = known.tables.iter().map(|t| &t.0).collect();
@@ -346,7 +371,7 @@ pub fn suggest(text: &str, caret: usize, known: &Known, force: bool) -> Option<S
                 if matches(schema) {
                     out.push(Item {
                         label: schema.clone(),
-                        insert: quoted(schema),
+                        insert: quoted(schema, known.dialect),
                         detail: String::new(),
                         kind: ItemKind::Schema,
                     });
@@ -367,7 +392,7 @@ pub fn suggest(text: &str, caret: usize, known: &Known, force: bool) -> Option<S
                     if matches(name) {
                         out.push(Item {
                             label: name.clone(),
-                            insert: quoted(name),
+                            insert: quoted(name, known.dialect),
                             detail: format!("{} · {kind}", key.1),
                             kind: ItemKind::Column,
                         });
@@ -397,7 +422,7 @@ pub fn suggest(text: &str, caret: usize, known: &Known, force: bool) -> Option<S
                 .filter(|(_, name, _)| matches(name))
                 .map(|(schema, name, args)| Item {
                     label: name.clone(),
-                    insert: format!("{}(", quoted(name)),
+                    insert: format!("{}(", quoted(name, known.dialect)),
                     detail: format!("{schema} · {args}"),
                     kind: ItemKind::Function,
                 })
@@ -470,12 +495,12 @@ fn is_word(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80
 }
 
-fn table_item(schema: &str, table: &str, kind: Kind, qualify: bool) -> Item {
+fn table_item(schema: &str, table: &str, kind: Kind, qualify: bool, dialect: Dialect) -> Item {
     // Out of the usual schema, the schema is part of what is inserted.
     let insert = if qualify && schema != "public" {
-        format!("{}.{}", quoted(schema), quoted(table))
+        format!("{}.{}", quoted(schema, dialect), quoted(table, dialect))
     } else {
-        quoted(table)
+        quoted(table, dialect)
     };
     Item {
         label: table.to_string(),
@@ -748,10 +773,10 @@ fn join_conditions(referenced: &[Referenced], known: &Known) -> Vec<String> {
                         .map(|(x, y)| {
                             format!(
                                 "{}.{} = {}.{}",
-                                quoted(&a.name),
-                                quoted(x),
-                                quoted(&b.name),
-                                quoted(y)
+                                quoted(&a.name, known.dialect),
+                                quoted(x, known.dialect),
+                                quoted(&b.name, known.dialect),
+                                quoted(y, known.dialect)
                             )
                         })
                         .collect::<Vec<_>>()
@@ -1006,8 +1031,9 @@ mod tests {
         assert!(needs_quotes("Id"));
         assert!(needs_quotes("select"));
         assert!(needs_quotes("1abc"));
-        assert_eq!(quoted("user_id"), "user_id");
-        assert_eq!(quoted("a\"b"), "\"a\"\"b\"");
+        assert_eq!(quoted("user_id", Dialect::Postgres), "user_id");
+        assert_eq!(quoted("a\"b", Dialect::Postgres), "\"a\"\"b\"");
+        assert_eq!(quoted("CustomerID", Dialect::Mysql), "`CustomerID`");
     }
 
     #[test]

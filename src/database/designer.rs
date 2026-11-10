@@ -4,7 +4,8 @@
 
 use super::completion::quoted;
 use super::protocol::{
-    quote_ident, quote_literal, ColumnDef, ConstraintDef, ConstraintKind, IndexDef, Structure,
+    quote_ident, quote_literal, ColumnDef, ConstraintDef, ConstraintKind, Dialect, IndexDef,
+    Structure,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -479,7 +480,7 @@ pub fn list(text: &str) -> Vec<String> {
 fn columns_sql(text: &str) -> String {
     list(text)
         .iter()
-        .map(|c| quoted(c))
+        .map(|c| quoted(c, Dialect::Postgres))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -494,7 +495,7 @@ fn index_columns_sql(text: &str) -> String {
                 .chars()
                 .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '"');
             if plain {
-                quoted(c.trim_matches('"'))
+                quoted(c.trim_matches('"'), Dialect::Postgres)
             } else {
                 c.clone()
             }
@@ -506,7 +507,7 @@ fn index_columns_sql(text: &str) -> String {
 /// A table named `schema.table` or `table`, quoted where it has to be.
 fn table_sql(text: &str) -> String {
     text.split('.')
-        .map(|part| quoted(part.trim().trim_matches('"')))
+        .map(|part| quoted(part.trim().trim_matches('"'), Dialect::Postgres))
         .collect::<Vec<_>>()
         .join(".")
 }

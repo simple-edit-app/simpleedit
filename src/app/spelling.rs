@@ -4,13 +4,38 @@
 use super::*;
 use crate::spell::{self, Language, Speller};
 use iced::widget::column;
+use std::sync::Arc;
 
 /// Files with more lines than this are not checked as they are typed.
 const MAX_LINES: usize = 20_000;
+/// Files with more lines than this are checked in the background, once the
+/// typing pauses: checking every word at each keystroke would slow it.
+const SYNC_LINES: usize = 2_000;
+/// The pause.
+const PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// What marks are computed for: the file, its text (revision), the settings.
+pub type SpellKey = (Option<PathBuf>, u64, u64);
+/// Marks computed in the background, and what for (none: given up, the
+/// text having changed again).
+pub type SpellChecked = (SpellKey, Vec<(usize, usize, usize)>);
 
 /// What the underlines are numbered from (the problems of the lint are
 /// numbered from 0).
 pub const MARK_BASE: usize = 1 << 30;
+
+/// The misspelled words of `text`, as (line, byte column, end column).
+fn spell_marks(speller: &Speller, text: &str, ext: &str) -> Vec<(usize, usize, usize)> {
+    let mut starts = vec![0usize];
+    starts.extend(text.match_indices('\n').map(|(i, _)| i + 1));
+    spell::misspelled(speller, text, ext)
+        .into_iter()
+        .map(|(from, to)| {
+            let line = starts.partition_point(|s| *s <= from).saturating_sub(1);
+            (line, from - starts[line], to - starts[line])
+        })
+        .collect()
+}
 
 /// A misspelled word and what could replace it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,7 +55,10 @@ pub struct SpellState {
     /// The misspelled words: (line, byte column, end column).
     pub marks: Vec<(usize, usize, usize)>,
     /// What `marks` were computed for: the file, its text, the settings.
-    key: Option<(Option<PathBuf>, u64, u64)>,
+    key: Option<SpellKey>,
+    /// The text asked for last, in the background: an answer for another
+    /// one is of no use (and is not even computed when it is already old).
+    wanted: Arc<std::sync::Mutex<Option<SpellKey>>>,
     /// Changes with the dictionary, the language, the words added.
     generation: u64,
     /// The languages of the picker.
@@ -81,8 +109,9 @@ impl SimpleEditApp {
     }
 
     /// Looks again at the words when the text, the file or the settings
-    /// changed.
-    pub(super) fn refresh_spelling(&mut self) {
+    /// changed: at once, or for a big file being typed in, in the
+    /// background once the typing pauses.
+    pub(super) fn refresh_spelling(&mut self) -> Task<Message> {
         let eligible = self.config.spell_check
             && self.current_file.is_some()
             && !self.current_file.as_deref().is_some_and(is_virtual)
@@ -94,7 +123,7 @@ impl SimpleEditApp {
                 self.spell.marks.clear();
             }
             self.spell.key = None;
-            return;
+            return Task::none();
         }
         let key = (
             self.current_file.clone(),
@@ -102,27 +131,63 @@ impl SimpleEditApp {
             self.spell.generation,
         );
         if self.spell.key.as_ref() == Some(&key) {
-            return;
+            return Task::none();
         }
-        self.spell.key = Some(key);
-        self.spell.marks.clear();
+        // The same file and settings, a bigger text that changed: in the
+        // background, the marks of before staying until then.
+        let typed = self
+            .spell
+            .key
+            .as_ref()
+            .is_some_and(|k| k.0 == key.0 && k.2 == key.2);
+        let later = typed && self.editor.content.line_count() > SYNC_LINES;
+        self.spell.key = Some(key.clone());
+        if !later {
+            self.spell.marks.clear();
+        }
         if !self.ensure_speller() {
-            return;
+            self.spell.marks.clear();
+            return Task::none();
         }
         let text = crate::editor::buffer_text(&self.editor.content);
         let ext = self.editor.language.clone().unwrap_or_default();
         let Some(speller) = &self.spell.speller else {
-            return;
+            return Task::none();
         };
-        let mut starts = vec![0usize];
-        starts.extend(text.match_indices('\n').map(|(i, _)| i + 1));
-        self.spell.marks = spell::misspelled(speller, &text, &ext)
-            .into_iter()
-            .map(|(from, to)| {
-                let line = starts.partition_point(|s| *s <= from).saturating_sub(1);
-                (line, from - starts[line], to - starts[line])
-            })
-            .collect();
+        if !later {
+            self.spell.marks = spell_marks(speller, &text, &ext);
+            return Task::none();
+        }
+        let speller = speller.clone();
+        let wanted = self.spell.wanted.clone();
+        if let Ok(mut w) = wanted.lock() {
+            *w = Some(key.clone());
+        }
+        Task::perform(
+            async move {
+                tokio::time::sleep(PAUSE).await;
+                let still = |w: &Arc<std::sync::Mutex<Option<SpellKey>>>| {
+                    w.lock().is_ok_and(|w| w.as_ref() == Some(&key))
+                };
+                if !still(&wanted) {
+                    return None;
+                }
+                tokio::task::spawn_blocking(move || {
+                    let marks = spell_marks(&speller, &text, &ext);
+                    (key, marks)
+                })
+                .await
+                .ok()
+            },
+            Message::SpellChecked,
+        )
+    }
+
+    /// The marks computed in the background, if still for the text of now.
+    pub(super) fn spell_checked(&mut self, done: Option<SpellChecked>) {
+        if let Some((_, marks)) = done.filter(|(key, _)| self.spell.key.as_ref() == Some(key)) {
+            self.spell.marks = marks;
+        }
     }
 
     /// The misspelled word at the cursor (or just before it), with
@@ -214,8 +279,7 @@ impl SimpleEditApp {
             }
         }
         self.spell.generation += 1;
-        self.refresh_spelling();
-        Task::none()
+        self.refresh_spelling()
     }
 
     pub(super) fn open_spell_languages(&mut self) -> Task<Message> {
@@ -239,14 +303,14 @@ impl SimpleEditApp {
         self.config.save();
         self.spell.speller = None;
         self.spell.generation += 1;
-        self.refresh_spelling();
+        let check = self.refresh_spelling();
         let language = if self.spell.language.is_empty() {
             self.config.spell_language.clone()
         } else {
             self.spell.language.clone()
         };
         self.set_status(t!("spell.language_set", code = language.as_str()), false);
-        Task::none()
+        check
     }
 
     /// The underlines of the misspelled words, for the editor to draw.
@@ -411,7 +475,7 @@ mod tests {
             stamp: DiskStamp::of(&file),
         })));
         std::mem::forget(dir);
-        app.refresh_spelling();
+        let _ = app.refresh_spelling();
         app
     }
 
@@ -426,11 +490,35 @@ mod tests {
         let _ = app.update(Message::EditorAction(text_editor::Action::Edit(
             text_editor::Edit::Paste(std::sync::Arc::new("world".into())),
         )));
-        app.refresh_spelling();
+        let _ = app.refresh_spelling();
         assert_eq!(app.spell.marks, vec![(1, 9, 13)]);
         // Off: nothing is marked.
         app.config.spell_check = false;
-        app.refresh_spelling();
+        let _ = app.refresh_spelling();
+        assert!(app.spell.marks.is_empty());
+    }
+
+    #[test]
+    fn a_big_file_is_checked_once_the_typing_pauses_and_only_for_its_text() {
+        let text = "hello wrold\n".to_string() + &"the nice world\n".repeat(SYNC_LINES);
+        let mut app = app_with(&text, "txt");
+        // Opened: checked at once.
+        assert_eq!(app.spell.marks, vec![(0, 6, 11)]);
+        // Typed in: the marks of before stay until the check, made later.
+        app.editor.content.select_bytes(0, 6, 5);
+        let _ = app.update(Message::EditorAction(text_editor::Action::Edit(
+            text_editor::Edit::Paste(std::sync::Arc::new("world".into())),
+        )));
+        let _ = app.refresh_spelling();
+        assert_eq!(app.spell.marks, vec![(0, 6, 11)]);
+        let key = app.spell.key.clone().unwrap();
+        // An answer for a text that is no more is dropped.
+        let old = (key.0.clone(), key.1 - 1, key.2);
+        let _ = app.update(Message::SpellChecked(Some((old, vec![]))));
+        assert_eq!(app.spell.marks, vec![(0, 6, 11)]);
+        let text = crate::editor::buffer_text(&app.editor.content);
+        let marks = spell_marks(app.spell.speller.as_ref().unwrap(), &text, "txt");
+        let _ = app.update(Message::SpellChecked(Some((key, marks))));
         assert!(app.spell.marks.is_empty());
     }
 
@@ -480,7 +568,7 @@ mod tests {
         app.spell.available = Some(Vec::new());
         app.spell.speller = None;
         app.spell.generation += 1;
-        app.refresh_spelling();
+        let _ = app.refresh_spelling();
         assert!(app.spell.marks.is_empty());
         let _ = app.update(Message::OpenSpellLanguages);
         assert!(app.status_is_error);

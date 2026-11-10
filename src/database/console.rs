@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use chrono::Local;
 use iced::widget::text_editor;
 
-use super::protocol::Executed;
+use super::protocol::{sql_tokens, Dialect, Executed, TokenKind};
 
 /// Most entries kept in the log.
 const MAX_LOG: usize = 1000;
@@ -62,6 +62,8 @@ pub struct Console {
     pub editor: text_editor::Content,
     /// The connection the queries run on.
     pub connection: Option<u64>,
+    /// The SQL of that connection: how the text is cut into statements.
+    pub dialect: super::protocol::Dialect,
     /// The database of the server they run in (the connection's own when empty).
     pub database: String,
     /// A transaction is open on the session of the console.
@@ -298,6 +300,7 @@ impl Console {
             log: Vec::new(),
             editor: text_editor::Content::with_text(&text),
             connection: None,
+            dialect: super::protocol::Dialect::default(),
             database: String::new(),
             in_transaction: false,
             running: false,
@@ -359,7 +362,7 @@ impl Console {
     pub fn statements(&self, all: bool) -> Vec<String> {
         let text = self.editor.text();
         let texts = |from: &str| -> Vec<String> {
-            split_statements(from)
+            split_statements(from, self.dialect)
                 .into_iter()
                 .map(|span| from[span.start..span.end].to_string())
                 .collect()
@@ -372,7 +375,7 @@ impl Console {
         }
         let cursor = self.editor.cursor().position;
         let caret = caret_offset(&text, cursor.line, cursor.column);
-        statement_at(&text, caret)
+        statement_at(&text, caret, self.dialect)
             .map(|span| vec![text[span.start..span.end].to_string()])
             .unwrap_or_default()
     }
@@ -391,7 +394,7 @@ impl Console {
         }
         let text = self.editor.text();
         let at = self.editor.cursor().position;
-        let span = statement_at(&text, caret_offset(&text, at.line, at.column))?;
+        let span = statement_at(&text, caret_offset(&text, at.line, at.column), self.dialect)?;
         let lines = |offset: usize| text[..offset].matches('\n').count();
         Some((lines(span.start), lines(span.end)))
     }
@@ -411,89 +414,132 @@ pub struct Span {
 /// Cuts a text into statements at the `;` that are not in a string, a quoted
 /// name, a `$$` block or a comment. Blank statements, and the ones that are
 /// only comments, are left out.
-pub fn split_statements(text: &str) -> Vec<Span> {
-    let bytes = text.as_bytes();
+pub fn split_statements(text: &str, dialect: Dialect) -> Vec<Span> {
+    // `DELIMITER //` lines (a command of the mysql client, in every dump of
+    // routines) change what ends a statement.
+    if dialect == Dialect::Mysql && text.lines().any(|l| is_delimiter_line(l).is_some()) {
+        return split_with_delimiters(text, dialect);
+    }
+    split_at_semicolons(text, 0, text.len(), dialect)
+}
+
+/// The new delimiter a `DELIMITER xx` line sets.
+fn is_delimiter_line(line: &str) -> Option<String> {
+    let line = line.trim();
+    let word = line.get(.."DELIMITER".len())?;
+    if !word.eq_ignore_ascii_case("DELIMITER") {
+        return None;
+    }
+    let rest = line["DELIMITER".len()..].trim();
+    (line.len() == "DELIMITER".len() || line[word.len()..].starts_with(char::is_whitespace)).then(
+        || {
+            if rest.is_empty() {
+                ";".into()
+            } else {
+                rest.to_string()
+            }
+        },
+    )
+}
+
+fn split_with_delimiters(text: &str, dialect: Dialect) -> Vec<Span> {
     let mut spans = Vec::new();
-    let mut start = 0;
-    let mut i = 0;
-    // What the text is in at `i`.
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\'' | b'"' => {
-                let quote = bytes[i];
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == quote {
-                        // A doubled quote is a quote in the text.
-                        if bytes.get(i + 1) == Some(&quote) {
-                            i += 2;
-                            continue;
-                        }
-                        break;
-                    }
-                    i += 1;
-                }
-                i += 1;
-            }
-            b'-' if bytes.get(i + 1) == Some(&b'-') => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                // They nest in PostgreSQL.
-                let mut depth = 1;
-                i += 2;
-                while i < bytes.len() && depth > 0 {
-                    if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
-                        depth += 1;
-                        i += 2;
-                    } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
-                        depth -= 1;
-                        i += 2;
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-            b'$' => {
-                // `$$` or `$tag$`, up to the same again.
-                let tag_end = text[i + 1..].find('$').filter(|n| {
-                    text[i + 1..i + 1 + n]
-                        .chars()
-                        .all(|c| c.is_alphanumeric() || c == '_')
-                });
-                match tag_end {
-                    Some(n) => {
-                        let tag = &text[i..i + n + 2];
-                        i += n + 2;
-                        match text[i..].find(tag) {
-                            Some(close) => i += close + tag.len(),
-                            None => i = bytes.len(),
-                        }
-                    }
-                    None => i += 1,
-                }
-            }
-            b';' => {
-                push_span(text, start, i, i + 1, &mut spans);
-                i += 1;
-                start = i;
-            }
-            _ => i += 1,
+    let mut delimiter = ";".to_string();
+    let (mut seg_start, mut pos) = (0, 0);
+    let mut flush = |from: usize, to: usize, delimiter: &str| {
+        if delimiter == ";" {
+            spans.extend(split_at_semicolons(text, from, to, dialect));
+            return;
+        }
+        let mut start = from;
+        while let Some(at) = text[start..to].find(delimiter) {
+            let at = start + at;
+            push_span(text, start, at, at + delimiter.len(), dialect, &mut spans);
+            start = at + delimiter.len();
+        }
+        push_span(text, start, to, to, dialect, &mut spans);
+    };
+    for line in text.split_inclusive('\n') {
+        let line_start = pos;
+        pos += line.len();
+        if let Some(next) = is_delimiter_line(line) {
+            flush(seg_start, line_start, &delimiter);
+            delimiter = next;
+            seg_start = pos;
         }
     }
-    push_span(text, start, bytes.len(), bytes.len(), &mut spans);
+    flush(seg_start, text.len(), &delimiter);
+    spans
+}
+
+/// The statements of `text[from..to]`, cut at the `;` that are tokens of
+/// their own. A trigger, a procedure or a function keeps the `;` of its
+/// `BEGIN … END` body.
+fn split_at_semicolons(text: &str, from: usize, to: usize, dialect: Dialect) -> Vec<Span> {
+    let part = &text[from..to];
+    let mut spans = Vec::new();
+    let mut start = from;
+    let mut depth = 0usize;
+    let mut words: Vec<String> = Vec::new();
+    let tokens = sql_tokens(part, dialect);
+    for (n, token) in tokens.iter().enumerate() {
+        let (a, b) = (from + token.start, from + token.end);
+        match token.kind {
+            TokenKind::Punct if &text[a..b] == ";" && depth == 0 => {
+                push_span(text, start, a, b, dialect, &mut spans);
+                start = b;
+                words.clear();
+            }
+            TokenKind::Word if dialect != Dialect::Postgres => {
+                let word = text[a..b].to_uppercase();
+                let routine = words.first().is_some_and(|w| w == "CREATE")
+                    && words.iter().take(10).any(|w| {
+                        matches!(w.as_str(), "TRIGGER" | "PROCEDURE" | "FUNCTION" | "EVENT")
+                    });
+                let next = tokens
+                    .iter()
+                    .skip(n + 1)
+                    .find(|t| t.kind != TokenKind::Comment)
+                    .map(|t| part[t.start..t.end].to_uppercase());
+                match word.as_str() {
+                    "BEGIN" | "CASE" if routine => depth += 1,
+                    // `END IF`, `END LOOP`… close what was not counted.
+                    "END"
+                        if depth > 0
+                            && !matches!(
+                                next.as_deref(),
+                                Some("IF" | "LOOP" | "WHILE" | "REPEAT")
+                            ) =>
+                    {
+                        depth -= 1;
+                    }
+                    _ => {}
+                }
+                if words.len() < 16 {
+                    words.push(word);
+                }
+            }
+            _ => {}
+        }
+    }
+    push_span(text, start, to, to, dialect, &mut spans);
     spans
 }
 
 /// Adds the statement of `text[start..end]`, trimmed, if it says anything.
-fn push_span(text: &str, start: usize, end: usize, reach: usize, spans: &mut Vec<Span>) {
+fn push_span(
+    text: &str,
+    start: usize,
+    end: usize,
+    reach: usize,
+    dialect: Dialect,
+    spans: &mut Vec<Span>,
+) {
     let end = end.min(text.len());
     let slice = &text[start..end];
     let lead = slice.len() - slice.trim_start().len();
     let trimmed = slice.trim();
-    if trimmed.is_empty() || only_comments(trimmed) {
+    if trimmed.is_empty() || only_comments(trimmed, dialect) {
         return;
     }
     let from = start + lead;
@@ -505,26 +551,16 @@ fn push_span(text: &str, start: usize, end: usize, reach: usize, spans: &mut Vec
 }
 
 /// Whether a text has nothing in it but comments.
-fn only_comments(text: &str) -> bool {
-    let mut rest = text.trim_start();
-    loop {
-        if let Some(after) = rest.strip_prefix("--") {
-            rest = after.split_once('\n').map_or("", |(_, r)| r).trim_start();
-        } else if let Some(after) = rest.strip_prefix("/*") {
-            match after.find("*/") {
-                Some(close) => rest = after[close + 2..].trim_start(),
-                None => return true,
-            }
-        } else {
-            return rest.is_empty();
-        }
-    }
+fn only_comments(text: &str, dialect: Dialect) -> bool {
+    sql_tokens(text, dialect)
+        .iter()
+        .all(|t| t.kind == TokenKind::Comment)
 }
 
 /// The statement the caret is in; between two, the next one; after the last,
 /// the last.
-pub fn statement_at(text: &str, caret: usize) -> Option<Span> {
-    let spans = split_statements(text);
+pub fn statement_at(text: &str, caret: usize, dialect: Dialect) -> Option<Span> {
+    let spans = split_statements(text, dialect);
     spans
         .iter()
         .find(|s| caret <= s.reach && caret >= s.start)
@@ -554,7 +590,7 @@ mod tests {
     use super::*;
 
     fn statements(text: &str) -> Vec<&str> {
-        split_statements(text)
+        split_statements(text, Dialect::Postgres)
             .into_iter()
             .map(|s| &text[s.start..s.end])
             .collect()
@@ -613,7 +649,8 @@ mod tests {
     fn the_statement_at_the_caret_is_the_one_it_is_in() {
         let text = "SELECT 1;\nSELECT 2;\nSELECT 3";
         let at = |caret: usize| {
-            &text[statement_at(text, caret).unwrap().start..statement_at(text, caret).unwrap().end]
+            &text[statement_at(text, caret, Dialect::Postgres).unwrap().start
+                ..statement_at(text, caret, Dialect::Postgres).unwrap().end]
         };
         assert_eq!(at(0), "SELECT 1");
         assert_eq!(at(5), "SELECT 1");
@@ -622,16 +659,16 @@ mod tests {
         assert_eq!(at(10), "SELECT 2");
         assert_eq!(at(25), "SELECT 3");
         assert_eq!(at(text.len()), "SELECT 3");
-        assert!(statement_at("   ", 1).is_none());
+        assert!(statement_at("   ", 1, Dialect::Postgres).is_none());
     }
 
     #[test]
     fn between_two_statements_the_next_one_is_taken() {
         let text = "SELECT 1;\n\n\nSELECT 2;";
-        let span = statement_at(text, 11).unwrap();
+        let span = statement_at(text, 11, Dialect::Postgres).unwrap();
         assert_eq!(&text[span.start..span.end], "SELECT 2");
         // Past the last one, the last.
-        let span = statement_at("SELECT 1;\n\n", 11).unwrap();
+        let span = statement_at("SELECT 1;\n\n", 11, Dialect::Postgres).unwrap();
         assert_eq!(&"SELECT 1;\n\n"[span.start..span.end], "SELECT 1");
     }
 
@@ -877,5 +914,53 @@ mod tests {
         console.editor = text_editor::Content::with_text("SELECT 0");
         console.append_query("SELECT 1");
         assert_eq!(console.editor.text().trim_end(), "SELECT 0;\n\nSELECT 1;");
+    }
+}
+
+#[cfg(test)]
+mod dialect_split_tests {
+    use super::*;
+
+    fn pieces(text: &str, dialect: Dialect) -> Vec<&str> {
+        split_statements(text, dialect)
+            .into_iter()
+            .map(|s| &text[s.start..s.end])
+            .collect()
+    }
+
+    #[test]
+    fn a_mysql_dump_is_cut_where_mysql_cuts_it() {
+        let dump = "INSERT INTO t VALUES ('it\\'s; ok'); SELECT 1; # a; comment\nSELECT `a;b`";
+        assert_eq!(
+            pieces(dump, Dialect::Mysql),
+            vec![
+                "INSERT INTO t VALUES ('it\\'s; ok')",
+                "SELECT 1",
+                "# a; comment\nSELECT `a;b`"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_trigger_body_is_one_statement() {
+        let text = "CREATE TRIGGER x AFTER INSERT ON t BEGIN UPDATE u SET a = 1; DELETE FROM v; END; SELECT 2";
+        let all = pieces(text, Dialect::Sqlite);
+        assert_eq!(all.len(), 2, "{all:?}");
+        assert!(all[0].ends_with("END"));
+        // A transaction's BEGIN is not a block.
+        assert_eq!(pieces("BEGIN; SELECT 1; COMMIT", Dialect::Sqlite).len(), 3);
+    }
+
+    #[test]
+    fn mysql_delimiter_lines_change_what_ends_a_statement() {
+        let text = "DELIMITER //\nCREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END//\nDELIMITER ;\nSELECT 3;";
+        let all = pieces(text, Dialect::Mysql);
+        assert_eq!(
+            all,
+            vec![
+                "CREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END",
+                "SELECT 3"
+            ]
+        );
     }
 }

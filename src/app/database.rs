@@ -74,13 +74,16 @@ impl SimpleEditApp {
             }
             return self.db_ask_password(conn);
         };
+        let mut no = 0;
         if let Some(tab) = self.db_tabs.get_mut(&path) {
             tab.loading = true;
             tab.error = None;
+            tab.load_no += 1;
+            no = tab.load_no;
         }
         Task::perform(
             database::rows_with(live, params, table, query),
-            move |done| Message::Db(DbMsg::Rows(path.clone(), done)),
+            move |done| Message::Db(DbMsg::RowsFor(path.clone(), no, done)),
         )
     }
 
@@ -115,6 +118,11 @@ impl SimpleEditApp {
         self.db_counter += 1;
         let title = format!("{} {}", t!("db.result"), self.db_counter);
         let path = PathBuf::from(format!("db://{}/{title}", self.db_counter));
+        let dialect = self
+            .db
+            .connection(conn)
+            .map(|c| c.dialect)
+            .unwrap_or_default();
         let mut tab = TableTab::new(
             conn,
             self.db.console.database.clone(),
@@ -122,6 +130,7 @@ impl SimpleEditApp {
             String::new(),
             self.db.page_size,
         );
+        tab.dialect = dialect;
         tab.title = title;
         tab.query = Some(result.sql.clone());
         tab.paged = result.deferred;
@@ -205,30 +214,48 @@ impl SimpleEditApp {
             .selection()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| crate::editor::buffer_text(&self.editor.content));
-        let statements: Vec<String> = database::console::split_statements(&text)
-            .into_iter()
-            .map(|span| text[span.start..span.end].to_string())
-            .collect();
+        let statements: Vec<String> =
+            database::console::split_statements(&text, self.db.console.dialect)
+                .into_iter()
+                .map(|span| text[span.start..span.end].to_string())
+                .collect();
         // The result and the log are shown where the console shows them.
         self.db.console.open = true;
         self.db_run_statements(statements)
+    }
+
+    /// Why the console can't move to another connection or database now:
+    /// a query is running, or a transaction is open (its locks would stay).
+    fn db_console_busy(&self) -> Option<String> {
+        if self.db.console.running {
+            Some(t!("db.console_busy_running").to_string())
+        } else if self.db.console.in_transaction {
+            Some(t!("db.console_busy_transaction").to_string())
+        } else {
+            None
+        }
     }
 
     fn db_run_statements(&mut self, statements: Vec<String>) -> Task<Message> {
         if self.db.console.running {
             return Task::none();
         }
+        // Only on the connection chosen: never on another one in its place.
         let Some(conn) = self
             .db
             .console
             .connection
             .filter(|id| self.db.connection(*id).is_some())
-            .or_else(|| self.db.connections.first().map(|c| c.id))
         else {
-            self.db.console.last = Some((false, t!("db.console_no_connection").to_string()));
+            let message = if self.db.connections.is_empty() {
+                t!("db.console_no_connection")
+            } else {
+                t!("db.console_choose_connection")
+            };
+            self.db.console.last = Some((false, message.to_string()));
             return Task::none();
         };
-        self.db.console.connection = Some(conn);
+        self.db.use_console_connection(Some(conn));
         self.db.console.save();
         if statements.is_empty() {
             self.db.console.last = Some((false, t!("db.console_nothing").to_string()));
@@ -237,7 +264,7 @@ impl SimpleEditApp {
         let production = self.db.connection(conn).is_some_and(|c| c.production);
         let risk = statements
             .iter()
-            .find_map(|sql| database::protocol::risk_of(sql, production));
+            .find_map(|sql| database::protocol::risk_of(sql, production, self.db.console.dialect));
         if let Some(risk) = risk {
             self.db.console.last = None;
             self.db.console.guard = Some(database::console::Guard {
@@ -389,6 +416,7 @@ impl SimpleEditApp {
                     (r1, c1),
                     grid::CopyFormat::Tsv,
                     "",
+                    tab.dialect,
                 );
                 return Some(iced::clipboard::write(text));
             }
@@ -540,6 +568,11 @@ impl SimpleEditApp {
         let path = PathBuf::from(format!("db://{}/{}", self.db_counter, title));
         let key = (conn, database.clone(), schema.clone(), table.clone());
         let mut tab = TableTab::new(conn, database, schema, table, self.db.page_size);
+        tab.dialect = self
+            .db
+            .connection(conn)
+            .map(|c| c.dialect)
+            .unwrap_or_default();
         tab.structure = self.db.structures.get(&key).cloned();
         if let Some(filter) = filter {
             tab.filter_text = filter.clone();
@@ -558,6 +591,30 @@ impl SimpleEditApp {
 
     pub(super) fn db_message(&mut self, msg: DbMsg) -> Task<Message> {
         match msg {
+            DbMsg::Answer(window, inner) => {
+                let open = match &window {
+                    database::AnswerFor::Designer(c, s, t) => self
+                        .db
+                        .designer
+                        .as_ref()
+                        .is_some_and(|d| d.conn == *c && d.schema == *s && d.table == *t),
+                    database::AnswerFor::Health(c, d) => self
+                        .db
+                        .health
+                        .as_ref()
+                        .is_some_and(|h| h.conn == *c && h.database == *d),
+                    database::AnswerFor::Import(c, s, t) => self
+                        .db
+                        .import
+                        .as_ref()
+                        .is_some_and(|i| i.conn == *c && i.schema == *s && i.table == *t),
+                };
+                if open {
+                    self.db_message(*inner)
+                } else {
+                    Task::none()
+                }
+            }
             DbMsg::OpenDialog(id) => {
                 let driver_file = self.db.driver_path.clone();
                 self.db.dialog = Some(match id.and_then(|id| self.db.connection(id).cloned()) {
@@ -840,6 +897,17 @@ impl SimpleEditApp {
             DbMsg::OpenTable(conn, database, schema, table) => {
                 self.db_open_table(conn, database, schema, table)
             }
+            DbMsg::RowsFor(path, no, done) => {
+                // Answers can come in any order: only the last asked counts.
+                let current = self.db_tabs.get(&path).is_some_and(|t| t.load_no == no);
+                if current {
+                    return self.db_message(DbMsg::Rows(path, done));
+                }
+                match self.db_tabs.get(&path).map(|t| t.conn) {
+                    Some(conn) => self.db_log(conn, &done.executed),
+                    None => Task::none(),
+                }
+            }
             DbMsg::Rows(path, done) => {
                 let conn = self.db_tabs.get(&path).map(|t| t.conn);
                 let log = match conn {
@@ -848,6 +916,12 @@ impl SimpleEditApp {
                 };
                 if let Some(tab) = self.db_tabs.get_mut(&path) {
                     match done.result {
+                        // Typing began while the page was on its way: the
+                        // page would wipe it, so the edits win.
+                        Ok(_) if !tab.pending.is_empty() || tab.editing.is_some() => {
+                            tab.loading = false;
+                            tab.notice = Some(t!("db.page_kept_edits").to_string());
+                        }
                         Ok(page) => tab.set_page(page),
                         Err(error) => {
                             tab.loading = false;
@@ -1275,7 +1349,8 @@ impl SimpleEditApp {
                     self.bookmark_panel.open = false;
                     self.git.open = false;
                     if self.db.console.connection.is_none() {
-                        self.db.console.connection = self.db.connections.first().map(|c| c.id);
+                        let first = self.db.connections.first().map(|c| c.id);
+                        self.db.use_console_connection(first);
                     }
                     if self.db.driver == Driver::Unknown {
                         return self.db_probe_driver();
@@ -1294,15 +1369,27 @@ impl SimpleEditApp {
             }
             DbMsg::ConsoleConnection(id) => {
                 if self.db.console.connection != Some(id) {
+                    // The query running, or the transaction open, stays on
+                    // the session of the connection it started on.
+                    if let Some(why) = self.db_console_busy() {
+                        self.db.console.last = Some((false, why));
+                        return Task::none();
+                    }
                     // Another connection: its session, not this one's.
                     self.db.console.database.clear();
                     self.db.console.in_transaction = false;
                 }
-                self.db.console.connection = Some(id);
+                self.db.use_console_connection(Some(id));
                 Task::none()
             }
             DbMsg::ConsoleDatabase(name) => {
                 if self.db.console.database != name {
+                    // What runs answers for the database it started in.
+                    if self.db.console.running {
+                        let why = t!("db.console_busy_running").to_string();
+                        self.db.console.last = Some((false, why));
+                        return Task::none();
+                    }
                     // The session moves to another database: a transaction
                     // of the old one is rolled back.
                     self.db.console.database = name;
@@ -1325,14 +1412,21 @@ impl SimpleEditApp {
                     return Task::none();
                 }
                 // Only a statement that reads can be run to be measured.
-                if analyze && statements.iter().any(|s| !database::protocol::wrappable(s)) {
+                if analyze
+                    && statements
+                        .iter()
+                        .any(|s| !database::protocol::wrappable(s, self.db.console.dialect))
+                {
                     self.db.console.last = Some((false, t!("db.explain_not_read").to_string()));
                     return Task::none();
                 }
-                let prefix = if analyze {
-                    "EXPLAIN (ANALYZE, BUFFERS) "
-                } else {
-                    "EXPLAIN "
+                let dialect = self.db.console.dialect;
+                let prefix = match (dialect, analyze) {
+                    (database::protocol::Dialect::Postgres, true) => "EXPLAIN (ANALYZE, BUFFERS) ",
+                    (database::protocol::Dialect::Mysql, true) => "EXPLAIN ANALYZE ",
+                    // SQLite measures nothing: its plan is all there is.
+                    (database::protocol::Dialect::Sqlite, _) => "EXPLAIN QUERY PLAN ",
+                    (_, false) => "EXPLAIN ",
                 };
                 let statements = statements
                     .into_iter()
@@ -1443,6 +1537,16 @@ impl SimpleEditApp {
                 if self.db.confirm.as_ref().is_some_and(|c| !c.running) {
                     self.db.confirm = None;
                 }
+                Task::none()
+            }
+            // The designer writes PostgreSQL's DDL only.
+            DbMsg::OpenDesigner(conn, ..)
+                if self
+                    .db
+                    .connection(conn)
+                    .is_some_and(|c| c.dialect != database::protocol::Dialect::Postgres) =>
+            {
+                self.set_status(t!("db.designer_pg_only"), true);
                 Task::none()
             }
             DbMsg::OpenDesigner(conn, database, schema, table) => {
@@ -1628,7 +1732,9 @@ impl SimpleEditApp {
                         self.db.console.last = Some((false, error));
                     }
                     Ok(ran) => {
-                        self.db.console.in_transaction = ran.in_transaction;
+                        if self.db.console.connection == Some(conn) {
+                            self.db.console.in_transaction = ran.in_transaction;
+                        }
                         let ms: u64 = ran.results.iter().map(|r| r.ms).sum();
                         self.db.console.last = Some(match &ran.failed {
                             Some((index, error)) => (

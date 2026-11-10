@@ -4936,6 +4936,7 @@ dependencies = [
  "iced_test",
  "image",
  "keyring",
+ "libc",
  "muda",
  "mysql",
  "once_cell",

@@ -1319,6 +1319,58 @@ pub struct Caret {
     pub anchor: Option<(usize, usize)>,
 }
 
+/// The carets without the ones that overlap: two selections that share text
+/// (or two cursors on the same spot) become one, the first keeping its place
+/// (and so its direction). Selections that only touch stay apart.
+fn merge_carets(carets: Vec<Caret>) -> Vec<Caret> {
+    let mut kept: Vec<Caret> = Vec::with_capacity(carets.len());
+    for caret in carets {
+        let (s2, e2) = caret.span();
+        let hit = kept.iter().position(|k| {
+            let (s1, e1) = k.span();
+            (s1 < e2 && s2 < e1) || (s1 == s2 && e1 == e2)
+        });
+        let Some(i) = hit else {
+            kept.push(caret);
+            continue;
+        };
+        let (s1, e1) = kept[i].span();
+        let (start, end) = (s1.min(s2), e1.max(e2));
+        let backwards = kept[i].anchor.is_some_and(|a| a > kept[i].position);
+        kept[i] = if start == end {
+            Caret {
+                position: start,
+                anchor: None,
+            }
+        } else if backwards {
+            Caret {
+                position: start,
+                anchor: Some(end),
+            }
+        } else {
+            Caret {
+                position: end,
+                anchor: Some(start),
+            }
+        };
+    }
+    // A merge can make the result touch-overlap another kept caret.
+    if kept.len() > 1 {
+        let n = kept.len();
+        let again = (0..n).any(|i| {
+            (i + 1..n).any(|j| {
+                let (s1, e1) = kept[i].span();
+                let (s2, e2) = kept[j].span();
+                (s1 < e2 && s2 < e1) || (s1 == s2 && e1 == e2)
+            })
+        });
+        if again {
+            return merge_carets(kept);
+        }
+    }
+    kept
+}
+
 impl Caret {
     /// The ends of what it selects, in order (both at the cursor if nothing).
     pub fn span(&self) -> ((usize, usize), (usize, usize)) {
@@ -1337,7 +1389,21 @@ impl Internal {
         if self.editor.cursor().selection.is_some() {
             self.editor.perform(Action::Move(Motion::Left));
         }
-        let at = |(line, column)| Position { line, column };
+        // Stale positions (another cursor's edit moved the text) must never
+        // reach the editor: it would split a line out of bounds.
+        let at = |(line, column): (usize, usize)| {
+            let line = line.min(self.editor.line_count().saturating_sub(1));
+            let mut column = self
+                .editor
+                .line(line)
+                .map_or(0, |l| column.min(l.text.len()));
+            if let Some(l) = self.editor.line(line) {
+                while !l.text.is_char_boundary(column) {
+                    column -= 1;
+                }
+            }
+            Position { line, column }
+        };
         self.editor.move_to(Cursor {
             position: at(caret.position),
             selection: caret.anchor.map(at),
@@ -1655,7 +1721,9 @@ impl Content {
         let mut found: Vec<Caret> = Vec::new();
         let last = carets.iter().map(|c| c.span().1).max().unwrap_or((0, 0));
         // From the last cursor to the end, then from the start.
-        let order: Vec<usize> = (last.0..line_count).chain(0..last.0).collect();
+        // (the cursor's own line is walked again, up to the cursor).
+        let order: Vec<usize> = (last.0..line_count).chain(0..=last.0).collect();
+        let wrapped_line = order.len() - 1;
         'lines: for (n, &l) in order.iter().enumerate() {
             let Some(text) = self.line(l) else { continue };
             let mut from = if n == 0 { last.1 } else { 0 };
@@ -1663,6 +1731,9 @@ impl Content {
                 let start = (l, from + i);
                 let end = (l, from + i + needle.len());
                 from = end.1;
+                if n == wrapped_line && n != 0 && start.1 >= last.1 {
+                    break;
+                }
                 if carets.iter().any(|c| c.span().0 == start) {
                     continue;
                 }
@@ -1705,6 +1776,83 @@ impl Content {
             })
             .collect();
         (!pieces.is_empty()).then(|| pieces.join("\n"))
+    }
+
+    /// Each selection replaced by what `f` makes of its own text, and kept
+    /// selected; a cursor with nothing selected stays as it is.
+    pub fn map_selections(&mut self, f: impl Fn(&str) -> String) {
+        // One cursor: its selection may be a word or lines (a double or a
+        // triple click), whose ends only the editor knows.
+        if self.extra_carets().is_empty() {
+            if let Some(old) = self.selection() {
+                let new = f(&old);
+                if new != old {
+                    self.perform_one(Action::Edit(Edit::Paste(Arc::new(new))));
+                }
+            }
+            return;
+        }
+        let mut all = vec![self.0.borrow().main_caret()];
+        all.extend(self.extra_carets());
+        let all = merge_carets(all);
+        let starts = self.line_starts();
+        let offset = |p: (usize, usize)| starts[p.0.min(starts.len() - 1)] + p.1;
+        let mut order: Vec<usize> = (0..all.len()).collect();
+        order.sort_by_key(|&i| all[i].span().0);
+        // From the last to the first: an edit never moves the ones before,
+        // and moves the ones after by what it adds or takes away.
+        let mut done: Vec<(usize, usize, usize)> = Vec::with_capacity(all.len());
+        for &i in order.iter().rev() {
+            let caret = all[i];
+            let (a, b) = caret.span();
+            let (from, to) = (offset(a), offset(b));
+            if caret.anchor.is_none() || a == b {
+                done.push((i, from, to));
+                continue;
+            }
+            let old = self.text_between(a, b);
+            let new = f(&old);
+            if new == old {
+                done.push((i, from, to));
+                continue;
+            }
+            self.0.get_mut().set_caret(caret);
+            self.perform_one(Action::Edit(Edit::Paste(Arc::new(new.clone()))));
+            let delta = new.len() as isize - old.len() as isize;
+            for d in &mut done {
+                d.1 = (d.1 as isize + delta) as usize;
+                d.2 = (d.2 as isize + delta) as usize;
+            }
+            done.push((i, from, from + new.len()));
+        }
+        done.sort_by_key(|d| d.0);
+        let starts = self.line_starts();
+        let at = |offset: usize| {
+            let line = starts.partition_point(|s| *s <= offset).saturating_sub(1);
+            (line, offset - starts[line])
+        };
+        let carets: Vec<Caret> = done
+            .into_iter()
+            .map(|(i, from, to)| {
+                let (start, end) = (at(from), at(to));
+                let backwards = all[i].anchor.is_some_and(|a| a > all[i].position);
+                match (from == to, backwards) {
+                    (true, _) => Caret {
+                        position: start,
+                        anchor: None,
+                    },
+                    (false, true) => Caret {
+                        position: start,
+                        anchor: Some(end),
+                    },
+                    (false, false) => Caret {
+                        position: end,
+                        anchor: Some(start),
+                    },
+                }
+            })
+            .collect();
+        self.keep_carets(carets);
     }
 
     fn text_between(&self, a: (usize, usize), b: (usize, usize)) -> String {
@@ -1763,11 +1911,7 @@ impl Content {
     /// The first caret becomes the cursor, the others the extra ones (two on
     /// the same spot are one).
     fn keep_carets(&mut self, carets: Vec<Caret>) {
-        let mut seen = std::collections::HashSet::new();
-        let carets: Vec<Caret> = carets
-            .into_iter()
-            .filter(|c| seen.insert(c.position))
-            .collect();
+        let carets = merge_carets(carets);
         let internal = self.0.get_mut();
         if let Some((main, rest)) = carets.split_first() {
             internal.set_caret(*main);
@@ -1777,6 +1921,7 @@ impl Content {
     }
 
     fn multi_edit(&mut self, all: Vec<Caret>, edit: Edit, auto_indent: bool) {
+        let all = merge_carets(all);
         let starts = self.line_starts();
         let offset = |p: (usize, usize)| starts[p.0.min(starts.len() - 1)] + p.1;
         let start_of = |c: &Caret| offset(c.span().0);
@@ -4300,5 +4445,43 @@ mod column_tests {
         assert_eq!(content.cursor_count(), 2);
         content.perform(Action::Edit(Edit::Insert('-')));
         assert_eq!(content.text(), "a-bc\na-bc\n");
+    }
+}
+
+#[cfg(test)]
+mod multi_cursor_regressions {
+    use super::*;
+
+    fn type_char(content: &mut Content, c: char) {
+        content.perform(Action::Edit(Edit::Insert(c)));
+    }
+
+    #[test]
+    fn undo_after_typing_at_several_cursors_restores_the_text() {
+        let mut content = Content::with_text("a\nb\nc");
+        content.add_cursor(1, 0);
+        content.add_cursor(2, 0);
+        type_char(&mut content, 'x');
+        assert_eq!(content.text(), "xa\nxb\nxc\n");
+        crate::editor::set_buffer_text(&mut content, "a\nb\nc\n");
+        assert_eq!(content.text(), "a\nb\nc\n");
+    }
+
+    #[test]
+    fn overlapping_selections_never_touch_unselected_lines() {
+        let mut content = Content::with_text("a\nb\nc\nd\ne");
+        content.add_cursor(1, 0);
+        content.perform(Action::Select(Motion::Down));
+        content.perform(Action::Select(Motion::Down));
+        type_char(&mut content, 'x');
+        assert!(content.text().contains("d\ne"));
+    }
+
+    #[test]
+    fn select_all_occurrences_includes_the_cursor_line() {
+        let mut content = Content::with_text("foo(foo)");
+        content.select_bytes(0, 4, 3);
+        content.add_next_occurrence(true);
+        assert_eq!(content.cursor_count(), 2);
     }
 }

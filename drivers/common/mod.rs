@@ -216,7 +216,7 @@ fn clauses(
     tiebreak: &[String],
 ) -> Result<String, String> {
     let mut sql = String::new();
-    if protocol::has_semicolon(&request.filter) {
+    if protocol::has_semicolon(&request.filter, request.target.dialect) {
         return Err("the condition cannot hold a `;`".to_string());
     }
     if !request.filter.trim().is_empty() {
@@ -333,7 +333,7 @@ fn rows(engine: &mut dyn Engine, request: &Request) -> Result<Value, String> {
 /// The rows of a query, sorted, filtered and paged by wrapping it.
 fn result_rows(engine: &mut dyn Engine, request: &Request) -> Result<Value, String> {
     let sql = request.sql.trim().trim_end_matches(';').trim().to_string();
-    if !protocol::wrappable(&sql) {
+    if !protocol::wrappable(&sql, request.target.dialect) {
         return Err("this query cannot be paged".to_string());
     }
     let limit = request.limit.max(1) as usize;
@@ -504,6 +504,24 @@ fn apply(engine: &mut dyn Engine, request: &Request) -> Result<Value, String> {
 
 // ------------------------------------------------------------------ queries
 
+/// Whether one of the functions named may change something when it runs: in
+/// MySQL, a stored function of one's own (SQLite has none but the app's).
+/// When the server can't say, it may.
+fn may_write(engine: &mut dyn Engine, dialect: protocol::Dialect, names: &[String]) -> bool {
+    if dialect != protocol::Dialect::Mysql {
+        return false;
+    }
+    let list: Vec<String> = names.iter().map(|n| engine.literal(n)).collect();
+    let sql = format!(
+        "SELECT 1 FROM information_schema.ROUTINES \
+         WHERE ROUTINE_TYPE = 'FUNCTION' AND ROUTINE_NAME IN ({}) LIMIT 1",
+        list.join(", ")
+    );
+    engine
+        .fetch(&sql, 1)
+        .map_or(true, |(_, rows, _)| !rows.is_empty())
+}
+
 /// The statements of the console, one after the other in one session.
 fn query(engine: &mut dyn Engine, request: &Request) -> Result<Value, String> {
     let mut results: Vec<QueryResult> = Vec::new();
@@ -513,7 +531,7 @@ fn query(engine: &mut dyn Engine, request: &Request) -> Result<Value, String> {
         engine.begin()?;
     }
     for (index, sql) in request.statements.iter().enumerate() {
-        if request.target.read_only && !protocol::reads_only(sql) {
+        if request.target.read_only && !protocol::reads_only(sql, request.target.dialect) {
             let message = "this data source is read-only".to_string();
             record(sql, Instant::now(), None, Some(message.clone()));
             failed = Some(json!({ "index": index, "error": message }));
@@ -521,12 +539,19 @@ fn query(engine: &mut dyn Engine, request: &Request) -> Result<Value, String> {
         }
         let started = Instant::now();
         // Several commands in one text can't be described, only run.
-        let columns = if protocol::is_multiple(sql) {
+        let columns = if protocol::is_multiple(sql, request.target.dialect) {
             None
         } else {
             engine.columns_of(sql).unwrap_or(None)
         };
-        if let Some(columns) = columns.filter(|_| protocol::wrappable(sql)) {
+        let deferred = columns.is_some()
+            && protocol::deferrable(
+                &request.statements,
+                index,
+                request.target.dialect,
+                |names| may_write(engine, request.target.dialect, names),
+            );
+        if let Some(columns) = columns.filter(|_| deferred) {
             results.push(QueryResult {
                 sql: sql.clone(),
                 ms: 0,
@@ -543,7 +568,7 @@ fn query(engine: &mut dyn Engine, request: &Request) -> Result<Value, String> {
             .columns_of(sql)
             .ok()
             .flatten()
-            .filter(|_| !protocol::is_multiple(sql));
+            .filter(|_| !protocol::is_multiple(sql, request.target.dialect));
         let mut result = QueryResult {
             sql: sql.clone(),
             ms: 0,
@@ -625,7 +650,7 @@ fn export(engine: &mut dyn Engine, request: &Request) -> Result<Value, String> {
         )
     } else {
         let sql = request.sql.trim().trim_end_matches(';').trim().to_string();
-        if !protocol::wrappable(&sql) {
+        if !protocol::wrappable(&sql, request.target.dialect) {
             return Err("this query cannot be exported".to_string());
         }
         let names = engine.columns_of(&sql)?.unwrap_or_default();

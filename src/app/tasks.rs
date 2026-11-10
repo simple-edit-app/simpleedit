@@ -71,6 +71,15 @@ impl SimpleEditApp {
 
     /// Runs a task, the output of the last one replaced.
     pub(super) fn start_task(&mut self, task: TaskSpec) -> Task<Message> {
+        // A command written by the project runs once its folder is trusted.
+        if let Some(root) = task
+            .custom
+            .as_ref()
+            .filter(|r| !crate::trust::is_trusted(r))
+        {
+            self.overlay = ActiveOverlay::ConfirmTrust(root.clone());
+            return Task::none();
+        }
         self.tasks.run += 1;
         let run = self.tasks.run;
         self.tasks.lines.clear();
@@ -288,6 +297,7 @@ mod tests {
             name: "build".into(),
             command: "true".into(),
             dir: dir.to_path_buf(),
+            custom: None,
         }
     }
 

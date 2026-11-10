@@ -310,10 +310,23 @@ impl Panel {
             }
             ToolMsg::PushLoaded(result) => {
                 match result {
-                    Ok(dialog) => {
-                        self.dialog = Some(Dialog::Push(dialog));
-                        self.typing = true;
-                    }
+                    // The dialog is already open: only what the push would
+                    // send is taken from the answer, and only if it is for
+                    // the remote and branch that are typed now.
+                    Ok(loaded) => match &mut self.dialog {
+                        Some(Dialog::Push(current)) => {
+                            if current.spec.remote == loaded.spec.remote
+                                && current.spec.target == loaded.spec.target
+                                && current.spec.source == loaded.spec.source
+                            {
+                                current.commits = loaded.commits;
+                            }
+                        }
+                        _ => {
+                            self.dialog = Some(Dialog::Push(loaded));
+                            self.typing = true;
+                        }
+                    },
                     Err(e) => self.notice = Some((e, true)),
                 }
                 Task::none()

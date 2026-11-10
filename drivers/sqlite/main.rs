@@ -752,13 +752,25 @@ mod tests {
         .unwrap();
         let results = answer["results"].as_array().unwrap();
         assert_eq!(results.len(), 3);
-        assert_eq!(results[0]["deferred"], true, "a reading is left to the tab");
+        // Writes come after it: read at once, as the rows were before them.
+        assert_eq!(results[0]["deferred"], false);
+        assert!(!results[0]["rows"].as_array().unwrap().is_empty());
         assert_eq!(results[2]["affected"], 2);
         assert_eq!(answer["failed"]["index"], 3);
         assert!(answer["failed"]["error"]
             .as_str()
             .unwrap()
             .contains("syntax"));
+        // Nothing written after it: a reading is left to the tab.
+        let answer = call(
+            &path,
+            json!({"op": "query", "statements": [
+                "UPDATE customers SET note = 'm' WHERE id < 2",
+                "SELECT id FROM customers",
+            ]}),
+        )
+        .unwrap();
+        assert_eq!(answer["results"][1]["deferred"], true);
         // All or none.
         let answer = call(
             &path,

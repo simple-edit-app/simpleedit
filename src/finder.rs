@@ -261,6 +261,17 @@ pub struct TextHit {
     /// The line, trimmed, with where the match is in it.
     pub preview: String,
     pub preview_at: (usize, usize),
+    /// A fingerprint of the text the match was found in (`text_stamp`; 0
+    /// when not known): its place says nothing once the text has changed.
+    pub stamp: u64,
+}
+
+/// The fingerprint of a text, never 0.
+pub fn text_stamp(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish().max(1)
 }
 
 /// Most places listed.
@@ -277,12 +288,33 @@ pub fn find_occurrences(
     options: &crate::find_replace::Options,
     replace: Option<&crate::find_replace::Replace>,
 ) -> Result<Vec<(TextHit, Option<String>)>, String> {
+    find_occurrences_until(
+        files,
+        open,
+        options,
+        replace,
+        &std::sync::atomic::AtomicBool::new(false),
+    )
+}
+
+/// The same, given up (with what was found so far) once `cancel` is set: a
+/// search for what was typed before is of no use.
+pub fn find_occurrences_until(
+    files: &[PathBuf],
+    open: &std::collections::HashMap<PathBuf, String>,
+    options: &crate::find_replace::Options,
+    replace: Option<&crate::find_replace::Replace>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<(TextHit, Option<String>)>, String> {
     if options.query.is_empty() {
         return Ok(Vec::new());
     }
     let re = crate::find_replace::compile(options)?;
     let mut hits = Vec::new();
     for path in files {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(hits);
+        }
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -313,9 +345,11 @@ pub fn find_occurrences(
             .extension()
             .map(|e| e.to_string_lossy().to_ascii_lowercase())
             .unwrap_or_default();
+        let mut stamp = None;
         for found in
             crate::find_replace::find_in(text, &ext, &re, options.context, options.regex, replace)
         {
+            let stamp = *stamp.get_or_insert_with(|| text_stamp(text));
             let line_start = found.start - found.col;
             let line_end = text[line_start..]
                 .find('\n')
@@ -333,6 +367,7 @@ pub fn find_occurrences(
                     len: found.end - found.start,
                     preview,
                     preview_at: at,
+                    stamp,
                 },
                 found.replacement,
             ));
@@ -376,6 +411,7 @@ pub fn search(
             continue;
         }
         let text = String::from_utf8_lossy(&bytes);
+        let mut stamp = None;
         for (n, line) in text.lines().enumerate() {
             for m in re.find_iter(line) {
                 if m.start() == m.end() {
@@ -392,6 +428,7 @@ pub fn search(
                     len: m.len(),
                     preview,
                     preview_at: at,
+                    stamp: *stamp.get_or_insert_with(|| text_stamp(&text)),
                 });
                 if hits.len() >= MAX_HITS {
                     return Ok(hits);
@@ -424,6 +461,37 @@ fn excerpt(line: &str, start: usize, len: usize) -> (String, (usize, usize)) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_search_that_was_cancelled_stops_before_the_next_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "needle\n").unwrap();
+        let options = crate::find_replace::Options {
+            query: "needle".into(),
+            ..Default::default()
+        };
+        let stop = std::sync::atomic::AtomicBool::new(true);
+        let found = super::find_occurrences_until(
+            std::slice::from_ref(&file),
+            &Default::default(),
+            &options,
+            None,
+            &stop,
+        )
+        .unwrap();
+        assert!(found.is_empty());
+        stop.store(false, std::sync::atomic::Ordering::Relaxed);
+        let found = super::find_occurrences_until(
+            std::slice::from_ref(&file),
+            &Default::default(),
+            &options,
+            None,
+            &stop,
+        )
+        .unwrap();
+        assert_eq!(found.len(), 1);
+    }
+
     use super::*;
 
     /// The best `limit` of `paths` for `query`, best first.

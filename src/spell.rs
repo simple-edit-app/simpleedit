@@ -89,8 +89,11 @@ pub fn pick_language<'a>(
     })
 }
 
+/// Cheap to clone (the dictionary is shared): a copy checks a text in the
+/// background.
+#[derive(Clone)]
 pub struct Speller {
-    dictionary: spellbook::Dictionary,
+    dictionary: std::sync::Arc<spellbook::Dictionary>,
     /// Words the user added, in lower case.
     personal: HashSet<String>,
     /// Words left alone until the app closes.
@@ -101,7 +104,7 @@ impl Speller {
     pub fn from_text(aff: &str, dic: &str) -> Result<Speller, String> {
         let dictionary = spellbook::Dictionary::new(aff, dic).map_err(|e| e.to_string())?;
         Ok(Speller {
-            dictionary,
+            dictionary: std::sync::Arc::new(dictionary),
             personal: HashSet::new(),
             ignored: HashSet::new(),
         })
@@ -256,7 +259,17 @@ pub fn misspelled(speller: &Speller, text: &str, ext: &str) -> Vec<(usize, usize
             return Vec::new();
         }
     }
-    let inside = |at: usize, list: &[(usize, usize)]| list.iter().any(|(s, e)| at >= *s && at < *e);
+    // The parts are in order and apart: the one a word could be in is found
+    // by halves, not by going through them all for each word.
+    let sorted = |mut list: Vec<(usize, usize)>| {
+        list.sort_unstable();
+        list
+    };
+    let (skip, only) = (sorted(skip), only.map(sorted));
+    let inside = |at: usize, list: &[(usize, usize)]| {
+        let i = list.partition_point(|(s, _)| *s <= at);
+        i > 0 && at < list[i - 1].1
+    };
     words(text)
         .into_iter()
         .filter(|(at, _)| only.as_ref().is_none_or(|o| inside(*at, o)))

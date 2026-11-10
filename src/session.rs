@@ -85,6 +85,18 @@ pub struct Session {
     pub files: Vec<FileSession>,
     pub active_file: Option<String>,
     pub untitled_counter: u32,
+    /// The API requests with changes not kept (without their credentials).
+    #[serde(default)]
+    pub api_tabs: Vec<ApiSession>,
+}
+
+/// A request of an API tab that was changed and not kept.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiSession {
+    pub request: crate::api::model::Request,
+    /// The request as it was last kept.
+    pub kept: crate::api::model::Request,
+    pub origin: Option<(u64, u64)>,
 }
 
 /// What reading the session file gave.
@@ -145,11 +157,35 @@ impl Session {
         }
         crate::fsutil::write_atomic(&path, json.as_bytes(), true)
     }
+
+    /// The same for a write that goes through a background task: one after
+    /// the other, and an older session never lands over a newer one.
+    pub fn write_numbered(json: &str, number: u64) -> std::io::Result<()> {
+        static LAST: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if !is_newer(*last, number) {
+            return Ok(());
+        }
+        Self::write(json)?;
+        *last = number;
+        Ok(())
+    }
+}
+
+/// Whether the write numbered `number` may land after the one numbered `last`.
+fn is_newer(last: u64, number: u64) -> bool {
+    number >= last
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_older_session_write_never_lands_over_a_newer_one() {
+        assert!(is_newer(3, 4) && is_newer(3, 3));
+        assert!(!is_newer(4, 3));
+    }
 
     fn entry(path: &Path) -> FileSession {
         let mut fs = FileSession {
@@ -176,6 +212,7 @@ mod tests {
             files: vec![fs],
             active_file: Some("/a/b.txt".into()),
             untitled_counter: 3,
+            api_tabs: vec![],
         };
         let back: Session = serde_json::from_str(&session.to_json().unwrap()).unwrap();
         assert_eq!(back.files[0].path(), PathBuf::from("/a/b.txt"));

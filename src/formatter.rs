@@ -87,11 +87,20 @@ pub async fn format(
     token: String,
     target: Option<std::path::PathBuf>,
 ) -> Result<String, String> {
+    // The tools read the configuration of the folder they run in, and some
+    // of it is code (`prettier.config.js`): in a folder not trusted they run
+    // elsewhere, under the file's name, with their own defaults.
     let dir = target
         .as_deref()
         .and_then(std::path::Path::parent)
         .filter(|d| d.is_dir())
-        .map(std::path::Path::to_path_buf);
+        .map(|d| {
+            if crate::trust::is_trusted(d) || crate::trust::untrusted_root(&d.join("x")).is_none() {
+                d.to_path_buf()
+            } else {
+                std::env::temp_dir()
+            }
+        });
     let stem = target
         .as_deref()
         .and_then(|p| p.file_stem())

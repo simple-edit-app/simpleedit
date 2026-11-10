@@ -37,6 +37,12 @@ fn command(repo: &Path, args: &[&str], env: &[(&str, &str)], stdin: bool) -> Com
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // Paths are names, not patterns: `app/[id]/page.tsx` is one file. (`git
+    // stash` builds pathspecs of its own, which this would break; its callers
+    // quote their paths with `:(literal)`.)
+    if args.first() != Some(&"stash") {
+        command.env("GIT_LITERAL_PATHSPECS", "1");
+    }
     command
 }
 
@@ -895,7 +901,8 @@ pub async fn stash_file(repo: &Path, path: &str, message: &str) -> Result<(), St
     if !message.trim().is_empty() {
         args.extend(["-m", message]);
     }
-    args.extend(["--", path]);
+    let literal = format!(":(literal){path}");
+    args.extend(["--", literal.as_str()]);
     run(repo, &args).await.map(|_| ())
 }
 
@@ -1668,6 +1675,27 @@ mod tests {
         let status = block(status(repo.path(), true)).unwrap();
         assert_eq!(status.staged.len(), 1);
         assert_eq!(status.unstaged.len(), 1);
+    }
+
+    #[test]
+    fn a_path_with_brackets_is_one_file_not_a_pattern() {
+        let repo = Repo::new();
+        repo.write("app/[id]/page.tsx", "one\n");
+        repo.write("app/i/page.tsx", "one\n");
+        repo.commit_all("first");
+        repo.write("app/[id]/page.tsx", "two\n");
+        repo.write("app/i/page.tsx", "two\n");
+        let status = block(status(repo.path(), true)).unwrap();
+        let change = status
+            .unstaged
+            .iter()
+            .find(|c| c.path.contains('['))
+            .unwrap()
+            .clone();
+        block(rollback(repo.path(), &change, false)).unwrap();
+        let text = |p: &str| std::fs::read_to_string(repo.path().join(p)).unwrap();
+        assert_eq!(text("app/[id]/page.tsx"), "one\n");
+        assert_eq!(text("app/i/page.tsx"), "two\n");
     }
 
     #[test]

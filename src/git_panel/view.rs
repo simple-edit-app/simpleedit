@@ -155,9 +155,16 @@ impl Panel {
                 text(t!("git.no_repo").to_string())
                     .size(13)
                     .color(se_theme::muted_text(dark)),
+                // The folder the repository would be made in, said on the
+                // button; none (the home folder): nothing to make.
                 plain_button(
-                    t!("git.init").to_string(),
-                    (!self.busy).then_some(Message::Git(GitMsg::Init)),
+                    match &self.init_dir {
+                        Some(dir) =>
+                            t!("git.init_in", dir = crate::app::display_path(dir).as_str())
+                                .to_string(),
+                        None => t!("git.init").to_string(),
+                    },
+                    (!self.busy && self.init_dir.is_some()).then_some(Message::Git(GitMsg::Init)),
                     true,
                     dark,
                 ),

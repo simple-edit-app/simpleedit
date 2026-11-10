@@ -73,6 +73,8 @@ keyring = { version = "3", default-features = false, features = ["apple-native"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["sync-secret-service", "crypto-rust", "vendored"] }
+# The SSH tunnel of the drivers dies with its driver (`PR_SET_PDEATHSIG`).
+libc = "0.2"
 
 [dev-dependencies]
 # Checks that every file icon is a glyph of the bundled Nerd Font.

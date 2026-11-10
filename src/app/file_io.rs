@@ -4,8 +4,7 @@ use super::*;
 use crate::tabs::Encoding;
 
 /// Reads a text file, refusing ones too large to edit comfortably, devices
-/// and pipes (which have no length and may never end), and anything that
-/// isn't UTF-8.
+/// and pipes (which have no length and may never end), and binary files.
 pub(super) fn read_text(path: &Path) -> Result<String, String> {
     read_decoded(path).map(|(text, _)| text)
 }
@@ -29,7 +28,18 @@ pub(super) fn read_decoded(path: &Path) -> Result<(String, Encoding), String> {
     if bytes.len() as u64 > MAX_OPEN_BYTES {
         return Err(t!("status.err_too_large", mb = MAX_OPEN_BYTES / (1024 * 1024)).to_string());
     }
+    if is_binary(&bytes) {
+        return Err(t!("status.err_binary").to_string());
+    }
     Ok(Encoding::detect(&bytes))
+}
+
+/// Whether bytes are those of a binary file (an image, an archive…): a NUL in
+/// the first 8 KiB, which text never holds, except UTF-16 with its byte
+/// order mark. Opened as text, the first save would change its bytes.
+pub(super) fn is_binary(bytes: &[u8]) -> bool {
+    let utf16 = bytes.starts_with(&[0xff, 0xfe]) || bytes.starts_with(&[0xfe, 0xff]);
+    !utf16 && bytes[..bytes.len().min(8192)].contains(&0)
 }
 
 /// Part of a file too large to open whole: the lines from about `from` to

@@ -325,10 +325,12 @@ pub fn parse(command: &str) -> Result<Request, String> {
         .find(|h| h.key.eq_ignore_ascii_case("content-type"))
         .map(|h| h.value.to_lowercase())
         .unwrap_or_default();
-    if let Some(path) = file_body {
+    if file_body.is_some() {
+        // A command from elsewhere does not get to pick a file of this
+        // machine to send: the file is chosen again, by hand.
         request.body = Body {
             kind: BodyKind::File,
-            file: path,
+            file: String::new(),
             ..Body::default()
         };
     } else if !urlencoded.is_empty()
@@ -533,7 +535,8 @@ mod tests {
         let r = parse("curl https://x --data-binary @/tmp/p.bin").unwrap();
         assert_eq!(
             (r.body.kind, r.body.file.as_str()),
-            (BodyKind::File, "/tmp/p.bin")
+            (BodyKind::File, ""),
+            "the path of an imported command is not kept"
         );
         // The JSON is told by what it is, without a header.
         let r = parse("curl https://x -d '[1,2]'").unwrap();
