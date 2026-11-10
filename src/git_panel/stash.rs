@@ -15,6 +15,10 @@ pub struct State {
     pub viewer: Viewer,
     /// The message of the next stash.
     pub message: String,
+    /// Keep the staged changes in the index when stashing.
+    pub keep_index: bool,
+    /// The name of the branch to create from a stash.
+    pub branch: String,
 }
 
 impl State {
@@ -127,8 +131,17 @@ impl Panel {
 
     pub(super) fn stash_push(&mut self) -> Task<Message> {
         let message = std::mem::take(&mut self.stash.message);
+        let keep_index = self.stash.keep_index;
         self.act(move |repo| async move {
-            history::stash_push(&repo, &message).await?;
+            history::stash_push(&repo, &message, keep_index).await?;
+            Ok(String::new())
+        })
+    }
+
+    pub(super) fn stash_to_branch(&mut self, index: usize) -> Task<Message> {
+        let name = std::mem::take(&mut self.stash.branch);
+        self.act(move |repo| async move {
+            history::stash_branch(&repo, &name, index).await?;
             Ok(String::new())
         })
     }

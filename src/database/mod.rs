@@ -45,6 +45,9 @@ pub const PAGE_SIZES: [u64; 6] = [50, 100, 200, 500, 1000, 5000];
 
 /// Longest wait for the driver to answer (a tunnel takes a while to come up).
 const CALL_TIMEOUT: Duration = Duration::from_secs(45);
+/// What a table page, an edit or an export may take when the connection sets
+/// no query timeout: nothing waits for ever (the browse session is shared).
+const BROWSE_TIMEOUT: Duration = Duration::from_secs(600);
 /// The driver is a few megabytes.
 const MAX_DRIVER: usize = 64 * 1024 * 1024;
 /// The most the app reads of one answer of a driver: a page of huge values
@@ -107,6 +110,12 @@ pub enum DbMsg {
     Rows(PathBuf, Done<Page>),
     /// The same, for the loading numbered so (an older answer is dropped).
     RowsFor(PathBuf, u64, Done<Page>),
+    /// Text from the clipboard, tab-separated, pasted from the selected cell.
+    Paste(PathBuf, Option<String>),
+    /// Counts the rows of a table tab under its filter.
+    Count(PathBuf),
+    /// The count asked for under this filter.
+    Counted(PathBuf, String, Done<u64>),
     /// Moves a table tab by this many pages.
     Turn(PathBuf, i64),
     Refresh(PathBuf),
@@ -1057,7 +1066,10 @@ fn wait_limit(request: &protocol::Request) -> Option<Duration> {
     // What reads or changes data waits as long as the connection allows (the
     // server stops it), the rest does not wait for long.
     match request.op.as_str() {
-        "query" | "rows" | "apply" | "export" | "import" | "dump" | "restore" => {
+        "rows" | "count" | "apply" | "export" if request.target.query_timeout == 0 => {
+            Some(BROWSE_TIMEOUT)
+        }
+        "query" | "rows" | "count" | "apply" | "export" | "import" | "dump" | "restore" => {
             match request.target.query_timeout {
                 0 => None,
                 seconds => Some(Duration::from_secs(seconds) + CALL_TIMEOUT),
@@ -1163,7 +1175,13 @@ async fn call_live(
         .await
         .ok_or_else(|| t!("db.err_driver_missing").to_string())?;
     let pid_cell = live.1.clone();
-    let mut guard = live.0.lock().await;
+    // Waiting for the session (a console that holds it) counts too.
+    let mut guard = match wait_limit(&request) {
+        Some(limit) => tokio::time::timeout(limit, live.0.lock())
+            .await
+            .map_err(|_| t!("db.err_timeout").to_string())?,
+        None => live.0.lock().await,
+    };
     let mut line = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
     line.push(b'\n');
     let work = async {
@@ -1342,6 +1360,24 @@ pub async fn rows_with(
             page.offset = offset;
             Ok(page)
         })
+}
+
+/// How many rows the table (or the query) has under the filter.
+pub async fn count(live: Option<Live>, params: Params, table: TableRef, query: Query) -> Done<u64> {
+    let mut request = table_request(&params, "count", &table);
+    request.filter = query.filter;
+    request.sql = query.sql.unwrap_or_default();
+    call_with(
+        live.or_else(|| params.browse.clone()),
+        params.driver.clone(),
+        request,
+    )
+    .await
+    .map(|answer| {
+        answer["total"]
+            .as_u64()
+            .ok_or_else(|| t!("db.err_driver_answer").to_string())
+    })
 }
 
 /// Makes the changes in the table, all or none; how many rows were touched.
@@ -1906,6 +1942,8 @@ pub struct TableTab {
     pub paged: bool,
     /// The widths the user gave to columns, by name: kept when a page comes.
     pub custom_widths: HashMap<String, f32>,
+    /// The number of rows under a filter (counted when asked for).
+    pub total: Option<(String, u64)>,
     /// What the table is made of, once read: for the links of its rows.
     pub structure: Option<protocol::Structure>,
     /// The tab shows a query of the console: its rows are asked for in the
@@ -1957,6 +1995,7 @@ impl TableTab {
             scroll: (0.0, 900.0),
             widths: Vec::new(),
             custom_widths: HashMap::new(),
+            total: None,
             structure: None,
             filter_text: String::new(),
             filter: String::new(),
@@ -2767,6 +2806,28 @@ impl State {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn table_pages_and_edits_never_wait_for_ever() {
+        for op in ["rows", "count", "apply", "export"] {
+            let mut request = protocol::Request {
+                op: op.to_string(),
+                ..Default::default()
+            };
+            assert_eq!(wait_limit(&request), Some(BROWSE_TIMEOUT), "{op}");
+            request.target.query_timeout = 10;
+            assert_eq!(
+                wait_limit(&request),
+                Some(Duration::from_secs(10) + CALL_TIMEOUT)
+            );
+        }
+        // The console's statements wait as long as the user lets them.
+        let query = protocol::Request {
+            op: "query".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(wait_limit(&query), None);
+    }
+
     use super::protocol::Column;
     use super::*;
 

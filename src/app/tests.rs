@@ -1175,6 +1175,47 @@ mod behavior_tests {
     }
 
     #[test]
+    fn enter_indents_after_a_bracket_and_splits_a_pair() {
+        let mut first = app();
+        type_text(&mut first, "if x {");
+        let _ = first.handle(Message::EditorAction(Action::Edit(Edit::Enter)));
+        type_text(&mut first, "y");
+        // The brace typed was closed on its own: the pair is split.
+        assert_eq!(text(&first), "if x {\n    y\n}\n");
+        let mut app = app();
+        app.editor.content = crate::code_editor::Content::with_text("f({})");
+        app.editor.content.select_bytes(0, 3, 0);
+        let _ = app.handle(Message::EditorAction(Action::Edit(Edit::Enter)));
+        type_text(&mut app, "a");
+        assert_eq!(text(&app), "f({\n    a\n})\n");
+    }
+
+    #[test]
+    fn reverting_throws_the_changes_away_and_stays_undoable() {
+        let mut app = app();
+        // A tab without a file has nothing to go back to.
+        let _ = app.handle(Message::RevertFile);
+        assert!(app.status_is_error);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "base\n").unwrap();
+        let _ = app.handle(Message::TabRead(Ok(Loaded {
+            path: file.clone(),
+            text: "base\n".into(),
+            format: TextFormat::default(),
+            stamp: DiskStamp::of(&file),
+        })));
+        type_text(&mut app, "edit");
+        let edited = text(&app);
+        assert!(app.is_dirty);
+        let _ = app.handle(Message::RevertFile);
+        assert_eq!(text(&app), "base\n");
+        assert!(!app.is_dirty);
+        let _ = app.handle(Message::Undo);
+        assert_eq!(text(&app), edited);
+    }
+
+    #[test]
     fn save_as_onto_a_tab_with_unsaved_work_is_refused() {
         let mut app = app();
         let other = PathBuf::from("/x/b.txt");
@@ -2287,6 +2328,55 @@ mod behavior_tests {
         let _ = app.update(Message::Db(DbMsg::RevertAll(path.clone())));
         let _ = app.update(Message::Db(DbMsg::Sort(path.clone(), 1)));
         assert_eq!(app.db_tabs[&path].order, vec![("label".to_string(), false)]);
+    }
+
+    #[test]
+    fn a_pasted_block_becomes_pending_edits_from_the_selected_cell() {
+        use crate::database::DbMsg;
+        let (mut app, path) = db_app(true);
+        app.db_tabs.get_mut(&path).unwrap().selected = Some((1, 1));
+        let _ = app.update(Message::Db(DbMsg::Paste(
+            path.clone(),
+            Some("a\t2024-01-02\nb\tc\n".into()),
+        )));
+        let tab = &app.db_tabs[&path];
+        assert_eq!(
+            tab.pending.value(tab.page.as_ref().unwrap(), 1, 1),
+            Some("a")
+        );
+        assert_eq!(
+            tab.pending.value(tab.page.as_ref().unwrap(), 1, 2),
+            Some("2024-01-02")
+        );
+        assert_eq!(
+            tab.pending.value(tab.page.as_ref().unwrap(), 2, 2),
+            Some("c")
+        );
+        assert_eq!(tab.pending.count(), 2);
+        // A table that cannot be edited takes nothing.
+        let (mut app, path) = db_app(false);
+        app.db_tabs.get_mut(&path).unwrap().selected = Some((0, 1));
+        let _ = app.update(Message::Db(DbMsg::Paste(path.clone(), Some("a".into()))));
+        assert!(app.db_tabs[&path].pending.is_empty());
+    }
+
+    #[test]
+    fn a_count_is_shown_only_for_the_filter_it_was_made_under() {
+        use crate::database::DbMsg;
+        let (mut app, path) = db_app(true);
+        let _ = app.update(Message::Db(DbMsg::Counted(
+            path.clone(),
+            String::new(),
+            Done::ok(42),
+        )));
+        assert_eq!(app.db_tabs[&path].total, Some((String::new(), 42)));
+        let _ = app.update(Message::Db(DbMsg::Counted(
+            path.clone(),
+            String::new(),
+            Done::err("boom"),
+        )));
+        assert_eq!(app.db_tabs[&path].total, Some((String::new(), 42)));
+        assert!(app.db_tabs[&path].notice.is_some());
     }
 
     #[test]

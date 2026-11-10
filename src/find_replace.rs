@@ -500,7 +500,8 @@ pub fn find_in(
     let mut found = Vec::new();
     for caps in re.captures_iter(text) {
         let m = caps.get(0).expect("the whole match");
-        if m.start() == m.end() {
+        // An empty match is only worth something to replace (`^` → `// `).
+        if m.start() == m.end() && !(regex && replace.is_some()) {
             continue;
         }
         if !context.keeps(region_at(&regions, m.start())) {
@@ -725,6 +726,24 @@ mod tests {
             text,
             &find_in(text, "txt", &re, Context::Anywhere, regex, Some(&replace)),
         )
+    }
+
+    #[test]
+    fn an_empty_match_can_be_replaced_with_a_regex() {
+        assert_eq!(replaced("a\nb", "^", "// ", true, false), "// a\n// b");
+        assert_eq!(replaced("a\nb", "$", ";", true, false), "a;\nb;");
+        // Not as a plain text, and not when only searching.
+        assert_eq!(replaced("a", "", "x", false, false), "a");
+        assert!(found_texts(
+            "a\nb",
+            "txt",
+            &Options {
+                query: "^".into(),
+                regex: true,
+                ..Options::default()
+            }
+        )
+        .is_empty());
     }
 
     #[test]

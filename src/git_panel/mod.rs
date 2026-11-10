@@ -914,6 +914,9 @@ pub enum GitMsg {
     StashPop(usize),
     StashDrop(usize),
     StashMessage(String),
+    StashKeepIndex(bool),
+    StashBranchName(String),
+    StashBranch(usize),
     StashPush,
     // Log
     RefsLoaded(PathBuf, Result<git::history::Refs, String>),
@@ -2041,6 +2044,16 @@ impl Panel {
                 self.stash.message = text;
                 Task::none()
             }
+            GitMsg::StashKeepIndex(on) => {
+                self.stash.keep_index = on;
+                Task::none()
+            }
+            GitMsg::StashBranchName(text) => {
+                self.typing = true;
+                self.stash.branch = text;
+                Task::none()
+            }
+            GitMsg::StashBranch(index) => self.stash_to_branch(index),
             GitMsg::StashPush => self.stash_push(),
             GitMsg::RefsLoaded(_, result) => self.refs_loaded(result),
             GitMsg::BranchClicked(name) => self.branch_clicked(name),

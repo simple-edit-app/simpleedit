@@ -29,6 +29,8 @@ pub struct Location {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     Line(String),
+    /// Lines that came together (the stream sends them in packets).
+    Lines(Vec<String>),
     /// The exit code (`None`: stopped by a signal, or never started).
     Done(Option<i32>),
 }
@@ -135,7 +137,18 @@ pub fn detect(root: &Path) -> Vec<TaskSpec> {
 /// The first place a line of output names that is a file: `path:12:5`,
 /// `path:12`, `path(12,5)` (TypeScript), `--> path:12:5` (Rust) or
 /// `File "path", line 12` (Python). Relative paths are from `dir`.
+#[cfg(test)]
 pub fn location(line: &str, dir: &Path) -> Option<Location> {
+    location_with(line, dir, &mut |p| p.is_file())
+}
+
+/// [`location`], asking `is_file` whether a path is a file (so that a caller
+/// reading many lines can remember the answers).
+pub fn location_with(
+    line: &str,
+    dir: &Path,
+    is_file: &mut dyn FnMut(&Path) -> bool,
+) -> Option<Location> {
     use std::sync::OnceLock;
     static PYTHON: OnceLock<regex::Regex> = OnceLock::new();
     static PLAIN: OnceLock<regex::Regex> = OnceLock::new();
@@ -151,14 +164,14 @@ pub fn location(line: &str, dir: &Path) -> Option<Location> {
         regex::Regex::new(r#"(/[^:()"'<>|]+\.[A-Za-z0-9_]+)(?::|\()(\d+)(?:[:,](\d+))?"#)
             .expect("a valid pattern")
     });
-    let resolve = |path: &str| {
+    let mut resolve = |path: &str| {
         let path = PathBuf::from(path);
         let full = if path.is_absolute() {
             path
         } else {
             dir.join(path)
         };
-        full.is_file().then_some(full)
+        is_file(&full).then_some(full)
     };
     if let Some(c) = python.captures(line) {
         if let Some(path) = resolve(&c[1]) {
@@ -282,8 +295,17 @@ pub fn run(task: TaskSpec) -> impl iced::futures::Stream<Item = Event> {
             forward(err, to.clone());
         }
         drop(to);
+        // What is already there goes in one packet: a verbose build would
+        // otherwise cost the window an update per line.
         while let Some(line) = from.recv().await {
-            if output.send(Event::Line(line)).await.is_err() {
+            let mut packet = vec![line];
+            while packet.len() < PACKET {
+                match from.try_recv() {
+                    Ok(line) => packet.push(line),
+                    Err(_) => break,
+                }
+            }
+            if output.send(Event::Lines(packet)).await.is_err() {
                 return;
             }
         }
@@ -294,6 +316,9 @@ pub fn run(task: TaskSpec) -> impl iced::futures::Stream<Item = Event> {
         let _ = output.send(Event::Done(code)).await;
     })
 }
+
+/// The most lines sent in one packet.
+const PACKET: usize = 200;
 
 /// How long a stopped task has to end on SIGTERM before SIGKILL.
 #[cfg(unix)]
@@ -463,6 +488,40 @@ mod tests {
         assert_eq!(strip_ansi("plain"), "plain");
     }
 
+    fn flat(events: &[Event]) -> Vec<String> {
+        events
+            .iter()
+            .flat_map(|e| match e {
+                Event::Line(l) => vec![l.clone()],
+                Event::Lines(l) => l.clone(),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_burst_of_lines_comes_in_packets() {
+        if cfg!(windows) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let events: Vec<Event> =
+            runtime.block_on(async { run(spec("t", "seq 1 1000", dir.path())).collect().await });
+        assert_eq!(flat(&events).len(), 1000);
+        let packets = events
+            .iter()
+            .filter(|e| matches!(e, Event::Lines(_)))
+            .count();
+        assert!(packets < 1000, "{packets} packets");
+        assert!(events
+            .iter()
+            .all(|e| !matches!(e, Event::Lines(l) if l.len() > PACKET)));
+    }
+
     #[test]
     fn a_run_streams_both_outputs_then_the_exit_code() {
         if cfg!(windows) {
@@ -478,13 +537,8 @@ mod tests {
                 .collect()
                 .await
         });
-        let lines: Vec<&str> = events
-            .iter()
-            .filter_map(|e| match e {
-                Event::Line(l) => Some(l.as_str()),
-                _ => None,
-            })
-            .collect();
+        let flat_lines = flat(&events);
+        let lines: Vec<&str> = flat_lines.iter().map(String::as_str).collect();
         assert!(
             lines.contains(&"out") && lines.contains(&"err"),
             "{lines:?}"
@@ -505,11 +559,9 @@ mod tests {
                 .collect()
                 .await
         });
-        assert!(
-            events.contains(&Event::Line("a\u{FFFD}b".into())),
-            "{events:?}"
-        );
-        assert!(events.contains(&Event::Line("after".into())));
+        let lines = flat(&events);
+        assert!(lines.contains(&"a\u{FFFD}b".to_string()), "{events:?}");
+        assert!(lines.contains(&"after".to_string()));
         assert_eq!(events.last(), Some(&Event::Done(Some(0))));
     }
 
@@ -525,7 +577,7 @@ mod tests {
         let pid: String = runtime.block_on(async {
             let mut events = Box::pin(run(spec("t", "sleep 30 & echo $!; wait", dir.path())));
             match events.next().await {
-                Some(Event::Line(line)) => line,
+                Some(Event::Lines(mut lines)) => lines.swap_remove(0),
                 other => panic!("{other:?}"),
             }
             // The stream dropped here is the Stop button.

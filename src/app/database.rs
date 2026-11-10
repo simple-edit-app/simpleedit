@@ -475,6 +475,12 @@ impl SimpleEditApp {
                 );
                 return Some(iced::clipboard::write(text));
             }
+            ("v", true, false) if picked && !shift && !console_typing && tab.editable() => {
+                return Some(
+                    iced::clipboard::read()
+                        .map(move |text| Message::Db(DbMsg::Paste(path.clone(), text))),
+                );
+            }
             ("c", true, false) if picked && !shift && !console_typing => {
                 let value = tab.pending.value(page, row, col)?.to_string();
                 return Some(iced::clipboard::write(value));
@@ -983,6 +989,48 @@ impl SimpleEditApp {
                             tab.loading = false;
                             tab.error = Some(error);
                         }
+                    }
+                }
+                log
+            }
+            DbMsg::Paste(path, text) => {
+                if let Some(tab) = self.db_tabs.get_mut(&path) {
+                    if let (Some(text), Some(page), Some(at)) = (
+                        text,
+                        tab.page.as_ref(),
+                        tab.block().map(|b| b.0).or(tab.selected),
+                    ) {
+                        if tab.editable() && tab.editing.is_none() {
+                            grid::paste_block(&mut tab.pending, page, at, &text);
+                        }
+                    }
+                }
+                Task::none()
+            }
+            DbMsg::Count(path) => {
+                let Some(tab) = self.db_tabs.get(&path) else {
+                    return Task::none();
+                };
+                let (conn, table, query) = (tab.conn, tab.table_ref(), tab.query(0));
+                let live = tab.live.then(|| self.db.live.get(&conn).cloned()).flatten();
+                let Some(params) = self.db_params(conn, false) else {
+                    return self.db_ask_password(conn);
+                };
+                let filter = query.filter.clone();
+                Task::perform(database::count(live, params, table, query), move |done| {
+                    Message::Db(DbMsg::Counted(path.clone(), filter.clone(), done))
+                })
+            }
+            DbMsg::Counted(path, filter, done) => {
+                let conn = self.db_tabs.get(&path).map(|t| t.conn);
+                let log = match conn {
+                    Some(conn) => self.db_log(conn, &done.executed),
+                    None => Task::none(),
+                };
+                if let Some(tab) = self.db_tabs.get_mut(&path) {
+                    match done.result {
+                        Ok(total) => tab.total = Some((filter, total)),
+                        Err(error) => tab.notice = Some(error),
                     }
                 }
                 log

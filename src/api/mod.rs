@@ -200,6 +200,32 @@ pub const MAX_SHOWN: usize = 2 * 1024 * 1024;
 /// The size up to which a body is parsed to be laid out.
 const MAX_PRETTY: usize = 8 * MAX_SHOWN;
 
+/// The longest line of the viewer: a longer one (a minified body) is shown
+/// on several, because laying out a line of megabytes freezes the interface.
+const MAX_LINE: usize = 8 * 1024;
+
+/// The text with its lines longer than `MAX_LINE` broken (for showing only).
+fn break_long_lines(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + text.len() / MAX_LINE + 1);
+    for (i, line) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let mut rest = line;
+        while rest.len() > MAX_LINE {
+            let mut at = MAX_LINE;
+            while !rest.is_char_boundary(at) {
+                at -= 1;
+            }
+            out.push_str(&rest[..at]);
+            out.push('\n');
+            rest = &rest[at..];
+        }
+        out.push_str(rest);
+    }
+    out
+}
+
 /// An answer with everything that costs time already worked out: made off
 /// the interface thread, then turned into a `ResponseView` there.
 #[derive(Debug, Clone)]
@@ -280,7 +306,7 @@ impl ResponseView {
         while !shown.is_char_boundary(end) {
             end -= 1;
         }
-        self.editor = text_editor::Content::with_text(&shown[..end]);
+        self.editor = text_editor::Content::with_text(&break_long_lines(&shown[..end]));
         *self.match_cache.borrow_mut() = None;
     }
 
@@ -354,6 +380,8 @@ pub struct State {
     pub environments: Vec<Environment>,
     pub active_env: Option<u64>,
     pub history: Vec<HistoryEntry>,
+    /// The names under which unreadable collection files were kept.
+    pub set_aside: Vec<String>,
     /// The next number for a collection, a folder, a request, an environment.
     pub next_id: u64,
     /// The collections and folders that are open in the panel.
@@ -382,6 +410,7 @@ impl State {
             environments: stored.environments,
             active_env: stored.active_env,
             history: stored.history,
+            set_aside: stored.set_aside,
             next_id: stored.next_id,
             open: HashSet::new(),
             filter: String::new(),
@@ -583,6 +612,15 @@ pub fn position_of(text: &str, offset: usize) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_very_long_line_is_broken_for_showing() {
+        let text = format!("{}\nshort\n{}", "é".repeat(MAX_LINE), "a".repeat(10));
+        let shown = break_long_lines(&text);
+        assert!(shown.lines().all(|l| l.len() <= MAX_LINE));
+        assert_eq!(shown.replace('\n', ""), text.replace('\n', ""));
+        assert_eq!(break_long_lines("a\nb"), "a\nb");
+    }
 
     #[test]
     fn the_next_match_is_found_from_a_place_then_from_the_start() {

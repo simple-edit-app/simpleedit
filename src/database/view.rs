@@ -1449,6 +1449,25 @@ pub fn table<'a>(path: &'a Path, tab: &'a TableTab, dark: bool) -> Element<'a, M
     .spacing(10)
     .padding([8, 12])
     .align_y(Alignment::Center);
+    // The number of rows under the filter: counted when asked for.
+    if shown.is_some() && !is_query {
+        let current = tab.where_clause();
+        match &tab.total {
+            Some((filter, total)) if *filter == current => {
+                bar = bar.push(
+                    text(t!("db.rows_total", n = total).to_string())
+                        .size(12)
+                        .color(p.muted),
+                );
+            }
+            _ => {}
+        }
+        bar = bar.push(nav(
+            "\u{03A3}",
+            t!("db.count_rows").to_string(),
+            Some(Message::Db(DbMsg::Count(owned()))),
+        ));
+    }
     // A table with no key is edited, its rows found by their place.
     if tab.editable() && shown.is_some_and(|page| page.primary_key.is_empty()) && !is_query {
         bar = bar.push(

@@ -199,6 +199,52 @@ pub async fn did_save(path: PathBuf, text: String) {
     }
 }
 
+/// Tells the servers that have `path` open that it was closed (`didClose`),
+/// so that they read it from the disk again and drop what they kept of it.
+/// Nothing is started for it.
+pub async fn did_close(path: PathBuf) {
+    let Some(servers) = SERVERS.get() else {
+        return;
+    };
+    let running: Vec<Arc<Server>> = servers
+        .lock()
+        .await
+        .values()
+        .filter_map(|cell| cell.get().cloned())
+        .filter(|s| s.alive.load(Ordering::SeqCst))
+        .collect();
+    let uri = path_to_uri(&path);
+    for server in running {
+        let _ = server.close(&uri).await;
+    }
+}
+
+/// How long a server may go unused before it is stopped (it starts again
+/// when next needed).
+const IDLE_STOP: Duration = Duration::from_secs(20 * 60);
+/// How often the servers are checked for being idle.
+const IDLE_CHECK: Duration = Duration::from_secs(60);
+
+/// Stops the servers nobody used for `limit` and that are not busy loading,
+/// and forgets them.
+async fn stop_idle(limit: Duration) {
+    let Some(servers) = SERVERS.get() else {
+        return;
+    };
+    servers.lock().await.retain(|_, cell| {
+        let Some(server) = cell.get() else {
+            return true;
+        };
+        let idle =
+            server.alive.load(Ordering::SeqCst) && !server.is_busy() && server.idle_for() >= limit;
+        if idle {
+            server.kill();
+        }
+        // A dead one is started again by `server_for`; dropping it frees it.
+        !idle && server.alive.load(Ordering::SeqCst)
+    });
+}
+
 /// How long the servers are given to answer `shutdown` when the program
 /// ends.
 const SHUTDOWN_WAIT: Duration = Duration::from_millis(700);
@@ -1620,6 +1666,8 @@ struct Server {
     next_id: AtomicI64,
     alive: AtomicBool,
     started: Instant,
+    /// When the program last wrote to the server.
+    last_used: StdMutex<Instant>,
     /// Tokens of the progress reports (indexing, …) that are running.
     progress: StdMutex<HashSet<String>>,
     /// Documents the server was told about: uri → (version, text).
@@ -1690,6 +1738,15 @@ impl Server {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let _ = RUNTIME.set(handle);
         }
+        static REAPER: std::sync::Once = std::sync::Once::new();
+        REAPER.call_once(|| {
+            tokio::spawn(async {
+                loop {
+                    tokio::time::sleep(IDLE_CHECK).await;
+                    stop_idle(IDLE_STOP).await;
+                }
+            });
+        });
         let mut child = Command::new(exe)
             .args(args)
             .current_dir(root)
@@ -1707,6 +1764,7 @@ impl Server {
             next_id: AtomicI64::new(1),
             alive: AtomicBool::new(true),
             started: Instant::now(),
+            last_used: StdMutex::new(Instant::now()),
             progress: Default::default(),
             docs: Default::default(),
             published: Default::default(),
@@ -1835,7 +1893,29 @@ impl Server {
         !self.progress.lock().map_or(true, |p| p.is_empty())
     }
 
+    /// How long since the program last wrote to the server.
+    fn idle_for(&self) -> Duration {
+        self.last_used
+            .lock()
+            .map_or(Duration::ZERO, |t| t.elapsed())
+    }
+
+    /// Closes one document (`didClose`), if the server has it open.
+    async fn close(&self, uri: &str) -> Result<(), String> {
+        if self.docs.lock().await.remove(uri).is_none() {
+            return Ok(());
+        }
+        self.send(&json!({
+            "jsonrpc": "2.0", "method": "textDocument/didClose",
+            "params": { "textDocument": { "uri": uri } },
+        }))
+        .await
+    }
+
     async fn send(&self, message: &Value) -> Result<(), String> {
+        if let Ok(mut used) = self.last_used.lock() {
+            *used = Instant::now();
+        }
         let body = message.to_string();
         let mut stdin = self.stdin.lock().await;
         let framed = format!("Content-Length: {}\r\n\r\n{body}", body.len());
@@ -2371,6 +2451,42 @@ while True:
             std::thread::sleep(Duration::from_millis(100));
         }
         panic!("the server process {pid} still runs");
+    }
+
+    #[test]
+    fn a_closed_document_is_forgotten_and_an_idle_server_is_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake.py");
+        std::fs::write(&script, FAKE_SERVER).unwrap();
+        let script = script.to_string_lossy().into_owned();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let server = server_for(Path::new(PYTHON), &[script.as_str()], dir.path())
+                .await
+                .unwrap();
+            let file = dir.path().join("m.py");
+            let uri = path_to_uri(&file);
+            server.sync(&uri, "python", "x = 1\n").await.unwrap();
+            assert!(server.docs.lock().await.contains_key(&uri));
+            did_close(file.clone()).await;
+            assert!(!server.docs.lock().await.contains_key(&uri));
+            // Closing what is not open does nothing.
+            did_close(file).await;
+
+            // Used a moment ago: kept. Unused for an hour: stopped, forgotten.
+            stop_idle(IDLE_STOP).await;
+            assert!(server.alive.load(Ordering::SeqCst));
+            *server.last_used.lock().unwrap() = Instant::now()
+                .checked_sub(IDLE_STOP + Duration::from_secs(60))
+                .unwrap();
+            stop_idle(IDLE_STOP).await;
+            assert!(!server.alive.load(Ordering::SeqCst));
+            let key = (PathBuf::from(PYTHON), dir.path().to_path_buf());
+            assert!(!SERVERS.get().unwrap().lock().await.contains_key(&key));
+        });
     }
 
     #[test]

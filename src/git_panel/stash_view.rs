@@ -1,6 +1,6 @@
 //! The Stash tab on screen.
 
-use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
+use iced::widget::{button, checkbox, column, container, row, scrollable, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 
 use super::diff_view::{self, Nav};
@@ -121,6 +121,27 @@ impl Panel {
         ]
         .spacing(6)
         .align_y(Alignment::Center);
+        let options = row![
+            checkbox(state.keep_index)
+                .label(t!("git.stash_keep_index").to_string())
+                .size(14)
+                .text_size(12.5)
+                .on_toggle(|on| Message::Git(GitMsg::StashKeepIndex(on))),
+            Space::new().width(Length::Fill),
+            text_input(&t!("git.stash_branch_name"), &state.branch)
+                .on_input(|t| Message::Git(GitMsg::StashBranchName(t)))
+                .on_submit_maybe(chosen.map(|i| Message::Git(GitMsg::StashBranch(i))))
+                .size(12.5)
+                .padding([4, 8])
+                .width(Length::Fixed(150.0))
+                .style(se_theme::Field::new(dark).style()),
+            act(
+                t!("git.stash_branch").to_string(),
+                chosen.map(GitMsg::StashBranch)
+            ),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
 
         let left = column![
             scrollable(container(list).padding([2, 6]))
@@ -132,7 +153,7 @@ impl Panel {
             scrollable(container(files).padding([2, 6]))
                 .style(se_theme::Scrollbar { dark }.style())
                 .height(Length::FillPortion(3)),
-            container(controls).padding([6, 10]),
+            container(column![controls, options].spacing(6)).padding([6, 10]),
         ]
         .width(Length::Fixed(430.0));
 
@@ -158,6 +179,7 @@ impl Panel {
         let apply = t!("git.stash_apply").to_string();
         let pop = t!("git.stash_pop").to_string();
         let drop = t!("git.stash_drop").to_string();
+        let branch = t!("git.stash_branch").to_string();
         crate::pointer_area::context_menu(target, move || {
             let item = |label: String, msg: GitMsg| -> Element<'static, Message> {
                 button(text(label).size(13))
@@ -178,6 +200,7 @@ impl Panel {
                 column![
                     item(apply.clone(), GitMsg::StashApply(index)),
                     item(pop.clone(), GitMsg::StashPop(index)),
+                    item(branch.clone(), GitMsg::StashBranch(index)),
                     item(drop.clone(), GitMsg::StashDrop(index)),
                 ]
                 .spacing(1)

@@ -246,6 +246,8 @@ pub enum Message {
     TabRead(Result<Loaded, String>),
     /// The open file changed on disk and was read again.
     FileReloaded(Result<Loaded, String>),
+    /// Throws the changes of the tab away and reads the file again.
+    RevertFile,
     SaveFile,
     SaveAll,
     SaveFileAs,
@@ -1295,6 +1297,13 @@ impl SimpleEditApp {
         }
         if let Some(name) = app.config.set_aside.clone() {
             app.set_status(t!("status.config_set_aside", name = name.as_str()), true);
+        }
+        if !app.api.set_aside.is_empty() {
+            let names = app.api.set_aside.join(", ");
+            app.set_status(
+                t!("status.api_collection_set_aside", name = names.as_str()),
+                true,
+            );
         }
         app.announce_new_version();
 
@@ -3860,6 +3869,40 @@ impl SimpleEditApp {
                 }
                 Task::none()
             }
+            Message::RevertFile => {
+                let Some(path) = self.current_file.clone().filter(|p| p.is_file()) else {
+                    self.set_status(t!("status.err_no_file"), true);
+                    return Task::none();
+                };
+                let too_large =
+                    std::fs::metadata(&path).is_ok_and(|meta| meta.len() > MAX_OPEN_BYTES);
+                if self.large_view().is_some() || too_large {
+                    self.set_status(t!("large.read_only"), true);
+                    return Task::none();
+                }
+                let Some(raw) = std::fs::read(&path)
+                    .ok()
+                    .and_then(|bytes| self.format.encoding.decode(&bytes))
+                else {
+                    self.set_status(
+                        t!("status.err_decode", name = self.format.encoding.label()),
+                        true,
+                    );
+                    return Task::none();
+                };
+                let (text, mut format) = TextFormat::decode(&raw);
+                format.encoding = self.format.encoding;
+                // The changes stay one Ctrl+Z away (`apply_reload` keeps
+                // the undo history).
+                self.is_dirty = false;
+                self.apply_reload(Loaded {
+                    stamp: DiskStamp::of(&path),
+                    path,
+                    text,
+                    format,
+                });
+                Task::none()
+            }
             Message::ReloadEncoding(encoding) => {
                 self.overlay = ActiveOverlay::None;
                 let Some(path) = self.current_file.clone().filter(|p| p.is_file()) else {
@@ -5834,13 +5877,43 @@ impl SimpleEditApp {
                     })
                     .unwrap_or_default();
                 let indent = indent[..indent.len().min(col)].to_string();
+                // Deeper after `{`, `(`, `[` (and `:` in Python); a pair
+                // `{|}` is split. Not over a selection, which Enter replaces.
+                let (before, after) = match self.editor.content.line(line_idx) {
+                    Some(l) if self.editor.content.selection().is_none() => {
+                        let col = col.min(l.len());
+                        (
+                            l.get(..col).unwrap_or_default().to_string(),
+                            l.get(col..).unwrap_or_default().to_string(),
+                        )
+                    }
+                    _ => Default::default(),
+                };
+                let unit = self.indent_unit();
+                let colon = self.editor.language.as_deref() == Some("py");
+                let (inner, closer) =
+                    crate::code_editor::smart_enter(&before, &after, &indent, &unit, colon);
                 self.editor
                     .content
                     .perform(text_editor::Action::Edit(text_editor::Edit::Enter));
-                if !indent.is_empty() {
+                if !inner.is_empty() {
                     self.editor.content.perform(text_editor::Action::Edit(
-                        text_editor::Edit::Paste(std::sync::Arc::new(indent)),
+                        text_editor::Edit::Paste(std::sync::Arc::new(inner.clone())),
                     ));
+                }
+                // `{|}`: the closer goes down to a line of its own.
+                if let Some(closer) = closer {
+                    self.editor
+                        .content
+                        .perform(text_editor::Action::Edit(text_editor::Edit::Enter));
+                    if !closer.is_empty() {
+                        self.editor.content.perform(text_editor::Action::Edit(
+                            text_editor::Edit::Paste(std::sync::Arc::new(closer)),
+                        ));
+                    }
+                    self.editor
+                        .content
+                        .select_bytes(line_idx + 1, inner.len(), 0);
                 }
                 self.is_dirty = true;
                 return Task::none();
@@ -7357,6 +7430,11 @@ impl SimpleEditApp {
         // The session is written by the next tick (in the background), not
         // here: closing many tabs would otherwise write it once per tab.
         self.session_rev = self.rev.wrapping_sub(1);
+        if index.is_some() && !is_untitled(&path) && !is_virtual(&path) {
+            // The language servers that had it open let go of it.
+            let closed = Task::future(crate::lsp::did_close(path)).discard();
+            return Task::batch([command, closed]);
+        }
         command
     }
 

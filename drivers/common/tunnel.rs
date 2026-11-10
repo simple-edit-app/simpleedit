@@ -113,6 +113,11 @@ impl Tunnel {
                 {
                     return Err("SSH: the tunnel stopped as it came up".to_string());
                 }
+                // Nobody reads stderr from here on: ssh would block once the
+                // pipe is full (about 64 KB of messages).
+                if let Some(err) = tunnel.child.stderr.take() {
+                    drain(err);
+                }
                 return Ok(tunnel);
             }
             if Instant::now() > deadline {
@@ -121,6 +126,13 @@ impl Tunnel {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+}
+
+/// Reads and drops what `reader` yields, on a thread, until it ends.
+fn drain<R: Read + Send + 'static>(mut reader: R) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut reader, &mut std::io::sink());
+    })
 }
 
 /// A script `ssh` runs to ask for the password: it prints the secret, which
@@ -189,6 +201,19 @@ impl Drop for Tunnel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drain_reads_a_pipe_to_its_end() {
+        let mut child = Command::new("sh")
+            .args(["-c", "head -c 300000 /dev/zero >&2"])
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let handle = drain(child.stderr.take().unwrap());
+        // Without the drain, the child would block on a full pipe.
+        assert!(child.wait().unwrap().success());
+        handle.join().unwrap();
+    }
 
     #[test]
     fn a_local_port_already_in_use_is_refused_before_ssh_is_run() {

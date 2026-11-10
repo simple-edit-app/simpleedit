@@ -216,6 +216,7 @@ fn run(input: &str, slot: &mut Option<(String, Session)>, serving: bool) -> Resu
         }
         "tree" => tree(session, &request),
         "rows" => guarded(client, &request.target, |c| rows(c, &request)),
+        "count" => guarded(client, &request.target, |c| count(c, &request)),
         "export" => guarded(client, &request.target, |c| export(c, &request)),
         "apply" => {
             if request.target.read_only {
@@ -1100,6 +1101,35 @@ fn clauses(
         sql.push_str(&format!(" ORDER BY {}", parts.join(", ")));
     }
     Ok(sql)
+}
+
+/// How many rows a table (or a query) has under the condition.
+fn count(client: &mut Client, request: &Request) -> Result<Value, String> {
+    let mut plain = request.clone();
+    plain.order.clear();
+    let tail = clauses(&plain, &[], &[], "")?;
+    let from = if request.sql.trim().is_empty() {
+        format!("{}.{}", quote(&request.schema), quote(&request.table))
+    } else {
+        let sql = request.sql.trim().trim_end_matches(';').trim().to_string();
+        if !protocol::wrappable(&sql, protocol::Dialect::Postgres) {
+            return Err("this query cannot be counted".to_string());
+        }
+        format!("(\n{sql}\n) AS \"q\"")
+    };
+    let sql = format!("SELECT COUNT(*) FROM {from}{tail}");
+    let started = Instant::now();
+    match client.query_one(&sql, &[]) {
+        Ok(row) => {
+            record(&sql, started, Some(1), None);
+            Ok(json!({ "total": row.get::<_, i64>(0) }))
+        }
+        Err(e) => {
+            let message = clean(e);
+            record(&sql, started, None, Some(message.clone()));
+            Err(message)
+        }
+    }
 }
 
 fn rows(client: &mut Client, request: &Request) -> Result<Value, String> {

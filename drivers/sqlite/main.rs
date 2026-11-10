@@ -641,6 +641,31 @@ mod tests {
     }
 
     #[test]
+    fn rows_are_counted_under_a_filter() {
+        let (_dir, path) = database();
+        let all = call(&path, json!({"op": "count", "table": "customers"})).unwrap();
+        assert_eq!(all["total"], 3);
+        let some = call(
+            &path,
+            json!({"op": "count", "table": "customers", "filter": "name LIKE 'B%'",
+                   "order": [{"column": "zzz", "desc": false}]}),
+        )
+        .unwrap();
+        assert_eq!(some["total"], 1);
+        let query = call(
+            &path,
+            json!({"op": "count", "sql": "SELECT id FROM customers WHERE id > 1"}),
+        )
+        .unwrap();
+        assert_eq!(query["total"], 2);
+        assert!(call(
+            &path,
+            json!({"op": "count", "table": "customers", "filter": "1; SELECT 2"})
+        )
+        .is_err());
+    }
+
+    #[test]
     fn a_table_is_read_by_pages_sorted_and_filtered() {
         let (_dir, path) = database();
         let page = |extra: Value| {

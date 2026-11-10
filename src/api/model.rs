@@ -664,6 +664,42 @@ pub enum ResolvedBody {
     File(String),
 }
 
+/// A random 64-bit number (the standard library's per-hasher random keys).
+fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
+}
+
+/// The dynamic variables Postman knows, worked out when the request goes
+/// (a variable the user defined under that name wins).
+fn dynamic_variable(name: &str) -> Option<String> {
+    match name {
+        "$guid" | "$randomUUID" => {
+            let (a, b) = (random_u64(), random_u64());
+            let (hi, lo) = (
+                (a & !0xF000) | 0x4000,
+                (b & 0x3FFF_FFFF_FFFF_FFFF) | (1 << 63),
+            );
+            Some(format!(
+                "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
+                (hi >> 32) as u32,
+                (hi >> 16) as u16,
+                hi as u16,
+                (lo >> 48) as u16,
+                lo & 0xFFFF_FFFF_FFFF
+            ))
+        }
+        "$timestamp" => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs().to_string()),
+        "$randomInt" => Some((random_u64() % 1001).to_string()),
+        _ => None,
+    }
+}
+
 /// Fills in the `{{name}}` of a text. What is not defined stays as it was,
 /// and is noted in `missing`.
 pub fn substitute(text: &str, vars: &HashMap<String, String>, missing: &mut Vec<String>) -> String {
@@ -677,8 +713,8 @@ pub fn substitute(text: &str, vars: &HashMap<String, String>, missing: &mut Vec<
             return out;
         };
         let name = after[..end].trim();
-        match vars.get(name) {
-            Some(value) => out.push_str(value),
+        match vars.get(name).cloned().or_else(|| dynamic_variable(name)) {
+            Some(value) => out.push_str(&value),
             None => {
                 out.push_str(&rest[start..start + 2 + end + 2]);
                 if !name.is_empty() && !missing.iter().any(|m| m == name) {
@@ -702,7 +738,11 @@ fn note_missing(text: &str, vars: &HashMap<String, String>, missing: &mut Vec<St
             return;
         };
         let name = after[..end].trim();
-        if !vars.contains_key(name) && !name.is_empty() && !missing.iter().any(|m| m == name) {
+        if !vars.contains_key(name)
+            && dynamic_variable(name).is_none()
+            && !name.is_empty()
+            && !missing.iter().any(|m| m == name)
+        {
             missing.push(name.to_string());
         }
         rest = &after[end + 2..];
@@ -977,6 +1017,22 @@ mod tests {
         // An open brace with no end is plain text.
         assert_eq!(substitute("a {{ b", &v, &mut Vec::new()), "a {{ b");
         assert_eq!(substitute("", &v, &mut Vec::new()), "");
+    }
+
+    #[test]
+    fn dynamic_variables_are_worked_out_when_sent() {
+        let v = HashMap::new();
+        let mut missing = Vec::new();
+        let out = substitute("{{$guid}}|{{$timestamp}}|{{$randomInt}}", &v, &mut missing);
+        assert!(missing.is_empty());
+        let parts: Vec<&str> = out.split('|').collect();
+        assert_eq!(parts[0].len(), 36);
+        assert_eq!(parts[0].as_bytes()[14], b'4');
+        assert!(parts[1].parse::<u64>().unwrap() > 1_600_000_000);
+        assert!(parts[2].parse::<u32>().unwrap() <= 1000);
+        let mut own = HashMap::new();
+        own.insert("$guid".to_string(), "mine".to_string());
+        assert_eq!(substitute("{{$guid}}", &own, &mut missing), "mine");
     }
 
     #[test]

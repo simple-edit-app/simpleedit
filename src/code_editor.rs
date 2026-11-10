@@ -2307,11 +2307,70 @@ impl Content {
         self.0.borrow().editor.copy()
     }
 
+    /// The cursor's line with its line break, for copying or cutting
+    /// without a selection; `None` with several cursors.
+    pub fn current_line(&self) -> Option<String> {
+        if !self.extra_carets().is_empty() {
+            return None;
+        }
+        let (line, _) = self.cursor_position();
+        let text = self.line(line)?.to_string();
+        Some(text + "\n")
+    }
+
+    /// Selects the cursor's line with one line break (the one before it
+    /// on the last line), so that deleting it takes the line away.
+    pub fn select_current_line(&self) {
+        let (line, _) = self.cursor_position();
+        let Some(len) = self.line(line).map(|l| l.len()) else {
+            return;
+        };
+        let (from, to) = if line + 1 < self.line_count() {
+            ((line, 0), (line + 1, 0))
+        } else if line > 0 {
+            let before = self.line(line - 1).map_or(0, |l| l.len());
+            ((line - 1, before), (line, len))
+        } else {
+            ((0, 0), (0, len))
+        };
+        if from != to {
+            self.0.borrow_mut().set_caret(Caret {
+                position: to,
+                anchor: Some(from),
+            });
+        }
+    }
+
     /// The cursor as (line, byte index within the line).
     pub fn cursor_position(&self) -> (usize, usize) {
         let position = self.0.borrow().editor.cursor().position;
         (position.line, position.column)
     }
+}
+
+/// What Enter writes after the line break between `before` and `after` (the
+/// text of the line around the cursor), for a line indented by `indent`:
+/// the indentation of the new line, one `unit` deeper after `{`, `(`, `[` (or
+/// `:` when `colon`); and, when the break splits a pair `{|}`, the
+/// indentation of the line for the closer that goes under it.
+pub fn smart_enter(
+    before: &str,
+    after: &str,
+    indent: &str,
+    unit: &str,
+    colon: bool,
+) -> (String, Option<String>) {
+    let last = before.trim_end().chars().next_back();
+    let deeper = matches!(last, Some('{' | '(' | '[')) || (colon && last == Some(':'));
+    if !deeper {
+        return (indent.to_string(), None);
+    }
+    let inner = format!("{indent}{unit}");
+    let splits = matches!(
+        (before.chars().next_back(), after.chars().next()),
+        (Some('{'), Some('}')) | (Some('('), Some(')')) | (Some('['), Some(']'))
+    );
+    (inner, splits.then(|| indent.to_string()))
 }
 
 /// A pasted text as the buffer wants it: only `\n` between lines.
@@ -2873,7 +2932,11 @@ where
                 shell.publish(on_edit(action));
             }
             Update::Copy => {
-                if let Some(selection) = self.content.selection_all() {
+                if let Some(selection) = self
+                    .content
+                    .selection_all()
+                    .or_else(|| self.content.current_line())
+                {
                     clipboard.write(clipboard::Kind::Standard, selection);
                 }
             }
@@ -2881,6 +2944,13 @@ where
                 if let Some(selection) = self.content.selection_all() {
                     clipboard.write(clipboard::Kind::Standard, selection);
                     shell.publish(on_edit(Action::Edit(cut_edit(self.content))));
+                } else if let Some(line) = self.content.current_line() {
+                    // No selection: the whole line goes.
+                    clipboard.write(clipboard::Kind::Standard, line);
+                    self.content.select_current_line();
+                    if self.content.selection().is_some() {
+                        shell.publish(on_edit(Action::Edit(Edit::Delete)));
+                    }
                 }
             }
             Update::Paste => {
@@ -4439,6 +4509,41 @@ mod multi_tests {
         type_char(&mut content, '-');
         // The cursor on the first line had nothing to join with.
         assert_eq!(content.text(), "-a-b\nc-d\n");
+    }
+
+    #[test]
+    fn a_line_without_selection_is_copied_and_cut_with_its_break() {
+        let mut content = Content::with_text("a\nbb\nc");
+        content.select_bytes(1, 1, 0);
+        assert_eq!(content.current_line().as_deref(), Some("bb\n"));
+        content.select_current_line();
+        content.perform(Action::Edit(Edit::Delete));
+        assert_eq!(content.text(), "a\nc\n");
+        // The last line takes the break before it.
+        content.select_bytes(1, 0, 0);
+        content.select_current_line();
+        content.perform(Action::Edit(Edit::Delete));
+        assert_eq!(content.text(), "a\n");
+        // With several cursors there is no line to copy.
+        let two = Content::with_text("a\nb");
+        two.add_cursor(1, 0);
+        assert_eq!(two.current_line(), None);
+    }
+
+    #[test]
+    fn enter_indents_deeper_after_an_opener_and_splits_a_pair() {
+        let enter = |b, a| smart_enter(b, a, "  ", "    ", false);
+        assert_eq!(enter("  if x {", ""), ("      ".into(), None));
+        assert_eq!(enter("  f(", ""), ("      ".into(), None));
+        assert_eq!(enter("  f(", ")"), ("      ".into(), Some("  ".into())));
+        assert_eq!(enter("  x = 1", ""), ("  ".into(), None));
+        // A colon only counts where asked for.
+        assert_eq!(enter("  if x:", "").0, "  ");
+        assert_eq!(smart_enter("if x:", "", "", "\t", true).0, "\t");
+        assert_eq!(
+            smart_enter("{", "}", "", "\t", false),
+            ("\t".into(), Some("".into()))
+        );
     }
 
     #[test]

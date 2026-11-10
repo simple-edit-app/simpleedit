@@ -67,6 +67,7 @@ fn glob(pattern: &str, name: &str) -> bool {
 /// never the folders it ignores as a whole (`node_modules`, `dist`); every
 /// file otherwise.
 pub fn list_files(root: &Path, exclude: &[String], ignored: bool) -> Vec<PathBuf> {
+    let with_ignored = ignored;
     let git = |args: &[&str]| {
         std::process::Command::new("git")
             .arg("-C")
@@ -99,16 +100,35 @@ pub fn list_files(root: &Path, exclude: &[String], ignored: bool) -> Vec<PathBuf
         })
         .flatten();
     let mut files: Vec<PathBuf> = match from_git {
-        Some(output) => output
-            .stdout
-            .split(|b| *b == 0)
-            .chain(ignored.iter().flat_map(|o| o.stdout.split(|b| *b == 0)))
-            .filter(|p| !p.is_empty())
-            .map(|p| root.join(String::from_utf8_lossy(p).as_ref()))
-            // A file deleted but not committed is still listed by Git.
-            .filter(|p| p.is_file())
-            .take(MAX_FILES)
-            .collect(),
+        Some(output) => {
+            let listed: Vec<PathBuf> = output
+                .stdout
+                .split(|b| *b == 0)
+                .filter(|p| !p.is_empty())
+                .map(|p| root.join(String::from_utf8_lossy(p).as_ref()))
+                .collect();
+            // A submodule or a nested repository is listed as one folder:
+            // its own files are listed in turn.
+            let nested: Vec<PathBuf> = listed
+                .iter()
+                .filter(|p| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()))
+                .flat_map(|dir| list_files(dir, exclude, with_ignored))
+                .collect();
+            listed
+                .into_iter()
+                .chain(
+                    ignored
+                        .iter()
+                        .flat_map(|o| o.stdout.split(|b| *b == 0))
+                        .filter(|p| !p.is_empty())
+                        .map(|p| root.join(String::from_utf8_lossy(p).as_ref())),
+                )
+                // A file deleted but not committed is still listed by Git.
+                .filter(|p| p.is_file())
+                .chain(nested)
+                .take(MAX_FILES)
+                .collect()
+        }
         None => {
             let mut found = Vec::new();
             walk(root, exclude, &mut found);
@@ -329,6 +349,27 @@ pub fn find_occurrences_until(
     replace: Option<&crate::find_replace::Replace>,
     cancel: &std::sync::atomic::AtomicBool,
 ) -> Result<Vec<(TextHit, Option<String>)>, String> {
+    find_occurrences_counting(
+        files,
+        open,
+        options,
+        replace,
+        cancel,
+        &std::sync::atomic::AtomicUsize::new(0),
+    )
+}
+
+/// The same, adding to `skipped` each file left out for being too big,
+/// unreadable or binary.
+pub fn find_occurrences_counting(
+    files: &[PathBuf],
+    open: &std::collections::HashMap<PathBuf, String>,
+    options: &crate::find_replace::Options,
+    replace: Option<&crate::find_replace::Replace>,
+    cancel: &std::sync::atomic::AtomicBool,
+    skipped: &std::sync::atomic::AtomicUsize,
+) -> Result<Vec<(TextHit, Option<String>)>, String> {
+    use std::sync::atomic::Ordering::Relaxed;
     if options.query.is_empty() {
         return Ok(Vec::new());
     }
@@ -352,12 +393,15 @@ pub fn find_occurrences_until(
             Some(text) => text,
             None => {
                 if std::fs::metadata(path).map_or(true, |m| m.len() > MAX_SIZE) {
+                    skipped.fetch_add(1, Relaxed);
                     continue;
                 }
                 let Ok(bytes) = std::fs::read(path) else {
+                    skipped.fetch_add(1, Relaxed);
                     continue;
                 };
                 let Some((decoded, _)) = decode_file(&bytes) else {
+                    skipped.fetch_add(1, Relaxed);
                     continue;
                 };
                 read = decoded;
@@ -494,6 +538,55 @@ fn excerpt(line: &str, start: usize, len: usize) -> (String, (usize, usize)) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn binary_files_are_counted_as_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("a.bin");
+        std::fs::write(&bin, b"cafe\0\0").unwrap();
+        let text = dir.path().join("b.txt");
+        std::fs::write(&text, "cafe").unwrap();
+        let options = crate::find_replace::Options {
+            query: "cafe".into(),
+            ..Default::default()
+        };
+        let skipped = std::sync::atomic::AtomicUsize::new(0);
+        let found = super::find_occurrences_counting(
+            &[bin, text],
+            &Default::default(),
+            &options,
+            None,
+            &std::sync::atomic::AtomicBool::new(false),
+            &skipped,
+        )
+        .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(skipped.into_inner(), 1);
+    }
+
+    #[test]
+    fn a_nested_repository_is_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |d: &std::path::Path| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(d)
+                .arg("init")
+                .arg("-q")
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("in.txt"), "x").unwrap();
+        std::fs::write(dir.path().join("out.txt"), "x").unwrap();
+        if !git(dir.path()) || !git(&nested) {
+            return;
+        }
+        let files = super::list_files(dir.path(), &[], false);
+        assert!(files.contains(&nested.join("in.txt")), "{files:?}");
+        assert!(files.contains(&dir.path().join("out.txt")));
+    }
+
     #[test]
     fn files_in_windows_1252_and_utf16_are_searched() {
         let dir = tempfile::tempdir().unwrap();

@@ -227,6 +227,7 @@ fn answer(engine: &mut dyn Engine, request: &Request) -> Result<Value, String> {
         }
         "tree" => Ok(json!({ "databases": engine.tree(request)? })),
         "rows" => rows(engine, request),
+        "count" => count(engine, request),
         "export" => export(engine, request),
         "apply" => {
             if request.target.read_only {
@@ -322,6 +323,31 @@ fn fetch_logged(
             Err(message)
         }
     }
+}
+
+/// How many rows a table (or a query) has under the condition.
+fn count(engine: &mut dyn Engine, request: &Request) -> Result<Value, String> {
+    let mut plain = request.clone();
+    plain.order.clear();
+    let tail = clauses(engine, &plain, &[], &[])?;
+    let from = if request.sql.trim().is_empty() {
+        table_name(engine, &request.schema, &request.table)
+    } else {
+        let sql = request.sql.trim().trim_end_matches(';').trim().to_string();
+        if !protocol::wrappable(&sql, request.target.dialect) {
+            return Err("this query cannot be counted".to_string());
+        }
+        format!("(\n{sql}\n) AS {}", engine.quote("q"))
+    };
+    let sql = format!("SELECT COUNT(*) FROM {from}{tail}");
+    let (_, data, _) = fetch_logged(engine, &sql, &sql, 1)?;
+    let total = data
+        .first()
+        .and_then(|row| row.first())
+        .and_then(|v| v.as_deref())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .ok_or_else(|| "the count is not a number".to_string())?;
+    Ok(json!({ "total": total }))
 }
 
 fn rows(engine: &mut dyn Engine, request: &Request) -> Result<Value, String> {

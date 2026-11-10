@@ -113,22 +113,8 @@ impl SimpleEditApp {
             return Task::none();
         }
         match event {
-            Event::Line(raw) => {
-                let text = engine::strip_ansi(&raw);
-                let dir = self
-                    .tasks
-                    .task
-                    .as_ref()
-                    .map(|t| t.dir.clone())
-                    .unwrap_or_default();
-                let at = engine::location(&text, &dir);
-                self.tasks.lines.push(OutLine { text, at });
-                if self.tasks.lines.len() > MAX_LINES {
-                    let extra = self.tasks.lines.len() - MAX_LINES;
-                    self.tasks.lines.drain(..extra);
-                }
-                iced::widget::operation::snap_to_end(log_id())
-            }
+            Event::Line(raw) => self.task_lines(vec![raw]),
+            Event::Lines(raws) => self.task_lines(raws),
             Event::Done(code) => {
                 self.tasks.handle = None;
                 self.tasks.done = Some(code.map_or(Done::NoCode, Done::Code));
@@ -143,6 +129,33 @@ impl SimpleEditApp {
                 Task::none()
             }
         }
+    }
+
+    /// Adds output lines: each file a place names is looked up once per
+    /// packet, and the log is moved to the end once.
+    fn task_lines(&mut self, raws: Vec<String>) -> Task<Message> {
+        let dir = self
+            .tasks
+            .task
+            .as_ref()
+            .map(|t| t.dir.clone())
+            .unwrap_or_default();
+        let mut known: std::collections::HashMap<PathBuf, bool> = Default::default();
+        let mut is_file = |path: &Path| {
+            *known
+                .entry(path.to_path_buf())
+                .or_insert_with(|| path.is_file())
+        };
+        for raw in raws {
+            let text = engine::strip_ansi(&raw);
+            let at = engine::location_with(&text, &dir, &mut is_file);
+            self.tasks.lines.push(OutLine { text, at });
+        }
+        if self.tasks.lines.len() > MAX_LINES {
+            let extra = self.tasks.lines.len() - MAX_LINES;
+            self.tasks.lines.drain(..extra);
+        }
+        iced::widget::operation::snap_to_end(log_id())
     }
 
     pub(super) fn task_stop(&mut self) -> Task<Message> {
@@ -359,6 +372,21 @@ mod tests {
         let _ = app.update(Message::TaskEvent(run, Event::Done(Some(2))));
         assert_eq!(app.tasks.done, Some(Done::Code(2)));
         assert!(app.status_is_error);
+    }
+
+    #[test]
+    fn a_packet_of_lines_is_added_at_once_with_its_places() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "").unwrap();
+        let mut app = app();
+        let _ = app.start_task(task(dir.path()));
+        let run = app.tasks.run;
+        let packet = vec!["a.rs:1:2".into(), "a.rs:5".into(), "none.rs:3".into()];
+        let _ = app.update(Message::TaskEvent(run, Event::Lines(packet)));
+        assert_eq!(app.tasks.lines.len(), 3);
+        assert_eq!(app.tasks.lines[0].at.as_ref().map(|l| l.col), Some(2));
+        assert_eq!(app.tasks.lines[1].at.as_ref().map(|l| l.line), Some(5));
+        assert!(app.tasks.lines[2].at.is_none());
     }
 
     #[test]

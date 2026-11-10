@@ -87,10 +87,65 @@ fn wants_new_window(args: impl Iterator<Item = std::ffi::OsString>) -> bool {
 /// Started from the Finder, the app gets launchd's minimal `PATH`: the usual
 /// tool folders are added to it, so that what it starts (language servers
 /// and their `#!/usr/bin/env node`, formatters, `npm`) finds its programs.
+const PATH_MARK: &str = "__SIMPLEEDIT_PATH__";
+
+/// The `PATH` a login shell printed between two markers, so that what the
+/// shell's startup files echo around it is ignored.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn marked_path(output: &str) -> Option<&str> {
+    let start = output.find(PATH_MARK)? + PATH_MARK.len();
+    let len = output[start..].find(PATH_MARK)?;
+    let path = output[start..start + len].trim();
+    (!path.is_empty()).then_some(path)
+}
+
+/// The `PATH` of the user's login shell (nvm and other version managers set
+/// it up there), or `None` if the shell is slow or fails: it is given 3 s.
+#[cfg(target_os = "macos")]
+fn login_shell_path() -> Option<String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
+    let mut child = Command::new(shell)
+        .arg("-lc")
+        .arg(format!("printf '{PATH_MARK}%s{PATH_MARK}' \"$PATH\""))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = stdout.read_to_end(&mut out);
+        let _ = tx.send(out);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(3)) {
+        Ok(out) => {
+            let _ = child.wait();
+            marked_path(&String::from_utf8_lossy(&out)).map(str::to_string)
+        }
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            None
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn complete_path() {
     let mut dirs: Vec<std::path::PathBuf> =
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+    // The shell's own folders (nvm, ...) come first.
+    if let Some(shell) = login_shell_path() {
+        let mut first: Vec<std::path::PathBuf> = std::env::split_paths(&shell).collect();
+        first.retain(|d| !d.as_os_str().is_empty());
+        dirs.retain(|d| !first.contains(d));
+        first.extend(dirs);
+        dirs = first;
+    }
     let mut extra: Vec<std::path::PathBuf> =
         ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin"]
             .map(std::path::PathBuf::from)
@@ -191,6 +246,15 @@ mod tests {
             .into_iter()
             .map(|t| t.path)
             .collect()
+    }
+
+    #[test]
+    fn the_shell_path_is_read_between_markers_and_noise_is_ignored() {
+        let out = format!("welcome\nnvm ready\n{PATH_MARK}/a/bin:/b/bin{PATH_MARK}trailing");
+        assert_eq!(marked_path(&out), Some("/a/bin:/b/bin"));
+        assert_eq!(marked_path("no marker"), None);
+        assert_eq!(marked_path(&format!("{PATH_MARK}{PATH_MARK}")), None);
+        assert_eq!(marked_path(&format!("{PATH_MARK}/a")), None);
     }
 
     #[test]

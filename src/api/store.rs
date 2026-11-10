@@ -42,6 +42,8 @@ pub struct Stored {
     pub active_env: Option<u64>,
     pub next_id: u64,
     pub history: Vec<HistoryEntry>,
+    /// The names under which unreadable collection files were kept.
+    pub set_aside: Vec<String>,
 }
 
 pub fn dir() -> Option<PathBuf> {
@@ -202,7 +204,11 @@ pub fn load() -> Stored {
                 {
                     unreadable_id = unreadable_id.max(id);
                 }
-                let _ = crate::fsutil::set_aside(&path);
+                if let Some(aside) = crate::fsutil::set_aside(&path) {
+                    if let Some(name) = aside.file_name() {
+                        stored.set_aside.push(name.to_string_lossy().into_owned());
+                    }
+                }
             }
         }
     }
@@ -310,10 +316,32 @@ pub fn forget_secrets(env: &Environment) {
     }
 }
 
+/// Writes the history off the interface thread (the write is synced to
+/// disk): the writes go one at a time, in order, and one that a newer call
+/// has overtaken is skipped.
 pub fn save_history(history: &[HistoryEntry]) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LATEST: AtomicU64 = AtomicU64::new(0);
+    static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let history = history[..history.len().min(MAX_HISTORY)].to_vec();
+    let ticket = LATEST.fetch_add(1, Ordering::SeqCst) + 1;
+    let job = move || {
+        let _turn = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+        if LATEST.load(Ordering::SeqCst) == ticket {
+            write_history(history);
+        }
+    };
+    // Tests read the file right after.
+    if cfg!(test) {
+        job();
+    } else {
+        std::thread::spawn(job);
+    }
+}
+
+fn write_history(mut kept: Vec<HistoryEntry>) {
     let Some(root) = dir() else { return };
     // The history is a record of what was sent, not a place for credentials.
-    let mut kept: Vec<HistoryEntry> = history[..history.len().min(MAX_HISTORY)].to_vec();
     for entry in &mut kept {
         let text = &mut entry.request.body.text;
         if text.len() > MAX_HISTORY_BODY {

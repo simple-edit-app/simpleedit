@@ -188,8 +188,8 @@ fn base_url(root: &Value) -> String {
 
 /// The sign-in the description asks for everywhere: a bearer token, basic,
 /// or an API key, read from variables.
-fn auth_of(root: &Value, variables: &mut Vec<Variable>) -> Auth {
-    let Some(name) = root["security"]
+fn auth_of(root: &Value, security: &Value, variables: &mut Vec<Variable>) -> Auth {
+    let Some(name) = security
         .as_array()
         .and_then(|s| s.first())
         .and_then(|s| s.as_object())
@@ -274,7 +274,7 @@ pub fn import(text: &str) -> Result<Imported, String> {
         value: base_url(&root),
         ..Variable::default()
     }];
-    let auth = auth_of(&root, &mut variables);
+    let auth = auth_of(&root, &root["security"], &mut variables);
     let mut top: Vec<Item> = Vec::new();
     let mut folders: Vec<Folder> = Vec::new();
     for (path, item) in paths {
@@ -295,7 +295,13 @@ pub fn import(text: &str) -> Result<Imported, String> {
             );
             request.method = method;
             request.url = format!("{{{{baseUrl}}}}{url_path}");
-            request.auth = auth.clone();
+            // An operation's own `security` replaces the global one
+            // (`[]` means none).
+            request.auth = if operation["security"].is_array() {
+                auth_of(&root, &operation["security"], &mut variables)
+            } else {
+                auth.clone()
+            };
             // The parameters of the path and of the operation.
             let listed = item["parameters"]
                 .as_array()
@@ -544,6 +550,28 @@ paths:
         assert_eq!(r.body.kind, BodyKind::Json);
         assert!(r.body.text.contains("\"n\": 0"));
         assert_eq!(imported.variables[0].value, "http://example.org/api");
+    }
+
+    #[test]
+    fn an_operation_security_replaces_the_global_one() {
+        let spec = r#"{"openapi": "3.0.0", "security": [{"b": []}],
+            "components": {"securitySchemes": {"b": {"type": "http", "scheme": "bearer"}}},
+            "paths": {"/open": {"get": {"security": []}}, "/shut": {"get": {}}}}"#;
+        let imported = import(spec).unwrap();
+        let mut kinds = Vec::new();
+        for item in &imported.collection.items {
+            match item {
+                Item::Request(r) => kinds.push(r.auth.kind),
+                Item::Folder(f) => {
+                    for i in &f.items {
+                        if let Item::Request(r) = i {
+                            kinds.push(r.auth.kind);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(kinds.contains(&AuthKind::Bearer) && kinds.contains(&AuthKind::None));
     }
 
     #[test]

@@ -253,9 +253,13 @@ impl SimpleEditApp {
                 };
                 self.results.generation += 1;
                 let generation = self.results.generation;
-                self.run_search(search, false, Default::default(), move |found| {
-                    Message::Results(ResultsMsg::Rerun_(generation, found))
-                })
+                self.run_search(
+                    search,
+                    false,
+                    Default::default(),
+                    Default::default(),
+                    move |found| Message::Results(ResultsMsg::Rerun_(generation, found)),
+                )
             }
             ResultsMsg::Rerun_(generation, found) => {
                 if generation == self.results.generation {

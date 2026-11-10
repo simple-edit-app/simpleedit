@@ -648,8 +648,11 @@ pub fn parse_stashes(out: &str) -> Vec<Stash> {
         .collect()
 }
 
-pub async fn stash_push(repo: &Path, message: &str) -> Result<(), String> {
+pub async fn stash_push(repo: &Path, message: &str, keep_index: bool) -> Result<(), String> {
     let mut args = vec!["stash", "push", "--include-untracked"];
+    if keep_index {
+        args.push("--keep-index");
+    }
     if !message.trim().is_empty() {
         args.push("-m");
         args.push(message);
@@ -670,6 +673,25 @@ pub async fn stash_pop(repo: &Path, index: usize) -> Result<(), String> {
     match run(repo, &["stash", "pop", &format!("stash@{{{index}}}")]).await {
         Ok(_) => Ok(()),
         // The stash is kept and its conflicts are left to settle.
+        Err(_) if super::has_conflicts(repo).await => Err(super::CONFLICT.to_string()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Checks out a new branch on the commit the stash was made from, applies the
+/// stash there and drops it (`git stash branch`).
+pub async fn stash_branch(repo: &Path, name: &str, index: usize) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() || name.starts_with('-') {
+        return Err(t!("git.stash_branch_name").to_string());
+    }
+    match run(
+        repo,
+        &["stash", "branch", name, &format!("stash@{{{index}}}")],
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
         Err(_) if super::has_conflicts(repo).await => Err(super::CONFLICT.to_string()),
         Err(e) => Err(e),
     }
@@ -1353,7 +1375,7 @@ mod tests {
         let repo = four_commits();
         repo.write("one.txt", "changed\n");
         repo.write("untracked.txt", "u\n");
-        block(stash_push(repo.path(), "my work")).unwrap();
+        block(stash_push(repo.path(), "my work", false)).unwrap();
         assert_eq!(
             std::fs::read_to_string(repo.path().join("one.txt")).unwrap(),
             "0\n"
@@ -1385,9 +1407,34 @@ mod tests {
         block(stash_pop(repo.path(), 0)).unwrap();
         assert!(block(stashes(repo.path())).unwrap().is_empty());
 
-        block(stash_push(repo.path(), "")).unwrap();
+        block(stash_push(repo.path(), "", false)).unwrap();
         block(stash_drop(repo.path(), 0)).unwrap();
         assert!(block(stashes(repo.path())).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_stash_can_keep_the_index_or_become_a_branch() {
+        let repo = four_commits();
+        repo.write("one.txt", "staged\n");
+        repo.git(&["add", "one.txt"]);
+        block(stash_push(repo.path(), "", true)).unwrap();
+        // The staged change stays in the index and the working tree.
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("one.txt")).unwrap(),
+            "staged\n"
+        );
+        assert_eq!(block(stashes(repo.path())).unwrap().len(), 1);
+        repo.git(&["reset", "-q", "--hard"]);
+
+        assert!(block(stash_branch(repo.path(), " ", 0)).is_err());
+        block(stash_branch(repo.path(), "from-stash", 0)).unwrap();
+        assert!(block(stashes(repo.path())).unwrap().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("one.txt")).unwrap(),
+            "staged\n"
+        );
+        let head = repo.git(&["rev-parse", "--abbrev-ref", "HEAD"]);
+        assert_eq!(head.trim(), "from-stash");
     }
 
     #[test]
@@ -1563,7 +1610,7 @@ mod tests {
         repo.write("f.txt", "base\n");
         repo.commit_all("base");
         repo.write("f.txt", "mine\n");
-        block(stash_push(repo.path(), "")).unwrap();
+        block(stash_push(repo.path(), "", false)).unwrap();
         repo.write("f.txt", "theirs\n");
         repo.commit_all("other");
         let error = block(stash_pop(repo.path(), 0)).unwrap_err();

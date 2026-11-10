@@ -130,6 +130,8 @@ pub struct FinderState {
     keep_selected: bool,
     /// Set to stop the search that is running.
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The files the running search left out (binary, too big, unreadable).
+    skipped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// The last row clicked, to tell a double click.
     last_click: Option<(usize, std::time::Instant)>,
     /// The folder as typed in its field (it may not be one yet).
@@ -172,6 +174,7 @@ impl Default for FinderState {
             preview_edited: false,
             keep_selected: false,
             cancel: Default::default(),
+            skipped: Default::default(),
             last_click: None,
             dir_text: String::new(),
             dir_history: Vec::new(),
@@ -555,6 +558,7 @@ impl SimpleEditApp {
         search: Search,
         wait: bool,
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        skipped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         on_done: impl Fn(Result<Vec<Occurrence>, String>) -> Message + Send + 'static,
     ) -> Task<Message> {
         let files = self.files_of(&search);
@@ -569,12 +573,13 @@ impl SimpleEditApp {
                     return Ok(Vec::new());
                 }
                 tokio::task::spawn_blocking(move || {
-                    crate::finder::find_occurrences_until(
+                    crate::finder::find_occurrences_counting(
                         &files,
                         &open,
                         &search.options,
                         search.replace.as_ref(),
                         &cancel,
+                        &skipped,
                     )
                     .map(|found| {
                         found
@@ -636,6 +641,7 @@ impl SimpleEditApp {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         self.finder.cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancel = self.finder.cancel.clone();
+        self.finder.skipped = Default::default();
         if wait {
             return Task::perform(
                 async move {
@@ -645,7 +651,8 @@ impl SimpleEditApp {
                 Message::FindDue,
             );
         }
-        self.run_search(search, false, cancel, move |result| {
+        let skipped = self.finder.skipped.clone();
+        self.run_search(search, false, cancel, skipped, move |result| {
             Message::FindResults(generation, result)
         })
     }
@@ -658,7 +665,8 @@ impl SimpleEditApp {
         }
         let search = self.finder_search();
         let cancel = self.finder.cancel.clone();
-        self.run_search(search, false, cancel, move |result| {
+        let skipped = self.finder.skipped.clone();
+        self.run_search(search, false, cancel, skipped, move |result| {
             Message::FindResults(generation, result)
         })
     }
@@ -1579,6 +1587,17 @@ impl SimpleEditApp {
             t!("finder.too_many", n = crate::finder::MAX_HITS).to_string()
         } else {
             String::new()
+        };
+        let skipped = f.skipped.load(std::sync::atomic::Ordering::Relaxed);
+        let note = if skipped > 0 && !f.searching && !f.text.is_empty() {
+            let skipped = t!("finder.skipped", n = skipped);
+            if note.is_empty() {
+                skipped.to_string()
+            } else {
+                format!("{note} - {skipped}")
+            }
+        } else {
+            note
         };
         if !note.is_empty() {
             list = list.push(container(text(note).size(12.5).color(p.muted)).padding([9, 10]));

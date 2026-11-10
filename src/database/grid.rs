@@ -27,6 +27,28 @@ pub fn block(a: (usize, usize), b: (usize, usize)) -> ((usize, usize), (usize, u
     ((a.0.min(b.0), a.1.min(b.1)), (a.0.max(b.0), a.1.max(b.1)))
 }
 
+/// Puts a block of tab-separated text (what a spreadsheet copies) into the
+/// cells from `(row, col)` on, as edits that wait. What falls outside the
+/// rows of the page and the columns is left out. How many cells it reached.
+pub fn paste_block(pending: &mut Pending, page: &Page, at: (usize, usize), text: &str) -> usize {
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    let text = text.strip_suffix('\r').unwrap_or(text);
+    let rows = pending.rows(page);
+    let mut reached = 0;
+    for (r, line) in text.split('\n').enumerate() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        for (c, value) in line.split('\t').enumerate() {
+            let (row, col) = (at.0 + r, at.1 + c);
+            if row >= rows || col >= page.columns.len() || pending.is_deleted(row) {
+                continue;
+            }
+            pending.type_into(page, row, col, value.to_string());
+            reached += 1;
+        }
+    }
+    reached
+}
+
 /// The cells of a block as text. `table` is the name `INSERT` writes to.
 pub fn block_text(
     page: &Page,
@@ -921,6 +943,18 @@ mod tests {
         p.today();
         assert!(p.value().is_some());
         assert_eq!(p.value().unwrap().len(), 19);
+    }
+
+    #[test]
+    fn a_pasted_block_fills_cells_and_stops_at_the_edges() {
+        let page = page();
+        let mut p = Pending::default();
+        let columns = page.columns.len();
+        let reached = paste_block(&mut p, &page, (0, columns - 1), "x\ty\r\nz\n");
+        // One column is left on the right: `y` falls out.
+        assert_eq!(reached, page.rows.len().min(2));
+        assert_eq!(p.value(&page, 0, columns - 1), Some("x"));
+        assert_eq!(paste_block(&mut p, &page, (99, 0), "a"), 0);
     }
 
     #[test]
