@@ -263,16 +263,17 @@ pub async fn fix(
     }
     if lsp && !by_a_tool {
         if let Ok(problems) = crate::lsp::diagnostics(ext, path, &now).await {
-            let mut fixes = Vec::new();
-            for problem in problems
+            let wanted: Vec<_> = problems
                 .iter()
                 .filter(|d| level.shows(d.severity) && source.is_none_or(|s| s == d.source))
                 .take(300)
-            {
-                if let Ok(list) = crate::lsp::code_actions(ext, path, &now, problem).await {
-                    fixes.extend(list.into_iter().next().filter(|f| f.safe));
-                }
-            }
+                .collect();
+            let fixes: Vec<_> = crate::lsp::first_fixes(ext, path, &now, &wanted)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|f| f.safe)
+                .collect();
             let refs: Vec<&super::Fix> = fixes.iter().collect();
             now = super::apply(&now, &refs).0;
         }

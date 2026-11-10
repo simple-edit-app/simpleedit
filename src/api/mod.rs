@@ -192,6 +192,8 @@ pub struct ResponseView {
 
 /// Most of a body that is put in the viewer.
 pub const MAX_SHOWN: usize = 2 * 1024 * 1024;
+/// The size up to which a body is parsed to be laid out.
+const MAX_PRETTY: usize = 8 * MAX_SHOWN;
 
 impl ResponseView {
     pub fn new(response: Response) -> ResponseView {
@@ -201,7 +203,9 @@ impl ResponseView {
         } else {
             response.text()
         };
-        let pretty = if text.len() <= MAX_SHOWN {
+        // A minified body is laid out even when it is long: a single line of
+        // megabytes freezes the viewer, and only the start of it is shown.
+        let pretty = if text.len() <= MAX_PRETTY {
             http::pretty(kind, &text)
         } else {
             None

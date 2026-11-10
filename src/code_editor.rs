@@ -705,6 +705,7 @@ where
         renderer: &mut iced::Renderer,
         editor: &Editor,
         version: (u64, u64),
+        kept: (usize, usize),
         cache: &RefCell<MinimapCache>,
         rect: Rectangle,
         minimap: Minimap,
@@ -714,10 +715,21 @@ where
         let lines = buffer.lines.len();
         let mut cache = cache.borrow_mut();
         if cache.key != Some(version) {
-            cache.spans = buffer
-                .lines
-                .iter()
-                .map(|l| minimap_span(l.text()))
+            // Only the lines the edits touched, when they are known.
+            let old = std::mem::take(&mut cache.spans);
+            let (head, tail) = kept;
+            let same = cache.key.is_some_and(|k| k.0 == version.0)
+                && head.saturating_add(tail) <= old.len().min(lines);
+            cache.spans = (0..lines)
+                .map(|i| {
+                    if same && i < head {
+                        old[i]
+                    } else if same && i >= lines - tail {
+                        old[old.len() - (lines - i)]
+                    } else {
+                        minimap_span(buffer.lines[i].text())
+                    }
+                })
                 .collect();
             cache.key = Some(version);
         }
@@ -1294,6 +1306,10 @@ struct Internal {
     id: u64,
     /// Topmost line edited since the widget last told its highlighter.
     changed_from: Option<usize>,
+    /// What the edits since the minimap was last drawn left alone: the lines
+    /// before the first (`.0`) and after the last (`.1`) one they touched;
+    /// `usize::MAX` for none.
+    minimap_kept: std::cell::Cell<(usize, usize)>,
     editor: Editor,
     is_dirty: bool,
     /// Bumped by every edit, to know when cached per-line data is stale.
@@ -1498,6 +1514,7 @@ impl Content {
         Self(RefCell::new(Internal {
             id: NEXT_CONTENT_ID.fetch_add(1, Ordering::Relaxed),
             changed_from: None,
+            minimap_kept: std::cell::Cell::new((usize::MAX, usize::MAX)),
             editor: Editor::with_text(text),
             is_dirty: true,
             revision: 0,
@@ -1884,8 +1901,11 @@ impl Content {
         out
     }
 
-    fn total_len(&self) -> usize {
-        self.lines().map(|l| l.len() + 1).sum()
+    /// The bytes (line breaks counted) of the lines `from..=to`.
+    fn lines_len(&self, from: usize, to: usize) -> usize {
+        (from..=to)
+            .map_while(|l| self.line(l).map(|t| t.len() + 1))
+            .sum()
     }
 
     fn line_starts(&self) -> Vec<usize> {
@@ -1954,10 +1974,18 @@ impl Content {
             }
         }
         // From the last to the first: an edit never moves the ones before.
-        let mut results: Vec<(usize, usize)> = Vec::new();
+        // A result is kept less the shift of the edits so far, so that the
+        // later ones move all of them at once (adding `shift` at the end).
+        let mut results: Vec<(usize, isize)> = Vec::new();
+        let mut shift = 0isize;
         for &i in ascending.iter().rev() {
             let caret = all[i];
-            let before = self.total_len();
+            // An edit only touches the lines from the one before its start
+            // (Backspace) to the one after its end (Delete).
+            let first = caret.span().0 .0.saturating_sub(1);
+            let last = caret.span().1 .0 + 1;
+            let lines_before = self.line_count();
+            let before = self.lines_len(first, last);
             self.0.get_mut().set_caret(caret);
             let (at_line, at_col) = caret.span().0;
             let indent = match (&edit, auto_indent) {
@@ -1979,20 +2007,24 @@ impl Content {
             if !indent.is_empty() {
                 self.perform_one(Action::Edit(Edit::Paste(Arc::new(indent))));
             }
-            let delta = self.total_len() as isize - before as isize;
-            for r in &mut results {
-                r.1 = (r.1 as isize + delta).max(0) as usize;
-            }
+            let grown = self.line_count() as isize - lines_before as isize;
+            let after = self.lines_len(first, (last as isize + grown).max(first as isize) as usize);
+            shift += after as isize - before as isize;
             let here = self.0.borrow().editor.cursor().position;
-            let starts_now = self.line_starts();
-            let at = starts_now.get(here.line).copied().unwrap_or(0) + here.column;
-            results.push((i, at));
+            // The lines before `first` are as they were.
+            let at = starts.get(first).copied().unwrap_or(0)
+                + (first..here.line)
+                    .map_while(|l| self.line(l).map(|t| t.len() + 1))
+                    .sum::<usize>()
+                + here.column;
+            results.push((i, at as isize - shift));
         }
         results.sort_by_key(|r| r.0);
         let starts = self.line_starts();
         let carets: Vec<Caret> = results
             .into_iter()
             .map(|(_, at)| {
+                let at = (at + shift).max(0) as usize;
                 let line = starts.partition_point(|s| *s <= at).saturating_sub(1);
                 Caret {
                     position: (line, at - starts[line]),
@@ -2042,6 +2074,17 @@ impl Content {
         });
         if touched.is_some() {
             internal.revision += 1;
+            // An edit joins or splits with a neighbour line (Backspace,
+            // Delete): one more line each side.
+            let cursor = internal.editor.cursor();
+            let line = cursor.position.line;
+            let other = cursor.selection.map_or(line, |a| a.line);
+            let (head, tail) = (
+                line.min(other).saturating_sub(1),
+                (lines_before - 1 - line.max(other).min(lines_before - 1)).saturating_sub(1),
+            );
+            let (h, t) = internal.minimap_kept.get();
+            internal.minimap_kept.set((h.min(head), t.min(tail)));
         }
         internal.editor.perform(action);
         if let Some(before) = touched {
@@ -3822,6 +3865,7 @@ where
                 renderer,
                 &internal.editor,
                 (internal.id, internal.revision),
+                internal.minimap_kept.replace((usize::MAX, usize::MAX)),
                 &state.minimap_cache,
                 minimap_rect(bounds),
                 minimap,
@@ -4383,6 +4427,18 @@ mod multi_tests {
         content.add_cursor(1, 1);
         content.perform_multi(Action::Edit(Edit::Enter), false);
         assert_eq!(content.text(), "\nab\nc\nd\n");
+    }
+
+    #[test]
+    fn backspace_at_line_starts_joins_lines_and_keeps_every_cursor() {
+        let mut content = Content::with_text("a\nb\nc\nd");
+        content.add_cursor(1, 0);
+        content.add_cursor(3, 0);
+        content.perform_multi(Action::Edit(Edit::Backspace), false);
+        assert_eq!(content.text(), "ab\ncd\n");
+        type_char(&mut content, '-');
+        // The cursor on the first line had nothing to join with.
+        assert_eq!(content.text(), "-a-b\nc-d\n");
     }
 
     #[test]

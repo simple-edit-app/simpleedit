@@ -31,7 +31,7 @@ pub fn words(line: &str) -> Result<Vec<String>, String> {
                     match chars.next() {
                         Some('\'') => break,
                         Some(other) => word.push(other),
-                        None => return Err("A quote is not closed.".to_string()),
+                        None => return Err(t!("api.err_quote").to_string()),
                     }
                 }
             }
@@ -47,10 +47,10 @@ pub fn words(line: &str) -> Result<Vec<String>, String> {
                                 word.push('\\');
                                 word.push(other);
                             }
-                            None => return Err("A quote is not closed.".to_string()),
+                            None => return Err(t!("api.err_quote").to_string()),
                         },
                         Some(other) => word.push(other),
-                        None => return Err("A quote is not closed.".to_string()),
+                        None => return Err(t!("api.err_quote").to_string()),
                     }
                 }
             }
@@ -66,10 +66,10 @@ pub fn words(line: &str) -> Result<Vec<String>, String> {
                             Some('r') => word.push('\r'),
                             Some('t') => word.push('\t'),
                             Some(other) => word.push(other),
-                            None => return Err("A quote is not closed.".to_string()),
+                            None => return Err(t!("api.err_quote").to_string()),
                         },
                         Some(other) => word.push(other),
-                        None => return Err("A quote is not closed.".to_string()),
+                        None => return Err(t!("api.err_quote").to_string()),
                     }
                 }
             }
@@ -199,6 +199,20 @@ const SKIPPED_WITH_VALUE: &[&str] = &[
     "--tls-max",
 ];
 
+/// Splits `-HLink: x` into `("-H", "Link: x")` when the first letter is an
+/// option that takes a value.
+fn short_with_attached_value(arg: &str) -> Option<(&str, &str)> {
+    if arg.starts_with("--") || arg.len() < 3 || !arg.is_char_boundary(2) {
+        return None;
+    }
+    let flag = arg.get(..2)?;
+    let valued = matches!(
+        flag,
+        "-X" | "-H" | "-d" | "-u" | "-A" | "-e" | "-b" | "-m" | "-F"
+    ) || SKIPPED_WITH_VALUE.contains(&flag);
+    valued.then(|| (flag, &arg[2..]))
+}
+
 /// Reads a `curl` command into a request.
 pub fn parse(command: &str) -> Result<Request, String> {
     let mut args = words(command)?.into_iter().peekable();
@@ -220,10 +234,17 @@ pub fn parse(command: &str) -> Result<Request, String> {
             Some((f, v)) => (f.to_string(), Some(v.to_string())),
             None => (arg.clone(), None),
         };
+        // `-HLink: x` and `-XPOST` are `-H "Link: x"` and `-X POST`.
+        let (flag, attached) = match short_with_attached_value(&arg) {
+            Some((f, v)) if attached.is_none() => (f.to_string(), Some(v.to_string())),
+            _ => (flag, attached),
+        };
         let mut value = |name: &str| -> Result<String, String> {
             match attached.clone() {
                 Some(v) => Ok(v),
-                None => args.next().ok_or_else(|| format!("{name} needs a value.")),
+                None => args
+                    .next()
+                    .ok_or_else(|| t!("api.err_needs_value", name = name).to_string()),
             }
         };
         match flag.as_str() {
@@ -231,7 +252,7 @@ pub fn parse(command: &str) -> Result<Request, String> {
                 let text = value(&flag)?;
                 method = Some(
                     Method::parse(&text)
-                        .ok_or_else(|| format!("The method {text} is not known."))?,
+                        .ok_or_else(|| t!("api.err_method", method = text).to_string())?,
                 );
             }
             "-H" | "--header" => {
@@ -287,7 +308,7 @@ pub fn parse(command: &str) -> Result<Request, String> {
             "-L" | "--location" => request.settings.follow_redirects = true,
             "-k" | "--insecure" => request.settings.verify_tls = false,
             "-F" | "--form" | "--form-string" => {
-                return Err("Forms with files (multipart) are not supported yet.".to_string());
+                return Err(t!("api.err_multipart").to_string());
             }
             f if SKIPPED_WITH_VALUE.contains(&f) => {
                 value(f)?;
@@ -313,7 +334,7 @@ pub fn parse(command: &str) -> Result<Request, String> {
             }
         }
     }
-    let url = url.ok_or_else(|| "There is no address in the command.".to_string())?;
+    let url = url.ok_or_else(|| t!("api.err_no_address").to_string())?;
     // The parameters of the address are lines of the table.
     let (base, query) = match url.split_once('?') {
         Some((b, q)) => (b.to_string(), Some(q.to_string())),
@@ -669,5 +690,13 @@ mod tests {
             ..Body::default()
         };
         assert!(export(&g.resolve(&HashMap::new())).contains("--data-binary '@/tmp/a b'"));
+    }
+
+    #[test]
+    fn short_options_with_a_glued_value_are_read() {
+        let r = parse("curl -XPOST -HLink:x -dabc https://x").unwrap();
+        assert_eq!(r.method, Method::Post);
+        assert_eq!(r.headers, vec![Pair::new("Link", "x")]);
+        assert_eq!(r.body.text, "abc");
     }
 }

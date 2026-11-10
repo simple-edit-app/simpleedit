@@ -76,9 +76,7 @@ fn read_auth(auth: &Value, warnings: &mut Vec<String>, name: &str) -> Option<Aut
             ..Auth::default()
         },
         other => {
-            warnings.push(format!(
-                "{name}: the sign-in \"{other}\" is not supported, it was left out."
-            ));
+            warnings.push(t!("api.warn_auth", name = name, other = other).to_string());
             Auth::default()
         }
     })
@@ -177,9 +175,7 @@ fn read_request(item: &Value, inherited: &Option<Auth>, warnings: &mut Vec<Strin
                         .collect()
                 })
                 .unwrap_or_default();
-            warnings.push(format!(
-                "{name}: a multipart form is kept as a simple form (files are left out)."
-            ));
+            warnings.push(t!("api.warn_multipart", name = name).to_string());
             request.body = Body {
                 kind: BodyKind::Form,
                 form: fields,
@@ -191,9 +187,7 @@ fn read_request(item: &Value, inherited: &Option<Auth>, warnings: &mut Vec<Strin
             // machine to send: it is chosen again, by hand.
             let src = text(&body["file"]["src"]);
             if !src.is_empty() {
-                warnings.push(format!(
-                    "{name}: the file {src} of the body was not kept, choose it again."
-                ));
+                warnings.push(t!("api.warn_file", name = name, src = src).to_string());
             }
             request.body = Body {
                 kind: BodyKind::File,
@@ -269,18 +263,37 @@ pub fn is_environment(json: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// How many items (the collection itself, folders, requests) carry a script.
+fn count_scripts(item: &Value) -> usize {
+    let own = item["event"].as_array().is_some_and(|events| {
+        events.iter().any(|e| {
+            e["script"]["exec"]
+                .as_array()
+                .is_some_and(|l| !l.is_empty())
+        })
+    });
+    let children = item["item"]
+        .as_array()
+        .map(|list| list.iter().map(count_scripts).sum())
+        .unwrap_or(0);
+    usize::from(own) + children
+}
+
 /// Reads a collection of Postman.
 pub fn import_collection(json: &str) -> Result<Imported, String> {
-    let value: Value = serde_json::from_str(json).map_err(|e| format!("Not a JSON file: {e}"))?;
+    let value: Value =
+        serde_json::from_str(json).map_err(|e| t!("api.err_not_json", error = e).to_string())?;
     if !value["item"].is_array() {
-        return Err("This is not a Postman collection (it has no \"item\").".to_string());
+        return Err(t!("api.err_not_collection").to_string());
     }
     let schema = value["info"]["schema"].as_str().unwrap_or("");
     let mut warnings = Vec::new();
     if schema.contains("v1.0") || schema.contains("v2.0") {
-        warnings.push(format!(
-            "The collection is in an older format ({schema}): some parts may be missing."
-        ));
+        warnings.push(t!("api.warn_schema", schema = schema).to_string());
+    }
+    let scripts = count_scripts(&value);
+    if scripts > 0 {
+        warnings.push(t!("api.postman_scripts", n = scripts).to_string());
     }
     let auth = read_auth(&value["auth"], &mut warnings, "collection");
     let items = read_items(&value["item"], &auth, &mut warnings);
@@ -304,9 +317,10 @@ pub fn import_collection(json: &str) -> Result<Imported, String> {
 
 /// Reads an environment of Postman.
 pub fn import_environment(json: &str) -> Result<Environment, String> {
-    let value: Value = serde_json::from_str(json).map_err(|e| format!("Not a JSON file: {e}"))?;
+    let value: Value =
+        serde_json::from_str(json).map_err(|e| t!("api.err_not_json", error = e).to_string())?;
     if !value["values"].is_array() {
-        return Err("This is not a Postman environment (it has no \"values\").".to_string());
+        return Err(t!("api.err_not_environment").to_string());
     }
     Ok(Environment {
         id: 0,
@@ -656,5 +670,13 @@ mod tests {
             panic!()
         };
         assert_eq!(r.params[0].value, "a b");
+    }
+
+    #[test]
+    fn scripts_are_reported_at_import() {
+        let json = r#"{"info": {"name": "c"}, "item": [{"name": "r", "request": "https://x",
+            "event": [{"listen": "test", "script": {"exec": ["pm.test()"]}}]}]}"#;
+        let imported = import_collection(json).unwrap();
+        assert_eq!(imported.warnings.len(), 1);
     }
 }

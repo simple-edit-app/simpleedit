@@ -155,11 +155,11 @@ pub fn extract(extracts: &[Extract], response: &Response) -> Vec<(String, Result
                     .as_ref()
                     .and_then(|root| json_path(root, &e.path))
                     .map(|v| shown(&v))
-                    .ok_or_else(|| format!("{}: not in the answer", e.path.trim())),
+                    .ok_or_else(|| t!("api.err_not_in_answer", path = e.path.trim()).to_string()),
                 ExtractSource::Header => response
                     .header(e.path.trim())
                     .map(str::to_string)
-                    .ok_or_else(|| format!("{}: no such header", e.path.trim())),
+                    .ok_or_else(|| t!("api.err_no_header", path = e.path.trim()).to_string()),
                 ExtractSource::Body => regex::Regex::new(e.path.trim())
                     .map_err(|err| err.to_string())
                     .and_then(|re| {
@@ -171,7 +171,7 @@ pub fn extract(extracts: &[Extract], response: &Response) -> Vec<(String, Result
                                     .map_or("", |m| m.as_str())
                                     .to_string()
                             })
-                            .ok_or_else(|| "no match in the body".to_string())
+                            .ok_or_else(|| t!("api.err_no_match").to_string())
                     }),
             };
             (e.variable.trim().to_string(), found)

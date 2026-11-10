@@ -2216,6 +2216,8 @@ fn grid<'a>(path: &'a Path, tab: &'a TableTab, dark: bool) -> Element<'a, Messag
     let first = ((offset / ROW_HEIGHT) as usize).saturating_sub(6);
     let last = (((offset + height) / ROW_HEIGHT) as usize + 6).min(count);
     let mut rows = column![Space::new().height(first as f32 * ROW_HEIGHT)];
+    // The date kind of each column, once for all the rows.
+    let picks: Vec<Option<PickKind>> = page.columns.iter().map(|c| PickKind::of(&c.kind)).collect();
     for i in first..last {
         let new_row = tab.pending.is_new(page, i);
         let deleted = tab.pending.is_deleted(i);
@@ -2233,18 +2235,6 @@ fn grid<'a>(path: &'a Path, tab: &'a TableTab, dark: bool) -> Element<'a, Messag
                 p.gutter
             }
         )];
-        // The rows this row is linked to, for the menu of each of its cells.
-        let related = std::sync::Arc::new(Related {
-            conn: tab.conn,
-            database: tab.database.clone(),
-            schema: tab.schema.clone(),
-            links: match (&tab.structure, new_row, page.rows.get(i)) {
-                (Some(structure), false, Some(values)) if tab.query.is_none() => {
-                    ddl::links(&tab.schema, structure, &page.columns, values, tab.dialect)
-                }
-                _ => Vec::new(),
-            },
-        });
         for (c, width) in tab.widths.iter().enumerate().take(page.columns.len()) {
             let edited = tab.pending.is_edited(i, c);
             let value = tab.pending.cell(page, i, c);
@@ -2312,7 +2302,7 @@ fn grid<'a>(path: &'a Path, tab: &'a TableTab, dark: bool) -> Element<'a, Messag
                 ..container::Style::default()
             });
             let nullable = page.columns[c].nullable;
-            let pick = PickKind::of(&page.columns[c].kind);
+            let pick = picks[c];
             let menu_path = path.to_path_buf();
             let mut hit = iced::widget::mouse_area(base);
             if editable {
@@ -2327,8 +2317,21 @@ fn grid<'a>(path: &'a Path, tab: &'a TableTab, dark: bool) -> Element<'a, Messag
                 edited: row_edited,
                 new_row,
             };
-            let related = related.clone();
+            // The rows this row is linked to are worked out when the menu
+            // opens, not for every cell at every frame.
             let element: Element<Message> = crate::pointer_area::context_menu(hit, move || {
+                let links = match (&tab.structure, new_row, page.rows.get(i)) {
+                    (Some(structure), false, Some(values)) if tab.query.is_none() => {
+                        ddl::links(&tab.schema, structure, &page.columns, values, tab.dialect)
+                    }
+                    _ => Vec::new(),
+                };
+                let related = Related {
+                    conn: tab.conn,
+                    database: tab.database.clone(),
+                    schema: tab.schema.clone(),
+                    links,
+                };
                 cell_menu(&menu_path, i, c, info, &related, dark)
             });
             // A click, left or right, gives the focus (it is only heard here:

@@ -116,9 +116,29 @@ impl SimpleEditApp {
     /// shows what it gave.
     fn db_open_result(&mut self, conn: u64, result: &database::QueryResult) -> Task<Message> {
         self.assign_db_color(conn);
-        self.db_counter += 1;
-        let title = format!("{} {}", t!("db.result"), self.db_counter);
-        let path = PathBuf::from(format!("db://{}/{title}", self.db_counter));
+        // The same query again fills the tab it already has; one with edits
+        // that wait is kept as it is (it counts as kept), and a new tab opens.
+        let reused = self
+            .db_tabs
+            .iter()
+            .find(|(_, t)| {
+                t.conn == conn
+                    && t.live
+                    && t.query.as_deref() == Some(result.sql.as_str())
+                    && t.pending.is_empty()
+            })
+            .map(|(path, t)| (path.clone(), t.title.clone()));
+        let (path, title) = match reused {
+            Some(found) => found,
+            None => {
+                self.db_counter += 1;
+                let title = format!("{} {}", t!("db.result"), self.db_counter);
+                (
+                    PathBuf::from(format!("db://{}/{title}", self.db_counter)),
+                    title,
+                )
+            }
+        };
         let dialect = self
             .db
             .connection(conn)
@@ -139,8 +159,10 @@ impl SimpleEditApp {
         if !result.deferred {
             tab.set_page(database::result_page(result));
         }
-        self.db_tabs.insert(path.clone(), tab);
-        self.sidebar.add_file(path.clone());
+        let known = self.db_tabs.insert(path.clone(), tab).is_some();
+        if !known {
+            self.sidebar.add_file(path.clone());
+        }
         let show = self.activate(path.clone());
         if result.deferred {
             Task::batch([show, self.db_load_rows(path, 0)])

@@ -708,9 +708,12 @@ async fn connect(ext: &str, path: &Path) -> Result<(Arc<Server>, &'static str, S
             let names: Vec<_> = candidates.iter().map(|c| c.0).collect();
             format!("no language server installed ({})", names.join(" / "))
         })?;
-    let root = crate::definition::project_root(path)
+    let mut root = crate::definition::project_root(path)
         .or_else(|| path.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("/"));
+    if language_id == "rust" {
+        root = cargo_workspace_root(&root);
+    }
     let name = exe
         .file_name()
         .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
@@ -718,6 +721,21 @@ async fn connect(ext: &str, path: &Path) -> Result<(Arc<Server>, &'static str, S
         .await
         .map_err(|e| format!("{name}: {e}"))?;
     Ok((server, language_id, name))
+}
+
+/// The top Cargo workspace above `root` (one rust-analyzer serves all its
+/// crates), or `root` itself.
+fn cargo_workspace_root(root: &Path) -> PathBuf {
+    let home = dirs::home_dir();
+    root.ancestors()
+        .take_while(|dir| Some(*dir) != home.as_deref() && dir.parent().is_some())
+        .filter(|dir| {
+            std::fs::read_to_string(dir.join("Cargo.toml"))
+                .is_ok_and(|t| t.lines().any(|l| l.trim() == "[workspace]"))
+        })
+        .last()
+        .unwrap_or(root)
+        .to_path_buf()
 }
 
 /// How long to wait for a server to publish its problems.
@@ -924,6 +942,36 @@ async fn fixes_of(
             edits,
             safe: true,
         });
+    }
+    Ok(fixes)
+}
+
+/// The first fix the language server offers for each problem, one
+/// connection for all of them.
+pub async fn first_fixes(
+    ext: &str,
+    path: &Path,
+    text: &str,
+    problems: &[&crate::lint::Diagnostic],
+) -> Result<Vec<crate::lint::Fix>, String> {
+    let (server, language_id, _) = connect(ext, path).await?;
+    let uri = path_to_uri(path);
+    server.sync(&uri, language_id, text).await?;
+    let range =
+        |line: usize, col: usize| json!({ "line": line, "character": utf16_col(text, line, col) });
+    let mut fixes = Vec::new();
+    for problem in problems {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "range": { "start": range(problem.line, problem.col), "end": range(problem.end_line, problem.end_col) },
+            "context": {
+                "diagnostics": problem.raw.iter().collect::<Vec<_>>(),
+                "only": ["quickfix"],
+            },
+        });
+        if let Ok(list) = fixes_of(&server, &uri, text, params).await {
+            fixes.extend(list.into_iter().next());
+        }
     }
     Ok(fixes)
 }
@@ -1893,7 +1941,9 @@ impl Server {
                 } else {
                     json!({ "text": text })
                 };
-                *known = text.to_string();
+                // Reuses the allocation of the previous copy.
+                known.clear();
+                known.push_str(text);
                 json!({
                     "jsonrpc": "2.0", "method": "textDocument/didChange",
                     "params": {
@@ -2489,6 +2539,21 @@ while True:
         assert_eq!(hits[0].container, None);
         assert_eq!((hits[1].line, hits[1].col), (0, 0));
         assert!(is_class_kind(23) && is_class_kind(5) && !is_class_kind(12));
+    }
+
+    #[test]
+    fn a_rust_crate_is_served_from_the_top_of_its_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let krate = dir.path().join("crates/a");
+        std::fs::create_dir_all(&krate).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace]\nmembers=[\"crates/a\"]\n",
+        )
+        .unwrap();
+        std::fs::write(krate.join("Cargo.toml"), "[package]\nname=\"a\"\n").unwrap();
+        assert_eq!(cargo_workspace_root(&krate), dir.path());
+        assert_eq!(cargo_workspace_root(dir.path()), dir.path());
     }
 
     #[test]

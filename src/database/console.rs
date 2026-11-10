@@ -97,6 +97,9 @@ pub struct Console {
     pub editor_focused: bool,
     /// The number the next console is given.
     pub next_doc: usize,
+    /// The statements of the last text asked about, with the dialect they
+    /// were cut for: the frame is worked out at every frame of the window.
+    spans_cache: std::cell::RefCell<Option<(String, super::protocol::Dialect, Vec<Span>)>>,
 }
 
 /// A place of the queries: a line, a column and a length, in characters.
@@ -323,6 +326,7 @@ impl Console {
             error_mark: None,
             editor_focused: false,
             next_doc: 2,
+            spans_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -398,7 +402,20 @@ impl Console {
         }
         let text = self.editor.text();
         let at = self.editor.cursor().position;
-        let span = statement_at(&text, caret_offset(&text, at.line, at.column), self.dialect)?;
+        let caret = caret_offset(&text, at.line, at.column);
+        let mut cache = self.spans_cache.borrow_mut();
+        let fresh = cache
+            .as_ref()
+            .is_some_and(|(t, d, _)| *d == self.dialect && *t == text);
+        if !fresh {
+            *cache = Some((
+                text.clone(),
+                self.dialect,
+                split_statements(&text, self.dialect),
+            ));
+        }
+        let spans = &cache.as_ref()?.2;
+        let span = pick_statement(spans, caret)?;
         let lines = |offset: usize| text[..offset].matches('\n').count();
         Some((lines(span.start), lines(span.end)))
     }
@@ -564,7 +581,11 @@ fn only_comments(text: &str, dialect: Dialect) -> bool {
 /// The statement the caret is in; between two, the next one; after the last,
 /// the last.
 pub fn statement_at(text: &str, caret: usize, dialect: Dialect) -> Option<Span> {
-    let spans = split_statements(text, dialect);
+    pick_statement(&split_statements(text, dialect), caret)
+}
+
+/// The statement of a list the caret is in, else the next one, else the last.
+fn pick_statement(spans: &[Span], caret: usize) -> Option<Span> {
     spans
         .iter()
         .find(|s| caret <= s.reach && caret >= s.start)
@@ -709,6 +730,9 @@ mod tests {
         // A selection runs instead: nothing is framed.
         console.editor.perform(Action::SelectAll);
         assert_eq!(console.statement_lines(), None);
+        // The cut of a text is not kept for another one.
+        console.editor = text_editor::Content::with_text("SELECT 1;\nSELECT 2;\nSELECT 3");
+        assert_eq!(console.statement_lines(), Some((0, 0)));
         // Nothing written, nothing framed.
         console.editor = text_editor::Content::new();
         assert_eq!(console.statement_lines(), None);

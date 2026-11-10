@@ -279,6 +279,19 @@ pub const MAX_HITS: usize = 2000;
 /// Files bigger than this are not looked into.
 const MAX_SIZE: u64 = 2 * 1024 * 1024;
 
+/// The text of a file's bytes and the encoding they are in (a byte order
+/// mark, UTF-8, else Windows-1252, as the editor reads them); `None` for a
+/// binary file.
+pub fn decode_file(bytes: &[u8]) -> Option<(String, crate::tabs::Encoding)> {
+    use crate::tabs::Encoding;
+    let (text, encoding) = Encoding::detect(bytes);
+    let utf16 = matches!(encoding, Encoding::Utf16Le | Encoding::Utf16Be);
+    if !utf16 && bytes.iter().take(8000).any(|b| *b == 0) {
+        return None;
+    }
+    Some((text, encoding))
+}
+
 /// Every match of a search in `files`, with what each would be replaced by.
 /// The text of a file open in the editor is `open`'s (its unsaved changes
 /// count), else the file's; a big or binary file is left out.
@@ -334,10 +347,10 @@ pub fn find_occurrences_until(
                 let Ok(bytes) = std::fs::read(path) else {
                     continue;
                 };
-                if bytes.iter().take(8000).any(|b| *b == 0) {
+                let Some((decoded, _)) = decode_file(&bytes) else {
                     continue;
-                }
-                read = String::from_utf8_lossy(&bytes).into_owned();
+                };
+                read = decoded;
                 &read
             }
         };
@@ -471,6 +484,26 @@ fn excerpt(line: &str, start: usize, len: usize) -> (String, (usize, usize)) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn files_in_windows_1252_and_utf16_are_searched() {
+        let dir = tempfile::tempdir().unwrap();
+        let latin = dir.path().join("a.txt");
+        std::fs::write(&latin, b"un caf\xe9\n").unwrap();
+        let wide = dir.path().join("b.txt");
+        let mut bytes = vec![0xff, 0xfe];
+        for u in "un caf\u{e9}\n".encode_utf16() {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        std::fs::write(&wide, bytes).unwrap();
+        let options = crate::find_replace::Options {
+            query: "caf\u{e9}".into(),
+            ..Default::default()
+        };
+        let found =
+            super::find_occurrences(&[latin, wide], &Default::default(), &options, None).unwrap();
+        assert_eq!(found.len(), 2);
+    }
+
     #[test]
     fn a_match_starting_on_the_newline_of_a_crlf_line_does_not_overflow() {
         let dir = tempfile::tempdir().unwrap();

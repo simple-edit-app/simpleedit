@@ -737,7 +737,7 @@ impl SimpleEditApp {
             return Some((text, Holder::Tab));
         }
         let bytes = std::fs::read(path).ok()?;
-        String::from_utf8(bytes).ok().map(|t| (t, Holder::Disk))
+        crate::finder::decode_file(&bytes).map(|(t, _)| (t, Holder::Disk))
     }
 
     /// Goes to the match picked (or the selected one); the window stays
@@ -1011,7 +1011,7 @@ impl SimpleEditApp {
                 redo.clear();
             }
             Holder::Disk => {
-                if crate::fsutil::write_atomic(path, new.as_bytes(), false).is_err() {
+                if write_encoded(path, new).is_err() {
                     return false;
                 }
                 self.bookmarks.remap(path, text, new);
@@ -1048,7 +1048,7 @@ impl SimpleEditApp {
                     self.bookmarks.remap(&w.path, &w.after, &w.before);
                 }
                 Holder::Disk => {
-                    if crate::fsutil::write_atomic(&w.path, w.before.as_bytes(), false).is_err() {
+                    if write_encoded(&w.path, &w.before).is_err() {
                         continue;
                     }
                     self.bookmarks.remap(&w.path, &w.after, &w.before);
@@ -2057,4 +2057,16 @@ mod todo_tests {
         let found = todo_hits(&[dir.path().to_path_buf()], &[], &open).unwrap();
         assert_eq!(found.len(), 2);
     }
+}
+
+/// Writes `text` to a file on disk in the encoding the file has now; an
+/// error if it cannot be written, or a character has no place in it.
+fn write_encoded(path: &Path, text: &str) -> Result<(), ()> {
+    let encoding = std::fs::read(path)
+        .ok()
+        .and_then(|b| crate::finder::decode_file(&b))
+        .ok_or(())?
+        .1;
+    let bytes = encoding.encode(text).ok_or(())?;
+    crate::fsutil::write_atomic(path, &bytes, false).map_err(|_| ())
 }

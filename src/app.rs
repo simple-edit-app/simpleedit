@@ -8616,18 +8616,20 @@ impl SimpleEditApp {
                 let blocks = blocks.clone();
                 // The wrapper gives `lazy` (which reports a shrink size) the
                 // full pane.
-                container(iced::widget::lazy((self.preview_rev, dark), move |_| {
-                    crate::preview::markdown::view(&blocks, dark)
-                }))
+                container(iced::widget::lazy(
+                    (self.preview_rev, dark, self.config.high_contrast),
+                    move |_| crate::preview::markdown::view(&blocks, dark),
+                ))
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()
             }
             PreviewDoc::Json(value) => {
                 let (value, collapsed) = (value.clone(), self.json_collapsed.clone());
-                container(iced::widget::lazy((self.preview_rev, dark), move |_| {
-                    crate::preview::json::view(&value, &collapsed, dark)
-                }))
+                container(iced::widget::lazy(
+                    (self.preview_rev, dark, self.config.high_contrast),
+                    move |_| crate::preview::json::view(&value, &collapsed, dark),
+                ))
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into()

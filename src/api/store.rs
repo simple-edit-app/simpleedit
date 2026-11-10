@@ -11,6 +11,9 @@ use super::model::{Collection, Environment, Item, Request};
 /// Most requests kept in the history.
 pub const MAX_HISTORY: usize = 200;
 
+/// Most of a body text kept in the history file.
+const MAX_HISTORY_BODY: usize = 64 * 1024;
+
 /// A request that was sent.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -266,6 +269,15 @@ pub fn save_history(history: &[HistoryEntry]) {
     // The history is a record of what was sent, not a place for credentials.
     let mut kept: Vec<HistoryEntry> = history[..history.len().min(MAX_HISTORY)].to_vec();
     for entry in &mut kept {
+        let text = &mut entry.request.body.text;
+        if text.len() > MAX_HISTORY_BODY {
+            let mut end = MAX_HISTORY_BODY;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+            text.push_str("\n[... truncated]");
+        }
         for (_, value) in auth_secrets(&mut entry.request) {
             if !only_variables(value) {
                 value.clear();

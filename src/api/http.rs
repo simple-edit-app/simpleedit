@@ -63,14 +63,12 @@ pub fn parse_cookie(line: &str) -> Option<Cookie> {
 pub async fn send(request: Resolved) -> Result<Response, String> {
     let url = request.url.trim();
     if url.is_empty() {
-        return Err("The address is empty.".to_string());
+        return Err(t!("api.err_address_empty").to_string());
     }
-    let parsed = reqwest::Url::parse(url).map_err(|e| format!("The address is not valid: {e}"))?;
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| t!("api.err_address_invalid", error = e).to_string())?;
     if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(format!(
-            "Only http and https addresses are sent, not {}.",
-            parsed.scheme()
-        ));
+        return Err(t!("api.err_scheme", scheme = parsed.scheme()).to_string());
     }
     // Redirects are followed here, not by the client: the headers of the
     // request (`X-API-Key`, tokens of any name) must not go along to another
@@ -88,16 +86,16 @@ pub async fn send(request: Resolved) -> Result<Response, String> {
         Vec::new();
     for (shown, value) in &request.headers {
         let name = reqwest::header::HeaderName::from_bytes(shown.as_bytes())
-            .map_err(|_| format!("The header name \"{shown}\" is not valid."))?;
+            .map_err(|_| t!("api.err_header_name", name = shown).to_string())?;
         let value = reqwest::header::HeaderValue::from_str(value)
-            .map_err(|_| format!("The value of the header {shown} is not valid."))?;
+            .map_err(|_| t!("api.err_header_value", name = shown).to_string())?;
         headers_out.push((name, value));
     }
     let mut body: Option<Vec<u8>> = match request.body {
         ResolvedBody::None => None,
         ResolvedBody::Bytes(bytes) => Some(bytes),
         ResolvedBody::File(path) if path.trim().is_empty() => {
-            return Err("The file to send is not chosen.".to_string());
+            return Err(t!("api.err_file_not_chosen").to_string());
         }
         ResolvedBody::File(path) => Some(
             tokio::fs::read(&path)
@@ -135,7 +133,7 @@ pub async fn send(request: Resolved) -> Result<Response, String> {
         };
         hops += 1;
         if hops > 10 || !matches!(next.scheme(), "http" | "https") {
-            return Err("Too many redirects.".to_string());
+            return Err(t!("api.err_redirects").to_string());
         }
         // Like a browser: 303 (and 301/302 for a POST) turn into a GET.
         if status == reqwest::StatusCode::SEE_OTHER

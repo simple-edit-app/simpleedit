@@ -200,59 +200,72 @@ pub async fn list(host: &str, dir: &str) -> Result<(String, Vec<Entry>), String>
     Ok((resolved, entries))
 }
 
-/// The bytes of a file, and when it was last changed.
-pub async fn download(file: &RemoteFile, limit: usize) -> Result<(Vec<u8>, Option<u64>), String> {
-    let bytes = run(
-        &file.host,
-        &format!("cat -- {}", quote(&file.path)),
-        None,
-        limit,
-    )
-    .await?;
-    Ok((bytes, mtime(file).await.ok()))
-}
+/// The shell code that prints the date of `$p` (seconds), on a GNU or a BSD
+/// system.
+const STAT_DATE: &str = "stat -c %Y -- \"$p\" 2>/dev/null || stat -f %m -- \"$p\" 2>/dev/null";
 
-/// When the file was last changed (seconds), on a GNU or a BSD system.
-pub async fn mtime(file: &RemoteFile) -> Result<u64, String> {
-    let path = quote(&file.path);
+/// The bytes of a file, and when it was last changed: one connection, the
+/// date first and the bytes after it.
+pub async fn download(file: &RemoteFile, limit: usize) -> Result<(Vec<u8>, Option<u64>), String> {
+    // The date line is a few bytes: it does not count in the limit.
+    const DATE_ROOM: usize = 32;
     let out = run(
         &file.host,
-        &format!("stat -c %Y -- {path} 2>/dev/null || stat -f %m -- {path}"),
+        &format!(
+            "p={}; {{ {STAT_DATE}; }} | head -n 1; echo; cat -- \"$p\"",
+            quote(&file.path)
+        ),
         None,
-        64,
+        limit + DATE_ROOM,
     )
     .await?;
-    String::from_utf8_lossy(&out)
-        .trim()
-        .parse()
-        .map_err(|_| "no date for the file".to_string())
+    // `date \n \n bytes`: the date may be missing, never the two newlines.
+    let first = out.iter().position(|&b| b == b'\n').ok_or("no answer")?;
+    let date = String::from_utf8_lossy(&out[..first]).trim().parse().ok();
+    let rest = out.get(first + 2..).ok_or("no answer")?;
+    if rest.len() > limit {
+        return Err("the file is too large".to_string());
+    }
+    Ok((rest.to_vec(), date))
 }
 
 /// Sends the bytes to the file, unless it changed on the machine since
-/// `known` (the date at the last copy). Returns the new date.
+/// `known` (the date at the last copy). Returns the new date. One connection:
+/// the check, the writing and the new date.
 pub async fn upload(
     file: &RemoteFile,
     bytes: Vec<u8>,
     known: Option<u64>,
 ) -> Result<Option<u64>, String> {
-    if let (Some(known), Ok(now)) = (known, mtime(file).await) {
-        if now != known {
-            return Err("the file changed on the server since it was opened".to_string());
-        }
-    }
-    run(
+    let check = match known {
+        Some(known) => format!(
+            "n=$({STAT_DATE}); if [ -n \"$n\" ] && [ \"$n\" != {known} ]; then echo {CHANGED} >&2; exit 1; fi; "
+        ),
+        None => String::new(),
+    };
+    let out = run(
         &file.host,
         &format!(
-            "t={tmp}; p={path}; cat > \"$t\" && {{ chmod --reference=\"$p\" \"$t\" 2>/dev/null || chmod $(stat -f %Lp \"$p\") \"$t\" 2>/dev/null; true; }} && mv -f -- \"$t\" \"$p\" || {{ rm -f -- \"$t\"; exit 1; }}",
+            "p={path}; t={tmp}; {check}cat > \"$t\" && {{ chmod --reference=\"$p\" \"$t\" 2>/dev/null || chmod $(stat -f %Lp \"$p\") \"$t\" 2>/dev/null; true; }} && mv -f -- \"$t\" \"$p\" || {{ rm -f -- \"$t\"; exit 1; }}; {STAT_DATE}; true",
             tmp = quote(&format!("{}.simpleedit-tmp", file.path)),
             path = quote(&file.path)
         ),
         Some(bytes),
         64,
     )
-    .await?;
-    Ok(mtime(file).await.ok())
+    .await
+    .map_err(|e| {
+        if e == CHANGED {
+            "the file changed on the server since it was opened".to_string()
+        } else {
+            e
+        }
+    })?;
+    Ok(String::from_utf8_lossy(&out).trim().parse().ok())
 }
+
+/// What the remote check says when the file is not the one that was read.
+const CHANGED: &str = "simpleedit-changed";
 
 #[cfg(test)]
 mod tests {

@@ -2612,8 +2612,27 @@ impl State {
         })
     }
 
+    /// Writes the connections: the keychain is asked for each one, which is
+    /// too slow for the thread of the window, so it is done on another, one
+    /// write at a time and the latest request last.
     pub fn persist(&self) {
-        save_stored(&self.connections, &self.driver_path, self.page_size);
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static ASKED: AtomicU64 = AtomicU64::new(0);
+        static DONE: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+        let no = ASKED.fetch_add(1, Ordering::SeqCst) + 1;
+        let (connections, driver_path, page_size) = (
+            self.connections.clone(),
+            self.driver_path.clone(),
+            self.page_size,
+        );
+        std::thread::spawn(move || {
+            let mut done = DONE.lock().unwrap_or_else(|e| e.into_inner());
+            // A later request already wrote what this one holds.
+            if *done < no {
+                save_stored(&connections, &driver_path, page_size);
+                *done = no;
+            }
+        });
     }
 
     /// How the driver of a system is doing.

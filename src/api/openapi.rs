@@ -43,7 +43,25 @@ fn resolve<'a>(root: &'a Value, mut value: &'a Value) -> &'a Value {
 /// An example value for a schema: its own example, its default, the first
 /// of its enumeration, or something of the right type.
 fn example(root: &Value, schema: &Value, depth: usize) -> Value {
-    let schema = resolve(root, schema);
+    example_in(root, schema, depth, &mut Vec::new())
+}
+
+/// `example`, knowing which `$ref` are being expanded: a schema that contains
+/// itself stops there instead of growing at every level.
+fn example_in(root: &Value, schema: &Value, depth: usize, open: &mut Vec<String>) -> Value {
+    let reference = schema.get("$ref").and_then(Value::as_str);
+    if reference.is_some_and(|r| open.iter().any(|o| o == r)) {
+        return Value::Null;
+    }
+    open.extend(reference.map(str::to_string));
+    let value = example_of(root, resolve(root, schema), depth, open);
+    if reference.is_some() {
+        open.pop();
+    }
+    value
+}
+
+fn example_of(root: &Value, schema: &Value, depth: usize, open: &mut Vec<String>) -> Value {
     if depth > 6 {
         return Value::Null;
     }
@@ -60,7 +78,7 @@ fn example(root: &Value, schema: &Value, depth: usize) -> Value {
             if key == "allOf" {
                 let mut merged = serde_json::Map::new();
                 for part in parts {
-                    if let Value::Object(map) = example(root, part, depth + 1) {
+                    if let Value::Object(map) = example_in(root, part, depth + 1, open) {
                         merged.extend(map);
                     }
                 }
@@ -68,7 +86,7 @@ fn example(root: &Value, schema: &Value, depth: usize) -> Value {
             }
             return parts
                 .first()
-                .map_or(Value::Null, |p| example(root, p, depth + 1));
+                .map_or(Value::Null, |p| example_in(root, p, depth + 1, open));
         }
     }
     let kind = schema["type"]
@@ -83,12 +101,12 @@ fn example(root: &Value, schema: &Value, depth: usize) -> Value {
             let mut map = serde_json::Map::new();
             if let Some(props) = schema["properties"].as_object() {
                 for (name, prop) in props {
-                    map.insert(name.clone(), example(root, prop, depth + 1));
+                    map.insert(name.clone(), example_in(root, prop, depth + 1, open));
                 }
             }
             Value::Object(map)
         }
-        "array" => Value::Array(vec![example(root, &schema["items"], depth + 1)]),
+        "array" => Value::Array(vec![example_in(root, &schema["items"], depth + 1, open)]),
         "integer" => Value::from(0),
         "number" => Value::from(0.0),
         "boolean" => Value::Bool(false),
@@ -246,10 +264,10 @@ fn auth_of(root: &Value, variables: &mut Vec<Variable>) -> Auth {
 }
 
 pub fn import(text: &str) -> Result<Imported, String> {
-    let root = parse(text).ok_or_else(|| "Not a JSON or YAML file.".to_string())?;
+    let root = parse(text).ok_or_else(|| t!("api.err_not_json_yaml").to_string())?;
     let paths = root["paths"]
         .as_object()
-        .ok_or_else(|| "This is not an OpenAPI description (it has no \"paths\").".to_string())?;
+        .ok_or_else(|| t!("api.err_not_openapi").to_string())?;
     let mut warnings = Vec::new();
     let mut variables = vec![Variable {
         key: "baseUrl".into(),
@@ -373,10 +391,9 @@ pub fn import(text: &str) -> Result<Imported, String> {
                         }
                     }
                 } else if let Some((kind, _)) = media.iter().next() {
-                    warnings.push(format!(
-                        "{} {path}: the body type {kind} is not kept.",
-                        method.as_str()
-                    ));
+                    let m = method.as_str();
+                    let text = t!("api.warn_body_type", method = m, path = path, kind = kind);
+                    warnings.push(text.to_string());
                 }
             }
             let tag = operation["tags"]
@@ -546,5 +563,23 @@ paths:
             panic!("a request");
         };
         assert!(r.body.text.contains("next"));
+    }
+
+    #[test]
+    fn a_wide_schema_that_contains_itself_stays_small() {
+        let props: String = (0..20)
+            .map(|i| format!("\"p{i}\": {{\"$ref\": \"#/components/schemas/Node\"}}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let root: Value = serde_json::from_str(&format!(
+            r##"{{"components": {{"schemas": {{"Node": {{"type": "object", "properties": {{{props}}}}}}}}}}}"##
+        ))
+        .unwrap();
+        let value = example(
+            &root,
+            &serde_json::json!({"$ref": "#/components/schemas/Node"}),
+            0,
+        );
+        assert!(value.to_string().len() < 2000);
     }
 }

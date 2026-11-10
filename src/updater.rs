@@ -267,6 +267,7 @@ pub async fn install_update(path: PathBuf, expected: String) -> Result<(), Strin
 }
 
 /// Whether the file still has the hash it was verified with.
+#[cfg(target_os = "linux")]
 fn still_verified(path: &Path, expected: &str) -> Result<(), String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     if sha256_hex(&bytes) == expected {
@@ -304,34 +305,49 @@ dpkg -i "$tmp/update.deb""#;
 
 #[cfg(target_os = "macos")]
 fn install_blocking(path: &Path, expected: &str) -> Result<(), String> {
-    still_verified(path, expected)?;
+    use std::io::Write;
+    use std::process::Stdio;
+    // The archive is read once and checked in memory; `tar` gets those very
+    // bytes on stdin and hands the binary back on stdout, so nothing read
+    // back from the disk is trusted.
+    let archive = std::fs::read(path).map_err(|e| e.to_string())?;
+    if sha256_hex(&archive) != expected {
+        return Err(t!("update.err_checksum").to_string());
+    }
     let tmp_dir = path
         .parent()
         .map(|d| d.join("extract"))
         .ok_or_else(|| t!("update.err_extract").to_string())?;
     std::fs::create_dir_all(&tmp_dir).map_err(|e| e.to_string())?;
 
-    let ok = std::process::Command::new("tar")
-        .arg("-xzf")
-        .arg(path)
-        .arg("-C")
-        .arg(&tmp_dir)
-        .status()
-        .map_err(|e| e.to_string())?
-        .success();
-
-    if !ok {
+    let mut child = std::process::Command::new("tar")
+        .args(["-xzOf", "-", "simpleedit"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| t!("update.err_extract").to_string())?;
+    let feeder = std::thread::spawn(move || {
+        let _ = stdin.write_all(&archive);
+    });
+    let output = child.wait_with_output().map_err(|e| e.to_string())?;
+    let _ = feeder.join();
+    if !output.status.success() || output.stdout.is_empty() {
         return Err(t!("update.err_extract").to_string());
     }
+    let binary = tmp_dir.join("simpleedit");
+    std::fs::write(&binary, &output.stdout).map_err(|e| e.to_string())?;
+    let binary_hash = sha256_hex(&output.stdout);
 
     // The privileged step copies the binary next to its destination (a place
     // only an administrator can write), checks that copy against the hash
     // taken here and only then moves it into place. The paths and the hash
     // go in as AppleScript arguments and are quoted by `quoted form of`,
     // never spliced into the script text.
-    let binary = tmp_dir.join("simpleedit");
-    let binary_hash =
-        sha256_hex(&std::fs::read(&binary).map_err(|_| t!("update.err_extract").to_string())?);
     let ok = std::process::Command::new("osascript")
         .args([
             "-e",
