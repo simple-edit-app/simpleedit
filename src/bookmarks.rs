@@ -166,15 +166,36 @@ impl Bookmarks {
         }
     }
 
-    /// Moves a file's bookmarks to a new path (an untitled file that was
-    /// saved).
+    /// Moves the bookmarks of a file, or of every file in a folder, to a new
+    /// path (an untitled file that was saved, a folder renamed or moved).
     pub fn rename(&mut self, from: &Path, to: &Path) {
-        if let Some(lines) = self.files.remove(&key(from)) {
-            self.files.insert(key(to), lines);
-            self.touch();
+        let moved = |k: &str| -> Option<String> {
+            let rest = Path::new(k).strip_prefix(from).ok()?;
+            Some(if rest.as_os_str().is_empty() {
+                key(to)
+            } else {
+                key(&to.join(rest))
+            })
+        };
+        let files: Vec<(String, String)> = self
+            .files
+            .keys()
+            .filter_map(|k| moved(k).map(|n| (k.clone(), n)))
+            .collect();
+        for (old, new) in files {
+            if let Some(lines) = self.files.remove(&old) {
+                self.files.insert(new, lines);
+                self.touch();
+            }
         }
-        if self.marked.remove(&key(from)) {
-            self.marked.insert(key(to));
+        let marked: Vec<(String, String)> = self
+            .marked
+            .iter()
+            .filter_map(|k| moved(k).map(|n| (k.clone(), n)))
+            .collect();
+        for (old, new) in marked {
+            self.marked.remove(&old);
+            self.marked.insert(new);
             self.touch();
         }
     }
@@ -274,6 +295,19 @@ impl Bookmarks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renaming_a_folder_moves_the_bookmarks_of_its_files() {
+        let mut b = Bookmarks::default();
+        b.toggle(Path::new("/p/d/a.rs"), 2);
+        b.toggle_file(Path::new("/p/d/sub/b.rs"));
+        b.toggle(Path::new("/p/dd/c.rs"), 1);
+        b.rename(Path::new("/p/d"), Path::new("/p/e"));
+        assert_eq!(b.lines(Path::new("/p/e/a.rs")), &[2]);
+        assert!(b.marked_paths().contains(Path::new("/p/e/sub/b.rs")));
+        assert_eq!(b.lines(Path::new("/p/dd/c.rs")), &[1]);
+        assert!(b.lines(Path::new("/p/d/a.rs")).is_empty());
+    }
 
     fn file() -> PathBuf {
         PathBuf::from("/tmp/a.rs")

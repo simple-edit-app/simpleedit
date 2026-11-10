@@ -1284,6 +1284,9 @@ impl SimpleEditApp {
                 .unwrap_or_default();
             app.set_status(t!("status.session_set_aside", name = name.as_str()), true);
         }
+        if let Some(name) = app.config.set_aside.clone() {
+            app.set_status(t!("status.config_set_aside", name = name.as_str()), true);
+        }
         app.announce_new_version();
 
         // This window takes the files that other commands name.

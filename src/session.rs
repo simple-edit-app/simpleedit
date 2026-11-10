@@ -150,7 +150,10 @@ impl Session {
     /// contents, so it is owner-only.
     pub fn write(json: &str) -> std::io::Result<()> {
         let path = Self::path().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "no data directory")
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                t!("status.no_data_dir").to_string(),
+            )
         })?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;

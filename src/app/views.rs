@@ -1104,7 +1104,7 @@ impl SimpleEditApp {
         let json = self
             .build_session()
             .to_json()
-            .ok_or_else(|| "session could not be serialized".to_string())?;
+            .ok_or_else(|| t!("status.session_not_serialized").to_string())?;
         crate::session::Session::write(&json).map_err(|e| e.to_string())?;
         self.last_session = fingerprint(&json);
         self.session_rev = self.rev;

@@ -1216,6 +1216,17 @@ pub fn import<'a>(im: &'a super::Import, dark: bool) -> Element<'a, Message> {
 
 /// The window that copies a table to another data source: where it goes, and
 /// whether its rows go too.
+/// A data source in the list of the copy: told apart by its id, since two of
+/// them can have the same label.
+#[derive(Clone, PartialEq)]
+struct Dest(u64, String);
+
+impl std::fmt::Display for Dest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.1)
+    }
+}
+
 pub fn copy_table<'a>(
     copy: &'a super::CopyTable,
     connections: &'a [super::Connection],
@@ -1240,11 +1251,10 @@ pub fn copy_table<'a>(
         .align_y(Alignment::Center)
     };
     // The data sources it can go to, by name.
-    let names: Vec<(u64, String)> = connections.iter().map(|c| (c.id, c.label())).collect();
+    let names: Vec<Dest> = connections.iter().map(|c| Dest(c.id, c.label())).collect();
     let chosen = copy
         .dest
-        .and_then(|id| names.iter().find(|(i, _)| *i == id).map(|(_, n)| n.clone()));
-    let by_name = names.clone();
+        .and_then(|id| names.iter().find(|d| d.0 == id).cloned());
     let source_name = connections
         .iter()
         .find(|c| c.id == copy.from.0)
@@ -1263,17 +1273,9 @@ pub fn copy_table<'a>(
                 .size(12.5)
                 .color(p.muted)
                 .width(Length::Fixed(130.0)),
-            pick_list(
-                names.iter().map(|(_, n)| n.clone()).collect::<Vec<_>>(),
-                chosen,
-                move |name: String| {
-                    let id = by_name
-                        .iter()
-                        .find(|(_, n)| *n == name)
-                        .map_or(0, |(id, _)| *id);
-                    Message::Db(DbMsg::CopyDest(id))
-                }
-            )
+            pick_list(names, chosen, |dest: Dest| Message::Db(DbMsg::CopyDest(
+                dest.0
+            )))
             .text_size(12.5)
             .padding([3, 8])
             .style(se_theme::Select { dark }.style())

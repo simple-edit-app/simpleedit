@@ -264,6 +264,23 @@ impl Engine for Session {
         literal(text)
     }
 
+    fn literal_for(&self, kind: &str, text: &str) -> String {
+        // Bytes that are not text are shown as `0x…`: they go back as bytes.
+        let kind = kind.to_lowercase();
+        let binary = kind.contains("binary") || kind.contains("blob");
+        match text.strip_prefix("0x") {
+            Some(hex)
+                if binary
+                    && !hex.is_empty()
+                    && hex.len() % 2 == 0
+                    && hex.bytes().all(|b| b.is_ascii_hexdigit()) =>
+            {
+                format!("X'{hex}'")
+            }
+            _ => literal(text),
+        }
+    }
+
     fn same(&self, column: &str, literal: &str) -> String {
         format!("{column} <=> {literal}")
     }

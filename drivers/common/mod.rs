@@ -43,6 +43,15 @@ pub trait Engine {
     fn literal(&self, text: &str) -> String {
         format!("'{}'", text.replace('\'', "''"))
     }
+    /// A text as the literal for a column of type `kind` (a hex dump as
+    /// bytes, for the binary ones).
+    fn literal_for(&self, _kind: &str, text: &str) -> String {
+        self.literal(text)
+    }
+    /// `column` equals the value `literal`, for finding a row by its key.
+    fn key_equals(&self, column: &str, literal: &str) -> String {
+        format!("{column} = {literal}")
+    }
     /// `column` equals `literal`, NULLs included.
     fn same(&self, column: &str, literal: &str) -> String;
     fn version(&mut self) -> Result<String, String>;
@@ -380,14 +389,26 @@ fn result_rows(engine: &mut dyn Engine, request: &Request) -> Result<Value, Stri
         .columns_of(&sql)?
         .ok_or_else(|| "this statement gives no rows".to_string())?;
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let wrapped = format!(
-        "SELECT * FROM (\n{sql}\n) AS {}{} LIMIT {} OFFSET {}",
-        engine.quote("q"),
-        clauses(engine, request, &refs, &[])?,
-        limit + 1,
-        request.offset
-    );
-    let (_, mut data, more) = fetch_logged(engine, &wrapped, &wrapped, limit)?;
+    let unchanged = request.filter.trim().is_empty() && request.order.is_empty();
+    let (mut data, more) = if unchanged && request.target.dialect == protocol::Dialect::Mysql {
+        // MariaDB drops the ORDER BY of a derived table, and MySQL refuses a
+        // join whose columns share a name: the query runs as it is, and the
+        // page is cut from its rows.
+        let skip = request.offset as usize;
+        let (_, mut all, more) = fetch_logged(engine, &sql, &sql, skip + limit)?;
+        all.drain(..skip.min(all.len()));
+        (all, more)
+    } else {
+        let wrapped = format!(
+            "SELECT * FROM (\n{sql}\n) AS {}{} LIMIT {} OFFSET {}",
+            engine.quote("q"),
+            clauses(engine, request, &refs, &[])?,
+            limit + 1,
+            request.offset
+        );
+        let (_, data, more) = fetch_logged(engine, &wrapped, &wrapped, limit)?;
+        (data, more)
+    };
     let has_more = more || data.len() > limit;
     data.truncate(limit);
     let columns: Vec<Column> = names
@@ -424,8 +445,15 @@ fn change_sql(
             .then_some(())
             .ok_or_else(|| format!("no column {name}"))
     };
-    let value = |v: &Option<String>| match v {
-        Some(text) => engine.literal(text),
+    let kind_of = |name: &str| -> &str {
+        shape
+            .columns
+            .iter()
+            .find(|c| c.name == name)
+            .map_or("", |c| c.kind.as_str())
+    };
+    let value = |column: &str, v: &Option<String>| match v {
+        Some(text) => engine.literal_for(kind_of(column), text),
         None => "NULL".to_string(),
     };
     if change.kind == ChangeKind::Insert {
@@ -434,7 +462,7 @@ fn change_sql(
         for (column, v) in &change.set {
             known(column)?;
             columns.push(engine.quote(column));
-            values.push(value(v));
+            values.push(value(column, v));
         }
         return Ok(if columns.is_empty() {
             format!("INSERT INTO {target} DEFAULT VALUES")
@@ -458,7 +486,10 @@ fn change_sql(
         for (column, v) in &change.original {
             known(column)?;
             conditions.push(match v {
-                Some(text) => engine.same(&engine.quote(column), &engine.literal(text)),
+                Some(text) => engine.same(
+                    &engine.quote(column),
+                    &engine.literal_for(kind_of(column), text),
+                ),
                 None => format!("{} IS NULL", engine.quote(column)),
             });
         }
@@ -471,7 +502,10 @@ fn change_sql(
             return Err("the row cannot be found: the table has no usable primary key".to_string());
         }
         for (column, v) in &change.key {
-            conditions.push(format!("{} = {}", engine.quote(column), engine.literal(v)));
+            conditions.push(engine.key_equals(
+                &engine.quote(column),
+                &engine.literal_for(kind_of(column), v),
+            ));
         }
     }
     match change.kind {
@@ -483,7 +517,7 @@ fn change_sql(
             let mut sets = Vec::new();
             for (column, v) in &change.set {
                 known(column)?;
-                sets.push(format!("{} = {}", engine.quote(column), value(v)));
+                sets.push(format!("{} = {}", engine.quote(column), value(column, v)));
             }
             Ok(format!(
                 "UPDATE {target} SET {} WHERE {}",

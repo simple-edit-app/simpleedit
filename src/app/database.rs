@@ -328,6 +328,17 @@ impl SimpleEditApp {
             Some(editing.text)
         };
         let page = page.clone();
+        // Nothing typed in a cell of an added row that holds no text leaves
+        // the column's default; an emptied text is an empty text.
+        if tab.pending.is_new(&page, editing.row)
+            && value.as_deref() == Some("")
+            && !matches!(
+                tab.pending.cell(&page, editing.row, editing.col),
+                grid::Cell::Value(_)
+            )
+        {
+            return;
+        }
         tab.pending.set(&page, editing.row, editing.col, value);
     }
 
@@ -373,8 +384,9 @@ impl SimpleEditApp {
                 return Some(self.db_message(DbMsg::CopyLog(at, database::LogCopy::Sql)));
             }
         }
-        let console_typing =
-            self.db.console.open && self.db.console.tab == database::console::ConsoleTab::Queries;
+        let console_typing = self.db.console.open
+            && self.db.console.tab == database::console::ConsoleTab::Queries
+            && self.db.console.editor_focused;
         let path = self.current_file.clone()?;
         let tab = self.db_tabs.get_mut(&path)?;
         // The form of a row and the SQL preview stand over the grid too.
@@ -905,11 +917,10 @@ impl SimpleEditApp {
                 }
                 // The columns of the tables come for the completion of queries.
                 let columns = match (read_columns, self.db.params(id)) {
-                    (true, Some(params)) => {
-                        Task::perform(database::table_columns(params), move |done| {
-                            Message::Db(DbMsg::ColumnsLoaded(id, done))
-                        })
-                    }
+                    (true, Some(params)) => Task::perform(
+                        database::table_columns(params, String::new()),
+                        move |done| Message::Db(DbMsg::ColumnsLoaded(id, done)),
+                    ),
                     _ => Task::none(),
                 };
                 Task::batch([log, columns])
@@ -1348,6 +1359,7 @@ impl SimpleEditApp {
                 }
             }
             DbMsg::Select(path, row, col) => {
+                self.db.console.editor_focused = false;
                 if let Some(tab) = self.db_tabs.get_mut(&path) {
                     // A click elsewhere ends what was typed.
                     if tab
@@ -1620,6 +1632,9 @@ impl SimpleEditApp {
             }
             DbMsg::Sql(action) => {
                 use iced::widget::text_editor::{Action, Edit};
+                if !matches!(&action, Action::Scroll { .. }) {
+                    self.db.console.editor_focused = true;
+                }
                 // Typing proposes; moving the caret, a click or a new line closes.
                 let typed = matches!(
                     &action,

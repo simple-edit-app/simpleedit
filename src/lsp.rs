@@ -1982,6 +1982,14 @@ impl Server {
                 let Some(uri) = params["uri"].as_str() else {
                     return;
                 };
+                // Problems computed for a text older than ours are stale.
+                if let Some(v) = params["version"].as_i64() {
+                    if let Some((current, _)) = self.docs.lock().await.get(uri) {
+                        if v < *current {
+                            return;
+                        }
+                    }
+                }
                 let list = params["diagnostics"]
                     .as_array()
                     .cloned()

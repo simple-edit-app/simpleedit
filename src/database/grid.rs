@@ -200,8 +200,8 @@ impl Pending {
     }
 
     /// Makes a cell hold `value`; asking for what the cell holds already
-    /// takes the edit back. In a row that is added, an empty text is the
-    /// column's default.
+    /// takes the edit back. In a row that is added, an empty text is a text
+    /// (`''`); `set_default` gives the column's default back.
     pub fn set(&mut self, page: &Page, row: usize, col: usize, value: Option<String>) {
         if self.is_new(page, row) {
             if let Some(cell) = self
@@ -211,7 +211,6 @@ impl Pending {
             {
                 *cell = match value {
                     None => NewCell::Null,
-                    Some(text) if text.is_empty() => NewCell::Default,
                     Some(text) => NewCell::Text(text),
                 };
             }
@@ -235,17 +234,21 @@ impl Pending {
             .get(row)
             .and_then(|r| r.get(col))
             .is_some_and(|v| v.is_none());
-        let value = if text.is_empty() && (was_null || self.is_new(page, row)) {
+        // In a row that is added, nothing typed in a cell that holds no text
+        // is the column's default; emptying a text makes it an empty text.
+        if self.is_new(page, row)
+            && text.is_empty()
+            && !matches!(self.cell(page, row, col), Cell::Value(_))
+        {
+            self.set_default(page, row, col);
+            return;
+        }
+        let value = if text.is_empty() && was_null {
             None
         } else {
             Some(text)
         };
-        // In a row that is added, empty is the column's default.
-        if self.is_new(page, row) && value.is_none() {
-            self.set(page, row, col, Some(String::new()));
-        } else {
-            self.set(page, row, col, value);
-        }
+        self.set(page, row, col, value);
     }
 
     /// A cell of a row that is added goes back to the column's default.
@@ -716,8 +719,10 @@ mod tests {
         assert_eq!(p.cell(&page, 3, 1), Cell::Value("hello"));
         assert_eq!(p.cell(&page, 3, 2), Cell::Null);
         assert_eq!(p.value(&page, 3, 1), Some("hello"));
-        // An empty text is the default again; so does asking for it.
+        // An empty text is an empty text; asking for the default gives it back.
         p.set(&page, 3, 1, Some(String::new()));
+        assert_eq!(p.cell(&page, 3, 1), Cell::Value(""));
+        p.set_default(&page, 3, 1);
         assert_eq!(p.cell(&page, 3, 1), Cell::Default);
         p.set(&page, 3, 2, Some("x".into()));
         p.set_default(&page, 3, 2);
@@ -982,5 +987,13 @@ mod tests {
         // A cell that held a text and is emptied holds an empty text.
         p.type_into(&page, 1, 2, String::new());
         assert_eq!(p.value(&page, 1, 2), Some(""));
+        // In a row that is added: nothing typed is the default, and a text
+        // that is emptied is an empty text.
+        let row = p.add_row(&page);
+        p.type_into(&page, row, 1, String::new());
+        assert_eq!(p.cell(&page, row, 1), Cell::Default);
+        p.type_into(&page, row, 1, "a".into());
+        p.type_into(&page, row, 1, String::new());
+        assert_eq!(p.cell(&page, row, 1), Cell::Value(""));
     }
 }

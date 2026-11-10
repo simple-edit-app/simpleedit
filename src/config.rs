@@ -610,6 +610,10 @@ pub struct Config {
     /// Which default keymap `shortcuts` was written under (1: before the IDEs').
     #[serde(default = "first_keymap")]
     pub shortcuts_version: u32,
+    /// Name of the copy kept of a config file whose unreadable settings were
+    /// reset (never saved).
+    #[serde(skip)]
+    pub set_aside: Option<String>,
     pub recent_files: Vec<String>,
     /// The folders added to the sidebar as projects, and those of them that
     /// are open in the tree.
@@ -690,6 +694,7 @@ impl Default for Config {
             last_version: String::new(),
             shortcuts: Shortcuts::default(),
             shortcuts_version: KEYMAP_VERSION,
+            set_aside: None,
             recent_files: Vec::new(),
             projects: Vec::new(),
             projects_open: Vec::new(),
@@ -799,8 +804,23 @@ impl Config {
     pub fn load() -> Self {
         if let Some(path) = Self::config_path() {
             if let Ok(s) = std::fs::read_to_string(&path) {
-                match serde_json::from_str::<Config>(&s) {
-                    Ok(mut cfg) => {
+                match Self::parse(&s) {
+                    Ok((mut cfg, dropped)) => {
+                        if dropped {
+                            // A newer version wrote values this one does not
+                            // know: the rest is kept, the original too.
+                            let bak = path.with_file_name(format!(
+                                "config.json.bak-{}",
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0)
+                            ));
+                            if std::fs::copy(&path, &bak).is_ok() {
+                                cfg.set_aside =
+                                    bak.file_name().map(|n| n.to_string_lossy().into_owned());
+                            }
+                        }
                         cfg.sanitize();
                         if cfg.shortcuts_version < KEYMAP_VERSION {
                             cfg.shortcuts.adopt_the_ide_keymap();
@@ -811,7 +831,15 @@ impl Config {
                     // Keep the unreadable file around instead of silently
                     // overwriting it with defaults on the next save.
                     Err(_) => {
-                        let _ = crate::fsutil::set_aside(&path);
+                        let aside = crate::fsutil::set_aside(&path);
+                        return Config {
+                            dark_mode: detect_system_dark_mode(),
+                            locale: detect_system_locale(),
+                            set_aside: aside.and_then(|a| {
+                                a.file_name().map(|n| n.to_string_lossy().into_owned())
+                            }),
+                            ..Default::default()
+                        };
                     }
                 }
             }
@@ -820,6 +848,28 @@ impl Config {
             dark_mode: detect_system_dark_mode(),
             locale: detect_system_locale(),
             ..Default::default()
+        }
+    }
+
+    /// Reads a config, leaving out the settings that fail to parse (a value
+    /// from a newer version) rather than all of them. The flag tells if any
+    /// were left out.
+    fn parse(s: &str) -> Result<(Config, bool), serde_json::Error> {
+        match serde_json::from_str::<Config>(s) {
+            Ok(cfg) => Ok((cfg, false)),
+            Err(e) => {
+                let serde_json::Value::Object(mut map) = serde_json::from_str(s)? else {
+                    return Err(e);
+                };
+                let before = map.len();
+                map.retain(|key, value| {
+                    let one = serde_json::Map::from_iter([(key.clone(), value.clone())]);
+                    serde_json::from_value::<Config>(serde_json::Value::Object(one)).is_ok()
+                });
+                let dropped = map.len() < before;
+                let cfg = serde_json::from_value(serde_json::Value::Object(map))?;
+                Ok((cfg, dropped))
+            }
         }
     }
 
@@ -1032,6 +1082,15 @@ mod tests {
         let mut config = Config::default();
         config.add_recent(&PathBuf::from("untitled://1"));
         assert!(config.recent_files.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_value_only_resets_its_own_setting() {
+        let (cfg, dropped) =
+            Config::parse(r#"{"tab_width": 7, "lint_trigger": "from_the_future"}"#).unwrap();
+        assert!(dropped);
+        assert_eq!(cfg.tab_width, 7);
+        assert!(Config::parse("not json").is_err());
     }
 
     #[test]

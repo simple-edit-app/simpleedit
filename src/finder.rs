@@ -357,7 +357,10 @@ pub fn find_occurrences_until(
             let line = text[line_start..line_end].trim_end_matches('\r');
             let trimmed = line.trim_start();
             let cut = line.len() - trimmed.len();
-            let len = found.end.min(line_start + line.len()) - found.start;
+            let len = found
+                .end
+                .min(line_start + line.len())
+                .saturating_sub(found.start);
             let (preview, at) = excerpt(trimmed, found.col.saturating_sub(cut), len);
             hits.push((
                 TextHit {
@@ -461,6 +464,25 @@ fn excerpt(line: &str, start: usize, len: usize) -> (String, (usize, usize)) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_match_starting_on_the_newline_of_a_crlf_line_does_not_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, "a\r\n\r\nb").unwrap();
+        let options = crate::find_replace::Options {
+            query: r"\n\s*\n".into(),
+            regex: true,
+            ..Default::default()
+        };
+        let found = super::find_occurrences(
+            std::slice::from_ref(&file),
+            &Default::default(),
+            &options,
+            None,
+        );
+        assert!(found.is_ok());
+    }
+
     #[test]
     fn a_search_that_was_cancelled_stops_before_the_next_file() {
         let dir = tempfile::tempdir().unwrap();

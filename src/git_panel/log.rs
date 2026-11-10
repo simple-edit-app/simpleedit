@@ -668,10 +668,7 @@ impl Panel {
                     async move {
                         let mut pushed = false;
                         for sha in &shas {
-                            let branches = history::branches_containing(&repo, sha)
-                                .await
-                                .unwrap_or_default();
-                            pushed |= branches.iter().any(|b| b.contains('/'));
+                            pushed |= history::on_remote(&repo, sha).await;
                         }
                         // The text to start the message from, oldest first.
                         let mut messages = Vec::new();

@@ -126,6 +126,8 @@ pub struct FinderState {
     /// The preview was typed in: the list keeps its place when it is looked
     /// at again, and the preview its cursor.
     preview_edited: bool,
+    /// The next results keep the selected row (after "Replace" of one match).
+    keep_selected: bool,
     /// Set to stop the search that is running.
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The last row clicked, to tell a double click.
@@ -168,6 +170,7 @@ impl Default for FinderState {
             undo: Vec::new(),
             preview: None,
             preview_edited: false,
+            keep_selected: false,
             cancel: Default::default(),
             last_click: None,
             dir_text: String::new(),
@@ -660,10 +663,14 @@ impl SimpleEditApp {
             return;
         }
         self.finder.searching = false;
+        let keep = std::mem::take(&mut self.finder.keep_selected);
         match result {
             Ok(hits) => {
                 self.finder.hits = hits;
-                self.finder.selected = if self.finder.preview_edited {
+                if keep {
+                    self.finder.preview = None;
+                }
+                self.finder.selected = if self.finder.preview_edited || keep {
                     self.finder
                         .selected
                         .min(self.finder.hits.len().saturating_sub(1))
@@ -1060,22 +1067,14 @@ impl SimpleEditApp {
         if count > 0 {
             let index = self.finder.selected;
             self.finder.hits.remove(index);
-            // The other matches of the file were found in the text before
-            // this replacement, which left their places as they were.
-            let path = occurrence.hit.path;
-            if let Some(stamp) = self
-                .file_text(&path)
-                .map(|(text, _)| crate::finder::text_stamp(&text))
-            {
-                for o in self.finder.hits.iter_mut().filter(|o| o.hit.path == path) {
-                    if o.hit.stamp == occurrence.hit.stamp {
-                        o.hit.stamp = stamp;
-                    }
-                }
-            }
             self.finder.selected = index.min(self.finder.hits.len().saturating_sub(1));
             self.finder.preview = None;
             self.refresh_finder_preview();
+            // The other matches of the file keep the places they had before
+            // this replacement (their stamp no longer fits, so none is
+            // replaced from them): looked for again, at the same row.
+            self.finder.keep_selected = true;
+            return self.search_files(false);
         }
         Task::none()
     }

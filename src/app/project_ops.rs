@@ -23,7 +23,7 @@ fn copy_name(path: &Path) -> String {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    if path.is_dir() {
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
         return format!("{name} copy");
     }
     match name.rsplit_once('.') {
@@ -32,9 +32,13 @@ fn copy_name(path: &Path) -> String {
     }
 }
 
-/// Copies a file, or a folder with everything in it.
+/// Copies a file, or a folder with everything in it. A link is copied as a
+/// link, not followed.
 fn copy_all(from: &Path, to: &Path) -> std::io::Result<()> {
-    if from.is_dir() {
+    let kind = std::fs::symlink_metadata(from)?.file_type();
+    if kind.is_symlink() {
+        copy_link(from, to)
+    } else if kind.is_dir() {
         std::fs::create_dir(to)?;
         for entry in std::fs::read_dir(from)? {
             let entry = entry?;
@@ -43,6 +47,21 @@ fn copy_all(from: &Path, to: &Path) -> std::io::Result<()> {
         Ok(())
     } else {
         std::fs::copy(from, to).map(drop)
+    }
+}
+
+#[cfg(unix)]
+fn copy_link(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(std::fs::read_link(from)?, to)
+}
+
+#[cfg(windows)]
+fn copy_link(from: &Path, to: &Path) -> std::io::Result<()> {
+    let target = std::fs::read_link(from)?;
+    if from.is_dir() {
+        std::os::windows::fs::symlink_dir(target, to)
+    } else {
+        std::os::windows::fs::symlink_file(target, to)
     }
 }
 
@@ -165,9 +184,8 @@ impl SimpleEditApp {
         }
     }
 
-    /// Renames a file or folder. The tabs inside it are closed first (they
-    /// must have nothing unsaved) and the one that was in the editor is
-    /// opened again under its new name.
+    /// Renames a file or folder. The tabs inside it must have nothing
+    /// unsaved; they follow to the new name, bookmarks and local history too.
     /// Moves a file or folder to another place (see `rename_entry`).
     pub(super) fn move_entry(&mut self, old: PathBuf, new: PathBuf) -> Task<Message> {
         self.rename_entry(old, new)
@@ -185,24 +203,59 @@ impl SimpleEditApp {
             .clone()
             .filter(|c| c.starts_with(&old))
             .and_then(|c| c.strip_prefix(&old).ok().map(|rest| new.join(rest)));
-        let mut tasks: Vec<Task<Message>> =
-            inside.into_iter().map(|p| self.close_path(p)).collect();
-        match std::fs::rename(&old, &new) {
-            Ok(()) => {
-                if old.is_file() || new.is_file() {
-                    self.bookmarks.rename(&old, &new);
-                }
-                self.projects.renamed(&old, &new);
-                self.save_projects();
-                if let Some(path) = back {
-                    tasks.push(self.activate(path));
-                }
-                tasks.push(Task::done(Message::Git(crate::git_panel::GitMsg::Refresh)));
+        // Renamed first: the tabs stay as they are when it fails.
+        if let Err(e) = std::fs::rename(&old, &new) {
+            self.set_status(format!("{}: {e}", t!("status.error")), true);
+            return Task::none();
+        }
+        let moved = |p: &Path| -> PathBuf {
+            match p.strip_prefix(&old) {
+                Ok(rest) if rest.as_os_str().is_empty() => new.clone(),
+                Ok(rest) => new.join(rest),
+                Err(_) => p.to_path_buf(),
             }
-            Err(e) => {
-                self.set_status(format!("{}: {e}", t!("status.error")), true);
+        };
+        // The tabs that are not in the editor follow to the new path.
+        for p in inside
+            .iter()
+            .filter(|p| self.current_file.as_ref() != Some(*p))
+        {
+            let to = moved(p);
+            self.sidebar.rename_file(p, to.clone());
+            if let Some(buffer) = self.file_cache.remove(p) {
+                self.file_cache.insert(to.clone(), buffer);
+            }
+            if let Some(undo) = self.undo_cache.remove(p) {
+                self.undo_cache.insert(to.clone(), undo);
+            }
+            if let Some(large) = self.large.remove(p) {
+                self.large.insert(to.clone(), large);
+            }
+            if self.preview_tab.as_ref() == Some(p) {
+                self.preview_tab = Some(to);
             }
         }
+        let mut tasks: Vec<Task<Message>> = Vec::new();
+        if let Some(current) = self.current_file.clone().filter(|c| inside.contains(c)) {
+            tasks.push(self.close_path(current));
+        }
+        for closed in &mut self.closed_tabs {
+            *closed = moved(closed);
+        }
+        self.bookmarks.rename(&old, &new);
+        let days = self.config.local_history_days;
+        if days > 0 {
+            if let Some(store) = crate::local_history::Store::global() {
+                let (from, to) = (old.clone(), new.clone());
+                tasks.push(Task::future(async move { store.rename_tree(&from, &to) }).discard());
+            }
+        }
+        self.projects.renamed(&old, &new);
+        self.save_projects();
+        if let Some(path) = back {
+            tasks.push(self.activate(path));
+        }
+        tasks.push(Task::done(Message::Git(crate::git_panel::GitMsg::Refresh)));
         Task::batch(tasks)
     }
 
@@ -332,6 +385,23 @@ impl SimpleEditApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn duplicating_a_folder_copies_links_as_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("a.txt"), "a").unwrap();
+        std::os::unix::fs::symlink("..", src.join("up")).unwrap();
+        let to = dir.path().join("copy");
+        copy_all(&src, &to).unwrap();
+        assert!(std::fs::symlink_metadata(to.join("up"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(to.join("a.txt")).unwrap(), "a");
+    }
 
     fn app_with_project() -> (SimpleEditApp, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();

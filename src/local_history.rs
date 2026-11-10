@@ -186,6 +186,33 @@ impl Store {
         }
     }
 
+    /// The history of a file, or of every file in a folder, follows it to a
+    /// new path.
+    pub fn rename_tree(&self, from: &Path, to: &Path) {
+        let _writing = writing();
+        for mut record in self.all_files() {
+            let Ok(rest) = record.path.strip_prefix(from) else {
+                continue;
+            };
+            let new = if rest.as_os_str().is_empty() {
+                to.to_path_buf()
+            } else {
+                to.join(rest)
+            };
+            let old_file = self.file_path(&record.path);
+            record.path = new;
+            let mut moved = self.file(&record.path);
+            moved.path = record.path.clone();
+            moved.revisions.extend(record.revisions);
+            moved.revisions.sort_by_key(|r| r.time);
+            if let Ok(json) = serde_json::to_vec(&moved) {
+                if write_atomically(&self.file_path(&moved.path), &json).is_some() {
+                    let _ = std::fs::remove_file(old_file);
+                }
+            }
+        }
+    }
+
     pub fn file(&self, path: &Path) -> FileRecord {
         std::fs::read(self.file_path(path))
             .ok()

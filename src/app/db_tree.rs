@@ -57,11 +57,11 @@ impl SimpleEditApp {
                 self.db.designer = Some(Designer::for_new_table(conn, database, schema));
                 Task::none()
             }
-            DbMsg::ShowDiagram(conn, _database, schema) => {
+            DbMsg::ShowDiagram(conn, database, schema) => {
                 let Some(params) = self.db_params(conn, false) else {
                     return self.db_ask_password(conn);
                 };
-                Task::perform(database::table_columns(params), move |done| {
+                Task::perform(database::table_columns(params, database), move |done| {
                     Message::Db(DbMsg::DiagramLoaded(schema.clone(), done))
                 })
             }

@@ -105,7 +105,7 @@ pub fn detect(root: &Path) -> Vec<TaskSpec> {
                 for name in scripts.keys() {
                     tasks.push(spec(
                         &format!("npm run {name}"),
-                        &format!("npm run {name}"),
+                        &format!("npm run {}", crate::remote::quote(name)),
                         root,
                     ));
                 }
@@ -117,7 +117,7 @@ pub fn detect(root: &Path) -> Vec<TaskSpec> {
             for target in make_targets(&text) {
                 tasks.push(spec(
                     &format!("make {target}"),
-                    &format!("make {target}"),
+                    &format!("make -- {}", crate::remote::quote(&target)),
                     root,
                 ));
             }

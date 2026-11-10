@@ -878,17 +878,18 @@ fn driver_candidates(picked: &str, dialect: protocol::Dialect) -> Vec<PathBuf> {
     {
         found.push(dir.join(dialect.driver_name()));
     }
-    found.push(downloaded_driver_of(dialect));
+    found.extend(downloaded_driver_of(dialect));
     found
 }
 
 /// Where the driver of a system is downloaded to.
-pub fn downloaded_driver_of(dialect: protocol::Dialect) -> PathBuf {
-    crate::fsutil::data_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("simpleedit")
-        .join("drivers")
-        .join(dialect.driver_name())
+/// None without a data directory: a shared `/tmp` is never used.
+pub fn downloaded_driver_of(dialect: protocol::Dialect) -> Option<PathBuf> {
+    crate::fsutil::data_dir().map(|dir| {
+        dir.join("simpleedit")
+            .join("drivers")
+            .join(dialect.driver_name())
+    })
 }
 
 /// The asset of a release that holds the driver for this system.
@@ -943,7 +944,7 @@ pub async fn download_driver_of(dialect: protocol::Dialect) -> Result<(), String
     let bytes =
         crate::updater::download_verified(version, &asset, MAX_DRIVER, Duration::from_secs(120))
             .await?;
-    let dest = downloaded_driver_of(dialect);
+    let dest = downloaded_driver_of(dialect).ok_or_else(|| t!("db.err_platform").to_string())?;
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         if let Some(dir) = dest.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -1317,21 +1318,19 @@ pub async fn apply(params: Params, table: TableRef, changes: Vec<protocol::Chang
 }
 
 /// The columns of every table of the database, for the completion.
-pub async fn table_columns(params: Params) -> Done<protocol::Catalog> {
-    call_with(
-        params.browse.clone(),
-        params.driver.clone(),
-        params.request("columns"),
-    )
-    .await
-    .map(|answer| {
-        Ok(protocol::Catalog {
-            columns: serde_json::from_value(answer["columns"].clone())
-                .map_err(|e| e.to_string())?,
-            foreign_keys: serde_json::from_value(answer["foreign_keys"].clone())
-                .unwrap_or_default(),
+pub async fn table_columns(params: Params, database: String) -> Done<protocol::Catalog> {
+    let mut request = params.request("columns");
+    request.database = database;
+    call_with(params.browse.clone(), params.driver.clone(), request)
+        .await
+        .map(|answer| {
+            Ok(protocol::Catalog {
+                columns: serde_json::from_value(answer["columns"].clone())
+                    .map_err(|e| e.to_string())?,
+                foreign_keys: serde_json::from_value(answer["foreign_keys"].clone())
+                    .unwrap_or_default(),
+            })
         })
-    })
 }
 
 /// Writes a backup of the database, a schema or a table (with `pg_dump`): how
@@ -1714,12 +1713,16 @@ pub async fn export_converted(
     path: String,
     format: &str,
 ) -> Done<String> {
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let temp = std::env::temp_dir().join(format!(
-        "simpleedit-export-{}-{}.csv",
-        std::process::id(),
-        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
+    let scratch = match tempfile::tempdir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            return Done {
+                result: Err(e.to_string()),
+                executed: Vec::new(),
+            }
+        }
+    };
+    let temp = scratch.path().join("export.csv");
     let dialect = params.target.dialect;
     let name = if query.sql.is_some() || table.table.is_empty() {
         "result".to_string()
@@ -1759,7 +1762,7 @@ pub async fn export_converted(
         .unwrap_or_else(|e| Err(e.to_string()));
         done.result = converted;
     }
-    let _ = std::fs::remove_file(&temp);
+    drop(scratch);
     done
 }
 
@@ -2447,6 +2450,22 @@ impl State {
         }
     }
 
+    /// The database the console of this connection runs in, when it is not
+    /// the connection's own.
+    fn console_database(&self, id: u64) -> Option<&str> {
+        let name = self.console.database.as_str();
+        (self.console.connection == Some(id) && !name.is_empty()).then_some(name)
+    }
+
+    /// The database the completion looks into: the console's, else the
+    /// connection's own.
+    fn completion_database<'a>(&self, id: u64, databases: &'a [Database]) -> Option<&'a Database> {
+        self.console_database(id)
+            .and_then(|name| databases.iter().find(|d| d.name == name))
+            .or_else(|| databases.iter().find(|d| d.current))
+            .or(databases.first())
+    }
+
     /// What the completion knows of a connection: its tables, and the
     /// columns when they have been read.
     pub fn known(&self, id: u64) -> completion::Known {
@@ -2455,8 +2474,7 @@ impl State {
             ..completion::Known::default()
         };
         if let Some(Tree::Loaded(databases)) = self.trees.get(&id) {
-            // The tables of the database the connection is on.
-            let current = databases.iter().find(|d| d.current).or(databases.first());
+            let current = self.completion_database(id, databases);
             for schema in current.into_iter().flat_map(|d| &d.schemas) {
                 for table in &schema.tables {
                     known
@@ -2467,7 +2485,7 @@ impl State {
         }
         known.foreign_keys = self.foreign_keys.get(&id).cloned().unwrap_or_default();
         if let Some(Tree::Loaded(databases)) = self.trees.get(&id) {
-            let current = databases.iter().find(|d| d.current).or(databases.first());
+            let current = self.completion_database(id, databases);
             for schema in current.into_iter().flat_map(|d| &d.schemas) {
                 for routine in &schema.routines {
                     known.routines.push((
@@ -2478,7 +2496,22 @@ impl State {
                 }
             }
         }
-        for column in self.columns.get(&id).into_iter().flatten() {
+        // The columns were read in the connection's own database.
+        let other = self
+            .console_database(id)
+            .is_some_and(|name| match self.trees.get(&id) {
+                Some(Tree::Loaded(databases)) => {
+                    !databases.iter().any(|d| d.current && d.name == name)
+                }
+                _ => false,
+            });
+        for column in self
+            .columns
+            .get(&id)
+            .filter(|_| !other)
+            .into_iter()
+            .flatten()
+        {
             known
                 .columns
                 .entry((column.schema.clone(), column.table.clone()))
@@ -2650,6 +2683,36 @@ mod tests {
         let mut state = State::load();
         state.connections.clear();
         state
+    }
+
+    #[test]
+    fn the_completion_knows_the_tables_of_the_database_of_the_console() {
+        let db = |name: &str, current: bool, table: &str| Database {
+            name: name.into(),
+            current,
+            schemas: vec![protocol::Schema {
+                name: "public".into(),
+                tables: vec![protocol::Table {
+                    name: table.into(),
+                    kind: Kind::Table,
+                }],
+                ..Default::default()
+            }],
+        };
+        let mut state = fresh();
+        state.trees.insert(
+            1,
+            Tree::Loaded(vec![
+                db("app", true, "orders"),
+                db("analytics", false, "events"),
+            ]),
+        );
+        let names =
+            |s: &State| -> Vec<String> { s.known(1).tables.into_iter().map(|t| t.1).collect() };
+        assert_eq!(names(&state), vec!["orders"]);
+        state.console.connection = Some(1);
+        state.console.database = "analytics".into();
+        assert_eq!(names(&state), vec!["events"]);
     }
 
     #[test]
@@ -3965,7 +4028,7 @@ mod tests {
                 assert!(!page.editable, "{sql}");
             }
             // The columns of the tables, for the completion.
-            let columns = table_columns(params.clone()).await;
+            let columns = table_columns(params.clone(), String::new()).await;
             assert!(columns.executed.iter().all(|e| e.internal));
             let catalog = columns.result.unwrap();
             assert!(catalog

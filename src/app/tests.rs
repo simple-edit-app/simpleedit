@@ -3498,6 +3498,23 @@ mod behavior_tests {
     }
 
     #[test]
+    fn copy_goes_to_the_grid_unless_the_console_editor_has_the_focus() {
+        use crate::database::console::ConsoleTab;
+        use crate::database::DbMsg;
+        let (mut app, path) = db_app(true);
+        app.db.console.open = true;
+        app.db.console.tab = ConsoleTab::Queries;
+        let _ = app.update(Message::Db(DbMsg::Select(path.clone(), 1, 0)));
+        // A cell was clicked last: the grid copies, the console being open.
+        assert!(app.db_key("c", true, false, false).is_some());
+        // Then the editor of the queries was clicked: it keeps Cmd/Ctrl+C.
+        app.db.console.editor_focused = true;
+        assert!(app.db_key("c", true, false, false).is_none());
+        let _ = app.update(Message::Db(DbMsg::Select(path, 1, 0)));
+        assert!(app.db_key("c", true, false, false).is_some());
+    }
+
+    #[test]
     fn a_key_a_text_field_used_or_a_window_over_the_grid_leaves_the_rows_alone() {
         use crate::database::TextView;
         let (mut app, path) = db_app(true);

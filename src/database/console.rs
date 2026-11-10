@@ -92,6 +92,9 @@ pub struct Console {
     pub running_sql: Vec<String>,
     /// The word of the queries the server blamed, to underline.
     pub error_mark: Option<ErrorMark>,
+    /// The editor of the queries was the last thing clicked or typed in (not
+    /// a cell of a grid): it is the one that has Cmd/Ctrl+C.
+    pub editor_focused: bool,
     /// The number the next console is given.
     pub next_doc: usize,
 }
@@ -318,6 +321,7 @@ impl Console {
             active: 0,
             running_sql: Vec::new(),
             error_mark: None,
+            editor_focused: false,
             next_doc: 2,
         }
     }

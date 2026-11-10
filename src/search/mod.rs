@@ -263,9 +263,7 @@ impl SearchState {
                 let range = &self.matches[i];
                 if let Some(caps) = re.captures_at(text, range.start) {
                     if caps.get(0).map(|m| m.range()) == Some(range.clone()) {
-                        let mut out = String::new();
-                        caps.expand(&self.replacement, &mut out);
-                        return out;
+                        return crate::find_replace::expand(&caps, &self.replacement, true);
                     }
                 }
             }
@@ -331,7 +329,11 @@ impl SearchState {
         }
         if self.use_regex {
             let re = build_regex(&self.query, self.case_sensitive).map_err(|e| e.to_string())?;
-            Ok(re.replace_all(text, self.replacement.as_str()).into_owned())
+            Ok(re
+                .replace_all(text, |caps: &regex::Captures| {
+                    crate::find_replace::expand(caps, &self.replacement, true)
+                })
+                .into_owned())
         } else if self.case_sensitive {
             Ok(text.replace(&self.query, &self.replacement))
         } else {
@@ -634,6 +636,12 @@ fn select_range(content: &mut crate::code_editor::Content, text: &str, range: Ra
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regex_replacement_reads_a_group_followed_by_an_underscore() {
+        let s = make_search(r"(\w+)@", "$1_at", true, true);
+        assert_eq!(s.replace_all("bob@x").unwrap(), "bob_atx");
+    }
 
     fn make_search(
         query: &str,

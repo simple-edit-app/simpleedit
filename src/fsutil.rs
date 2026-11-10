@@ -53,7 +53,7 @@ pub fn write_atomic(path: &Path, data: &[u8], private: bool) -> std::io::Result<
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "read-only file",
+            t!("status.err_permission").to_string(),
         ));
     }
     #[cfg(unix)]

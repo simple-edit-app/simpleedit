@@ -308,6 +308,28 @@ pub async fn branches_containing(repo: &Path, sha: &str) -> Result<Vec<String>, 
         .collect())
 }
 
+/// Whether a remote-tracking branch contains the commit (a local branch
+/// named `feature/x` does not count).
+pub async fn on_remote(repo: &Path, sha: &str) -> bool {
+    run(
+        repo,
+        &[
+            "branch",
+            "-r",
+            "--contains",
+            sha,
+            "--format=%(refname:short)",
+        ],
+    )
+    .await
+    .map(|out| {
+        out.lines()
+            .map(str::trim)
+            .any(|l| !l.is_empty() && !l.ends_with("/HEAD"))
+    })
+    .unwrap_or(false)
+}
+
 /// The commits of HEAD, to tell which ones a branch's log shares with it.
 pub async fn head_commits(repo: &Path, limit: usize) -> Result<HashSet<String>, String> {
     let max = format!("--max-count={limit}");

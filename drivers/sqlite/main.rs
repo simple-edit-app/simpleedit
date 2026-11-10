@@ -100,7 +100,18 @@ impl Engine for Session {
     }
 
     fn same(&self, column: &str, literal: &str) -> String {
-        format!("{column} IS {literal}")
+        // The text is what the grid shows: a number in a column without
+        // affinity, or a blob, is not equal to it as such.
+        format!(
+            "({column} IS {literal} \
+             OR (typeof({column}) = 'integer' AND CAST({column} AS TEXT) = {literal}) \
+             OR (typeof({column}) = 'real' AND {column} = CAST({literal} AS REAL)) \
+             OR (typeof({column}) = 'blob' AND 'x''' || lower(hex({column})) || '''' = {literal}))"
+        )
+    }
+
+    fn key_equals(&self, column: &str, literal: &str) -> String {
+        self.same(column, literal)
     }
 
     fn version(&mut self) -> Result<String, String> {
@@ -734,6 +745,46 @@ mod tests {
         let open = |r: &Request| Session::open(r).map(|s| Box::new(s) as Box<dyn Engine>);
         let refused = common::run(&request.to_string(), &mut None, &open, false);
         assert!(refused.unwrap_err().contains("read-only"));
+    }
+
+    #[test]
+    fn rows_without_type_affinity_or_with_blobs_are_found_by_what_is_shown() {
+        let (_dir, path) = database();
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE loose (a, b);
+                 INSERT INTO loose VALUES (5, x'9f00'), (2.0, 'z');
+                 CREATE TABLE untyped_key (k PRIMARY KEY, v);
+                 INSERT INTO untyped_key VALUES (7, 'q');",
+            )
+            .unwrap();
+        let apply = |table: &str, change: Value| {
+            call(
+                &path,
+                json!({"op": "apply", "table": table, "changes": [change]}),
+            )
+        };
+        let done = apply(
+            "loose",
+            json!({"kind": "update", "key": [["rowid", "1"]], "set": [["a", "6"]],
+                   "original": [["a", "5"], ["b", "x'9f00'"]]}),
+        )
+        .unwrap();
+        assert_eq!(done["applied"], 1);
+        let done = apply(
+            "loose",
+            json!({"kind": "delete", "key": [["rowid", "2"]], "set": [],
+                   "original": [["a", "2"], ["b", "z"]]}),
+        )
+        .unwrap();
+        assert_eq!(done["applied"], 1);
+        let done = apply(
+            "untyped_key",
+            json!({"kind": "delete", "key": [["k", "7"]], "set": []}),
+        )
+        .unwrap();
+        assert_eq!(done["applied"], 1);
     }
 
     #[test]

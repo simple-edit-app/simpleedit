@@ -1347,10 +1347,14 @@ fn driver_tab<'a>(state: &'a State, dialog: &'a Dialog, dark: bool) -> Element<'
         ),
         labeled(
             t!("db.driver_location").to_string(),
-            text(super::downloaded_driver_of(dialect).display().to_string())
-                .size(12)
-                .font(se_theme::MONO)
-                .color(p.muted),
+            text(
+                super::downloaded_driver_of(dialect)
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default()
+            )
+            .size(12)
+            .font(se_theme::MONO)
+            .color(p.muted),
             dark
         ),
     ]
