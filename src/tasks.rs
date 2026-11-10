@@ -196,9 +196,22 @@ pub fn run(task: TaskSpec) -> impl iced::futures::Stream<Item = Event> {
         to: tokio::sync::mpsc::UnboundedSender<String>,
     ) {
         tokio::spawn(async move {
-            let mut lines = BufReader::new(reader).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if to.send(line).is_err() {
+            // Bytes, not `lines()`: an invalid UTF-8 byte must not end the
+            // output (and close the pipe under the command).
+            let mut reader = BufReader::new(reader);
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                if !matches!(reader.read_until(b'\n', &mut buf).await, Ok(n) if n > 0) {
+                    break;
+                }
+                if buf.last() == Some(&b'\n') {
+                    buf.pop();
+                    if buf.last() == Some(&b'\r') {
+                        buf.pop();
+                    }
+                }
+                if to.send(String::from_utf8_lossy(&buf).into_owned()).is_err() {
                     break;
                 }
             }
@@ -430,6 +443,27 @@ mod tests {
             "{lines:?}"
         );
         assert_eq!(events.last(), Some(&Event::Done(Some(3))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_byte_that_is_not_utf8_does_not_end_the_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let events: Vec<Event> = runtime.block_on(async {
+            run(spec("t", "printf 'a\\351b\\nafter\\n'", dir.path()))
+                .collect()
+                .await
+        });
+        assert!(
+            events.contains(&Event::Line("a\u{FFFD}b".into())),
+            "{events:?}"
+        );
+        assert!(events.contains(&Event::Line("after".into())));
+        assert_eq!(events.last(), Some(&Event::Done(Some(0))));
     }
 
     #[cfg(target_os = "linux")]

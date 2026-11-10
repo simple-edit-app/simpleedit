@@ -300,6 +300,7 @@ pub fn compile(options: &Options) -> Result<Regex, String> {
     regex::RegexBuilder::new(&body)
         .case_insensitive(!options.case_sensitive)
         .multi_line(true)
+        .crlf(true)
         .build()
         .map_err(|e| e.to_string())
 }
@@ -554,6 +555,18 @@ pub fn apply(text: &str, found: &[Found]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dollar_matches_before_a_crlf() {
+        let re = compile(&Options {
+            query: "foo(.*)$".into(),
+            regex: true,
+            ..Options::default()
+        })
+        .unwrap();
+        let caps = re.captures("a foo!\r\nb").unwrap();
+        assert_eq!(&caps[1], "!");
+    }
 
     fn kinds(ext: &str, text: &str) -> Vec<(String, Region)> {
         regions(ext, text)

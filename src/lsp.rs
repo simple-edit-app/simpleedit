@@ -164,6 +164,78 @@ fn configuration(family: &str, section: &str, trusted: bool) -> Value {
     }
 }
 
+/// Tells the servers that already have `path` open that it was saved
+/// (`didSave`), which is when rust-analyzer runs its check. Nothing is
+/// started for it.
+pub async fn did_save(path: PathBuf, text: String) {
+    let Some(servers) = SERVERS.get() else {
+        return;
+    };
+    let running: Vec<Arc<Server>> = servers
+        .lock()
+        .await
+        .values()
+        .filter_map(|cell| cell.get().cloned())
+        .filter(|s| s.alive.load(Ordering::SeqCst))
+        .collect();
+    let uri = path_to_uri(&path);
+    for server in running {
+        if !server.docs.lock().await.contains_key(&uri) {
+            continue;
+        }
+        // The server saved what is on disk: it must have been told that.
+        if server.sync(&uri, "", &text).await.is_err() {
+            continue;
+        }
+        let mut params = json!({ "textDocument": { "uri": uri } });
+        if server.capability(&["textDocumentSync", "save", "includeText"]) == json!(true) {
+            params["text"] = json!(text);
+        }
+        let _ = server
+            .send(&json!({
+                "jsonrpc": "2.0", "method": "textDocument/didSave", "params": params,
+            }))
+            .await;
+    }
+}
+
+/// How long the servers are given to answer `shutdown` when the program
+/// ends.
+const SHUTDOWN_WAIT: Duration = Duration::from_millis(700);
+
+/// Asks every server to end (`shutdown`, then `exit`), then stops what is
+/// left. Waits for at most [`SHUTDOWN_WAIT`]: closing the program must not
+/// wait for a server that does not answer.
+pub fn stop_servers() {
+    let (Some(runtime), Some(servers)) = (RUNTIME.get(), SERVERS.get()) else {
+        return;
+    };
+    let (done, finished) = std::sync::mpsc::channel();
+    runtime.spawn(async move {
+        let running: Vec<Arc<Server>> = servers
+            .lock()
+            .await
+            .values()
+            .filter_map(|cell| cell.get().cloned())
+            .collect();
+        let ends = running.iter().map(|server| async move {
+            if server.alive.load(Ordering::SeqCst) {
+                let _ =
+                    tokio::time::timeout(SHUTDOWN_WAIT, server.request("shutdown", Value::Null))
+                        .await;
+                let _ = server
+                    .send(&json!({ "jsonrpc": "2.0", "method": "exit" }))
+                    .await;
+            }
+            server.kill();
+        });
+        iced::futures::future::join_all(ends).await;
+        let _ = done.send(());
+    });
+    // A little more than they are given: the rest is killed by the exit.
+    let _ = finished.recv_timeout(SHUTDOWN_WAIT + Duration::from_millis(200));
+}
+
 /// Stops every server: they start again, with the settings of now, when
 /// next needed.
 pub async fn restart_servers() {
@@ -595,6 +667,17 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
     Some(PathBuf::from(String::from_utf8(bytes).ok()?))
 }
 
+fn same_uri(a: &str, b: &str) -> bool {
+    uri_key(a) == uri_key(b)
+}
+
+/// What identifies a document in what a server says: its decoded path. The
+/// same file has several spellings as a URI (`+`, `(` or `@` escaped or
+/// not), and servers do not encode them as `path_to_uri` does.
+fn uri_key(uri: &str) -> String {
+    uri_to_path(uri).map_or_else(|| uri.to_string(), |p| p.to_string_lossy().into_owned())
+}
+
 // ---- Problems and fixes ---------------------------------------------------
 
 /// The main program that serves a file extension (to tell servers apart).
@@ -696,7 +779,7 @@ impl Server {
         self.published
             .lock()
             .ok()
-            .and_then(|p| p.get(uri).cloned())
+            .and_then(|p| p.get(&uri_key(uri)).cloned())
             .unwrap_or_default()
     }
 
@@ -761,8 +844,13 @@ fn lint_of(raw: &Value, text: &str, server: &str) -> Option<crate::lint::Diagnos
 /// The edits of a workspace edit that are for `uri`, in byte columns.
 fn edits_for(edit: &Value, uri: &str, text: &str) -> Vec<crate::lint::Edit> {
     let mut lists: Vec<&Value> = Vec::new();
-    if let Some(list) = edit.get("changes").and_then(|c| c.get(uri)) {
-        lists.push(list);
+    if let Some(changes) = edit.get("changes").and_then(Value::as_object) {
+        lists.extend(
+            changes
+                .iter()
+                .filter(|(u, _)| same_uri(u, uri))
+                .map(|(_, l)| l),
+        );
     }
     for change in edit
         .get("documentChanges")
@@ -770,7 +858,10 @@ fn edits_for(edit: &Value, uri: &str, text: &str) -> Vec<crate::lint::Edit> {
         .into_iter()
         .flatten()
     {
-        if change["textDocument"]["uri"].as_str() == Some(uri) {
+        if change["textDocument"]["uri"]
+            .as_str()
+            .is_some_and(|u| same_uri(u, uri))
+        {
             if let Some(list) = change.get("edits") {
                 lists.push(list);
             }
@@ -924,7 +1015,7 @@ fn workspace_files(edit: &Value, uri: &str, text: &str) -> Result<Vec<FileEdits>
         let Some(path) = uri_to_path(&u) else {
             continue;
         };
-        let file_text = if u == uri {
+        let file_text = if same_uri(&u, uri) {
             text.to_string()
         } else {
             std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?
@@ -1505,6 +1596,9 @@ type Servers = Mutex<HashMap<(PathBuf, PathBuf), Arc<tokio::sync::OnceCell<Arc<S
 
 static SERVERS: OnceLock<Servers> = OnceLock::new();
 
+/// The runtime the servers run on, to reach them when the program ends.
+static RUNTIME: OnceLock<tokio::runtime::Handle> = OnceLock::new();
+
 /// How long an answer is waited for: a server that never gives one must not
 /// leave what asked (Format, a rename, a completion…) waiting for ever.
 const ANSWER_WAIT: Duration = Duration::from_secs(30);
@@ -1545,6 +1639,9 @@ impl Drop for StartGuard {
 
 impl Server {
     async fn start(exe: &Path, args: &[&str], root: &Path) -> Result<Arc<Server>, String> {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let _ = RUNTIME.set(handle);
+        }
         let mut child = Command::new(exe)
             .args(args)
             .current_dir(root)
@@ -1890,7 +1987,7 @@ impl Server {
                     .cloned()
                     .unwrap_or_default();
                 if let Ok(mut published) = self.published.lock() {
-                    let entry = published.entry(uri.to_string()).or_default();
+                    let entry = published.entry(uri_key(uri)).or_default();
                     entry.0 += 1;
                     entry.1 = list;
                 }
@@ -2003,6 +2100,20 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn spellings_of_a_uri_are_the_same_document() {
+        // `+` and `(` are written plainly by some servers, escaped by us.
+        let path = Path::new("/home/u/c++/Projet (copie)/x.rs");
+        let ours = path_to_uri(path);
+        let theirs = "file:///home/u/c++/Projet%20(copie)/x.rs";
+        assert_ne!(ours, theirs);
+        assert!(same_uri(&ours, theirs));
+        let edit = json!({ "changes": { theirs: [{
+            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 1 } },
+            "newText": "y" }] } });
+        assert_eq!(edits_for(&edit, &ours, "x").len(), 1);
+    }
+
     #[test]
     fn a_program_is_run_once_to_know_whether_it_works_until_forgotten() {
         use std::os::unix::fs::PermissionsExt;

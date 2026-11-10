@@ -144,7 +144,7 @@ pub async fn run_tool(tool: &Tool, program: &Path, job: &Job) -> Result<Vec<Diag
         Format::Ruff => parse::ruff(&stdout, text, name),
         Format::Flake8 => Some(parse::flake8(&stdout, text, name)),
         Format::Pylint => parse::pylint(&stdout, text, name),
-        Format::Mypy => Some(parse::mypy(&stdout, text, name)),
+        Format::Mypy => Some(parse::mypy(&stdout, text, name, &job.path)),
         Format::ShellCheck => parse::shellcheck(&stdout, text, name),
         // The report goes to either output, by version.
         Format::Stylelint => {
@@ -163,15 +163,7 @@ pub async fn run_tool(tool: &Tool, program: &Path, job: &Job) -> Result<Vec<Diag
         Format::SqlFluff => parse::sqlfluff(&stdout, text, name),
         Format::Hlint => parse::hlint(&stdout, text, name),
         Format::Xmllint => Some(parse::xmllint(&both, text, name)),
-        Format::Clippy => {
-            // Named from the folder of the nearest Cargo.toml.
-            let relative = job
-                .path
-                .strip_prefix(&dir)
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
-                .unwrap_or(file_name);
-            Some(parse::clippy(&stdout, text, name, &relative))
-        }
+        Format::Clippy => Some(parse::clippy(&stdout, text, name, &job.path)),
         Format::Json => unreachable!("checked above"),
     };
     let mut found = parsed.ok_or_else(|| complaint(&stderr, &stdout))?;

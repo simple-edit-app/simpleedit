@@ -1615,18 +1615,13 @@ impl Content {
     /// A block of text selected from one place to another: a cursor on each
     /// line between, selecting the same columns. The cursor is the one of
     /// the line of `to`.
-    pub fn column_select(&self, from: (usize, usize), to: (usize, usize)) {
-        let chars = |line: usize, byte: usize| {
-            self.line(line).map_or(0, |t| {
-                t.get(..byte.min(t.len())).map_or(0, |p| p.chars().count())
-            })
-        };
-        let (a, b) = (chars(from.0, from.1), chars(to.0, to.1));
+    pub fn column_select(&self, from: (usize, usize), to: (usize, usize), tab: usize) {
+        let column =
+            |line: usize, byte: usize| self.line(line).map_or(0, |t| visual_column(&t, byte, tab));
+        let (a, b) = (column(from.0, from.1), column(to.0, to.1));
         let (left, right) = (a.min(b), a.max(b));
-        let byte = |line: usize, n: usize| {
-            self.line(line)
-                .map_or(0, |t| t.char_indices().nth(n).map_or(t.len(), |(i, _)| i))
-        };
+        let byte =
+            |line: usize, n: usize| self.line(line).map_or(0, |t| byte_at_column(&t, n, tab));
         let (top, bottom) = (from.0.min(to.0), from.0.max(to.0));
         let mut carets: Vec<Caret> = (top..=bottom)
             .map(|l| {
@@ -1652,7 +1647,7 @@ impl Content {
     }
 
     /// A cursor in the line above (or below) each one, at the same column.
-    pub fn add_cursor_vertically(&self, down: bool) {
+    pub fn add_cursor_vertically(&self, down: bool, tab: usize) {
         let mut all = vec![self.0.borrow().main_caret()];
         all.extend(self.extra_carets());
         let last = self.line_count().saturating_sub(1);
@@ -1664,6 +1659,12 @@ impl Content {
                 line.checked_sub(1)
             };
             if let Some(target) = target {
+                let col = match (self.line(line), self.line(target)) {
+                    (Some(from), Some(to)) => {
+                        byte_at_column(&to, visual_column(&from, col, tab), tab)
+                    }
+                    _ => col,
+                };
                 self.add_cursor(target, col);
             }
         }
@@ -1677,6 +1678,8 @@ impl Content {
         // two ends: make it a plain one (or select the word at the cursor).
         let had_selection = self.0.borrow().editor.cursor().selection.is_some();
         let (line, col) = self.cursor_position();
+        let word = |c: char| c.is_alphanumeric() || c == '_';
+        let mut whole_word = false;
         let found = {
             let Some(text) = self.line(line) else { return };
             match self
@@ -1689,7 +1692,7 @@ impl Content {
                     .find(|i| *i == col || i + needle.len() == col)
                     .map(|i| (i, needle.len())),
                 _ => {
-                    let word = |c: char| c.is_alphanumeric() || c == '_';
+                    whole_word = true;
                     let col = col.min(text.len());
                     let start = text[..col]
                         .char_indices()
@@ -1714,6 +1717,8 @@ impl Content {
         let Some(needle) = self.selection().filter(|s| !s.is_empty()) else {
             return;
         };
+        // Started from a word (or selecting a whole word): only whole words.
+        let whole_word = whole_word || needle.chars().all(word);
         let main = self.0.borrow().main_caret();
         let mut carets = vec![main];
         carets.extend(self.extra_carets());
@@ -1731,6 +1736,12 @@ impl Content {
                 let start = (l, from + i);
                 let end = (l, from + i + needle.len());
                 from = end.1;
+                if whole_word
+                    && (text[..start.1].chars().next_back().is_some_and(word)
+                        || text[end.1..].chars().next().is_some_and(word))
+                {
+                    continue;
+                }
                 if n == wrapped_line && n != 0 && start.1 >= last.1 {
                     break;
                 }
@@ -2732,8 +2743,11 @@ where
         {
             if let Some(at) = cursor.position_in(layout.bounds()) {
                 let point = at - Vector::new(padding.left, padding.top);
-                self.content
-                    .column_select(anchor, self.content.position_at(point));
+                self.content.column_select(
+                    anchor,
+                    self.content.position_at(point),
+                    self.marks.tab_width,
+                );
                 shell.request_redraw();
             }
             shell.capture_event();
@@ -2761,7 +2775,7 @@ where
                 state.is_focused = true;
                 let at = self.content.position_at(click.position());
                 state.column_anchor = Some(at);
-                self.content.column_select(at, at);
+                self.content.column_select(at, at, self.marks.tab_width);
                 shell.request_redraw();
             }
             // Alt and a click: one more cursor there.
@@ -4434,8 +4448,8 @@ mod multi_tests {
     fn cursors_above_and_below() {
         let mut content = Content::with_text("aa\nbb\ncc");
         content.select_bytes(1, 1, 0);
-        content.add_cursor_vertically(true);
-        content.add_cursor_vertically(false);
+        content.add_cursor_vertically(true, 4);
+        content.add_cursor_vertically(false, 4);
         assert_eq!(content.cursor_count(), 3);
     }
 
@@ -4456,6 +4470,40 @@ mod multi_tests {
     }
 }
 
+/// The visible column of byte `byte` in `text`: a tab goes to the next
+/// multiple of `tab`, wide characters take two columns.
+fn visual_column(text: &str, byte: usize, tab: usize) -> usize {
+    let tab = tab.max(1);
+    let end = byte.min(text.len());
+    text.char_indices()
+        .take_while(|(i, _)| *i < end)
+        .fold(0, |col, (_, c)| {
+            if c == '\t' {
+                (col / tab + 1) * tab
+            } else {
+                col + unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
+            }
+        })
+}
+
+/// The byte of `text` at the visible column `target` (the end of the line
+/// when it is shorter).
+fn byte_at_column(text: &str, target: usize, tab: usize) -> usize {
+    let tab = tab.max(1);
+    let mut col = 0;
+    for (i, c) in text.char_indices() {
+        if col >= target {
+            return i;
+        }
+        col = if c == '\t' {
+            (col / tab + 1) * tab
+        } else {
+            col + unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
+        };
+    }
+    text.len()
+}
+
 #[cfg(test)]
 mod column_tests {
     use super::*;
@@ -4463,7 +4511,7 @@ mod column_tests {
     #[test]
     fn a_block_selects_the_same_columns_on_each_line() {
         let mut content = Content::with_text("abcd\nefgh\nij");
-        content.column_select((0, 1), (2, 2));
+        content.column_select((0, 1), (2, 2), 4);
         assert_eq!(content.cursor_count(), 3);
         assert_eq!(content.selection_all().as_deref(), Some("b\nf\nj"));
         content.perform(Action::Edit(Edit::Delete));
@@ -4471,9 +4519,20 @@ mod column_tests {
     }
 
     #[test]
+    fn a_block_follows_visible_columns() {
+        let content = Content::with_text("\tab\n    cd");
+        content.column_select((0, 1), (1, 5), 4);
+        assert_eq!(content.selection_all().as_deref(), Some("a\nc"));
+        let mut content = Content::with_text("éé\nabc");
+        content.select_bytes(0, 4, 0);
+        content.add_cursor_vertically(true, 4);
+        assert_eq!(content.extra_carets()[0].position, (1, 2));
+    }
+
+    #[test]
     fn an_empty_block_is_a_column_of_cursors() {
         let mut content = Content::with_text("abc\nabc");
-        content.column_select((0, 1), (1, 1));
+        content.column_select((0, 1), (1, 1), 4);
         assert_eq!(content.cursor_count(), 2);
         content.perform(Action::Edit(Edit::Insert('-')));
         assert_eq!(content.text(), "a-bc\na-bc\n");
@@ -4486,6 +4545,16 @@ mod multi_cursor_regressions {
 
     fn type_char(content: &mut Content, c: char) {
         content.perform(Action::Edit(Edit::Insert(c)));
+    }
+
+    #[test]
+    fn next_occurrence_of_a_word_skips_longer_words() {
+        let mut content = Content::with_text("count account count");
+        content.select_bytes(0, 0, 0);
+        content.add_next_occurrence(false);
+        content.add_next_occurrence(false);
+        assert_eq!(content.cursor_count(), 2);
+        assert_eq!(content.extra_carets()[0].span().0, (0, 14));
     }
 
     #[test]

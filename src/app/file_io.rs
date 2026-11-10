@@ -12,6 +12,11 @@ pub(super) fn read_text(path: &Path) -> Result<String, String> {
 /// Like `read_text`, with the encoding the file is in (UTF-8, a byte order
 /// mark, or Windows-1252 when it is not valid UTF-8).
 pub(super) fn read_decoded(path: &Path) -> Result<(String, Encoding), String> {
+    read_bytes(path).map(|bytes| Encoding::detect(&bytes))
+}
+
+/// The bytes of a text file, with the checks of `read_text`.
+pub(super) fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
     use std::io::Read;
 
     let meta = std::fs::metadata(path).map_err(read_error)?;
@@ -31,7 +36,7 @@ pub(super) fn read_decoded(path: &Path) -> Result<(String, Encoding), String> {
     if is_binary(&bytes) {
         return Err(t!("status.err_binary").to_string());
     }
-    Ok(Encoding::detect(&bytes))
+    Ok(bytes)
 }
 
 /// Whether bytes are those of a binary file (an image, an archive…): a NUL in

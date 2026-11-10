@@ -869,6 +869,9 @@ pub enum GitMsg {
     Init,
     /// An action ended: what it said, or why it failed.
     Done(Result<String, String>),
+    /// The answer of something that is not an action (it doesn't hold the
+    /// panel busy, so it doesn't free it either).
+    Reply(Result<String, String>),
     DismissNotice,
     // Stash
     StashesLoaded(PathBuf, Result<Vec<git::history::Stash>, String>),
@@ -943,6 +946,7 @@ impl GitMsg {
                 | GitMsg::CommitInfoLoaded(..)
                 | GitMsg::RewriteReady(..)
                 | GitMsg::Done(_)
+                | GitMsg::Reply(_)
         ) || matches!(self, GitMsg::Tool(m) if m.is_background())
     }
 }
@@ -1341,6 +1345,8 @@ impl Panel {
                 };
                 let path = entry.change.path.clone();
                 let was_staged = entry.staged;
+                // Unstaging a rename also brings the old name back.
+                let from = entry.change.from.clone().filter(|_| was_staged);
                 // Staging a conflicted file marks it settled: with its
                 // markers still in, they would go into the commit.
                 if !was_staged && entry.change.kind == Kind::Conflict {
@@ -1358,7 +1364,7 @@ impl Panel {
                     }
                 }
                 self.act(move |repo| async move {
-                    let paths = [path];
+                    let paths: Vec<String> = std::iter::once(path).chain(from).collect();
                     if was_staged {
                         git::unstage(&repo, &paths).await?;
                     } else {
@@ -1381,7 +1387,11 @@ impl Panel {
                         .map(|c| c.path.clone())
                         .collect()
                 } else {
-                    status.staged.iter().map(|c| c.path.clone()).collect()
+                    status
+                        .staged
+                        .iter()
+                        .flat_map(|c| std::iter::once(c.path.clone()).chain(c.from.clone()))
+                        .collect()
                 };
                 if paths.is_empty() {
                     return Task::none();
@@ -1504,7 +1514,7 @@ impl Panel {
                     },
                     |result| match result {
                         Ok(spec) => Message::OpenMergeTab(std::sync::Arc::new(spec)),
-                        Err(error) => Message::Git(GitMsg::Done(Err(error))),
+                        Err(error) => Message::Git(GitMsg::Reply(Err(error))),
                     },
                 )
             }
@@ -1598,7 +1608,7 @@ impl Panel {
                         return Task::none();
                     };
                     return Task::perform(async move { git::last_message(&repo).await }, |m| {
-                        Message::Git(GitMsg::Done(m.map(|m| format!("\u{1}{m}"))))
+                        Message::Git(GitMsg::Reply(m.map(|m| format!("\u{1}{m}"))))
                     });
                 }
                 Task::none()
@@ -1836,6 +1846,12 @@ impl Panel {
                     async move { git::run(&dir, &["init", "-q"]).await.map(|_| String::new()) },
                     |result| Message::Git(GitMsg::Done(result)),
                 )
+            }
+            GitMsg::Reply(result) => {
+                let busy = self.busy;
+                let task = self.update(GitMsg::Done(result), ctx);
+                self.busy = busy;
+                task
             }
             GitMsg::Done(result) => {
                 self.busy = false;

@@ -585,7 +585,7 @@ impl Panel {
                         })
                         .collect();
                     if entries.is_empty() {
-                        Message::Git(GitMsg::Done(Err(t!("git.no_diff").to_string())))
+                        Message::Git(GitMsg::Reply(Err(t!("git.no_diff").to_string())))
                     } else {
                         Message::OpenDiffTab(DiffTab {
                             repo,
@@ -595,7 +595,7 @@ impl Panel {
                         })
                     }
                 }
-                Err(error) => Message::Git(GitMsg::Done(Err(error))),
+                Err(error) => Message::Git(GitMsg::Reply(Err(error))),
             },
         )
     }
@@ -787,8 +787,8 @@ impl Panel {
                                 start: 0,
                             })
                         }
-                        Ok(_) => Message::Git(GitMsg::Done(Err(t!("git.no_diff").to_string()))),
-                        Err(e) => Message::Git(GitMsg::Done(Err(e))),
+                        Ok(_) => Message::Git(GitMsg::Reply(Err(t!("git.no_diff").to_string()))),
+                        Err(e) => Message::Git(GitMsg::Reply(Err(e))),
                     },
                 )
             }

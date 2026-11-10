@@ -26,7 +26,20 @@ pub async fn run(repo: &Path, args: &[&str]) -> Result<String, String> {
 /// A git command for `repo`: no password or editor prompt nobody could see.
 fn command(repo: &Path, args: &[&str], env: &[(&str, &str)], stdin: bool) -> Command {
     let mut command = Command::new("git");
+    // The user's own diff settings (no `a/` and `b/`, mnemonic prefixes,
+    // colours) would make the patches unreadable to our parser and to
+    // `git apply`.
     command
+        .args([
+            "-c",
+            "diff.noprefix=false",
+            "-c",
+            "diff.mnemonicPrefix=false",
+            "-c",
+            "color.ui=false",
+            "-c",
+            "color.diff=false",
+        ])
         .args(args)
         .current_dir(repo)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -785,7 +798,20 @@ pub async fn rollback_block(
     if current != block.added.iter().map(String::as_str).collect::<Vec<_>>() {
         return Err(t!("git.err_file_changed").to_string());
     }
-    let old: Vec<String> = block.removed.iter().map(|l| format!("{l}{eol}")).collect();
+    let last = block.removed.len().saturating_sub(1);
+    let old: Vec<String> = block
+        .removed
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            // The old text ended the file without an end of line.
+            if block.removed_no_eol && i == last {
+                l.clone()
+            } else {
+                format!("{l}{eol}")
+            }
+        })
+        .collect();
     lines.splice(block.at..end, old);
     tokio::fs::write(&target, lines.concat())
         .await
@@ -1036,6 +1062,9 @@ pub async fn diff_with(
                 "show",
                 "--format=",
                 "--patch",
+                // A merge against its first parent (as the file list), not
+                // a combined `diff --cc` that is empty or unreadable here.
+                "--diff-merges=first-parent",
                 "--no-color",
                 "--no-ext-diff",
                 "-U3",
@@ -2171,5 +2200,107 @@ mod tests {
         );
         assert!(repo.path().join("b.txt").exists());
         assert!(repo.git(&["status", "--porcelain"]).contains("D  b.txt"));
+    }
+
+    #[test]
+    fn a_block_of_a_crlf_file_is_staged() {
+        let repo = Repo::new();
+        repo.git(&["config", "core.autocrlf", "false"]);
+        repo.write("w.bat", "a\r\nb\r\nc\r\n");
+        repo.commit_all("first");
+        repo.write("w.bat", "a\r\nB\r\nc\r\n");
+        let diff = block(diff_of(repo.path(), &Source::Unstaged, "w.bat")).unwrap();
+        assert_eq!(diff.hunks[0].lines[1].text, "b");
+        block(apply_patch(
+            repo.path(),
+            &diff.block_patch(0, false).unwrap(),
+            false,
+        ))
+        .unwrap();
+        assert_eq!(repo.git(&["show", ":w.bat"]), "a\r\nB\r\nc\r\n");
+    }
+
+    #[test]
+    fn a_block_at_a_file_without_final_newline_is_staged_and_rolled_back() {
+        let repo = Repo::new();
+        repo.write("n.txt", "a\nb");
+        repo.commit_all("first");
+        repo.write("n.txt", "a\nB\n");
+        let diff = block(diff_of(repo.path(), &Source::Unstaged, "n.txt")).unwrap();
+        block(apply_patch(
+            repo.path(),
+            &diff.block_patch(0, false).unwrap(),
+            false,
+        ))
+        .unwrap();
+        assert_eq!(repo.git(&["show", ":n.txt"]), "a\nB\n");
+        let diff = block(diff_of(repo.path(), &Source::Unstaged, "n.txt")).unwrap();
+        assert!(diff.is_empty());
+        // Back to HEAD: the old last line has no end of line.
+        repo.git(&["reset", "-q"]);
+        let diff = block(diff_of(repo.path(), &Source::Unstaged, "n.txt")).unwrap();
+        block(rollback_block(repo.path(), "n.txt", &diff, 0)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("n.txt")).unwrap(),
+            "a\nb"
+        );
+        assert!(repo.git(&["status", "--porcelain"]).trim().is_empty());
+    }
+
+    #[test]
+    fn the_users_diff_settings_do_not_change_the_patches() {
+        let repo = Repo::new();
+        repo.write("c.txt", "1\n");
+        repo.commit_all("first");
+        repo.git(&["config", "diff.noprefix", "true"]);
+        repo.git(&["config", "color.ui", "always"]);
+        repo.write("c.txt", "2\n");
+        let diff = block(diff_of(repo.path(), &Source::Unstaged, "c.txt")).unwrap();
+        assert_eq!(diff.path, "c.txt");
+        block(apply_patch(
+            repo.path(),
+            &diff.block_patch(0, false).unwrap(),
+            false,
+        ))
+        .unwrap();
+        assert_eq!(repo.git(&["show", ":c.txt"]), "2\n");
+        assert!(!block(tools::local_patch(repo.path()))
+            .unwrap()
+            .contains('\u{1b}'));
+    }
+
+    #[test]
+    fn a_merge_commit_shows_its_diff_against_the_first_parent() {
+        let repo = Repo::new();
+        repo.write("a.txt", "1\n");
+        repo.commit_all("first");
+        repo.git(&["checkout", "-q", "-b", "topic"]);
+        repo.write("b.txt", "topic\n");
+        repo.commit_all("topic");
+        repo.git(&["checkout", "-q", "-"]);
+        repo.write("a.txt", "2\n");
+        repo.commit_all("main");
+        repo.git(&["merge", "-q", "--no-ff", "-m", "merge", "topic"]);
+        let diff = block(diff_of(
+            repo.path(),
+            &Source::Commit("HEAD".into()),
+            "b.txt",
+        ))
+        .unwrap();
+        assert_eq!(diff.added(), 1);
+    }
+
+    #[test]
+    fn unstaging_a_rename_brings_the_old_name_back_too() {
+        let repo = Repo::new();
+        repo.write("old.txt", "x\n");
+        repo.commit_all("first");
+        repo.git(&["mv", "old.txt", "new.txt"]);
+        // What the panel passes for a staged rename: the new and the old name.
+        block(unstage(repo.path(), &["new.txt".into(), "old.txt".into()])).unwrap();
+        assert_eq!(
+            repo.git(&["status", "--porcelain"]),
+            " D old.txt\n?? new.txt\n"
+        );
     }
 }

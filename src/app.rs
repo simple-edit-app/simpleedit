@@ -355,6 +355,8 @@ pub enum Message {
     SymbolHoverLoaded(u64, iced::Point, Result<Option<String>, String>),
     LargeMove(LargeMove),
     LargeLoaded(PathBuf, Result<(String, u64, u64), String>),
+    /// The part of a large file in front, read again because the file changed.
+    LargeRefreshed(PathBuf, Result<(String, u64, u64), String>),
     LineOp(text_ops::LineOp),
     CaseOp(text_ops::CaseOp),
     ConvertIndent(bool),
@@ -884,8 +886,8 @@ pub struct SimpleEditApp {
     diff_counter: u32,
     /// What files held before a rollback or an arrow of a diff changed them
     /// (Ctrl+Z in a diff brings it back), and what Ctrl+Y puts again.
-    work_undo: Vec<(PathBuf, String)>,
-    work_redo: Vec<(PathBuf, String)>,
+    work_undo: Vec<(PathBuf, Vec<u8>)>,
+    work_redo: Vec<(PathBuf, Vec<u8>)>,
     merge_tabs: MergeTabs,
     merge_counter: u32,
     blame: Option<BlameState>,
@@ -983,6 +985,8 @@ pub struct SimpleEditApp {
     nav_forward: Vec<Place>,
     /// Whether the "changed on disk" warning was already shown.
     external_warned: bool,
+    /// When the part of a large file in front was last read again.
+    large_refreshed: Option<std::time::Instant>,
     /// Size on disk of `size_for`, cached so `view` does no I/O.
     file_size: Option<u64>,
     size_for: Option<PathBuf>,
@@ -1223,6 +1227,7 @@ impl SimpleEditApp {
             nav_back: Vec::new(),
             nav_forward: Vec::new(),
             external_warned: false,
+            large_refreshed: None,
             file_size: None,
             size_for: None,
             undo_new_group: true,
@@ -2494,6 +2499,8 @@ impl SimpleEditApp {
             }
             Message::FileReloaded(result) => {
                 match result {
+                    // Too large to open whole: only its first part came.
+                    Ok(loaded) if self.large.contains_key(&loaded.path) => {}
                     Ok(loaded) => {
                         self.history_record(&loaded.path, &loaded.text);
                         self.apply_reload(loaded);
@@ -2628,7 +2635,13 @@ impl SimpleEditApp {
                                 }
                             }
                         }
-                        if !self.is_scratch(&path) {
+                        // Not for a tab closed while the save was running.
+                        let still_open = origin.as_ref().is_none_or(|o| {
+                            is_untitled(o)
+                                || self.sidebar.files().contains(o)
+                                || self.sidebar.files().contains(&path)
+                        });
+                        if still_open && !self.is_scratch(&path) {
                             self.sidebar.add_file(path.clone());
                         }
                         let saved_fp = fingerprint(&saved);
@@ -2665,7 +2678,9 @@ impl SimpleEditApp {
                             Task::none()
                         };
                         let sent = self.remote_send(&path);
-                        return Task::batch([panel, self.refresh_diff_tabs(), sent]);
+                        let told = Task::future(crate::lsp::did_save(path.clone(), saved.clone()))
+                            .discard();
+                        return Task::batch([panel, self.refresh_diff_tabs(), sent, told]);
                     }
                     Err(e) if e == CANCELLED => self.autosaving = false,
                     Err(e) => {
@@ -3713,6 +3728,27 @@ impl SimpleEditApp {
                 }
                 Task::none()
             }
+            Message::LargeRefreshed(path, result) => {
+                if let Ok((text, start, end)) = result {
+                    if self.current_file.as_ref() == Some(&path) {
+                        let size = std::fs::metadata(&path).map_or(0, |m| m.len());
+                        if let Some(view) = self.large.get_mut(&path) {
+                            view.start = start;
+                            view.end = end;
+                            view.size = size;
+                        }
+                        // Read only: nothing to undo, the cursor stays.
+                        if crate::editor::buffer_text(&self.editor.content) != text {
+                            let (line, col) = self.editor.content.cursor_position();
+                            self.replace_buffer_text(&text);
+                            self.restore_cursor(line, col);
+                            self.text_rev += 1;
+                        }
+                        self.saved_fp = Some(fingerprint(&text));
+                    }
+                }
+                Task::none()
+            }
             Message::LineOp(op) => {
                 if self.editing_blocked() {
                     return Task::none();
@@ -3857,7 +3893,9 @@ impl SimpleEditApp {
                 Task::none()
             }
             Message::AddCursor(down) => {
-                self.editor.content.add_cursor_vertically(down);
+                self.editor
+                    .content
+                    .add_cursor_vertically(down, self.indent().1);
                 Task::none()
             }
             Message::Zoom(step) => {
@@ -4224,6 +4262,7 @@ impl SimpleEditApp {
                 Ok(()) => {
                     self.config.save();
                     crate::tasks::stop_all();
+                    crate::lsp::stop_servers();
                     std::process::exit(0)
                 }
                 // Unsaved buffers live on in the session file; if it can't be
@@ -4236,6 +4275,7 @@ impl SimpleEditApp {
             Message::QuitAnyway => {
                 self.config.save();
                 crate::tasks::stop_all();
+                crate::lsp::stop_servers();
                 std::process::exit(0)
             }
             Message::ContextCopy => {
@@ -6163,9 +6203,14 @@ impl SimpleEditApp {
         // A selection is surrounded rather than replaced, whether or not the
         // brackets and quotes complete themselves; the selection stays on the
         // text. (The undo step was opened by `editor_action`.)
-        let markdown = matches!(self.editor.language.as_deref(), Some("md") | None);
+        let language = self.editor.language.as_deref();
+        let markdown = matches!(language, Some("md" | "markdown"));
+        let markup = matches!(
+            language,
+            Some("html" | "htm" | "xml" | "xsl" | "xsd" | "svg" | "jsx" | "tsx" | "vue")
+        );
         let wrap = match ch {
-            '<' => Some('>'),
+            '<' if markup => Some('>'),
             '*' | '_' | '~' if markdown => Some(ch),
             _ => closer.or(is_quote.then_some(ch)),
         };
@@ -6787,8 +6832,8 @@ impl SimpleEditApp {
 
     /// Keeps what a file holds now, before something rewrites it.
     fn remember_file(&mut self, path: PathBuf) {
-        if let Ok(text) = file_io::read_text(&path) {
-            self.work_undo.push((path, text));
+        if let Ok(bytes) = file_io::read_bytes(&path) {
+            self.work_undo.push((path, bytes));
             if self.work_undo.len() > 50 {
                 self.work_undo.remove(0);
             }
@@ -6852,14 +6897,14 @@ impl SimpleEditApp {
             return Task::none();
         };
         // What the file holds now is what the opposite key gives back.
-        let now = file_io::read_text(&path).unwrap_or_default();
+        let now = file_io::read_bytes(&path).unwrap_or_default();
         let (other, label) = if undo {
             (&mut self.work_redo, t!("status.diff_undone"))
         } else {
             (&mut self.work_undo, t!("status.diff_redone"))
         };
         other.push((path.clone(), now));
-        if let Err(e) = crate::fsutil::write_atomic(&path, text.as_bytes(), false) {
+        if let Err(e) = crate::fsutil::write_atomic(&path, &text, false) {
             self.set_status(format!("{}: {e}", t!("status.error")), true);
             return Task::none();
         }
@@ -7197,6 +7242,7 @@ impl SimpleEditApp {
         }
         self.file_cache.remove(&path);
         self.undo_cache.remove(&path);
+        self.large.remove(&path);
         self.diff_tabs.remove(&path);
         self.merge_tabs.remove(&path);
         self.db_tabs.remove(&path);
@@ -7618,17 +7664,21 @@ impl SimpleEditApp {
             self.config_dirty = true;
         }
         // A file too large to open whole came as its first part.
+        self.large.remove(&path);
         if let Ok(meta) = std::fs::metadata(&path) {
             if meta.is_file() && meta.len() > MAX_OPEN_BYTES {
                 let len = buffer
                     .content
                     .as_ref()
                     .map_or(0, |c| crate::editor::buffer_text(c).len() as u64);
-                self.large.entry(path.clone()).or_insert(LargeView {
-                    start: 0,
-                    end: len,
-                    size: meta.len(),
-                });
+                self.large.insert(
+                    path.clone(),
+                    LargeView {
+                        start: 0,
+                        end: len,
+                        size: meta.len(),
+                    },
+                );
             }
         }
         if self.config.detect_indent && !self.indents.contains_key(&path) {
@@ -7771,6 +7821,31 @@ impl SimpleEditApp {
                 self.set_status(t!("status.changed_on_disk"), true);
             }
             return Task::none();
+        }
+        if let Some(view) = self.large.get(&path).copied() {
+            if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_OPEN_BYTES) {
+                // A big part is read: not more than once in a while.
+                let waited = self.large_refreshed.map(|t| t.elapsed());
+                if waited.is_some_and(|w| w < std::time::Duration::from_secs(5)) {
+                    return Task::none();
+                }
+                self.large_refreshed = Some(std::time::Instant::now());
+                self.disk_stamp = Some(now);
+                return Task::perform(
+                    async move {
+                        let read = path.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            file_io::read_window(&read, view.start, LARGE_WINDOW)
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()));
+                        (path, result)
+                    },
+                    |(path, result)| Message::LargeRefreshed(path, result),
+                );
+            }
+            // Back under the limit: it opens whole again.
+            self.large.remove(&path);
         }
         // The new state becomes the baseline only once it has been applied.
         Task::perform(read_file(path, false), Message::FileReloaded)

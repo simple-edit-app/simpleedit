@@ -2,6 +2,7 @@
 
 use super::{Diagnostic, Edit, Fix, Severity};
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 
 /// The text a report talks about, to turn the columns the tools count in
 /// (characters, UTF-16 units) into bytes.
@@ -374,8 +375,30 @@ pub fn pylint(out: &str, text: &str, source: &str) -> Option<Vec<Diagnostic>> {
     Some(found)
 }
 
+/// Whether a path a tool printed (relative to where it ran, or absolute) is
+/// `path`, compared by path components, not by characters.
+fn same_file(path: &Path, printed: &str) -> bool {
+    let printed = Path::new(printed);
+    if printed.is_absolute() {
+        path == printed
+    } else {
+        path.ends_with(printed.strip_prefix(".").unwrap_or(printed))
+    }
+}
+
 /// mypy, `--show-column-numbers`: `file:line:col: error: message  [code]`.
-pub fn mypy(out: &str, text: &str, source: &str) -> Vec<Diagnostic> {
+pub fn mypy(out: &str, text: &str, source: &str, path: &Path) -> Vec<Diagnostic> {
+    // Only the lines about this file: mypy follows imports and reports on
+    // the other files too.
+    let file = regex(r"^(?P<file>[^:]+):\d+:");
+    let mine: String = out
+        .lines()
+        .filter(|l| {
+            file.captures(l)
+                .is_some_and(|c| same_file(path, c["file"].trim()))
+        })
+        .fold(String::new(), |acc, l| acc + l + "\n");
+    let out = mine.as_str();
     let pattern = regex(
         r"^[^:]+:(?P<line>\d+):(?:(?P<col>\d+):)? (?P<level>error|warning|note): (?P<msg>.*?)(?:  \[(?P<code>[\w-]+)\])?$",
     );
@@ -797,7 +820,7 @@ pub fn json(text: &str, source: &str) -> Vec<Diagnostic> {
 
 /// `cargo clippy --message-format json`: the compiler messages of `file`,
 /// with the suggestions that are safe to apply as fixes (byte offsets).
-pub fn clippy(out: &str, text: &str, source: &str, file_name: &str) -> Vec<Diagnostic> {
+pub fn clippy(out: &str, text: &str, source: &str, path: &Path) -> Vec<Diagnostic> {
     let doc = Doc::new(text);
     let mut found = Vec::new();
     for line in out.lines() {
@@ -814,11 +837,16 @@ pub fn clippy(out: &str, text: &str, source: &str, file_name: &str) -> Vec<Diagn
         if !matches!(level, "error" | "warning" | "note" | "help") {
             continue;
         }
+        // Paths are relative to the workspace root, which is the folder of
+        // the package or one above it: `src/lib.rs` of another package of
+        // the workspace is not this file.
+        let manifest = string(&value, "manifest_path").map(PathBuf::from);
+        let mine = |f: &str| clippy_file(path, manifest.as_deref(), f);
         let spans = message.get("spans").and_then(Value::as_array);
         let Some(primary) = spans.and_then(|s| {
             s.iter().find(|s| {
                 s.get("is_primary").and_then(Value::as_bool) == Some(true)
-                    && string(s, "file_name").is_some_and(|f| f.ends_with(file_name))
+                    && string(s, "file_name").is_some_and(|f| mine(&f))
             })
         }) else {
             continue;
@@ -844,7 +872,7 @@ pub fn clippy(out: &str, text: &str, source: &str, file_name: &str) -> Vec<Diagn
             &doc,
         );
         let mut edits = Vec::new();
-        let machine = collect_suggestions(message, file_name, &doc, &mut edits);
+        let machine = collect_suggestions(message, &mine, &doc, &mut edits);
         if !edits.is_empty() {
             d.fixes.push(Fix {
                 title: "Apply the suggestion".into(),
@@ -857,8 +885,25 @@ pub fn clippy(out: &str, text: &str, source: &str, file_name: &str) -> Vec<Diagn
     found
 }
 
+/// Whether the file of a clippy span is `path`.
+fn clippy_file(path: &Path, manifest: Option<&Path>, file: &str) -> bool {
+    let file = Path::new(file);
+    if file.is_absolute() {
+        return path == file;
+    }
+    let Some(package) = manifest.and_then(Path::parent) else {
+        return path.ends_with(file);
+    };
+    package.ancestors().any(|root| root.join(file) == path)
+}
+
 /// Gathers the suggestions of a message; true when all of them are certain.
-fn collect_suggestions(message: &Value, file_name: &str, doc: &Doc, edits: &mut Vec<Edit>) -> bool {
+fn collect_suggestions(
+    message: &Value,
+    mine: &dyn Fn(&str) -> bool,
+    doc: &Doc,
+    edits: &mut Vec<Edit>,
+) -> bool {
     let mut certain = true;
     let children = message.get("children").and_then(Value::as_array);
     let own = message.get("spans").and_then(Value::as_array);
@@ -875,7 +920,7 @@ fn collect_suggestions(message: &Value, file_name: &str, doc: &Doc, edits: &mut 
         let Some(replacement) = string(span, "suggested_replacement") else {
             continue;
         };
-        if !string(span, "file_name").is_some_and(|f| f.ends_with(file_name)) {
+        if !string(span, "file_name").is_some_and(|f| mine(&f)) {
             continue;
         }
         match span.get("suggestion_applicability").and_then(Value::as_str) {
@@ -1003,9 +1048,17 @@ mod tests {
             "a.py:2:5: error: Incompatible types  [assignment]\na.py:3: note: See docs\n",
             text,
             "mypy",
+            Path::new("/p/a.py"),
         );
         assert_eq!(t[0].code.as_deref(), Some("assignment"));
         assert_eq!(t[1].severity, Severity::Info);
+        let other = mypy(
+            "b.py:10: error: x\n/p/a.py:2: error: y\n",
+            text,
+            "mypy",
+            Path::new("/p/a.py"),
+        );
+        assert_eq!(other.len(), 1);
     }
 
     #[test]
@@ -1051,11 +1104,32 @@ mod tests {
         let text = "fn main() {\n    let x = vec![1].len() == 0;\n}\n";
         let line = r#"{"reason":"compiler-message","message":{"level":"warning","message":"length comparison to zero","code":{"code":"clippy::len_zero"},"spans":[{"file_name":"src/main.rs","byte_start":24,"byte_end":42,"line_start":2,"line_end":2,"column_start":13,"column_end":31,"is_primary":true,"suggested_replacement":null}],"children":[{"level":"help","message":"using `is_empty` is clearer","spans":[{"file_name":"src/main.rs","byte_start":24,"byte_end":42,"line_start":2,"line_end":2,"column_start":13,"column_end":31,"is_primary":true,"suggested_replacement":"vec![1].is_empty()","suggestion_applicability":"MachineApplicable"}],"children":[]}]}}
 {"reason":"build-finished","success":true}"#;
-        let found = clippy(line, text, "clippy", "src/main.rs");
+        let found = clippy(line, text, "clippy", Path::new("/p/src/main.rs"));
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].code.as_deref(), Some("clippy::len_zero"));
         let (fixed, _) = super::super::apply(text, &[&found[0].fixes[0]]);
         assert_eq!(fixed, "fn main() {\n    let x = vec![1].is_empty();\n}\n");
-        assert!(clippy(line, text, "clippy", "src/other.rs").is_empty());
+        assert!(clippy(line, text, "clippy", Path::new("/p/src/other.rs")).is_empty());
+        // In a workspace, paths are from its root: not the root package's file.
+        let member = line.replace(
+            "{\"reason\":\"compiler-message\",",
+            "{\"reason\":\"compiler-message\",\"manifest_path\":\"/w/crates/b/Cargo.toml\",",
+        );
+        let member = member.replace("\"src/main.rs\"", "\"crates/b/src/main.rs\"");
+        assert_eq!(
+            clippy(
+                &member,
+                text,
+                "clippy",
+                Path::new("/w/crates/b/src/main.rs")
+            )
+            .len(),
+            1
+        );
+        let root = line.replace(
+            "{\"reason\":\"compiler-message\",",
+            "{\"reason\":\"compiler-message\",\"manifest_path\":\"/w/Cargo.toml\",",
+        );
+        assert!(clippy(&root, text, "clippy", Path::new("/w/crates/b/src/main.rs")).is_empty());
     }
 }

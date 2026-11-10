@@ -13,6 +13,11 @@ pub enum Tag {
 pub struct Line {
     pub tag: Tag,
     pub text: String,
+    /// The line ended with a carriage return (CRLF file); it is not in `text`
+    /// but a patch has to give it back.
+    pub cr: bool,
+    /// Git said `\ No newline at end of file` after it.
+    pub no_eol: bool,
     /// Line numbers in the old and the new file.
     pub old_no: Option<u32>,
     pub new_no: Option<u32>,
@@ -45,6 +50,8 @@ pub struct Block {
     pub added: Vec<String>,
     /// The old lines it replaces.
     pub removed: Vec<String>,
+    /// The last old line had no end of line (the end of a file).
+    pub removed_no_eol: bool,
 }
 
 /// A row of the unified layout.
@@ -182,19 +189,22 @@ impl FileDiff {
                                 at,
                                 added: Vec::new(),
                                 removed: Vec::new(),
+                                removed_no_eol: false,
                             })
                             .added
                             .push(line.text.clone());
                         at += 1;
                     }
-                    Tag::Removed => current
-                        .get_or_insert_with(|| Block {
+                    Tag::Removed => {
+                        let block = current.get_or_insert_with(|| Block {
                             at,
                             added: Vec::new(),
                             removed: Vec::new(),
-                        })
-                        .removed
-                        .push(line.text.clone()),
+                            removed_no_eol: false,
+                        });
+                        block.removed.push(line.text.clone());
+                        block.removed_no_eol |= line.no_eol;
+                    }
                 }
             }
             blocks.extend(current);
@@ -301,7 +311,13 @@ impl FileDiff {
                 new_len += usize::from(in_new);
                 body.push(sign);
                 body.push_str(&line.text);
+                if line.cr {
+                    body.push('\r');
+                }
                 body.push('\n');
+                if line.no_eol {
+                    body.push_str("\\ No newline at end of file\n");
+                }
             }
             if out.is_empty() {
                 let old = self.old_path.as_deref().unwrap_or(&self.path);
@@ -340,7 +356,10 @@ pub fn parse_diff(text: &str) -> Vec<FileDiff> {
     let mut files: Vec<FileDiff> = Vec::new();
     let mut old_no = 0u32;
     let mut new_no = 0u32;
-    for line in text.lines() {
+    // Split on `\n` only: a `\r` ends a line of a CRLF file, not a line of the
+    // diff, and a patch made of the lines must give it back.
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    for line in text.split('\n') {
         if let Some(rest) = line.strip_prefix("diff --git ") {
             // `a/path b/path` (the paths may hold spaces: split in the middle).
             let path = rest
@@ -408,12 +427,21 @@ pub fn parse_diff(text: &str) -> Vec<FileDiff> {
         } else if let Some(hunk) = file.hunks.len().checked_sub(1).map(|h| (h, h)) {
             let (hunk_index, _) = hunk;
             let hunk = &mut file.hunks[hunk_index];
+            if line.starts_with('\\') {
+                // `\ No newline at end of file`: about the line before.
+                if let Some(last) = hunk.lines.last_mut() {
+                    last.no_eol = true;
+                }
+                continue;
+            }
+            let (line, cr) = match line.strip_suffix('\r') {
+                Some(stripped) => (stripped, true),
+                None => (line, false),
+            };
             let (tag, text) = match line.as_bytes().first() {
                 Some(b'+') => (Tag::Added, &line[1..]),
                 Some(b'-') => (Tag::Removed, &line[1..]),
                 Some(b' ') => (Tag::Context, &line[1..]),
-                // `\ No newline at end of file`
-                Some(b'\\') => continue,
                 // An empty context line.
                 None => (Tag::Context, ""),
                 _ => continue,
@@ -432,6 +460,8 @@ pub fn parse_diff(text: &str) -> Vec<FileDiff> {
             hunk.lines.push(Line {
                 tag,
                 text: text.to_string(),
+                cr,
+                no_eol: false,
                 old_no: old,
                 new_no: new,
                 pos: (hunk_index, hunk.lines.len()),

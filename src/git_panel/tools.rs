@@ -263,7 +263,7 @@ impl Panel {
                     .map_err(|e| e.to_string())?;
                 Ok("\u{b}patch".to_string())
             },
-            |result| Message::Git(GitMsg::Done(result)),
+            |result| Message::Git(GitMsg::Reply(result)),
         )
     }
 
@@ -656,12 +656,16 @@ impl Panel {
                 self.refresh(ctx)
             }
             ToolMsg::ReposRun(what) => {
+                if self.busy {
+                    return Task::none();
+                }
                 let Some(Dialog::Repos(lines, said)) = &mut self.dialog else {
                     return Task::none();
                 };
                 said.clear();
                 let lines = lines.clone();
                 let mode = self.pull_mode;
+                self.busy = true;
                 Task::perform(
                     async move {
                         let mut said = Vec::new();
@@ -674,6 +678,7 @@ impl Panel {
                 )
             }
             ToolMsg::ReposDone(results) => {
+                self.busy = false;
                 if let Some(Dialog::Repos(_, said)) = &mut self.dialog {
                     *said = results;
                 }

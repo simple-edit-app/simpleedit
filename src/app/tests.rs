@@ -1043,6 +1043,21 @@ mod behavior_tests {
     }
 
     #[test]
+    fn ctrl_z_in_a_diff_keeps_the_encoding_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        let latin1 = b"caf\xe9\n".to_vec();
+        std::fs::write(&file, &latin1).unwrap();
+        let mut app = app();
+        app.current_file = Some(PathBuf::from("diff://1/Commit"));
+        app.git.repo = Some(dir.path().to_path_buf());
+        app.remember_file(file.clone());
+        std::fs::write(&file, "head\n").unwrap();
+        let _ = app.handle(Message::Undo);
+        assert_eq!(std::fs::read(&file).unwrap(), latin1);
+    }
+
+    #[test]
     fn ctrl_z_in_a_diff_brings_back_what_a_rollback_removed() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("a.txt");
@@ -5002,7 +5017,7 @@ mod text_command_tests {
     fn each_cursor_changes_the_case_of_its_own_selection() {
         // The empty line gives a cursor with nothing selected.
         let mut app = app_with("abcd\n\nefgh\n");
-        app.editor.content.column_select((0, 1), (2, 3));
+        app.editor.content.column_select((0, 1), (2, 3), 4);
         let _ = app.update(Message::CaseOp(text_ops::CaseOp::Upper));
         assert_eq!(buffer(&app), "aBCd\n\neFGh\n");
         // The selections are still there, each on its own text.
@@ -5215,6 +5230,37 @@ mod large_file_tests {
         assert_eq!(crate::editor::buffer_text(&app.editor.content), "more\n");
         assert_eq!(app.large_view().unwrap().start, 5);
         assert!(!app.is_dirty);
+    }
+
+    #[test]
+    fn a_large_file_that_changed_keeps_its_part_and_is_forgotten_when_closed() {
+        let (_dir, path) = file_of(10);
+        let mut app = SimpleEditApp::blank(Config::default());
+        let _ = app.restore_session(crate::session::Session::default());
+        let _ = app.update(Message::TabRead(Ok(Loaded {
+            path: path.clone(),
+            text: "line\n".into(),
+            format: TextFormat::default(),
+            stamp: None,
+        })));
+        app.large.insert(
+            path.clone(),
+            LargeView {
+                start: 5,
+                end: 10,
+                size: 100,
+            },
+        );
+        let _ = app.update(Message::LargeRefreshed(
+            path.clone(),
+            Ok(("more\n".into(), 5, 12)),
+        ));
+        let view = app.large_view().unwrap();
+        assert_eq!((view.start, view.end), (5, 12));
+        assert_eq!(crate::editor::buffer_text(&app.editor.content), "more\n");
+        assert!(app.undo_stack.is_empty());
+        let _ = app.close_path(path.clone());
+        assert!(!app.large.contains_key(&path));
     }
 
     #[test]

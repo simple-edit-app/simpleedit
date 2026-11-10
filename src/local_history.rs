@@ -85,9 +85,22 @@ fn hash(bytes: &[u8]) -> String {
     text
 }
 
+/// Writes a file readable by its owner only (copies of private files).
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(bytes)
+}
+
 fn write_atomically(path: &Path, bytes: &[u8]) -> Option<()> {
     let temporary = path.with_extension("tmp");
-    std::fs::write(&temporary, bytes).ok()?;
+    write_private(&temporary, bytes).ok()?;
     std::fs::rename(&temporary, path).ok()
 }
 
@@ -438,6 +451,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::at(dir.path().to_path_buf());
         (dir, store)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kept_copies_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, store) = store();
+        store.record(Path::new("/p/.env"), "SECRET=1", 10);
+        for sub in ["blobs", "files"] {
+            for entry in std::fs::read_dir(dir.path().join(sub)).unwrap() {
+                let mode = entry.unwrap().metadata().unwrap().permissions().mode();
+                assert_eq!(mode & 0o077, 0, "{sub}");
+            }
+        }
     }
 
     #[test]
