@@ -205,11 +205,7 @@ impl SimpleEditApp {
             }
             ApiMsg::DialogOk => self.api_dialog_ok(),
             ApiMsg::DialogClose => {
-                if matches!(self.api.dialog, Some(Dialog::Environments)) {
-                    self.api.save_environments();
-                }
-                // A question that came from the list of environments goes back to it.
-                self.api.dialog = None;
+                self.api_close_dialog();
                 Task::none()
             }
             ApiMsg::OpenCurl => {
@@ -280,8 +276,12 @@ impl SimpleEditApp {
                 Task::none()
             }
             ApiMsg::VarKey(i, key) => {
+                let id = self.api.editing_env;
                 self.api_env_mut(|env| {
                     if let Some(v) = env.vars.get_mut(i) {
+                        if let (true, Some(id)) = (v.secret, id) {
+                            crate::api::store::forget_secret(id, &v.key);
+                        }
                         v.key = key;
                     }
                 });
@@ -304,8 +304,12 @@ impl SimpleEditApp {
                 Task::none()
             }
             ApiMsg::VarSecret(i, on) => {
+                let id = self.api.editing_env;
                 self.api_env_mut(|env| {
                     if let Some(v) = env.vars.get_mut(i) {
+                        if let (true, false, Some(id)) = (v.secret, on, id) {
+                            crate::api::store::forget_secret(id, &v.key);
+                        }
                         v.secret = on;
                     }
                 });
@@ -316,9 +320,13 @@ impl SimpleEditApp {
                 Task::none()
             }
             ApiMsg::VarDel(i) => {
+                let id = self.api.editing_env;
                 self.api_env_mut(|env| {
                     if i < env.vars.len() {
-                        env.vars.remove(i);
+                        let v = env.vars.remove(i);
+                        if let (true, Some(id)) = (v.secret, id) {
+                            crate::api::store::forget_secret(id, &v.key);
+                        }
                     }
                 });
                 Task::none()
@@ -438,6 +446,14 @@ impl SimpleEditApp {
                 Task::none()
             }
         }
+    }
+
+    /// Closes the open dialog, whichever way; the environments are kept.
+    pub(super) fn api_close_dialog(&mut self) {
+        if matches!(self.api.dialog, Some(Dialog::Environments)) {
+            self.api.save_environments();
+        }
+        self.api.dialog = None;
     }
 
     /// Changes the environment that is open in its window.
@@ -946,7 +962,13 @@ impl SimpleEditApp {
             }
             Act::BodySaved(done) => match done {
                 Some(Ok(file)) => {
-                    tab.notice = Some(t!("api.exported", path = file.as_str()).to_string())
+                    let cut = tab.response.as_ref().is_some_and(|v| v.response.truncated);
+                    let size = api::view::size(http::MAX_BODY);
+                    tab.notice = Some(if cut {
+                        t!("api.exported_truncated", path = file.as_str(), size = size).to_string()
+                    } else {
+                        t!("api.exported", path = file.as_str()).to_string()
+                    })
                 }
                 Some(Err(error)) => tab.error = Some(error),
                 None => {}

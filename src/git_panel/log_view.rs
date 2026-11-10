@@ -170,7 +170,7 @@ impl Panel {
 
         let head_row = self.tree_row(
             0,
-            "HEAD (Current Branch)".to_string(),
+            t!("git.head_current").to_string(),
             self.log.branch.as_deref() == Some("HEAD"),
             Some("HEAD".to_string()),
             None,
@@ -1185,6 +1185,14 @@ impl Panel {
                     .on_action(|a| Message::Git(GitMsg::DialogMessage(a)))
                     .size(13)
                     .height(Length::Fixed(150.0))
+                    .into(),
+                *pushed,
+            ),
+            Dialog::Guard { pushed, .. } => (
+                t!("git.rewrite_title").to_string(),
+                text(t!("git.rewrite_text").to_string())
+                    .size(12.5)
+                    .color(p.muted)
                     .into(),
                 *pushed,
             ),

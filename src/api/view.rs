@@ -91,7 +91,26 @@ fn small_button<'a>(
 }
 
 /// A size in bytes, as a person reads it.
-fn size(bytes: usize) -> String {
+/// An entry of a list that is told apart by its id, not its name.
+#[derive(Clone)]
+struct Choice {
+    id: Option<u64>,
+    name: String,
+}
+
+impl PartialEq for Choice {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl std::fmt::Display for Choice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.name)
+    }
+}
+
+pub fn size(bytes: usize) -> String {
     crate::database::protocol::human_size(bytes as i64)
 }
 
@@ -141,22 +160,28 @@ pub fn sidebar<'a>(
 
     // The environment that is on, and the way to edit them.
     let none = t!("api.no_env").to_string();
-    let mut names = vec![none.clone()];
-    names.extend(state.environments.iter().map(|e| e.name.clone()));
+    let mut names = vec![Choice {
+        id: None,
+        name: none.clone(),
+    }];
+    names.extend(state.environments.iter().map(|e| Choice {
+        id: Some(e.id),
+        name: e.name.clone(),
+    }));
     let chosen = state
         .active_env
         .and_then(|id| state.environment(id))
-        .map(|e| e.name.clone())
-        .unwrap_or_else(|| none.clone());
-    let by_name: Vec<(u64, String)> = state
-        .environments
-        .iter()
-        .map(|e| (e.id, e.name.clone()))
-        .collect();
+        .map(|e| Choice {
+            id: Some(e.id),
+            name: e.name.clone(),
+        })
+        .unwrap_or(Choice {
+            id: None,
+            name: none.clone(),
+        });
     let env_row = row![
-        pick_list(names, Some(chosen), move |name: String| {
-            let id = by_name.iter().find(|(_, n)| *n == name).map(|(id, _)| *id);
-            api(ApiMsg::SelectEnv(id))
+        pick_list(names, Some(chosen), move |choice: Choice| {
+            api(ApiMsg::SelectEnv(choice.id))
         })
         .text_size(12.5)
         .padding([3, 8])
@@ -608,24 +633,20 @@ pub fn tab<'a>(
         head = head.push(text("●").size(11).color(p.accent));
     }
     if tab.origin.is_none() && !state.collections.is_empty() {
-        let names: Vec<String> = state.collections.iter().map(|c| c.name.clone()).collect();
+        let choice = |c: &super::model::Collection| Choice {
+            id: Some(c.id),
+            name: c.name.clone(),
+        };
+        let names: Vec<Choice> = state.collections.iter().map(choice).collect();
         let chosen = tab
             .save_target
             .and_then(|id| state.collection(id))
             .or_else(|| state.collections.first())
-            .map(|c| c.name.clone());
-        let ids: Vec<(u64, String)> = state
-            .collections
-            .iter()
-            .map(|c| (c.id, c.name.clone()))
-            .collect();
+            .map(choice);
         let target_path = path.to_path_buf();
         head = head.push(
-            pick_list(names, chosen, move |name: String| {
-                let id = ids
-                    .iter()
-                    .find(|(_, n)| *n == name)
-                    .map_or(0, |(id, _)| *id);
+            pick_list(names, chosen, move |picked: Choice| {
+                let id = picked.id.unwrap_or(0);
                 Message::Api(ApiMsg::Tab(target_path.clone(), Act::SaveTarget(id)))
             })
             .text_size(12.5)

@@ -141,13 +141,13 @@ pub enum StashAction {
     Drop,
 }
 
-/// `03/09/2026 16:12`
+/// `03/09/2026 16:12` (the order of the day and the month follows the language)
 pub fn format_time(epoch: i64) -> String {
     use chrono::TimeZone;
     chrono::Local
         .timestamp_opt(epoch, 0)
         .single()
-        .map(|t| t.format("%d/%m/%Y %H:%M").to_string())
+        .map(|t| t.format(&t!("git.datetime_format")).to_string())
         .unwrap_or_default()
 }
 
@@ -157,6 +157,6 @@ pub fn format_date(epoch: i64) -> String {
     chrono::Local
         .timestamp_opt(epoch, 0)
         .single()
-        .map(|t| t.format("%d/%m/%Y").to_string())
+        .map(|t| t.format(&t!("git.date_format")).to_string())
         .unwrap_or_default()
 }

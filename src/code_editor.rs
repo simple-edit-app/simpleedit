@@ -3904,7 +3904,7 @@ fn bracket_pair(editor: &Editor) -> Option<((usize, usize), (usize, usize))> {
     const REACH: usize = 20_000;
     let cursor = editor.cursor();
     let (line, col) = (cursor.position.line, cursor.position.column);
-    let text = editor.line(line)?.text.to_string();
+    let text = editor.line(line)?.text;
     let after = text
         .get(col..)
         .and_then(|t| t.chars().next())
@@ -3927,7 +3927,7 @@ fn bracket_pair(editor: &Editor) -> Option<((usize, usize), (usize, usize))> {
         let mut budget = REACH;
         if forward {
             for l in line..editor.line_count() {
-                let t = editor.line(l)?.text.to_string();
+                let t = editor.line(l)?.text;
                 let from = if l == line { at } else { 0 };
                 for (i, c) in t.get(from..)?.char_indices() {
                     budget = budget.checked_sub(1)?;
@@ -3943,7 +3943,7 @@ fn bracket_pair(editor: &Editor) -> Option<((usize, usize), (usize, usize))> {
             }
         } else {
             for l in (0..=line).rev() {
-                let t = editor.line(l)?.text.to_string();
+                let t = editor.line(l)?.text;
                 let to = if l == line { at + 1 } else { t.len() };
                 for (i, c) in t.get(..to)?.char_indices().rev() {
                     budget = budget.checked_sub(1)?;

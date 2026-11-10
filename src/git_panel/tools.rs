@@ -727,6 +727,19 @@ impl Panel {
     }
 
     fn commit_file_action(&mut self, action: CommitFile, index: usize) -> Task<Message> {
+        if matches!(action, CommitFile::Remove | CommitFile::Extract) {
+            if let Some(sha) = self.log.files_for.clone() {
+                return self.guard(super::log::Guarded::File(action, index), sha);
+            }
+        }
+        self.run_commit_file_action(action, index)
+    }
+
+    pub(super) fn run_commit_file_action(
+        &mut self,
+        action: CommitFile,
+        index: usize,
+    ) -> Task<Message> {
         let Some(sha) = self.log.files_for.clone() else {
             return Task::none();
         };

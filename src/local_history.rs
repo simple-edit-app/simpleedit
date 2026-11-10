@@ -20,6 +20,8 @@ const MAX_LABELS: usize = 500;
 /// Files read at once when a folder is about to go.
 const MAX_TREE_FILES: usize = 2000;
 const DAY: i64 = 24 * 60 * 60;
+/// Whatever the working days, nothing is kept longer than this.
+const MAX_AGE_DAYS: i64 = 365;
 
 /// Writing goes one at a time: two lists read, changed and written back at
 /// once would lose what one of them added.
@@ -310,34 +312,52 @@ impl Store {
     }
 
     /// Forgets what is older than `days` working days (those a file changed
-    /// on), then the oldest of all while the history is over `max_bytes`.
+    /// on) or than `MAX_AGE_DAYS` calendar days, then the oldest of all while
+    /// the history is over `max_bytes`.
     pub fn prune(&self, days: u32, max_bytes: u64) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        self.prune_at(days, max_bytes, now);
+    }
+
+    fn prune_at(&self, days: u32, max_bytes: u64, now: i64) {
         let _writing = writing();
         let mut files = self.all_files();
+        let oldest_allowed = now - MAX_AGE_DAYS * DAY;
         for file in &mut files {
             let worked: BTreeSet<i64> = file.revisions.iter().map(|r| r.time / DAY).collect();
             let kept: BTreeSet<i64> = worked.into_iter().rev().take(days as usize).collect();
-            file.revisions.retain(|r| kept.contains(&(r.time / DAY)));
+            file.revisions
+                .retain(|r| kept.contains(&(r.time / DAY)) && r.time >= oldest_allowed);
         }
-        let size = |file: &[FileRecord]| {
-            let blobs: HashSet<&str> = file
-                .iter()
-                .flat_map(|f| f.revisions.iter().map(|r| r.blob.as_str()))
-                .collect();
-            blobs
-                .iter()
-                .filter_map(|b| std::fs::metadata(self.dir.join("blobs").join(b)).ok())
-                .map(|m| m.len())
-                .sum::<u64>()
-        };
-        while size(&files) > max_bytes {
+        // Each blob is measured once, then counted while a revision uses it.
+        let mut uses: std::collections::HashMap<String, (u64, usize)> =
+            std::collections::HashMap::new();
+        let mut total = 0u64;
+        for revision in files.iter().flat_map(|f| &f.revisions) {
+            let entry = uses.entry(revision.blob.clone()).or_insert_with(|| {
+                let len = std::fs::metadata(self.dir.join("blobs").join(&revision.blob))
+                    .map_or(0, |m| m.len());
+                total += len;
+                (len, 0)
+            });
+            entry.1 += 1;
+        }
+        while total > max_bytes {
             let oldest = files
                 .iter_mut()
                 .filter(|f| !f.revisions.is_empty())
                 .min_by_key(|f| f.revisions[0].time);
             match oldest {
                 Some(file) => {
-                    file.revisions.remove(0);
+                    let revision = file.revisions.remove(0);
+                    if let Some((len, count)) = uses.get_mut(&revision.blob) {
+                        *count -= 1;
+                        if *count == 0 {
+                            total -= *len;
+                        }
+                    }
                 }
                 None => break,
             }
@@ -566,7 +586,7 @@ mod tests {
         store.record(path, "day two", 100 * DAY);
         store.record(path, "day three", 200 * DAY);
         let gone = store.file(path).revisions[0].blob.clone();
-        store.prune(2, MAX_BYTES);
+        store.prune_at(2, MAX_BYTES, 200 * DAY);
         let kept = store.file(path).revisions;
         assert_eq!(kept.len(), 2);
         assert_eq!(kept[0].time, 100 * DAY);
@@ -574,11 +594,21 @@ mod tests {
     }
 
     #[test]
+    fn a_year_old_revision_goes_whatever_the_working_days() {
+        let (_dir, store) = store();
+        let path = Path::new("/p/a");
+        store.record(path, "old", DAY);
+        store.record(path, "new", 500 * DAY);
+        store.prune_at(30, MAX_BYTES, 500 * DAY);
+        assert_eq!(store.file(path).revisions.len(), 1);
+    }
+
+    #[test]
     fn the_oldest_goes_when_the_history_is_too_big() {
         let (_dir, store) = store();
         store.record(Path::new("/p/a"), "aaaaaaaaaa", 1);
         store.record(Path::new("/p/b"), "bbbbbbbbbb", 2);
-        store.prune(30, 15);
+        store.prune_at(30, 15, 10);
         assert!(store.file(Path::new("/p/a")).revisions.is_empty());
         assert_eq!(store.file(Path::new("/p/b")).revisions.len(), 1);
     }

@@ -148,6 +148,12 @@ fn run(input: &str, slot: &mut Option<(String, Session)>, serving: bool) -> Resu
     let key = serde_json::to_string(&(&request.target, database)).unwrap_or_default();
     let usable = matches!(slot, Some((k, s)) if *k == key && !s.client.is_closed());
     if !usable {
+        // A transaction died with its session: opening another one would run
+        // the next statement on its own, outside of what the user began.
+        if matches!(slot, Some((k, s)) if *k == key && s.in_transaction) {
+            *slot = None;
+            return Err("the session was lost while a transaction was open: the transaction is rolled back by the server; run it again".to_string());
+        }
         *slot = None;
         let opened = Session::open(&request.target, &request.database)?;
         *slot = Some((key, opened));
@@ -205,7 +211,9 @@ fn run(input: &str, slot: &mut Option<(String, Session)>, serving: bool) -> Resu
         "query" => {
             let mut answer = guarded(client, &request.target, |c| query(c, &request))?;
             if serving {
-                answer["in_transaction"] = json!(in_transaction(client));
+                let open = in_transaction(client);
+                answer["in_transaction"] = json!(open);
+                session.in_transaction = open;
             }
             Ok(answer)
         }
@@ -286,6 +294,8 @@ struct Session {
     _tunnel: Option<Tunnel>,
     /// The local end of the tunnel the connection goes through, if any.
     tunnel_port: Option<u16>,
+    /// Whether the last statement left a transaction open.
+    in_transaction: bool,
 }
 
 impl Session {
@@ -367,6 +377,7 @@ impl Session {
             client,
             _tunnel: tunnel,
             tunnel_port,
+            in_transaction: false,
         })
     }
 }

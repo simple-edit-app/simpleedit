@@ -981,7 +981,16 @@ pub async fn reset(repo: &Path, to: &str, mode: ResetMode) -> Result<(), String>
 /// Takes the last commit back, its changes staying staged; its message.
 pub async fn undo_last_commit(repo: &Path) -> Result<String, String> {
     let message = last_message(repo).await?;
-    run(repo, &["reset", "--soft", "HEAD~1"]).await?;
+    if run(repo, &["rev-parse", "--verify", "-q", "HEAD~1"])
+        .await
+        .is_ok()
+    {
+        run(repo, &["reset", "--soft", "HEAD~1"]).await?;
+    } else {
+        // The root commit has no parent: the branch goes back to being
+        // unborn, the index keeps what was committed.
+        run(repo, &["update-ref", "-d", "HEAD"]).await?;
+    }
     Ok(message)
 }
 

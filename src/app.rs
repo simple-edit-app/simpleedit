@@ -4274,6 +4274,7 @@ impl SimpleEditApp {
                     if self.session_owner {
                         self.config.save();
                     }
+                    self.api.save_environments();
                     crate::tasks::stop_all();
                     crate::lsp::stop_servers();
                     std::process::exit(0)
@@ -4289,6 +4290,7 @@ impl SimpleEditApp {
                 if self.session_owner {
                     self.config.save();
                 }
+                self.api.save_environments();
                 crate::tasks::stop_all();
                 crate::lsp::stop_servers();
                 std::process::exit(0)
@@ -7296,7 +7298,9 @@ impl SimpleEditApp {
                 None => self.ensure_tab(),
             };
         }
-        let _ = self.save_session_now();
+        // The session is written by the next tick (in the background), not
+        // here: closing many tabs would otherwise write it once per tab.
+        self.session_rev = self.rev.wrapping_sub(1);
         command
     }
 

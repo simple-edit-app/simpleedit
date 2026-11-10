@@ -35,6 +35,7 @@ impl SimpleEditApp {
             return self.db_ask_password(id);
         };
         self.db.trees.insert(id, Tree::Loading);
+        self.db.forget_known();
         Task::perform(database::tree(params), move |result| {
             Message::Db(DbMsg::TreeLoaded(id, result))
         })
@@ -498,7 +499,8 @@ impl SimpleEditApp {
 
     /// Escape gives up what is being typed or picked in the table in front.
     pub(super) fn db_escape(&mut self) -> bool {
-        if self.api.dialog.take().is_some() {
+        if self.api.dialog.is_some() {
+            self.api_close_dialog();
             return true;
         }
         if self.db.text.take().is_some() || self.db.links.take().is_some() {
@@ -890,6 +892,7 @@ impl SimpleEditApp {
             DbMsg::TreeLoaded(id, done) => {
                 let log = self.db_log(id, &done.executed);
                 let read_columns = done.result.is_ok();
+                self.db.forget_known();
                 if self.db.connection(id).is_some() {
                     self.db.trees.insert(
                         id,
@@ -1685,6 +1688,7 @@ impl SimpleEditApp {
             DbMsg::ColumnsLoaded(id, done) => {
                 let log = self.db_log(id, &done.executed);
                 if let Ok(catalog) = done.result {
+                    self.db.forget_known();
                     self.db.columns.insert(id, catalog.columns);
                     self.db.foreign_keys.insert(id, catalog.foreign_keys);
                 }

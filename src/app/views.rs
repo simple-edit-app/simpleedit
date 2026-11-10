@@ -441,7 +441,12 @@ impl SimpleEditApp {
         let scratch = &self.scratch;
         let ghost = move |active: bool| (se_theme::GhostButton { dark, active }).style();
         // Left empty, the name is the next free `scratchN`, shown as a hint.
-        let suggestion = crate::scratch::next_name(&scratch.dir, scratch.ext.as_str());
+        // (Only looked up when it is shown: it stats the folder.)
+        let suggestion = if scratch.name.is_empty() {
+            crate::scratch::next_name(&scratch.dir, scratch.ext.as_str())
+        } else {
+            String::new()
+        };
         let create = button(text(t!("scratch.create").to_string()).size(12.5))
             .padding([5, 12])
             .on_press(Message::ScratchCreate)

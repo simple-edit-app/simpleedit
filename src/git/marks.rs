@@ -40,7 +40,10 @@ pub fn compute(base: Option<&str>, current: &str) -> ChangeMarks {
     if !current.is_empty() && !current.ends_with('\n') {
         current.push('\n');
     }
-    let diff = TextDiff::from_lines(base.as_str(), current.as_str());
+    // Bounded: a file that differs from end to end must not freeze typing.
+    let diff = TextDiff::configure()
+        .timeout(std::time::Duration::from_millis(50))
+        .diff_lines(base.as_str(), current.as_str());
     for op in diff.ops() {
         match *op {
             DiffOp::Equal { .. } => {}
@@ -81,7 +84,10 @@ pub fn revert(base: Option<&str>, current: &str, line: usize) -> Option<String> 
     if !current.is_empty() && !current.ends_with('\n') {
         current.push('\n');
     }
-    let diff = TextDiff::from_lines(base.as_str(), current.as_str());
+    // Bounded: a file that differs from end to end must not freeze typing.
+    let diff = TextDiff::configure()
+        .timeout(std::time::Duration::from_millis(50))
+        .diff_lines(base.as_str(), current.as_str());
     let (old_lines, new_lines): (Vec<&str>, Vec<&str>) = (
         base.split_inclusive('\n').collect(),
         current.split_inclusive('\n').collect(),

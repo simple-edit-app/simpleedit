@@ -371,11 +371,23 @@ const MAX_INLINE_CHARS: usize = 200_000;
 /// on, so an unmatched opener repeated thousands of times (`*a *a *a …`)
 /// doesn't rescan the rest of the line each time.
 #[derive(Default)]
-struct Misses(std::collections::HashMap<String, usize>);
+struct Misses(
+    std::collections::HashMap<String, usize>,
+    // The last occurrence found: searched from `.0`, it was at `.1`.
+    std::collections::HashMap<String, (usize, usize)>,
+);
 
 impl Misses {
     fn known(&self, key: &str, from: usize) -> bool {
         self.0.get(key).is_some_and(|miss| from >= *miss)
+    }
+
+    /// An occurrence already found that a search from `from` would find too.
+    fn found(&self, key: &str, from: usize) -> Option<usize> {
+        self.1
+            .get(key)
+            .filter(|(start, end)| (*start..=*end).contains(&from))
+            .map(|(_, end)| *end)
     }
 
     fn record(&mut self, key: &str, from: usize) {
@@ -520,9 +532,15 @@ fn find_cached(chars: &[char], from: usize, needle: &str, misses: &mut Misses) -
     if misses.known(needle, from) {
         return None;
     }
+    if let Some(end) = misses.found(needle, from) {
+        return Some(end);
+    }
     let found = find(chars, from, needle);
-    if found.is_none() {
-        misses.record(needle, from);
+    match found {
+        None => misses.record(needle, from),
+        Some(end) => {
+            misses.1.insert(needle.to_string(), (from, end));
+        }
     }
     found
 }
@@ -1084,6 +1102,16 @@ mod tests {
 
     fn plain(text: &str) -> Vec<Span> {
         vec![Span::new(text, Style::Plain)]
+    }
+
+    #[test]
+    fn many_openers_with_one_closer_stay_fast() {
+        let line = format!("{}]", "[".repeat(MAX_INLINE_CHARS - 1));
+        let started = std::time::Instant::now();
+        let spans = parse_inline(&line);
+        assert!(started.elapsed().as_secs() < 2);
+        let text: String = spans.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(text, line);
     }
 
     #[test]

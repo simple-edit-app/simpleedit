@@ -47,6 +47,9 @@ pub const PAGE_SIZES: [u64; 6] = [50, 100, 200, 500, 1000, 5000];
 const CALL_TIMEOUT: Duration = Duration::from_secs(45);
 /// The driver is a few megabytes.
 const MAX_DRIVER: usize = 64 * 1024 * 1024;
+/// The most the app reads of one answer of a driver: a page of huge values
+/// would otherwise be held whole, by the driver and then here.
+const MAX_ANSWER: u64 = 256 * 1024 * 1024;
 
 // ---------------------------------------------------------------- messages
 
@@ -1076,10 +1079,14 @@ async fn call_inner(
         stdin.write_all(&body).await.map_err(|e| e.to_string())?;
         drop(stdin);
         let mut out = String::new();
-        stdout
+        (&mut stdout)
+            .take(MAX_ANSWER + 1)
             .read_to_string(&mut out)
             .await
             .map_err(|e| e.to_string())?;
+        if out.len() as u64 > MAX_ANSWER {
+            return Err(t!("db.err_answer_too_large").to_string());
+        }
         Ok::<String, String>(out)
     };
     let out = match wait_limit(&request) {
@@ -1162,13 +1169,16 @@ async fn call_live(
         // connection was just made; the answer is the line with `ok` in it.
         loop {
             let mut out = String::new();
-            let read = process
-                .stdout
+            let read = (&mut process.stdout)
+                .take(MAX_ANSWER + 1)
                 .read_line(&mut out)
                 .await
                 .map_err(|e| e.to_string())?;
             if read == 0 {
                 return Err(t!("db.err_driver_answer").to_string());
+            }
+            if read as u64 > MAX_ANSWER {
+                return Err(t!("db.err_answer_too_large").to_string());
             }
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(out.trim()) {
                 if value.get("ok").is_none() {
@@ -2349,6 +2359,9 @@ impl Dialog {
 // ------------------------------------------------------------------- state
 
 pub struct State {
+    /// What the completion knows, kept until the tree or the columns change:
+    /// the connection, the console's database and the result.
+    known_cache: std::sync::Mutex<Option<(u64, String, std::sync::Arc<completion::Known>)>>,
     pub connections: Vec<Connection>,
     /// Passwords typed but not kept in the file: `(password, ssh secret)`.
     pub passwords: HashMap<u64, (String, String)>,
@@ -2416,6 +2429,7 @@ impl State {
     pub fn load() -> Self {
         let stored = load_stored();
         State {
+            known_cache: Default::default(),
             connections: stored.connections,
             passwords: HashMap::new(),
             once: HashMap::new(),
@@ -2468,7 +2482,26 @@ impl State {
 
     /// What the completion knows of a connection: its tables, and the
     /// columns when they have been read.
-    pub fn known(&self, id: u64) -> completion::Known {
+    pub fn known(&self, id: u64) -> std::sync::Arc<completion::Known> {
+        let name = self.console_database(id).unwrap_or_default().to_string();
+        let mut cache = self.known_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((cached, database, known)) = cache.as_ref() {
+            if *cached == id && *database == name {
+                return known.clone();
+            }
+        }
+        let known = std::sync::Arc::new(self.build_known(id));
+        *cache = Some((id, name, known.clone()));
+        known
+    }
+
+    /// Forgets what `known` kept: the tree, the columns or the connection
+    /// changed.
+    pub fn forget_known(&self) {
+        *self.known_cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn build_known(&self, id: u64) -> completion::Known {
         let mut known = completion::Known {
             dialect: self.connection(id).map(|c| c.dialect).unwrap_or_default(),
             ..completion::Known::default()
@@ -2519,10 +2552,19 @@ impl State {
                 .push((column.name.clone(), column.kind.clone()));
         }
         // A table the tree leaves out (a filter) is known by its columns.
-        for (schema, table) in known.columns.keys().cloned().collect::<Vec<_>>() {
-            if !known.tables.iter().any(|t| t.0 == schema && t.1 == table) {
-                known.tables.push((schema, table, Kind::Table));
-            }
+        let listed: std::collections::HashSet<(String, String)> = known
+            .tables
+            .iter()
+            .map(|t| (t.0.clone(), t.1.clone()))
+            .collect();
+        let unlisted: Vec<(String, String)> = known
+            .columns
+            .keys()
+            .filter(|key| !listed.contains(*key))
+            .cloned()
+            .collect();
+        for (schema, table) in unlisted {
+            known.tables.push((schema, table, Kind::Table));
         }
         known
     }
@@ -2618,6 +2660,7 @@ impl State {
             None => self.connections.push(connection),
         }
         self.trees.remove(&id);
+        self.forget_known();
         // The settings may have changed: the next run connects afresh.
         self.live.remove(&id);
         self.forget_browse(id);
@@ -2656,6 +2699,7 @@ impl State {
         self.passwords.remove(&id);
         self.once.remove(&id);
         self.trees.remove(&id);
+        self.forget_known();
         self.live.remove(&id);
         self.forget_browse(id);
         let prefix = format!("{id}/");
@@ -2708,7 +2752,7 @@ mod tests {
             ]),
         );
         let names =
-            |s: &State| -> Vec<String> { s.known(1).tables.into_iter().map(|t| t.1).collect() };
+            |s: &State| -> Vec<String> { s.known(1).tables.iter().map(|t| t.1.clone()).collect() };
         assert_eq!(names(&state), vec!["orders"]);
         state.console.connection = Some(1);
         state.console.database = "analytics".into();

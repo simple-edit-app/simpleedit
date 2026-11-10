@@ -928,6 +928,7 @@ pub enum GitMsg {
     RebaseSet(usize, git::history::PlanAction),
     RebaseSubject(usize, String),
     RewriteReady(log::Action, bool, String),
+    GuardReady(log::Guarded, bool),
     DialogMessage(text_editor::Action),
     DialogOk,
     DialogCancel,
@@ -956,6 +957,7 @@ impl GitMsg {
                 | GitMsg::CommitFilesLoaded(..)
                 | GitMsg::CommitInfoLoaded(..)
                 | GitMsg::RewriteReady(..)
+                | GitMsg::GuardReady(..)
                 | GitMsg::Done(_)
                 | GitMsg::Reply(_)
         ) || matches!(self, GitMsg::Tool(m) if m.is_background())
@@ -2042,6 +2044,7 @@ impl Panel {
                 self.rewrite_ready(action, pushed, text);
                 Task::none()
             }
+            GitMsg::GuardReady(then, pushed) => self.guard_ready(then, pushed),
             GitMsg::DialogMessage(action) => {
                 if let Some(log::Dialog::Message { content, .. }) = &mut self.log.dialog {
                     content.perform(action);
@@ -2894,8 +2897,9 @@ mod tests {
         ];
         panel.log.files_for = Some("sha".into());
         let _ = panel.update(GitMsg::TickCommitFile("c".into(), true), &ctx());
-        let msg = GitMsg::Tool(tools::ToolMsg::FileOf(tools::CommitFile::Extract, 1));
-        let _ = panel.update(msg, &ctx());
+        // The check for a pushed commit is asynchronous: what runs once it
+        // has answered is what opens the dialog.
+        let _ = panel.run_commit_file_action(tools::CommitFile::Extract, 1);
         let Some(tools::Dialog::Extract { paths, sha, .. }) = &panel.dialog else {
             panic!("the dialog");
         };

@@ -249,6 +249,11 @@ pub fn save_environments(environments: &[Environment], active: Option<u64>, next
     }
 }
 
+/// Forgets one secret variable's entry in the keychain.
+pub fn forget_secret(env_id: u64, key: &str) {
+    let _ = crate::database::secrets::save(env_id, &secret_name(key), "");
+}
+
 /// Forgets the secrets of an environment that was deleted.
 pub fn forget_secrets(env: &Environment) {
     for var in env.vars.iter().filter(|v| v.secret) {

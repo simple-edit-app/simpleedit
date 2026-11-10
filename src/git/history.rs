@@ -122,6 +122,14 @@ pub async fn log_filtered(
     search: Option<(SearchMode, &str)>,
     filter: &LogFilter,
 ) -> Result<Vec<Commit>, String> {
+    // A repository without a commit has no log, which is not an error.
+    if rev == "HEAD"
+        && run(repo, &["rev-parse", "--verify", "-q", "HEAD"])
+            .await
+            .is_err()
+    {
+        return Ok(Vec::new());
+    }
     let max = format!("--max-count={limit}");
     let mut args = vec![
         "log",
@@ -650,15 +658,21 @@ pub async fn stash_push(repo: &Path, message: &str) -> Result<(), String> {
 }
 
 pub async fn stash_apply(repo: &Path, index: usize) -> Result<(), String> {
-    run(repo, &["stash", "apply", &format!("stash@{{{index}}}")])
-        .await
-        .map(|_| ())
+    match run(repo, &["stash", "apply", &format!("stash@{{{index}}}")]).await {
+        Ok(_) => Ok(()),
+        // The stash is kept and its conflicts are left to settle.
+        Err(_) if super::has_conflicts(repo).await => Err(super::CONFLICT.to_string()),
+        Err(e) => Err(e),
+    }
 }
 
 pub async fn stash_pop(repo: &Path, index: usize) -> Result<(), String> {
-    run(repo, &["stash", "pop", &format!("stash@{{{index}}}")])
-        .await
-        .map(|_| ())
+    match run(repo, &["stash", "pop", &format!("stash@{{{index}}}")]).await {
+        Ok(_) => Ok(()),
+        // The stash is kept and its conflicts are left to settle.
+        Err(_) if super::has_conflicts(repo).await => Err(super::CONFLICT.to_string()),
+        Err(e) => Err(e),
+    }
 }
 
 pub async fn stash_drop(repo: &Path, index: usize) -> Result<(), String> {
@@ -1518,6 +1532,43 @@ mod tests {
         let base = shas(&repo).last().unwrap().clone();
         let err = block(drop_commits(repo.path(), &[base])).unwrap_err();
         assert!(err.contains("merge"));
+    }
+
+    #[test]
+    fn an_empty_repository_has_an_empty_log() {
+        let repo = Repo::new();
+        let log = block(log_filtered(
+            repo.path(),
+            "HEAD",
+            10,
+            None,
+            None,
+            &LogFilter::default(),
+        ))
+        .unwrap();
+        assert!(log.is_empty());
+        // The root commit can be taken back: the branch is unborn again.
+        repo.write("a.txt", "a\n");
+        repo.commit_all("root");
+        assert_eq!(
+            block(crate::git::undo_last_commit(repo.path())).unwrap(),
+            "root"
+        );
+        assert!(repo.git(&["status", "--porcelain"]).contains("A  a.txt"));
+    }
+
+    #[test]
+    fn a_stash_that_conflicts_is_left_to_settle() {
+        let repo = Repo::new();
+        repo.write("f.txt", "base\n");
+        repo.commit_all("base");
+        repo.write("f.txt", "mine\n");
+        block(stash_push(repo.path(), "")).unwrap();
+        repo.write("f.txt", "theirs\n");
+        repo.commit_all("other");
+        let error = block(stash_pop(repo.path(), 0)).unwrap_err();
+        assert_eq!(error, crate::git::CONFLICT);
+        assert_eq!(block(stashes(repo.path())).unwrap().len(), 1);
     }
 
     #[test]

@@ -2903,6 +2903,9 @@ fn queries_view<'a>(state: &'a State, dark: bool) -> Element<'a, Message> {
         })
         .font(se_theme::MONO)
         .size(13)
+        // A line is a row: the frame, the underline and the list below are
+        // placed by logical line, which wrapping would shift.
+        .wrapping(iced::widget::text::Wrapping::None)
         .padding([8, 12])
         .height(Length::Fill);
     // The statement "Run" would run (the caret is in it), framed; when

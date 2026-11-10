@@ -36,6 +36,9 @@ pub enum Dialog {
         content: text_editor::Content,
         pushed: bool,
     },
+    /// A rewrite of the history to confirm, with the warning when the
+    /// commits are already pushed.
+    Guard { then: Guarded, pushed: bool },
     /// A confirmation (drop).
     Confirm { shas: Vec<String>, pushed: bool },
     /// A name to type for a branch or a tag made at a commit.
@@ -52,6 +55,13 @@ pub enum Dialog {
         base: Option<String>,
         items: Vec<PlanItem>,
     },
+}
+
+/// A rewrite that runs once the user has been told about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Guarded {
+    Log(LogAction),
+    File(super::tools::CommitFile, usize),
 }
 
 /// What a name typed in the log is for.
@@ -710,7 +720,46 @@ impl Panel {
             .collect()
     }
 
+    /// Asks whether the commit is already pushed, then goes on with `then`.
+    pub(super) fn guard(&mut self, then: Guarded, sha: String) -> Task<Message> {
+        let Some(repo) = self.repo.clone() else {
+            return Task::none();
+        };
+        Task::perform(
+            async move { history::on_remote(&repo, &sha).await },
+            move |pushed| Message::Git(GitMsg::GuardReady(then, pushed)),
+        )
+    }
+
+    pub(super) fn guard_ready(&mut self, then: Guarded, pushed: bool) -> Task<Message> {
+        if pushed {
+            self.log.dialog = Some(Dialog::Guard { then, pushed });
+            return Task::none();
+        }
+        self.run_guarded(then)
+    }
+
+    fn run_guarded(&mut self, then: Guarded) -> Task<Message> {
+        match then {
+            Guarded::Log(action) => self.run_log_action(action),
+            Guarded::File(action, index) => self.run_commit_file_action(action, index),
+        }
+    }
+
     pub(super) fn log_action(&mut self, action: LogAction) -> Task<Message> {
+        if matches!(
+            action,
+            LogAction::Fixup | LogAction::SquashInto | LogAction::RebaseFrom
+        ) && self.log.availability().rebase
+        {
+            if let Some(sha) = self.selected_shas().into_iter().next() {
+                return self.guard(Guarded::Log(action), sha);
+            }
+        }
+        self.run_log_action(action)
+    }
+
+    fn run_log_action(&mut self, action: LogAction) -> Task<Message> {
         let avail = self.log.availability();
         let shas = self.selected_shas();
         let Some(repo) = self.repo.clone() else {
@@ -909,6 +958,7 @@ impl Panel {
                     Ok(String::new())
                 })
             }
+            Dialog::Guard { then, .. } => self.run_guarded(then),
             Dialog::Confirm { shas, .. } => self.act(move |repo| async move {
                 history::drop_commits(&repo, &shas).await?;
                 Ok(String::new())
