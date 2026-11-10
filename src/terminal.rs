@@ -9,7 +9,7 @@
 use std::io::{Read, Write};
 use std::num::NonZeroU16;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use iced::keyboard::{self, key::Named, Key};
@@ -28,6 +28,28 @@ const CELL_H: f32 = 18.0;
 const PAD_X: f32 = 10.0;
 const PAD_Y: f32 = 6.0;
 const SCROLLBACK: usize = 5_000;
+
+/// Counts what the shells print (and their ends): the repaint waits for it.
+static OUTPUT: AtomicU64 = AtomicU64::new(0);
+
+/// A message, at most every 33 ms, while some shell printed or ended: an idle
+/// terminal does not repaint the window.
+pub fn changes() -> iced::Subscription<Message> {
+    iced::Subscription::run(|| {
+        iced::stream::channel(1, async |mut output| {
+            use iced::futures::SinkExt;
+            let mut seen = OUTPUT.load(Ordering::Relaxed);
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(33)).await;
+                let now = OUTPUT.load(Ordering::Relaxed);
+                if now != seen {
+                    seen = now;
+                    let _ = output.send(Message::TerminalTick).await;
+                }
+            }
+        })
+    })
+}
 
 fn nonzero(n: u16) -> NonZeroU16 {
     NonZeroU16::new(n.max(1)).unwrap_or(NonZeroU16::MIN)
@@ -106,12 +128,14 @@ impl Session {
                         if let Ok(mut parser) = session.parser.lock() {
                             parser.process(&buffer[..n]);
                         };
+                        OUTPUT.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
             if let Some(session) = weak.upgrade() {
                 session.alive.store(false, Ordering::Relaxed);
             }
+            OUTPUT.fetch_add(1, Ordering::Relaxed);
         });
         Ok(session)
     }
@@ -740,10 +764,14 @@ impl canvas::Program<Message> for Screen<'_> {
                         });
                         if glyph.is_empty() || glyph == " " {
                             // A blank only matters inside a run (it keeps the columns).
-                            if let Some((_, text, ..)) = run.as_mut() {
-                                if same_style || bg.is_none() {
+                            if same_style || bg.is_none() {
+                                if let Some((_, text, ..)) = run.as_mut() {
                                     text.push(' ');
                                 }
+                            } else {
+                                // A styled blank (cursor, selection) ends the run: the
+                                // next glyph starts at its own column.
+                                flush(&mut frame, &mut run);
                             }
                             // Trailing blanks end the run lazily: trimmed on flush.
                         } else if width == 2 || !same_style {

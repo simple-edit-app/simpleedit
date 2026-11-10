@@ -21,6 +21,24 @@ pub fn dir_of(setting: &str) -> PathBuf {
     }
 }
 
+/// Dropped in a folder the application made or took over, so that moving the
+/// scratch files never sweeps up the files of someone else.
+const MARKER: &str = ".simpleedit-scratch";
+
+/// Whether the application owns `dir`: it is the default folder or it carries
+/// the marker.
+fn owned(dir: &Path) -> bool {
+    dir == default_dir() || dir.join(MARKER).exists()
+}
+
+/// Whether `dir` can become the scratch folder: absent, empty, or already ours.
+pub fn usable(dir: &Path) -> bool {
+    owned(dir)
+        || std::fs::read_dir(dir)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(true)
+}
+
 /// Whether `path` is one of the scratch files kept in `dir`.
 pub fn is_scratch(dir: &Path, path: &Path) -> bool {
     path.parent() == Some(dir)
@@ -33,6 +51,7 @@ pub fn list(dir: &Path) -> Vec<PathBuf> {
             entries
                 .filter_map(Result::ok)
                 .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+                .filter(|e| e.file_name() != MARKER)
                 .map(|e| e.path())
                 .collect()
         })
@@ -72,6 +91,7 @@ pub fn next_name(dir: &Path, ext: &str) -> String {
 pub fn create(dir: &Path, name: &str, ext: &str) -> Result<PathBuf, String> {
     let file = file_name(name, ext)?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let _ = std::fs::write(dir.join(MARKER), "");
     let path = dir.join(file);
     std::fs::OpenOptions::new()
         .write(true)
@@ -85,12 +105,18 @@ pub fn create(dir: &Path, name: &str, ext: &str) -> Result<PathBuf, String> {
 }
 
 /// Moves the scratch files of `from` into `to` (a file whose name is taken
-/// there stays where it was). Returns how many moved.
+/// there stays where it was; a folder the application doesn't own is left
+/// alone). Returns how many moved.
 pub fn relocate(from: &Path, to: &Path) -> Result<usize, String> {
     if from == to {
         return Ok(0);
     }
     std::fs::create_dir_all(to).map_err(|e| e.to_string())?;
+    let _ = std::fs::write(to.join(MARKER), "");
+    // A folder the application never owned holds files that are not its own.
+    if !owned(from) {
+        return Ok(0);
+    }
     let mut moved = 0;
     for file in list(from) {
         let Some(name) = file.file_name() else {
@@ -293,6 +319,24 @@ mod tests {
         assert_eq!(list(&root), vec![b.clone(), a.clone()]);
         assert!(is_scratch(&root, &a));
         assert!(!is_scratch(&root, &dir.path().join("x.txt")));
+    }
+
+    #[test]
+    fn a_folder_with_foreign_files_is_neither_usable_nor_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let docs = dir.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        assert!(usable(&docs));
+        std::fs::write(docs.join("mine.txt"), "x").unwrap();
+        assert!(!usable(&docs));
+        let to = dir.path().join("to");
+        assert_eq!(relocate(&docs, &to), Ok(0));
+        assert!(docs.join("mine.txt").exists());
+        // Once the application owns a folder, it can be moved away.
+        let own = dir.path().join("own");
+        create(&own, "a", "txt").unwrap();
+        assert!(usable(&own));
+        assert_eq!(relocate(&own, &to), Ok(1));
     }
 
     #[test]

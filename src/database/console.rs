@@ -44,7 +44,7 @@ impl LogEntry {
             self.ms
         );
         if let Some(rows) = self.rows {
-            head.push_str(&format!(" {rows} rows"));
+            head.push_str(&format!(" {}", rust_i18n::t!("db.log_rows", n = rows)));
         }
         let mut out = format!("{head}\n{}", self.sql);
         if let Some(error) = &self.error {

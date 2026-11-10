@@ -495,16 +495,18 @@ pub async fn create_tag(
 
 /// Sends a tag to `origin`.
 pub async fn push_tag(repo: &Path, name: &str) -> Result<(), String> {
-    run_network(repo, &["push", "origin", &format!("refs/tags/{name}")])
+    let remote = super::default_remote(repo).await;
+    run_network(repo, &["push", &remote, &format!("refs/tags/{name}")])
         .await
         .map(|_| ())
 }
 
 /// Removes a tag from `origin`.
 pub async fn delete_remote_tag(repo: &Path, name: &str) -> Result<(), String> {
+    let remote = super::default_remote(repo).await;
     run_network(
         repo,
-        &["push", "origin", "--delete", &format!("refs/tags/{name}")],
+        &["push", &remote, "--delete", &format!("refs/tags/{name}")],
     )
     .await
     .map(|_| ())
@@ -529,12 +531,16 @@ pub async fn push_branch(
         args.extend(["--force-with-lease", super::FORCE_IF_INCLUDES]);
     }
     let target;
+    let remote;
     match upstream.and_then(|u| u.split_once('/')) {
         Some((remote, branch)) => {
             target = format!("{name}:refs/heads/{branch}");
             args.extend([remote, target.as_str()]);
         }
-        None => args.extend(["--set-upstream", "origin", name]),
+        None => {
+            remote = super::default_remote(repo).await;
+            args.extend(["--set-upstream", remote.as_str(), name]);
+        }
     }
     super::run_push(repo, &args).await.map(|_| ())
 }
@@ -758,12 +764,36 @@ pub async fn blame_with(
     path: &str,
     options: &BlameOptions,
 ) -> Result<Vec<BlameLine>, String> {
+    blame_inner(repo, rev, path, options, None).await
+}
+
+/// Blame of a file as an editor holds it: `contents` (unsaved changes
+/// included) in place of the copy on disk, so lines match what is shown.
+pub async fn blame_contents(
+    repo: &Path,
+    path: &str,
+    contents: &str,
+    options: &BlameOptions,
+) -> Result<Vec<BlameLine>, String> {
+    blame_inner(repo, None, path, options, Some(contents)).await
+}
+
+async fn blame_inner(
+    repo: &Path,
+    rev: Option<&str>,
+    path: &str,
+    options: &BlameOptions,
+    contents: Option<&str>,
+) -> Result<Vec<BlameLine>, String> {
     let extra = options.args();
     let mut args = vec!["blame", "--porcelain"];
     args.extend(extra.iter().map(String::as_str));
+    if contents.is_some() {
+        args.extend(["--contents", "-"]);
+    }
     args.extend(rev);
     args.extend(["--", path]);
-    let out = run(repo, &args).await?;
+    let out = run_with(repo, &args, contents, &[]).await?;
     let mut lines = parse_blame(&out);
     // The messages of the commits met, for what a pointer on a line shows.
     let mut shas: Vec<&str> = lines
@@ -1005,7 +1035,12 @@ pub async fn interactive_rebase(
             ));
         }
     };
-    for item in plan.iter().filter(|i| i.action != PlanAction::Drop) {
+    for item in plan {
+        if item.action == PlanAction::Drop {
+            // Explicit, for `rebase.missingCommitsCheck=error`.
+            todo.push_str(&format!("drop {}\n", item.sha));
+            continue;
+        }
         if !item.action.folds() {
             close_group(&mut todo, &mut reword);
         }
@@ -1028,8 +1063,8 @@ pub async fn interactive_rebase(
     }
     close_group(&mut todo, &mut reword);
     // Everything dropped leaves nothing to pick, which git refuses.
-    if todo.is_empty() {
-        todo.push_str("noop\n");
+    if todo.lines().all(|l| l.starts_with("drop ")) {
+        todo = "noop\n".to_string();
     }
     rebase_todo(repo, base, &todo, &files).await
 }
@@ -1053,17 +1088,19 @@ pub async fn drop_commits(repo: &Path, shas: &[String]) -> Result<(), String> {
     let base = parent_of(repo, &oldest).await?;
     ensure_linear(repo, base.as_deref()).await?;
     let all = commits_after(repo, base.as_deref()).await?;
-    let todo: String = all
+    // Written as `drop`, not left out: `rebase.missingCommitsCheck=error`
+    // refuses a todo that omits a commit. Dropping every commit leaves
+    // nothing to pick, which git refuses: `noop` then.
+    let mut todo: String = all
         .iter()
-        .filter(|c| !shas.contains(c))
-        .map(|c| format!("pick {c}\n"))
+        .map(|c| {
+            let word = if shas.contains(c) { "drop" } else { "pick" };
+            format!("{word} {c}\n")
+        })
         .collect();
-    // Dropping every commit leaves nothing to pick, which git refuses.
-    let todo = if todo.is_empty() {
-        "noop\n".to_string()
-    } else {
-        todo
-    };
+    if !todo.contains("pick ") {
+        todo = "noop\n".to_string();
+    }
     rebase_with(repo, base.as_deref(), &todo, None).await
 }
 
@@ -1364,6 +1401,32 @@ mod tests {
         block(drop_commits(repo.path(), &[all[1].clone()])).unwrap(); // "three"
         assert_eq!(history(&repo), vec!["four", "two", "one"]);
         assert!(!repo.path().join("three.txt").exists());
+    }
+
+    #[test]
+    fn a_drop_is_explicit_in_the_todo_and_accepted_when_omissions_are_errors() {
+        let repo = four_commits();
+        repo.git(&["config", "rebase.missingCommitsCheck", "error"]);
+        let all = shas(&repo);
+        block(drop_commits(repo.path(), &[all[1].clone()])).unwrap();
+        assert_eq!(history(&repo), vec!["four", "two", "one"]);
+    }
+
+    #[test]
+    fn a_blame_can_be_made_on_the_text_of_the_buffer() {
+        let repo = Repo::new();
+        repo.write("a.txt", "one\ntwo\n");
+        repo.commit_all("first");
+        let lines = block(blame_contents(
+            repo.path(),
+            "a.txt",
+            "zero\none\ntwo\n",
+            &BlameOptions::default(),
+        ))
+        .unwrap();
+        assert_eq!(lines.len(), 3);
+        assert!(!lines[0].committed());
+        assert_eq!(lines[1].summary, "first");
     }
 
     #[test]

@@ -3037,17 +3037,18 @@ where
                         col += tab;
                     }
                 }
-                if let (Some(color), false) = (marks.whitespace, blank && run.text.is_empty()) {
-                    let mut col = 0usize;
-                    for c in run.text.chars() {
-                        let x = origin.x + col as f32 * cell;
-                        match c {
-                            ' ' => {
-                                if x > bounds.x + bounds.width {
-                                    break;
-                                }
+                if let Some(color) = marks.whitespace {
+                    // Only the glyphs of this visual row: `run.text` holds
+                    // the whole line, wrapped or not.
+                    for glyph in run.glyphs {
+                        let x = origin.x + glyph.x;
+                        if x > bounds.x + bounds.width {
+                            break;
+                        }
+                        match run.text.get(glyph.start..glyph.end) {
+                            Some(" ") => {
                                 if let Some(rect) = bounds.intersection(&Rectangle {
-                                    x: x + cell / 2.0 - 1.0,
+                                    x: x + glyph.w / 2.0 - 1.0,
                                     y: top + row_height / 2.0 - 1.0,
                                     width: 2.0,
                                     height: 2.0,
@@ -3060,14 +3061,12 @@ where
                                         color,
                                     );
                                 }
-                                col += 1;
                             }
-                            '\t' => {
-                                let width = tab - col % tab;
+                            Some("\t") => {
                                 if let Some(rect) = bounds.intersection(&Rectangle {
                                     x: x + 2.0,
                                     y: top + row_height / 2.0,
-                                    width: (width as f32 * cell - 4.0).max(1.0),
+                                    width: (glyph.w - 4.0).max(1.0),
                                     height: 1.0,
                                 }) {
                                     renderer.fill_quad(
@@ -3078,9 +3077,8 @@ where
                                         color,
                                     );
                                 }
-                                col += width;
                             }
-                            _ => col += 1,
+                            _ => {}
                         }
                     }
                 }

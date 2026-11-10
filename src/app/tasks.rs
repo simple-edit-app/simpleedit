@@ -8,6 +8,11 @@ use iced::widget::column;
 /// Lines of output kept; the oldest go first.
 const MAX_LINES: usize = 5000;
 
+/// Height of a line of output, so that only the visible ones are built.
+const LINE_H: f32 = 16.0;
+/// Lines built beyond the visible ones, on each side.
+const OVERSCAN: usize = 20;
+
 /// One line of output, with the place it names.
 pub struct OutLine {
     pub text: String,
@@ -28,6 +33,9 @@ pub struct TaskPanel {
     handle: Option<iced::task::Handle>,
     /// What the picker lists.
     pub choices: Vec<TaskSpec>,
+    /// Where the log is scrolled to (offset, viewport height) once the user
+    /// left the end; `None` while it follows the end.
+    pub away: Option<(f32, f32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +91,7 @@ impl SimpleEditApp {
         self.tasks.run += 1;
         let run = self.tasks.run;
         self.tasks.lines.clear();
+        self.tasks.away = None;
         self.tasks.done = None;
         self.tasks.task = Some(task.clone());
         self.tasks.open = true;
@@ -92,6 +101,11 @@ impl SimpleEditApp {
         .abortable();
         self.tasks.handle = Some(handle.abort_on_drop());
         start
+    }
+
+    /// The log was scrolled: remembers what is visible.
+    pub(super) fn task_scrolled(&mut self, offset: f32, height: f32, content: f32) {
+        self.tasks.away = (content - offset - height > LINE_H * 2.0).then_some((offset, height));
     }
 
     pub(super) fn task_event(&mut self, run: u64, event: Event) -> Task<Message> {
@@ -246,10 +260,25 @@ impl SimpleEditApp {
             .push(small(t!("tasks.clear").to_string(), Message::TaskClear))
             .push(small("—".to_string(), Message::TaskToggle));
 
+        // Only the visible lines (and a margin) are built, between spacers.
+        let total = self.tasks.lines.len();
+        let (offset, height) = self.tasks.away.unwrap_or((0.0, self.panel_height));
+        let shown_count = (height / LINE_H) as usize + 2 * OVERSCAN;
+        let first = if self.tasks.away.is_some() {
+            ((offset / LINE_H) as usize).saturating_sub(OVERSCAN)
+        } else {
+            total.saturating_sub(shown_count)
+        }
+        .min(total);
+        let last = (first + shown_count).min(total);
         let mut log = column![].spacing(0).padding([4, 10]);
-        for line in &self.tasks.lines {
+        if first > 0 {
+            log = log.push(Space::new().height(first as f32 * LINE_H));
+        }
+        for line in &self.tasks.lines[first..last] {
             let shown = text(line.text.clone())
                 .size(12)
+                .line_height(iced::Pixels(LINE_H))
                 .font(se_theme::MONO)
                 .shaping(iced::widget::text::Shaping::Advanced)
                 .wrapping(iced::widget::text::Wrapping::None);
@@ -262,6 +291,9 @@ impl SimpleEditApp {
                 None => Element::from(shown.color(p.text)),
             });
         }
+        if last < total {
+            log = log.push(Space::new().height((total - last) as f32 * LINE_H));
+        }
         container(
             column![
                 container(header).padding([6, 12]),
@@ -270,6 +302,11 @@ impl SimpleEditApp {
                     .style(se_theme::rule(dark)),
                 scrollable(log)
                     .id(log_id())
+                    .on_scroll(|v| Message::TaskScrolled(
+                        v.absolute_offset().y,
+                        v.bounds().height,
+                        v.content_bounds().height
+                    ))
                     .style(se_theme::Scrollbar { dark }.style())
                     .width(Length::Fill)
                     .height(Length::Fill),
@@ -338,6 +375,15 @@ mod tests {
         let run = app.tasks.run;
         let _ = app.update(Message::TaskEvent(run - 1, Event::Line("after".into())));
         assert!(app.tasks.lines.is_empty());
+    }
+
+    #[test]
+    fn the_log_follows_the_end_until_scrolled_away() {
+        let mut app = app();
+        app.task_scrolled(0.0, 100.0, 1000.0);
+        assert_eq!(app.tasks.away, Some((0.0, 100.0)));
+        app.task_scrolled(900.0, 100.0, 1000.0);
+        assert_eq!(app.tasks.away, None);
     }
 
     #[test]

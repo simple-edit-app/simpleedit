@@ -39,6 +39,47 @@ struct Session {
     _tunnel: Option<tunnel::Tunnel>,
 }
 
+/// Whether a transaction is open once `sql` has run: the client cannot read
+/// the server's flag, so the statement says. A DDL statement commits
+/// implicitly, and `SET autocommit = 0` opens a transaction that stays open.
+fn tx_after(open: bool, sql: &str) -> bool {
+    let lower = sql.trim_start().to_lowercase();
+    let squashed: String = lower.split_whitespace().collect::<Vec<_>>().join(" ");
+    let first = squashed.split([' ', '(', ';']).next().unwrap_or("");
+    if first == "begin" || squashed.starts_with("start transaction") {
+        true
+    } else if first == "commit" || (first == "rollback" && !squashed.contains("savepoint")) {
+        false
+    } else if first == "set" {
+        let compact = squashed.replace(' ', "");
+        if compact.contains("autocommit=0") || compact.contains("autocommit=off") {
+            true
+        } else if compact.contains("autocommit=1") || compact.contains("autocommit=on") {
+            false
+        } else {
+            open
+        }
+    } else if matches!(
+        first,
+        "create"
+            | "alter"
+            | "drop"
+            | "truncate"
+            | "rename"
+            | "grant"
+            | "revoke"
+            | "analyze"
+            | "optimize"
+            | "repair"
+            | "lock"
+            | "unlock"
+    ) {
+        false
+    } else {
+        open
+    }
+}
+
 fn clean(error: mysql::Error) -> String {
     match error {
         mysql::Error::MySqlError(e) => e.message,
@@ -88,7 +129,9 @@ impl Session {
                             ssl.ca_file.trim(),
                         )));
                     }
-                    if ssl.mode == SslMode::VerifyCa {
+                    // Through a tunnel the connection goes to 127.0.0.1, a
+                    // name no certificate has: the chain is still checked.
+                    if ssl.mode == SslMode::VerifyCa || tunnel.is_some() {
                         opts = opts.with_danger_skip_domain_validation(true);
                     }
                 }
@@ -98,9 +141,22 @@ impl Session {
                         .with_danger_skip_domain_validation(true);
                 }
             }
+            if !ssl.client_cert.trim().is_empty() && !ssl.client_key.trim().is_empty() {
+                opts = opts.with_client_identity(Some(mysql::ClientIdentity::new(
+                    std::path::PathBuf::from(ssl.client_cert.trim()),
+                    std::path::PathBuf::from(ssl.client_key.trim()),
+                )));
+            }
             options = options.ssl_opts(Some(opts));
         }
-        let mut conn = Conn::new(options).map_err(clean)?;
+        let mut conn = match Conn::new(options.clone()) {
+            Ok(conn) => conn,
+            // `prefer`: plain when the server does not do TLS.
+            Err(_) if ssl.mode == SslMode::Prefer => {
+                Conn::new(options.ssl_opts(None::<SslOpts>)).map_err(clean)?
+            }
+            Err(e) => return Err(clean(e)),
+        };
         let mut settings = Vec::new();
         if !target.time_zone.trim().is_empty() {
             settings.push(format!(
@@ -412,16 +468,9 @@ impl Engine for Session {
 
     fn execute(&mut self, sql: &str) -> Result<u64, String> {
         self.conn.query_drop(sql).map_err(clean)?;
-        // A transaction the user begins or ends by hand.
-        let lower = sql.trim_start().to_lowercase();
-        if lower.starts_with("begin") || lower.starts_with("start transaction") {
-            self.in_tx = true;
-        } else if lower.starts_with("commit")
-            || (lower.starts_with("rollback") && !lower.contains("savepoint"))
-        {
-            self.in_tx = false;
-        }
-        Ok(self.conn.affected_rows())
+        let affected = self.conn.affected_rows();
+        self.in_tx = tx_after(self.in_tx, sql);
+        Ok(affected)
     }
 
     fn columns_of(&mut self, sql: &str) -> Result<Option<Vec<String>>, String> {
@@ -695,6 +744,18 @@ impl Engine for Session {
 mod tests {
     use super::*;
     use serde_json::{json, Value as Json};
+
+    #[test]
+    fn the_transaction_flag_follows_the_statements() {
+        assert!(tx_after(false, "BEGIN"));
+        assert!(tx_after(false, "set autocommit = 0"));
+        assert!(!tx_after(true, "SET autocommit=1"));
+        assert!(!tx_after(true, "CREATE TABLE t (a int)"));
+        assert!(!tx_after(true, "rollback"));
+        assert!(tx_after(true, "ROLLBACK TO SAVEPOINT s"));
+        assert!(tx_after(true, "insert into t values (1)"));
+        assert!(!tx_after(false, "select 1"));
+    }
 
     #[test]
     fn values_are_shown_as_text_with_nulls_apart() {

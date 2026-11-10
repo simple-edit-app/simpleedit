@@ -787,6 +787,14 @@ fn export(engine: &mut dyn Engine, request: &Request) -> Result<Value, String> {
             rows += 1;
             Ok(())
         })?;
+        if !json_format && !wrote_header {
+            // No row: the header still says what the columns are.
+            if let Some(names) = engine.columns_of(&select)? {
+                let header: Vec<String> =
+                    names.iter().map(|n| csv_field(Some(n.as_str()))).collect();
+                writeln!(out, "{}", header.join(",")).map_err(|e| e.to_string())?;
+            }
+        }
         if json_format {
             out.write_all(if rows == 0 { b"]\n" } else { b"\n]\n" })
                 .map_err(|e| e.to_string())?;

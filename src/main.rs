@@ -84,7 +84,36 @@ fn wants_new_window(args: impl Iterator<Item = std::ffi::OsString>) -> bool {
         .any(|a| a == "--new-window" || a == "-n")
 }
 
+/// Started from the Finder, the app gets launchd's minimal `PATH`: the usual
+/// tool folders are added to it, so that what it starts (language servers
+/// and their `#!/usr/bin/env node`, formatters, `npm`) finds its programs.
+#[cfg(target_os = "macos")]
+fn complete_path() {
+    let mut dirs: Vec<std::path::PathBuf> =
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
+    let mut extra: Vec<std::path::PathBuf> =
+        ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin"]
+            .map(std::path::PathBuf::from)
+            .into();
+    if let Some(home) = dirs::home_dir() {
+        extra.extend(
+            [".cargo/bin", ".local/bin", "go/bin", ".npm-global/bin"].map(|d| home.join(d)),
+        );
+    }
+    for dir in extra {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    if let Ok(path) = std::env::join_paths(dirs) {
+        // Single-threaded at this point.
+        std::env::set_var("PATH", path);
+    }
+}
+
 fn main() -> iced::Result {
+    #[cfg(target_os = "macos")]
+    complete_path();
     // The saved preference wins; Config::load() falls back to the system locale
     // only when no config file exists yet.
     let config = config::Config::load();

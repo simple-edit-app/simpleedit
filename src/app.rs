@@ -337,6 +337,8 @@ pub enum Message {
     OpenTaskPicker,
     RunTask(usize),
     TaskEvent(u64, crate::tasks::Event),
+    /// The task log was scrolled: offset, viewport height, content height.
+    TaskScrolled(f32, f32, f32),
     TaskStop,
     TaskRerun,
     TaskClear,
@@ -1352,6 +1354,7 @@ impl SimpleEditApp {
                     | Message::SessionWritten(_)
                     | Message::PreviewTick
                     | Message::TerminalTick
+                    | Message::TaskScrolled(..)
                     | Message::WindowResized(..)
                     | Message::Git(crate::git_panel::GitMsg::Pick(_))
                     | Message::DiffTab(DiffNav::Pick(_) | DiffNav::Scrolled(..))
@@ -1614,10 +1617,7 @@ impl SimpleEditApp {
             );
         }
         if self.terminal.open {
-            subscriptions.push(
-                iced::time::every(std::time::Duration::from_millis(33))
-                    .map(|_| Message::TerminalTick),
-            );
+            subscriptions.push(crate::terminal::changes());
         }
         #[cfg(all(target_os = "macos", not(test)))]
         subscriptions.push(crate::native_menu::subscription());
@@ -2346,6 +2346,7 @@ impl SimpleEditApp {
                     | Message::SessionWritten(_)
                     | Message::PreviewTick
                     | Message::TerminalTick
+                    | Message::TaskScrolled(..)
                     | Message::WindowResized(..)
             );
         if closes_menu || matches!(message, Message::ToggleMenu(_) | Message::HoverMenu(_)) {
@@ -3530,6 +3531,10 @@ impl SimpleEditApp {
                 }
             }
             Message::TaskEvent(run, event) => self.task_event(run, event),
+            Message::TaskScrolled(offset, height, content) => {
+                self.task_scrolled(offset, height, content);
+                Task::none()
+            }
             Message::TaskStop => self.task_stop(),
             Message::TaskRerun => match self.tasks.task.clone() {
                 Some(task) => self.start_task(task),
@@ -3537,6 +3542,7 @@ impl SimpleEditApp {
             },
             Message::TaskClear => {
                 self.tasks.lines.clear();
+                self.tasks.away = None;
                 Task::none()
             }
             Message::TaskToggle => {
@@ -4263,7 +4269,11 @@ impl SimpleEditApp {
             }
             Message::Quit => match self.save_session_now() {
                 Ok(()) => {
-                    self.config.save();
+                    // A second window would undo the settings changed meanwhile
+                    // in the first.
+                    if self.session_owner {
+                        self.config.save();
+                    }
                     crate::tasks::stop_all();
                     crate::lsp::stop_servers();
                     std::process::exit(0)
@@ -4276,7 +4286,9 @@ impl SimpleEditApp {
                 }
             },
             Message::QuitAnyway => {
-                self.config.save();
+                if self.session_owner {
+                    self.config.save();
+                }
                 crate::tasks::stop_all();
                 crate::lsp::stop_servers();
                 std::process::exit(0)
@@ -6627,6 +6639,8 @@ impl SimpleEditApp {
             return Task::none();
         };
         let options = self.blame_options.clone();
+        // What the editor shows, unsaved changes included.
+        let contents = crate::editor::buffer_text(&self.editor.content);
         Task::perform(
             async move {
                 let root = crate::git::repo_root(&path)
@@ -6635,7 +6649,8 @@ impl SimpleEditApp {
                 let relative =
                     relative_to(&root, &path).ok_or_else(|| t!("git.no_repo").to_string())?;
                 let lines =
-                    crate::git::history::blame_with(&root, None, &relative, &options).await?;
+                    crate::git::history::blame_contents(&root, &relative, &contents, &options)
+                        .await?;
                 Ok::<_, String>((path, (root, relative, lines)))
             },
             |result| match result {
@@ -7355,6 +7370,12 @@ impl SimpleEditApp {
             self.config_dirty = true;
             return Task::none();
         }
+        // An existing folder of other files would turn them all into scratches.
+        if !crate::scratch::usable(&new) {
+            self.preferences.scratch_draft = self.config.scratch_dir.clone();
+            self.set_status(t!("scratch.err_not_empty"), true);
+            return Task::none();
+        }
         self.flush_scratch();
         // Their buffers are closed first: the files are about to move.
         let open: Vec<PathBuf> = self
@@ -7813,6 +7834,11 @@ impl SimpleEditApp {
             return Task::none();
         };
         let Some(now) = DiskStamp::of(&path) else {
+            // Deleted or moved away: saving would silently recreate it.
+            if self.disk_stamp.is_some() && !self.external_warned {
+                self.external_warned = true;
+                self.set_status(t!("status.deleted_on_disk"), true);
+            }
             return Task::none();
         };
         if Some(now) == self.disk_stamp {

@@ -182,8 +182,15 @@ impl text::Highlighter for Highlighter {
         self.current_line += 1;
 
         // Coloring a minified file's single line takes seconds on each
-        // keystroke; such a line stays plain.
+        // keystroke; such a line stays plain, but its start still moves the
+        // parser along (an opened comment or string reaches the next lines).
         if line.len() > MAX_HIGHLIGHTED_LINE {
+            let mut end = MAX_HIGHLIGHTED_LINE;
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            let (parser, _) = self.caches.last_mut().expect("Caches must not be empty");
+            let _ = parser.parse_line(&format!("{}\n", &line[..end]), &SYNTAXES);
             return Box::new(std::iter::empty());
         }
 
@@ -671,6 +678,19 @@ const next = 1;
         let long = format!("[{}]", "1,".repeat(super::MAX_HIGHLIGHTED_LINE));
         assert_eq!(h.highlight_line(&long).count(), 0);
         assert!(h.highlight_line("[1]").count() > 0);
+    }
+
+    #[test]
+    fn a_very_long_line_still_advances_the_parser() {
+        use iced::advanced::text::Highlighter as _;
+        let mut h = super::Highlighter::new(&super::Settings {
+            dark: true,
+            extension: "c".into(),
+        });
+        let long = format!("/* {}", "x".repeat(super::MAX_HIGHLIGHTED_LINE));
+        assert_eq!(h.highlight_line(&long).count(), 0);
+        // Still inside the comment: the next line is one single span.
+        assert_eq!(h.highlight_line("int a = 1;").count(), 1);
     }
 
     #[test]

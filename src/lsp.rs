@@ -301,7 +301,7 @@ fn extra_bin_dirs() -> Vec<PathBuf> {
             dirs.push(home.join(sub));
         }
     }
-    for fixed in ["/usr/local/bin", "/snap/bin"] {
+    for fixed in ["/opt/homebrew/bin", "/usr/local/bin", "/snap/bin"] {
         dirs.push(PathBuf::from(fixed));
     }
     dirs
@@ -2063,7 +2063,15 @@ fn stopped() -> RpcError {
 async fn read_loop(server: Arc<Server>, stdout: ChildStdout) {
     let mut reader = BufReader::new(stdout);
     while let Some(message) = read_message(&mut reader).await {
-        server.handle(message).await;
+        // The answer to a request of the server waits for the stdin lock: apart,
+        // so that reading goes on (the server may be blocked writing to us
+        // while a large message is being written to it).
+        if message.get("method").is_some() && message.get("id").is_some() {
+            let server = server.clone();
+            tokio::spawn(async move { server.handle(message).await });
+        } else {
+            server.handle(message).await;
+        }
     }
     server.alive.store(false, Ordering::SeqCst);
     // Whoever waits for an answer won't get one.

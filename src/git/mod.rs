@@ -45,6 +45,11 @@ fn command(repo: &Path, args: &[&str], env: &[(&str, &str)], stdin: bool) -> Com
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_EDITOR", "true")
+        // Inherited when we are the `core.editor` of a `git commit`: they
+        // would point every command at that commit's repository and index.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
         .envs(env.iter().copied())
         .stdin(if stdin { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
@@ -871,8 +876,10 @@ pub async fn commit(
 /// Pushes the current branch (creating its upstream the first time).
 pub async fn push(repo: &Path, branch: &str, has_upstream: bool) -> Result<(), String> {
     let mut args = vec!["push"];
+    let remote;
     if !has_upstream {
-        args.extend(["--set-upstream", "origin", branch]);
+        remote = default_remote(repo).await;
+        args.extend(["--set-upstream", remote.as_str(), branch]);
     }
     run_network(repo, &args).await.map(|_| ())
 }
@@ -909,9 +916,43 @@ pub async fn apply_patch(repo: &Path, patch: &str, reverse: bool) -> Result<(), 
 /// Gets what the remotes have (without changing the working tree), and drops
 /// the branches they no longer have.
 pub async fn fetch(repo: &Path) -> Result<(), String> {
-    run_network(repo, &["fetch", "--all", "--prune"])
-        .await
-        .map(|_| ())
+    // ssh would ask for a passphrase or a host key on a terminal nobody
+    // watches; unless the user set their own ssh command, it must not ask.
+    let custom = std::env::var_os("GIT_SSH_COMMAND").is_some()
+        || run(repo, &["config", "core.sshCommand"])
+            .await
+            .is_ok_and(|c| !c.trim().is_empty());
+    let env: &[(&str, &str)] = if custom {
+        &[]
+    } else {
+        &[("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")]
+    };
+    run_timed(
+        repo,
+        &["fetch", "--all", "--prune"],
+        None,
+        env,
+        NETWORK_TIMEOUT,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// The remote a push goes to when the branch has no upstream:
+/// `remote.pushDefault`, else the only remote, else `origin`.
+pub async fn default_remote(repo: &Path) -> String {
+    if let Ok(name) = run(repo, &["config", "remote.pushDefault"]).await {
+        if !name.trim().is_empty() {
+            return name.trim().to_string();
+        }
+    }
+    if let Ok(list) = run(repo, &["remote"]).await {
+        let mut remotes = list.lines().map(str::trim).filter(|r| !r.is_empty());
+        if let (Some(only), None) = (remotes.next(), remotes.next()) {
+            return only.to_string();
+        }
+    }
+    "origin".to_string()
 }
 
 /// How far `reset` goes.
@@ -1024,13 +1065,16 @@ impl Default for DiffOptions {
 
 #[cfg(test)]
 pub async fn diff_of(repo: &Path, source: &Source, path: &str) -> Result<FileDiff, String> {
-    diff_with(repo, source, path, DiffOptions::default()).await
+    diff_with(repo, source, path, None, DiffOptions::default()).await
 }
 
+/// : where a renamed file came from. Both names must be in the
+/// pathspec, or git cannot pair them and shows the whole file as added.
 pub async fn diff_with(
     repo: &Path,
     source: &Source,
     path: &str,
+    from: Option<&str>,
     options: DiffOptions,
 ) -> Result<FileDiff, String> {
     let owned;
@@ -1122,6 +1166,9 @@ pub async fn diff_with(
     for arg in args {
         if arg == "-U3" {
             full.push(&context);
+            if from.is_some() {
+                full.push("-M");
+            }
             if options.ignore_blanks {
                 full.push("-w");
             }
@@ -1129,6 +1176,7 @@ pub async fn diff_with(
             full.push(arg);
         }
     }
+    full.extend(from);
     let args = full;
     // `--no-index` exits with 1 when the files differ.
     let out = match run(repo, &args).await {
@@ -1695,6 +1743,50 @@ mod tests {
     }
 
     #[test]
+    fn a_push_goes_to_the_only_remote_whatever_its_name() {
+        let remote = tempfile::tempdir().unwrap();
+        std::process::Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .current_dir(remote.path())
+            .status()
+            .unwrap();
+        let repo = Repo::new();
+        repo.git(&["remote", "add", "upstream", remote.path().to_str().unwrap()]);
+        repo.write("a.txt", "one\n");
+        repo.commit_all("first");
+        assert_eq!(block(default_remote(repo.path())), "upstream");
+        block(push(repo.path(), "main", false)).unwrap();
+    }
+
+    #[test]
+    fn a_renamed_file_is_shown_as_a_rename() {
+        let repo = Repo::new();
+        let text: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        repo.write("old.txt", &text);
+        repo.commit_all("first");
+        repo.git(&["mv", "old.txt", "new.txt"]);
+        repo.write("new.txt", &text.replace("line 3\n", "changed\n"));
+        repo.git(&["add", "new.txt"]);
+        let diff = block(diff_with(
+            repo.path(),
+            &Source::Staged,
+            "new.txt",
+            Some("old.txt"),
+            DiffOptions::default(),
+        ))
+        .unwrap();
+        assert_eq!(diff.hunks.len(), 1);
+        assert_eq!(
+            diff.hunks[0]
+                .lines
+                .iter()
+                .filter(|l| l.tag == diff::Tag::Added)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn a_rewritten_branch_is_refused_by_a_plain_push() {
         let remote = tempfile::tempdir().unwrap();
         std::process::Command::new("git")
@@ -2071,8 +2163,16 @@ mod tests {
         repo.write("f.txt", "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n");
         repo.commit_all("first");
         repo.write("f.txt", "a\nb\nc\nd\ne\n f\ng\nh\ni\nJ\n");
-        let read =
-            |options| block(diff_with(repo.path(), &Source::Unstaged, "f.txt", options)).unwrap();
+        let read = |options| {
+            block(diff_with(
+                repo.path(),
+                &Source::Unstaged,
+                "f.txt",
+                None,
+                options,
+            ))
+            .unwrap()
+        };
         // Default: the indented line counts.
         assert_eq!(read(DiffOptions::default()).changes(), 2);
         // Blanks ignored: only the real change.

@@ -474,8 +474,9 @@ impl Viewer {
         let options = self.options();
         let source = entry.source.clone();
         let path = entry.change.path.clone();
+        let from = entry.change.from.clone();
         Task::perform(
-            async move { git::diff_with(&repo, &source, &path, options).await },
+            async move { git::diff_with(&repo, &source, &path, from.as_deref(), options).await },
             move |result| Message::Git(GitMsg::DiffLoaded(token, result)),
         )
     }
@@ -525,7 +526,17 @@ impl Viewer {
         let (token, repo) = (self.token, repo.to_path_buf());
         let options = self.options();
         Task::perform(
-            async move { git::diff_with(&repo, &entry.source, &entry.change.path, options).await },
+            async move {
+                let change = &entry.change;
+                git::diff_with(
+                    &repo,
+                    &entry.source,
+                    &change.path,
+                    change.from.as_deref(),
+                    options,
+                )
+                .await
+            },
             move |result| Message::Git(GitMsg::DiffLoaded(token, result)),
         )
     }

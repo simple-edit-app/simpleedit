@@ -1709,7 +1709,7 @@ fn import(client: &mut Client, request: &Request) -> Result<Value, String> {
             })
             .collect();
         let sql = format!(
-            "INSERT INTO {target} ({}) SELECT {} FROM jsonb_array_elements($1::text::jsonb) AS e(j)",
+            "INSERT INTO {target} ({}) SELECT {} FROM jsonb_array_elements(CASE WHEN jsonb_typeof($1::text::jsonb) = 'array' THEN $1::text::jsonb ELSE jsonb_build_array($1::text::jsonb) END) AS e(j)",
             columns.join(", "),
             values.join(", ")
         );

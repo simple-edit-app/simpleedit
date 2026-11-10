@@ -826,14 +826,32 @@ impl Designer {
             }
         }
 
-        // What is made again or added.
+        // What is made again or added. What is made again was written with
+        // the names the columns had: they are the new ones by now.
+        let renames: Vec<(&str, &str)> = self
+            .columns
+            .iter()
+            .filter(|c| !c.dropped)
+            .filter_map(|c| {
+                let original = c.original.as_ref()?;
+                (c.name.trim() != original.name).then(|| (original.name.as_str(), c.name.trim()))
+            })
+            .collect();
         for c in &self.constraints {
             if c.dropped {
                 continue;
             }
             let again = c.original.is_some() && c.modified() && !c.renamed_only();
-            if c.original.is_none() || again {
+            if c.original.is_none() {
                 out.push(format!("ALTER TABLE {table} ADD {}", constraint_sql(c)));
+            } else if again {
+                let mut moved = c.clone();
+                moved.columns = rename_columns(&c.columns, &renames);
+                moved.expr = rename_columns(&c.expr, &renames);
+                out.push(format!(
+                    "ALTER TABLE {table} ADD {}",
+                    constraint_sql(&moved)
+                ));
             }
         }
         for i in &self.indexes {
@@ -841,8 +859,13 @@ impl Designer {
                 continue;
             }
             let again = i.original.is_some() && i.modified() && !i.renamed_only();
-            if i.original.is_none() || again {
+            if i.original.is_none() {
                 out.push(index_sql(i, &table));
+            } else if again {
+                let mut moved = i.clone();
+                moved.columns = rename_columns(&i.columns, &renames);
+                moved.extra = rename_columns(&i.extra, &renames);
+                out.push(index_sql(&moved, &table));
             }
         }
 
@@ -1019,6 +1042,57 @@ fn column_comment(table: &str, column: &str, comment: &str) -> String {
 }
 
 /// `CREATE INDEX` for an index that is new or made again.
+/// `text` (a list of columns, an expression) with the names of columns that
+/// were renamed put in place of the old ones, bare or quoted; quoted text and
+/// string literals are left alone. All at once, so that two columns can swap.
+fn rename_columns(text: &str, renames: &[(&str, &str)]) -> String {
+    if renames.is_empty() {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::new();
+    let mut at = 0;
+    while at < chars.len() {
+        let c = chars[at];
+        if c == '\'' || c == '"' {
+            let mut end = at + 1;
+            while end < chars.len() {
+                if chars[end] == c {
+                    if chars.get(end + 1) == Some(&c) {
+                        end += 2;
+                        continue;
+                    }
+                    break;
+                }
+                end += 1;
+            }
+            let end = (end + 1).min(chars.len());
+            let token: String = chars[at..end].iter().collect();
+            let name = token.trim_matches('"');
+            match renames.iter().find(|(old, _)| c == '"' && *old == name) {
+                Some((_, new)) => out.push_str(&quoted(new, Dialect::Postgres)),
+                None => out.push_str(&token),
+            }
+            at = end;
+        } else if c.is_alphanumeric() || c == '_' {
+            let mut end = at;
+            while end < chars.len() && (chars[end].is_alphanumeric() || chars[end] == '_') {
+                end += 1;
+            }
+            let word: String = chars[at..end].iter().collect();
+            match renames.iter().find(|(old, _)| *old == word) {
+                Some((_, new)) => out.push_str(&quoted(new, Dialect::Postgres)),
+                None => out.push_str(&word),
+            }
+            at = end;
+        } else {
+            out.push(c);
+            at += 1;
+        }
+    }
+    out
+}
+
 fn index_sql(i: &EditIndex, table: &str) -> String {
     let name = if i.name.trim().is_empty() {
         String::new()
@@ -1135,6 +1209,25 @@ mod tests {
             ..Default::default()
         });
         d
+    }
+
+    #[test]
+    fn a_renamed_column_is_followed_in_what_is_made_again() {
+        let mut d = designer();
+        d.columns[1].name = "title".into();
+        d.indexes[0].unique = true;
+        d.constraints[2].on_delete = "CASCADE".into();
+        let sql = d.statements().join("\n");
+        assert!(
+            sql.contains("RENAME COLUMN \"label\" TO \"title\""),
+            "{sql}"
+        );
+        assert!(sql.contains("(title)"), "{sql}");
+        assert!(!sql.contains("(label)"), "{sql}");
+        assert_eq!(
+            rename_columns("a, \"b c\" > 'a'", &[("a", "b"), ("b c", "d e")]),
+            "b, \"d e\" > 'a'"
+        );
     }
 
     #[test]
