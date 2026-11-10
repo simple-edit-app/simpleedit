@@ -426,9 +426,22 @@ pub async fn create_branch(repo: &Path, name: &str, start: Option<&str>) -> Resu
     run(repo, &args).await.map(|_| ())
 }
 
-/// Deletes a local branch, merged or not.
-pub async fn delete_branch(repo: &Path, name: &str) -> Result<(), String> {
-    run(repo, &["branch", "-D", name]).await.map(|_| ())
+/// What [`delete_branch`] answers when git refuses to delete a branch whose
+/// commits are not merged anywhere.
+pub const NOT_MERGED: &str = "not merged";
+
+/// Deletes a local branch. Without `force` an unmerged one is kept (its
+/// commits would only be left in the reflog) and the answer is
+/// [`NOT_MERGED`].
+pub async fn delete_branch(repo: &Path, name: &str, force: bool) -> Result<(), String> {
+    if force {
+        return run(repo, &["branch", "-D", name]).await.map(|_| ());
+    }
+    // Git's own words are read here, so they must not be translated.
+    match run_with(repo, &["branch", "-d", name], None, &[("LC_ALL", "C")]).await {
+        Err(error) if error.contains("not fully merged") => Err(NOT_MERGED.to_string()),
+        other => other.map(|_| ()),
+    }
 }
 
 /// Deletes a branch on its remote (`origin/topic`).
@@ -482,7 +495,7 @@ pub async fn delete_tag(repo: &Path, name: &str) -> Result<(), String> {
 /// Pushes a local branch to its upstream (`origin/topic`: the branch `topic`
 /// of `origin`, whatever the local one is called); with none, to a branch of
 /// the same name on `origin`, which becomes its upstream. `force`:
-/// `--force-with-lease`.
+/// `--force-with-lease` and `--force-if-includes`.
 pub async fn push_branch(
     repo: &Path,
     name: &str,
@@ -491,7 +504,7 @@ pub async fn push_branch(
 ) -> Result<(), String> {
     let mut args = vec!["push"];
     if force {
-        args.push("--force-with-lease");
+        args.extend(["--force-with-lease", super::FORCE_IF_INCLUDES]);
     }
     let target;
     match upstream.and_then(|u| u.split_once('/')) {
@@ -501,7 +514,7 @@ pub async fn push_branch(
         }
         None => args.extend(["--set-upstream", "origin", name]),
     }
-    run_network(repo, &args).await.map(|_| ())
+    super::run_push(repo, &args).await.map(|_| ())
 }
 
 /// Switches to a tag or a commit (the head is then detached).
@@ -1495,7 +1508,7 @@ mod tests {
         ))
         .unwrap();
         assert!(repo.path().join("b.txt").exists());
-        block(delete_branch(repo.path(), "side")).unwrap();
+        block(delete_branch(repo.path(), "side", false)).unwrap();
         assert!(!repo.git(&["branch"]).contains("side"));
         // Rebase: another branch replayed on main.
         repo.git(&["checkout", "-q", "-b", "topic", "HEAD~1"]);
@@ -1577,6 +1590,51 @@ mod tests {
         repo.git(&["tag", "v1"]);
         block(delete_tag(repo.path(), "v1")).unwrap();
         assert!(repo.git(&["tag"]).trim().is_empty());
+    }
+
+    #[test]
+    fn a_force_push_does_not_overwrite_a_commit_only_fetched_in_the_background() {
+        let repo = Repo::new();
+        let remote = with_remote(&repo);
+        repo.write("a.txt", "one\n");
+        repo.commit_all("first");
+        block(push_branch(repo.path(), "main", None, false)).unwrap();
+        // A colleague pushes on top of it.
+        let other = Repo::new();
+        other.git(&["remote", "add", "origin", remote.path().to_str().unwrap()]);
+        other.git(&["fetch", "-q", "origin"]);
+        other.git(&["checkout", "-q", "-B", "main", "origin/main"]);
+        other.write("b.txt", "theirs\n");
+        other.commit_all("theirs");
+        other.git(&["push", "-q", "origin", "main"]);
+        // The automatic fetch brings it here, but nobody looked at it.
+        repo.git(&["fetch", "-q", "origin"]);
+        repo.git(&["commit", "-q", "--amend", "-m", "reworded"]);
+        assert!(block(push_branch(repo.path(), "main", Some("origin/main"), true)).is_err());
+        let there = std::process::Command::new("git")
+            .args(["log", "-1", "--format=%s", "main"])
+            .current_dir(remote.path())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&there.stdout).trim(), "theirs");
+    }
+
+    #[test]
+    fn an_unmerged_branch_is_kept_unless_its_deletion_is_forced() {
+        let repo = Repo::new();
+        repo.write("a.txt", "one\n");
+        repo.commit_all("first");
+        repo.git(&["checkout", "-q", "-b", "side"]);
+        repo.write("b.txt", "side\n");
+        repo.commit_all("only on side");
+        repo.git(&["checkout", "-q", "main"]);
+        assert_eq!(
+            block(delete_branch(repo.path(), "side", false)).unwrap_err(),
+            NOT_MERGED
+        );
+        assert!(repo.git(&["branch"]).contains("side"));
+        block(delete_branch(repo.path(), "side", true)).unwrap();
+        assert!(!repo.git(&["branch"]).contains("side"));
     }
 
     #[test]

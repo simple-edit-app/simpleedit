@@ -57,6 +57,16 @@ pub struct Results {
 
 const ROW: f32 = 26.0;
 
+/// How many matches each file has, in one pass: counted file by file, a
+/// list of every file of a project took seconds to draw.
+fn per_file(hits: &[Occurrence]) -> std::collections::HashMap<&Path, usize> {
+    let mut counts = std::collections::HashMap::new();
+    for o in hits {
+        *counts.entry(o.hit.path.as_path()).or_insert(0) += 1;
+    }
+    counts
+}
+
 fn glyph<'a>(code: u32, color: iced::Color) -> Element<'a, Message> {
     text(char::from_u32(code).unwrap_or(' '))
         .font(iced_fonts::NERD_FONT)
@@ -495,6 +505,7 @@ impl SimpleEditApp {
         if let Some(t) = tab {
             let mut last_dir: Option<&Path> = None;
             let mut last_file: Option<&Path> = None;
+            let per_file = per_file(&t.hits);
             for (i, o) in t.hits.iter().enumerate() {
                 let path = o.hit.path.as_path();
                 if r.group_dirs {
@@ -518,7 +529,7 @@ impl SimpleEditApp {
                 }
                 if Some(path) != last_file {
                     last_file = Some(path);
-                    let in_file = t.hits.iter().filter(|h| h.hit.path == path).count();
+                    let in_file = per_file.get(path).copied().unwrap_or(0);
                     let name = path
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
@@ -654,6 +665,20 @@ mod tests {
     }
 
     #[test]
+    fn the_matches_of_each_file_are_counted_in_one_pass() {
+        let hits = vec![
+            occurrence("/x/a.rs", 0),
+            occurrence("/x/a.rs", 4),
+            occurrence("/x/b.rs", 1),
+            occurrence("/x/a.rs", 9),
+        ];
+        let counts = per_file(&hits);
+        assert_eq!(counts.get(Path::new("/x/a.rs")), Some(&3));
+        assert_eq!(counts.get(Path::new("/x/b.rs")), Some(&1));
+        assert_eq!(counts.len(), 2);
+    }
+
+    #[test]
     fn tabs_replace_each_other_unless_pinned_or_asked() {
         let mut app = app();
         app.results_add("a".into(), None, vec![occurrence("/x/a.rs", 0)]);
@@ -691,6 +716,7 @@ mod tests {
                 ctrl,
                 shift: false,
                 alt,
+                captured: false,
             });
         };
         key(&mut app, "Delete", false, false);

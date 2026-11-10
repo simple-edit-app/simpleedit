@@ -815,6 +815,42 @@ mod tests {
     }
 
     #[test]
+    fn a_commit_that_fails_leaves_no_transaction_and_a_retry_writes_once() {
+        let (_dir, path) = database();
+        let open = |r: &Request| Session::open(r).map(|s| Box::new(s) as Box<dyn Engine>);
+        let mut slot = None;
+        let mut ask = |request: Value| {
+            let mut request = request;
+            request["target"] = json!({"database": path, "query_timeout": 1});
+            common::run(&request.to_string(), &mut slot, &open, true)
+        };
+        let insert = json!({"op": "apply", "table": "log", "changes": [
+            {"kind": "insert", "key": [], "set": [["msg", "once"]]}]});
+        // A reader holds the file: the commit waits for it, then gives up.
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .query_row("SELECT count(*) FROM log", [], |r| r.get(0))
+            .unwrap();
+        assert!(ask(insert.clone()).is_err());
+        let console = json!({"op": "query", "transaction": true, "statements": [
+            "INSERT INTO log VALUES ('console', NULL)"]});
+        assert!(ask(console).is_err());
+        reader.execute_batch("COMMIT").unwrap();
+        let ended = ask(json!({"op": "query", "statements": ["SELECT 1"]})).unwrap();
+        assert_eq!(ended["in_transaction"], false);
+        assert_eq!(ask(insert).unwrap()["applied"], 1);
+        let count: i64 = reader
+            .query_row(
+                "SELECT count(*) FROM log WHERE msg IN ('once', 'console')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
     fn the_rows_are_exported_as_csv_and_json_with_nulls_apart() {
         let (dir, path) = database();
         let csv = dir.path().join("out.csv").to_string_lossy().into_owned();

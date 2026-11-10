@@ -398,6 +398,29 @@ pub struct Editing {
     pub text: String,
 }
 
+/// The most characters a cell of the grid shows.
+pub const CELL_CHARS: usize = 200;
+
+/// What a cell of the grid shows of its value: one line, cut after
+/// `CELL_CHARS` characters. Laying out a value of 100 KB for every row that
+/// scrolls into view makes the grid stutter; the whole value stays in the
+/// page for copying, editing, the preview and the exports.
+pub fn shown(value: &str) -> std::borrow::Cow<'_, str> {
+    let long = value.len() > CELL_CHARS && value.chars().nth(CELL_CHARS).is_some();
+    if !long && !value.contains(char::is_control) {
+        return std::borrow::Cow::Borrowed(value);
+    }
+    let mut line: String = value
+        .chars()
+        .take(CELL_CHARS)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if long {
+        line.push('…');
+    }
+    std::borrow::Cow::Owned(line)
+}
+
 // -------------------------------------------------------------------- date
 
 /// What a date picker picks, from the type of the column.
@@ -413,7 +436,13 @@ impl PickKind {
     /// `timestamp with time zone`, …), if it is one of the temporal ones.
     pub fn of(column_type: &str) -> Option<PickKind> {
         let t = column_type.trim().to_lowercase();
-        if t.starts_with("timestamp") {
+        // An array of dates (`date[]`, or `_date` as PostgreSQL names it)
+        // holds a list, which one picked value would replace.
+        if t.ends_with("[]") || t.starts_with('_') {
+            return None;
+        }
+        // `datetime` (MySQL, SQLite) starts like `date` but keeps a time.
+        if t.starts_with("timestamp") || t.starts_with("datetime") {
             Some(PickKind::DateTime)
         } else if t.starts_with("date") {
             Some(PickKind::Date)
@@ -774,6 +803,19 @@ mod tests {
     }
 
     #[test]
+    fn a_long_value_is_shown_on_one_line_and_cut_short() {
+        assert_eq!(shown("short"), "short");
+        assert_eq!(shown("two\nlines\r\n"), "two lines  ");
+        let long = "é".repeat(100_000);
+        let line = shown(&long);
+        assert_eq!(line.chars().count(), CELL_CHARS + 1);
+        assert!(line.ends_with('…'));
+        // Exactly as long as the limit: nothing is cut.
+        let full = "a".repeat(CELL_CHARS);
+        assert_eq!(shown(&full), full.as_str());
+    }
+
+    #[test]
     fn the_column_type_says_which_picker() {
         assert_eq!(PickKind::of("date"), Some(PickKind::Date));
         assert_eq!(PickKind::of("time without time zone"), Some(PickKind::Time));
@@ -788,6 +830,25 @@ mod tests {
         );
         assert_eq!(PickKind::of("text"), None);
         assert_eq!(PickKind::of("integer"), None);
+    }
+
+    #[test]
+    fn a_datetime_column_keeps_its_time_and_an_array_gets_no_picker() {
+        assert_eq!(PickKind::of("datetime"), Some(PickKind::DateTime));
+        assert_eq!(PickKind::of("DATETIME(6)"), Some(PickKind::DateTime));
+        assert_eq!(PickKind::of("datetime2"), Some(PickKind::DateTime));
+        assert_eq!(PickKind::of("date[]"), None);
+        assert_eq!(PickKind::of("_date"), None);
+        assert_eq!(PickKind::of("timestamp with time zone[]"), None);
+        // Picking a day in a datetime cell keeps the time it had.
+        let mut p = Picker::new(
+            0,
+            0,
+            PickKind::of("datetime").unwrap(),
+            Some("2026-02-10 14:30:00"),
+        );
+        p.day = Some(15);
+        assert_eq!(p.value().as_deref(), Some("2026-02-15 14:30:00"));
     }
 
     #[test]

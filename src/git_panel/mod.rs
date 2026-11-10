@@ -1341,6 +1341,22 @@ impl Panel {
                 };
                 let path = entry.change.path.clone();
                 let was_staged = entry.staged;
+                // Staging a conflicted file marks it settled: with its
+                // markers still in, they would go into the commit.
+                if !was_staged && entry.change.kind == Kind::Conflict {
+                    let markers = self
+                        .repo
+                        .as_ref()
+                        .and_then(|repo| std::fs::read_to_string(repo.join(&path)).ok())
+                        .is_some_and(|text| git::conflicts::parse(&text, false).is_some());
+                    if markers {
+                        self.notice = Some((
+                            t!("git.stage_conflict_markers", name = path.as_str()).to_string(),
+                            true,
+                        ));
+                        return Task::none();
+                    }
+                }
                 self.act(move |repo| async move {
                     let paths = [path];
                     if was_staged {
@@ -1356,7 +1372,14 @@ impl Panel {
                     return Task::none();
                 };
                 let paths: Vec<String> = if stage {
-                    status.unstaged.iter().map(|c| c.path.clone()).collect()
+                    // Conflicts are left out: staging one marks it settled,
+                    // markers and all. Each is staged by itself once settled.
+                    status
+                        .unstaged
+                        .iter()
+                        .filter(|c| c.kind != Kind::Conflict)
+                        .map(|c| c.path.clone())
+                        .collect()
                 } else {
                     status.staged.iter().map(|c| c.path.clone()).collect()
                 };
@@ -1857,6 +1880,18 @@ impl Panel {
                                     t!("git.branch_created", name = &created[1..]).to_string(),
                                     false,
                                 ));
+                            }
+                            unmerged if unmerged.starts_with('\u{d}') => {
+                                // Git kept a branch that is not merged: the
+                                // next click on Delete forces it.
+                                let name = unmerged[1..].to_string();
+                                self.notice = Some((
+                                    t!("git.branch_not_merged", name = name.as_str()).to_string(),
+                                    true,
+                                ));
+                                self.branches.selected = Some(branches::Ref::Branch(name.clone()));
+                                self.branches.force_delete = Some(name);
+                                self.branches.confirm = Some(branches::RefAction::Delete);
                             }
                             "\u{7}fetched" => {
                                 self.notice = Some((t!("git.fetched").to_string(), false));
@@ -2851,5 +2886,62 @@ mod tests {
         let _ = panel.update(GitMsg::Tool(pick), &ctx());
         assert_eq!(panel.dialog, None);
         assert_eq!(panel.message.text().trim_end(), "one\n\nbody");
+    }
+
+    #[test]
+    fn a_conflicted_file_is_not_staged_while_it_still_has_its_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut panel = panel_with_branches();
+        panel.repo = Some(dir.path().to_path_buf());
+        let change = |path: &str, kind| Change {
+            path: path.into(),
+            from: None,
+            kind,
+        };
+        let status = panel.status.as_mut().unwrap();
+        status.unstaged = vec![change("both.txt", Kind::Conflict)];
+        let status = status.clone();
+        panel.viewer.entries = Panel::commit_entries(&status);
+        std::fs::write(
+            dir.path().join("both.txt"),
+            "<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> t\n",
+        )
+        .unwrap();
+        // The heading's checkbox leaves conflicts out.
+        let _ = panel.update(GitMsg::StageAll(true), &ctx());
+        assert!(!panel.busy, "nothing else to stage");
+        // Its own checkbox refuses, and says why.
+        let _ = panel.update(GitMsg::ToggleStaged(0), &ctx());
+        assert!(!panel.busy);
+        assert!(panel.notice.as_ref().is_some_and(|(_, error)| *error));
+        // Settled by hand: staging it is how it is marked settled.
+        std::fs::write(dir.path().join("both.txt"), "x\ny\n").unwrap();
+        let _ = panel.update(GitMsg::ToggleStaged(0), &ctx());
+        assert!(panel.busy);
+    }
+
+    #[test]
+    fn an_unmerged_branch_is_deleted_only_by_one_more_click_right_after_the_refusal() {
+        use branches::{Ref, RefAction::Delete};
+        let mut panel = panel_with_branches();
+        panel.busy = true;
+        // Git kept `topic`: it is picked again and Delete waits to force it.
+        let _ = panel.update(GitMsg::Done(Ok("\u{d}topic".into())), &ctx());
+        assert_eq!(panel.branches.selected, Some(Ref::Branch("topic".into())));
+        assert_eq!(panel.branches.confirm, Some(Delete));
+        assert_eq!(panel.branches.force_delete.as_deref(), Some("topic"));
+        assert!(panel.notice.as_ref().is_some_and(|(_, error)| *error));
+        let _ = panel.ref_action(Delete);
+        assert!(panel.busy);
+        assert_eq!(panel.branches.force_delete, None);
+        // Anything else in between: the next Delete asks afresh, unforced.
+        let mut panel = panel_with_branches();
+        panel.busy = true;
+        let _ = panel.update(GitMsg::Done(Ok("\u{d}topic".into())), &ctx());
+        let _ = panel.update(GitMsg::SelectRef(Ref::Branch("topic".into())), &ctx());
+        let _ = panel.update(GitMsg::SelectRef(Ref::Branch("topic".into())), &ctx());
+        let _ = panel.ref_action(Delete);
+        assert!(!panel.busy, "the first click only asks");
+        assert_eq!(panel.branches.force_delete, None);
     }
 }

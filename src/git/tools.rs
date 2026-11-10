@@ -6,7 +6,7 @@ use std::path::Path;
 
 use super::graph::Commit;
 use super::history::{self, parse_log};
-use super::{run, run_network, run_with, stopped, MergeMode, PullMode};
+use super::{run, run_push, run_with, stopped, MergeMode, PullMode};
 
 // ─── Branches, files ────────────────────────────────────────────────────────
 
@@ -166,6 +166,7 @@ impl PushSpec {
         let mut args = vec!["push".to_string()];
         if self.force {
             args.push("--force-with-lease".to_string());
+            args.push(super::FORCE_IF_INCLUDES.to_string());
         }
         match self.tags {
             PushTags::None => {}
@@ -185,7 +186,7 @@ impl PushSpec {
 pub async fn push(repo: &Path, spec: &PushSpec) -> Result<(), String> {
     let args = spec.args();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    run_network(repo, &args).await.map(|_| ())
+    run_push(repo, &args).await.map(|_| ())
 }
 
 /// The commits a push would send: those the target lacks, or, with no
@@ -618,6 +619,7 @@ mod tests {
             [
                 "push",
                 "--force-with-lease",
+                "--force-if-includes",
                 "--tags",
                 "--set-upstream",
                 "--",

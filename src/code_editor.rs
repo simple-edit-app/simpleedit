@@ -2823,7 +2823,7 @@ where
             Update::Cut => {
                 if let Some(selection) = self.content.selection_all() {
                     clipboard.write(clipboard::Kind::Standard, selection);
-                    shell.publish(on_edit(Action::Edit(Edit::Delete)));
+                    shell.publish(on_edit(Action::Edit(cut_edit(self.content))));
                 }
             }
             Update::Paste => {
@@ -4018,8 +4018,11 @@ impl Update {
                         keyboard::Key::Named(key::Named::Delete) => {
                             return edit(Edit::Delete);
                         }
+                        // Escape belongs to the app (back to one cursor,
+                        // popups closed); the editor keeps the focus so that
+                        // typing goes on right after it.
                         keyboard::Key::Named(key::Named::Escape) => {
-                            return Some(Self::Unfocus);
+                            return None;
                         }
                         keyboard::Key::Character("c") if modifiers.command() => {
                             return Some(Self::Copy);
@@ -4086,6 +4089,18 @@ impl Update {
             },
             _ => None,
         }
+    }
+}
+
+/// The edit that takes the cut text away. With several cursors, Delete
+/// would also remove the next character at the cursors without a
+/// selection; pasting nothing empties the selections and leaves those
+/// cursors alone.
+fn cut_edit(content: &Content) -> Edit {
+    if content.extra_carets().is_empty() {
+        Edit::Delete
+    } else {
+        Edit::Paste(Arc::new(String::new()))
     }
 }
 
@@ -4267,6 +4282,11 @@ mod tests {
     }
 
     #[test]
+    fn escape_is_left_to_the_app_and_keeps_the_focus() {
+        assert!(from_key(key::Named::Escape, keyboard::Modifiers::empty()).is_none());
+    }
+
+    #[test]
     fn consumed_keys_are_known() {
         assert!(!consumes_key("ArrowUp", false, true));
         assert!(!consumes_key("ArrowLeft", false, true));
@@ -4388,6 +4408,18 @@ mod multi_tests {
         content.select_bytes(0, 0, 3);
         content.add_next_occurrence(false);
         assert_eq!(content.selection_all().as_deref(), Some("foo\nfoo"));
+    }
+
+    #[test]
+    fn cutting_with_several_cursors_leaves_the_cursors_without_a_selection_alone() {
+        let mut content = Content::with_text("foo bar foo\nxy");
+        content.select_bytes(0, 0, 3);
+        content.add_next_occurrence(false);
+        content.add_cursor(1, 0);
+        assert_eq!(content.cursor_count(), 3);
+        content.perform(Action::Edit(cut_edit(&content)));
+        assert_eq!(content.text(), " bar \nxy\n");
+        assert_eq!(content.cursor_count(), 3);
     }
 
     #[test]

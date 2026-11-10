@@ -67,6 +67,29 @@ pub async fn run_network(repo: &Path, args: &[&str]) -> Result<String, String> {
     run_timed(repo, args, None, &[], NETWORK_TIMEOUT).await
 }
 
+/// What a forced push adds to `--force-with-lease`. Alone, the lease is
+/// checked against `refs/remotes/…`, which the automatic fetch keeps up to
+/// date: a colleague's commit fetched in the background, but never merged
+/// here, would be overwritten without a word.
+pub const FORCE_IF_INCLUDES: &str = "--force-if-includes";
+
+/// `git push …` that may be forced. Git older than 2.30 does not know
+/// [`FORCE_IF_INCLUDES`]: the push is then made again with the lease alone,
+/// as it was before that option existed.
+pub async fn run_push(repo: &Path, args: &[&str]) -> Result<String, String> {
+    match run_network(repo, args).await {
+        Err(error) if args.contains(&FORCE_IF_INCLUDES) && error.contains("force-if-includes") => {
+            let older: Vec<&str> = args
+                .iter()
+                .copied()
+                .filter(|a| *a != FORCE_IF_INCLUDES)
+                .collect();
+            run_network(repo, &older).await
+        }
+        other => other,
+    }
+}
+
 async fn run_timed(
     repo: &Path,
     args: &[&str],

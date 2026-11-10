@@ -1463,6 +1463,7 @@ mod tests {
             ctrl: false,
             shift: false,
             alt: false,
+            captured: false,
         });
     }
 
@@ -1891,6 +1892,7 @@ mod tests {
                 ctrl: false,
                 shift: false,
                 alt: true,
+                captured: false,
             });
         };
         alt(&mut app, "ArrowDown");

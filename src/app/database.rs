@@ -345,6 +345,22 @@ impl SimpleEditApp {
         if self.show_preferences || self.overlay != ActiveOverlay::None || self.tree_focus {
             return None;
         }
+        // A window of the database panel covers the grid: Alt+Delete there
+        // must not mark a row of the table behind it.
+        let db = &self.db;
+        if db.dialog.is_some()
+            || db.designer.is_some()
+            || db.health.is_some()
+            || db.import.is_some()
+            || db.copy_table.is_some()
+            || db.backup.is_some()
+            || db.confirm.is_some()
+            || db.text.is_some()
+            || db.links.is_some()
+            || db.new_schema.is_some()
+        {
+            return None;
+        }
         // The log in view: Cmd/Ctrl+C copies the entry that was clicked.
         if ctrl
             && !shift
@@ -361,7 +377,8 @@ impl SimpleEditApp {
             self.db.console.open && self.db.console.tab == database::console::ConsoleTab::Queries;
         let path = self.current_file.clone()?;
         let tab = self.db_tabs.get_mut(&path)?;
-        if tab.editing.is_some() || tab.picker.is_some() {
+        // The form of a row and the SQL preview stand over the grid too.
+        if tab.editing.is_some() || tab.picker.is_some() || tab.form.is_some() || tab.preview {
             return None;
         }
         let page = tab.page.as_ref()?;
@@ -369,6 +386,9 @@ impl SimpleEditApp {
         if rows == 0 || cols == 0 {
             return None;
         }
+        // The arrows start from the first cell when none is selected; the
+        // keys that act on a cell (edit, delete, copy) need one picked.
+        let picked = tab.selected.is_some();
         let (row, col) = tab.selected.unwrap_or((0, 0));
         let page_rows = ((tab.scroll.1 / database::ROW_HEIGHT) as usize)
             .saturating_sub(1)
@@ -397,13 +417,13 @@ impl SimpleEditApp {
                     (row.saturating_sub(1), cols - 1)
                 }
             }
-            ("F4", false, false) => {
+            ("F4", false, false) if picked => {
                 return Some(self.db_message(DbMsg::OpenForm(path, row)));
             }
-            ("F2", false, false) => {
+            ("F2", false, false) if picked => {
                 return Some(self.db_message(DbMsg::Edit(path, row, col)));
             }
-            ("Delete", false, true) => {
+            ("Delete", false, true) if picked => {
                 return Some(self.db_message(DbMsg::DeleteRow(path, row)));
             }
             // The console's own editor has Cmd/Ctrl+C when it is the one in use.
@@ -420,7 +440,7 @@ impl SimpleEditApp {
                 );
                 return Some(iced::clipboard::write(text));
             }
-            ("c", true, false) if !shift && !console_typing => {
+            ("c", true, false) if picked && !shift && !console_typing => {
                 let value = tab.pending.value(page, row, col)?.to_string();
                 return Some(iced::clipboard::write(value));
             }
@@ -1206,9 +1226,21 @@ impl SimpleEditApp {
                 if let Some(tab) = self.db_tabs.get_mut(&path) {
                     if let (true, Some(page)) = (tab.editable(), tab.page.clone()) {
                         tab.editing = None;
+                        let before = tab.pending.rows(&page);
                         tab.pending.delete(&page, row);
-                        tab.selected = None;
                         tab.notice = None;
+                        // The next row takes the selection, so that Alt+Delete
+                        // again goes down the table instead of jumping to a
+                        // row out of view. A new row is taken out, and the
+                        // next one moves up into its place.
+                        let rows = tab.pending.rows(&page);
+                        let col = tab.selected.map_or(0, |(_, c)| c);
+                        let next = if rows < before { row } else { row + 1 };
+                        tab.anchor = None;
+                        tab.selected = (rows > 0).then(|| (next.min(rows - 1), col));
+                        if let Some((next, _)) = tab.selected {
+                            return Self::db_reveal(tab, next);
+                        }
                     }
                 }
                 Task::none()

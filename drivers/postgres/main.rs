@@ -2011,42 +2011,193 @@ fn dump(request: &Request, tunnel_port: Option<u16>) -> Result<Value, String> {
     Ok(json!({ "path": request.path, "tool": version, "size": size, "said": said }))
 }
 
-/// How a backup file is made: `pg_restore` reads the custom and tar formats,
-/// `psql` the SQL ones.
-/// A `psql` meta-command of a dump that runs a program of the machine
-/// (`\!`, a pipe, `\copy … program`): the first line that does.
-fn runs_a_program(line: &str) -> bool {
-    let line = line.trim_start();
-    let Some(command) = line.strip_prefix('\\') else {
-        return false;
-    };
-    let lower = command.to_ascii_lowercase();
-    let name: String = lower
-        .chars()
-        .take_while(|c| c.is_ascii_alphabetic() || *c == '!')
-        .collect();
-    let rest = lower[name.len()..].trim_start().to_string();
-    match name.as_str() {
-        "!" | "setenv" | "cd" => true,
-        "o" | "out" | "g" | "gx" | "w" | "write" | "copy" | "e" | "edit" | "ef" | "ev" => {
-            rest.starts_with('|') || rest.contains(" program ") || name.starts_with('e')
+/// Where a `COPY` statement is: psql reads the lines after a `COPY … FROM
+/// stdin` as its rows, not as SQL.
+#[derive(Default, Clone, Copy, PartialEq)]
+enum CopyState {
+    /// At the start of a statement.
+    #[default]
+    Start,
+    /// A statement that is not a `COPY`, or a `COPY` that is not from stdin.
+    Other,
+    /// `COPY`, before its first `FROM` or `TO`.
+    Copy,
+    /// `COPY … FROM`.
+    From,
+    /// `COPY … FROM stdin`.
+    Stdin,
+}
+
+/// The lines of a SQL dump as psql reads them, as far as its meta-commands
+/// go: a backslash outside a string, a quoted name, a comment or a `$$`
+/// block starts one, anywhere on a line (after SQL, after another
+/// meta-command), and the rest of the line is its arguments.
+#[derive(Default)]
+struct PsqlLines {
+    /// Read as psql does when the server has `standard_conforming_strings`
+    /// off: a backslash escapes in every string.
+    escapes: bool,
+    /// The string, name, comment or `$$` block that goes on to the next line,
+    /// from its start.
+    open: String,
+    /// The parentheses open: a `;` in them does not end the statement.
+    depth: u32,
+    copy: CopyState,
+    /// In the rows of a `COPY … FROM stdin`, up to the line `\.`.
+    in_rows: bool,
+}
+
+impl PsqlLines {
+    /// Whether the line holds a meta-command that is not one pg_dump writes.
+    fn refuses(&mut self, line: &str) -> bool {
+        use protocol::TokenKind;
+        if self.in_rows {
+            self.in_rows = line.trim_end_matches('\r') != "\\.";
+            return false;
         }
-        _ => lower.starts_with('!'),
+        let line = if self.escapes {
+            escapes_read(line)
+        } else {
+            line.to_string()
+        };
+        // A long string or block goes on: only a line that may end it is
+        // worth reading again from its start.
+        if !self.open.is_empty() && !line.contains(closing(&self.open)) {
+            self.open.push_str(&line);
+            self.open.push('\n');
+            return false;
+        }
+        let mut text = std::mem::take(&mut self.open);
+        text.push_str(&line);
+        text.push('\n');
+        let bytes = text.as_bytes();
+        for token in protocol::sql_tokens(&text, protocol::Dialect::Postgres) {
+            // The text ends with a line break: a string, a name or a comment
+            // that holds it is not closed.
+            if token.end >= text.len()
+                && matches!(
+                    token.kind,
+                    TokenKind::Text | TokenKind::Quoted | TokenKind::Comment
+                )
+            {
+                // With the `E` of an `E'…'`, which says how it is read.
+                let at = token.start;
+                let e_string = at > 0
+                    && matches!(bytes[at - 1], b'e' | b'E')
+                    && (at < 2
+                        || !(bytes[at - 2].is_ascii_alphanumeric() || bytes[at - 2] == b'_'));
+                self.open = text[if e_string { at - 1 } else { at }..].to_string();
+                return false;
+            }
+            let piece = &text[token.start..token.end];
+            match (token.kind, piece) {
+                (TokenKind::Comment, _) => {}
+                // A meta-command takes the rest of the line.
+                (TokenKind::Punct, "\\") => return !harmless_meta(&text[token.end..]),
+                (TokenKind::Punct, "(") => {
+                    self.depth += 1;
+                    if self.copy == CopyState::From {
+                        self.copy = CopyState::Other;
+                    }
+                }
+                (TokenKind::Punct, ")") => self.depth = self.depth.saturating_sub(1),
+                (TokenKind::Punct, ";") if self.depth == 0 => {
+                    if self.copy == CopyState::Stdin {
+                        self.in_rows = true;
+                    }
+                    self.copy = CopyState::Start;
+                }
+                (kind, piece) => {
+                    let word = |w: &str| kind == TokenKind::Word && piece.eq_ignore_ascii_case(w);
+                    self.copy = match self.copy {
+                        CopyState::Start if word("copy") => CopyState::Copy,
+                        CopyState::Start => CopyState::Other,
+                        // The first `FROM` or `TO` of the statement says
+                        // which way it goes; one in a query or a condition
+                        // does not.
+                        CopyState::Copy if self.depth == 0 && word("from") => CopyState::From,
+                        CopyState::Copy if self.depth == 0 && word("to") => CopyState::Other,
+                        CopyState::From if word("stdin") => CopyState::Stdin,
+                        CopyState::From => CopyState::Other,
+                        state => state,
+                    };
+                }
+            }
+        }
+        false
     }
 }
 
-/// Reads a SQL dump for the meta-commands that would run programs.
-fn dump_runs_programs(path: &str) -> Result<Option<usize>, String> {
-    let file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
-    for (n, line) in std::io::BufReader::new(file).split(b'\n').enumerate() {
+/// What ends a string, a quoted name, a comment or a `$tag$` block, from
+/// its start.
+fn closing(open: &str) -> &str {
+    let open = open.trim_start_matches(['e', 'E']);
+    if open.starts_with("/*") {
+        "*/"
+    } else if let Some(tag) = open.strip_prefix('$') {
+        tag.find('$').map_or("$", |n| &open[..n + 2])
+    } else {
+        &open[..1]
+    }
+}
+
+/// A line where `\'` and `\\` are escapes, as in a string when
+/// `standard_conforming_strings` is off: each becomes `\x`, which ends no
+/// string and is still a backslash outside one.
+fn escapes_read(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if c == '\\' && matches!(chars.peek(), Some('\'' | '\\')) {
+            chars.next();
+            out.push('x');
+        }
+    }
+    out
+}
+
+/// A meta-command pg_dump writes in a plain dump, with nothing in its
+/// arguments for psql to run (a backquote) or to read as another command.
+fn harmless_meta(command: &str) -> bool {
+    let command = command.trim_end_matches(['\n', '\r']);
+    let name_end = command
+        .find(|c: char| c.is_whitespace() || c == '\\')
+        .unwrap_or(command.len());
+    let (name, arguments) = command.split_at(name_end);
+    matches!(name, "connect" | "c" | "restrict" | "unrestrict") && !arguments.contains(['\\', '`'])
+}
+
+/// The first line of a SQL dump with a psql meta-command other than those
+/// pg_dump writes: `\!`, `\o`, `\copy`, a backquote… can run a program of
+/// this machine or read and write its files. The lines are read twice, as
+/// psql reads them with `standard_conforming_strings` on and off: a dump can
+/// turn it off, and a server can have it off.
+fn first_meta_line(reader: impl BufRead) -> Result<Option<usize>, String> {
+    let mut plain = PsqlLines::default();
+    let mut escaping = PsqlLines {
+        escapes: true,
+        ..PsqlLines::default()
+    };
+    for (n, line) in reader.split(b'\n').enumerate() {
         let line = line.map_err(|e| e.to_string())?;
-        if runs_a_program(&String::from_utf8_lossy(&line)) {
+        let line = String::from_utf8_lossy(&line);
+        // Both are told every line, to stay where psql is.
+        if plain.refuses(&line) | escaping.refuses(&line) {
             return Ok(Some(n + 1));
         }
     }
     Ok(None)
 }
 
+/// Reads a SQL dump for the meta-commands that could run programs.
+fn dump_runs_programs(path: &str) -> Result<Option<usize>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
+    first_meta_line(std::io::BufReader::new(file))
+}
+
+/// How a backup file is made: `pg_restore` reads the custom and tar formats,
+/// `psql` the SQL ones.
 fn backup_kind(path: &str) -> Result<&'static str, String> {
     let mut file = std::fs::File::open(path).map_err(|e| format!("{path}: {e}"))?;
     let mut head = [0u8; 512];
@@ -2528,13 +2679,54 @@ mod tests {
 
     #[test]
     fn a_dump_that_runs_a_program_is_recognised() {
-        assert!(runs_a_program("\\! rm -rf ~"));
-        assert!(runs_a_program("  \\o | sh"));
-        assert!(runs_a_program("\\copy t to program 'x'"));
-        assert!(runs_a_program("\\setenv A b"));
-        assert!(!runs_a_program("\\connect shop"));
-        assert!(!runs_a_program("\\copy t from 'a.csv'"));
-        assert!(!runs_a_program("SELECT 1; -- \\! not at the start"));
+        let line = |dump: &str| first_meta_line(dump.as_bytes()).unwrap();
+        assert_eq!(line("\\! rm -rf ~"), Some(1));
+        assert_eq!(line("  \\o | sh"), Some(1));
+        assert_eq!(line("\\copy t to program 'x'"), Some(1));
+        assert_eq!(line("\\setenv A b"), Some(1));
+        assert_eq!(line("\\copy t from 'a.csv'"), Some(1));
+        // After SQL or another meta-command, in a backquote, a file written.
+        assert_eq!(line("SELECT 1;\nSELECT 1; \\! cmd"), Some(2));
+        assert_eq!(line("\\x \\! cmd"), Some(1));
+        assert_eq!(line("\\echo `cmd`"), Some(1));
+        assert_eq!(line("\\set x `cmd`"), Some(1));
+        assert_eq!(line("\\o /tmp/x"), Some(1));
+        assert_eq!(line("\\i other.sql"), Some(1));
+        assert_eq!(line("\\connect shop \\! cmd"), Some(1));
+        assert_eq!(line("\\connect `cmd`"), Some(1));
+        // Inside parentheses psql has not sent the statement: what follows
+        // a `COPY` there is SQL, not rows.
+        assert_eq!(line("SELECT (\nCOPY t FROM stdin;\n\\! cmd"), Some(3));
+        // A `COPY` that does not read stdin has no rows after it.
+        assert_eq!(
+            line("COPY (SELECT 1 FROM stdin) TO stdout;\n\\! cmd"),
+            Some(2)
+        );
+        assert_eq!(
+            line("COPY t FROM '/f' WHERE a IS DISTINCT FROM stdin;\n\\! cmd"),
+            Some(2)
+        );
+        // With `standard_conforming_strings` off, `\'` does not end a string.
+        assert_eq!(line("SELECT 'a\\' ' \\! cmd"), Some(1));
+        // What pg_dump writes, and what only looks like a meta-command.
+        let dump = "\\restrict abc123\n\
+            SET standard_conforming_strings = on;\n\
+            SELECT 1; -- \\! in a comment\n\
+            /* \\! in a\n block \\! comment */\n\
+            CREATE FUNCTION f() RETURNS text AS $$\n  SELECT '\\! x';\n$$ LANGUAGE sql;\n\
+            INSERT INTO t VALUES ('a\n\\! in a string', E'\\'\\\\', \"x\\\");\n\
+            COPY public.t (a, b) FROM stdin;\n\
+            1\t\\N\n\
+            2\tC:\\\\path \\! not a command\n\
+            \\.\n\
+            \\connect -reuse-previous=on \"dbname='shop'\"\n\
+            \\unrestrict abc123\n";
+        assert_eq!(line(dump), None);
+        // After the rows, SQL again.
+        assert_eq!(
+            line("COPY t FROM stdin;\n1\n\\.\nSELECT 1; \\! cmd"),
+            Some(4)
+        );
     }
 
     #[test]

@@ -94,6 +94,7 @@ mod behavior_tests {
                 ctrl: true,
                 shift: false,
                 alt: false,
+                captured: false,
             });
         };
         // Ctrl+Z would take back the editor's last typing, Ctrl+A select it.
@@ -500,6 +501,7 @@ mod behavior_tests {
                 ctrl: true,
                 shift,
                 alt: false,
+                captured: false,
             });
         };
         ctrl_tab(&mut app, false);
@@ -1175,6 +1177,18 @@ mod behavior_tests {
     }
 
     #[test]
+    fn save_as_from_a_tab_closed_during_the_dialog_writes_nothing() {
+        let mut app = app();
+        let closed = PathBuf::from("/x/Untitled-1");
+        let _ = app.handle(Message::SaveAsChosen(
+            Some(closed),
+            Ok(PathBuf::from("/x/notes.txt")),
+        ));
+        assert!(app.status_is_error);
+        assert_eq!(app.status_message, t!("status.save_as_tab_closed"));
+    }
+
+    #[test]
     fn save_as_renames_the_tab_and_moves_its_bookmarks() {
         let dir = tempfile::tempdir().unwrap();
         let (a, b) = (dir.path().join("a.txt"), dir.path().join("b.txt"));
@@ -1378,6 +1392,7 @@ mod behavior_tests {
             ctrl: false,
             shift: false,
             alt: false,
+            captured: false,
         };
         let _ = app.handle(key("ArrowDown"));
         let ActiveOverlay::References(shown) = &app.overlay else {
@@ -1803,6 +1818,31 @@ mod behavior_tests {
     }
 
     #[test]
+    fn a_merge_is_not_applied_over_unsaved_changes_of_the_same_file() {
+        let mut app = app();
+        let spec = merge_spec();
+        let file = spec.repo.join(&spec.path);
+        app.sidebar.add_file(file.clone());
+        app.file_cache.insert(
+            file,
+            CachedBuffer {
+                dirty: true,
+                ..CachedBuffer::blank()
+            },
+        );
+        let _ = app.handle(Message::OpenMergeTab(std::sync::Arc::new(spec)));
+        let _ = app.handle(Message::Merge(crate::git_panel::merge::MergeMsg::All(
+            crate::git::conflicts::Side::Yours,
+        )));
+        let _ = app.handle(Message::Merge(crate::git_panel::merge::MergeMsg::Apply));
+        assert!(app.status_is_error);
+        assert_eq!(
+            app.status_message,
+            t!("git.merge_buffer_unsaved", name = "dir/f.txt").to_string()
+        );
+    }
+
+    #[test]
     fn the_conflicts_dialog_only_opens_when_there_are_conflicts() {
         let mut app = app();
         let _ = app.handle(Message::OpenConflicts);
@@ -1952,6 +1992,7 @@ mod behavior_tests {
             ctrl,
             shift,
             alt,
+            captured: false,
         });
     }
 
@@ -3442,6 +3483,93 @@ mod behavior_tests {
     }
 
     #[test]
+    fn a_key_a_text_field_used_or_a_window_over_the_grid_leaves_the_rows_alone() {
+        use crate::database::TextView;
+        let (mut app, path) = db_app(true);
+        app.db_tabs.get_mut(&path).unwrap().selected = Some((1, 0));
+        // Option+Delete deleted a word in the WHERE field: no row is marked.
+        let _ = app.handle(Message::KeyPressed {
+            key: "Delete".into(),
+            ctrl: false,
+            shift: false,
+            alt: true,
+            captured: true,
+        });
+        assert!(!app.db_tabs[&path].pending.is_deleted(1));
+        // The form of a row, the SQL preview and a window of the panel.
+        app.db_tabs.get_mut(&path).unwrap().form = Some(1);
+        assert!(app.db_key("Delete", false, false, true).is_none());
+        app.db_tabs.get_mut(&path).unwrap().form = None;
+        app.db_tabs.get_mut(&path).unwrap().preview = true;
+        assert!(app.db_key("Delete", false, false, true).is_none());
+        assert!(app.db_key("c", true, false, false).is_none());
+        app.db_tabs.get_mut(&path).unwrap().preview = false;
+        app.db.text = Some(TextView {
+            title: "items".into(),
+            text: "CREATE TABLE items ()".into(),
+        });
+        assert!(app.db_key("Delete", false, false, true).is_none());
+        assert!(!app.db_tabs[&path].pending.is_deleted(1));
+        // Once the grid is in front again, the key is its own.
+        app.db.text = None;
+        let _ = app.handle(Message::KeyPressed {
+            key: "Delete".into(),
+            ctrl: false,
+            shift: false,
+            alt: true,
+            captured: false,
+        });
+        assert!(app.db_tabs[&path].pending.is_deleted(1));
+    }
+
+    #[test]
+    fn alt_delete_goes_down_the_table_and_needs_a_selected_cell() {
+        let (mut app, path) = db_app(true);
+        // Nothing selected: the keys that act on a cell do nothing.
+        for (k, ctrl, alt) in [
+            ("Delete", false, true),
+            ("F2", false, false),
+            ("F4", false, false),
+            ("c", true, false),
+        ] {
+            assert!(app.db_key(k, ctrl, false, alt).is_none(), "{k}");
+        }
+        let tab = &app.db_tabs[&path];
+        assert!(tab.pending.is_empty() && tab.editing.is_none() && tab.form.is_none());
+        // Each Alt+Delete marks the selected row and moves to the next one.
+        app.db_tabs.get_mut(&path).unwrap().selected = Some((1, 1));
+        assert!(app.db_key("Delete", false, false, true).is_some());
+        assert!(app.db_tabs[&path].pending.is_deleted(1));
+        assert_eq!(app.db_tabs[&path].selected, Some((2, 1)));
+        assert!(app.db_key("Delete", false, false, true).is_some());
+        assert!(app.db_tabs[&path].pending.is_deleted(2));
+        // The last row stays selected; row 0 is never touched.
+        assert_eq!(app.db_tabs[&path].selected, Some((2, 1)));
+        assert!(app.db_key("Delete", false, false, true).is_some());
+        assert!(!app.db_tabs[&path].pending.is_deleted(0));
+    }
+
+    #[test]
+    fn a_long_cell_is_edited_from_its_whole_value() {
+        use crate::database::DbMsg;
+        let (mut app, path) = db_app(true);
+        let long = "x".repeat(10_000);
+        app.db_tabs
+            .get_mut(&path)
+            .unwrap()
+            .page
+            .as_mut()
+            .unwrap()
+            .rows[0][1] = Some(long.clone());
+        let _ = app.update(Message::Db(DbMsg::Edit(path.clone(), 0, 1)));
+        let tab = &app.db_tabs[&path];
+        assert_eq!(
+            tab.editing.as_ref().map(|e| e.text.as_str()),
+            Some(long.as_str())
+        );
+    }
+
+    #[test]
     fn the_tabs_of_a_database_are_grouped_under_it() {
         use crate::database::DbMsg;
         let (mut app, path) = db_app(true);
@@ -4769,6 +4897,68 @@ mod text_command_tests {
         crate::editor::buffer_text(&app.editor.content)
     }
 
+    fn edit(app: &mut SimpleEditApp, edit: Edit) {
+        let _ = app.update(Message::EditorAction(Action::Edit(edit)));
+    }
+
+    #[test]
+    fn backspaces_in_a_row_are_undone_with_one_ctrl_z() {
+        let mut app = app_with("hello world");
+        let _ = app.update(Message::EditorAction(Action::Move(
+            text_editor::Motion::DocumentEnd,
+        )));
+        let before = app.undo_stack.len();
+        for _ in 0..5 {
+            edit(&mut app, Edit::Backspace);
+        }
+        assert_eq!(buffer(&app), "hello \n");
+        // One undo point for the five, not a copy of the buffer each.
+        assert_eq!(app.undo_stack.len(), before + 1);
+        let _ = app.update(Message::Undo);
+        assert_eq!(buffer(&app), "hello world\n");
+    }
+
+    #[test]
+    fn a_move_or_another_kind_of_deletion_starts_a_new_undo_step() {
+        let mut app = app_with("abcdef");
+        let _ = app.update(Message::EditorAction(Action::Move(
+            text_editor::Motion::DocumentEnd,
+        )));
+        edit(&mut app, Edit::Backspace);
+        edit(&mut app, Edit::Backspace);
+        let _ = app.update(Message::EditorAction(Action::Move(
+            text_editor::Motion::DocumentStart,
+        )));
+        edit(&mut app, Edit::Delete);
+        edit(&mut app, Edit::Delete);
+        edit(&mut app, Edit::Insert('x'));
+        assert_eq!(buffer(&app), "xcd\n");
+        let _ = app.update(Message::Undo);
+        assert_eq!(buffer(&app), "cd\n");
+        let _ = app.update(Message::Undo);
+        assert_eq!(buffer(&app), "abcd\n");
+        let _ = app.update(Message::Undo);
+        assert_eq!(buffer(&app), "abcdef\n");
+    }
+
+    #[test]
+    fn a_delete_after_backspaces_is_a_step_of_its_own() {
+        let mut app = app_with("abcdef");
+        let _ = app.update(Message::EditorAction(Action::Move(
+            text_editor::Motion::DocumentEnd,
+        )));
+        for _ in 0..3 {
+            let _ = app.update(Message::EditorAction(Action::Move(
+                text_editor::Motion::Left,
+            )));
+        }
+        edit(&mut app, Edit::Backspace);
+        edit(&mut app, Edit::Delete);
+        assert_eq!(buffer(&app), "abef\n");
+        let _ = app.update(Message::Undo);
+        assert_eq!(buffer(&app), "abdef\n");
+    }
+
     #[test]
     fn lines_are_sorted_from_the_menu_of_actions() {
         let mut app = app_with("b\na\nc\n");
@@ -5026,6 +5216,31 @@ mod large_file_tests {
         assert_eq!(app.large_view().unwrap().start, 5);
         assert!(!app.is_dirty);
     }
+
+    #[test]
+    fn a_large_tab_is_not_reloaded_whole_with_another_encoding() {
+        let (_dir, path) = file_of(10);
+        let mut app = SimpleEditApp::blank(Config::default());
+        let _ = app.restore_session(crate::session::Session::default());
+        let _ = app.update(Message::TabRead(Ok(Loaded {
+            path: path.clone(),
+            text: "line\n".into(),
+            format: TextFormat::default(),
+            stamp: None,
+        })));
+        app.large.insert(
+            path,
+            LargeView {
+                start: 0,
+                end: 5,
+                size: 100 * 1024 * 1024,
+            },
+        );
+        let _ = app.update(Message::ReloadEncoding(crate::tabs::Encoding::Latin9));
+        assert!(app.status_is_error);
+        assert_eq!(app.status_message, t!("large.read_only"));
+        assert_eq!(crate::editor::buffer_text(&app.editor.content), "line\n");
+    }
 }
 
 #[cfg(test)]
@@ -5281,6 +5496,7 @@ mod keyboard_list_tests {
             ctrl: false,
             shift: false,
             alt: false,
+            captured: false,
         });
     }
 

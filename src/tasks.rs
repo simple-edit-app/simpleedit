@@ -215,6 +215,10 @@ pub fn run(task: TaskSpec) -> impl iced::futures::Stream<Item = Event> {
             c.arg("-c");
             c
         };
+        // In a group of its own, so that a stop reaches what the shell
+        // started too (a dev server, the program `cargo run` built).
+        #[cfg(unix)]
+        command.process_group(0);
         let spawned = command
             .arg(&task.command)
             .current_dir(&task.dir)
@@ -233,6 +237,11 @@ pub fn run(task: TaskSpec) -> impl iced::futures::Stream<Item = Event> {
                 return;
             }
         };
+        // Dropped with the stream (a stop), it ends the whole group.
+        #[cfg(unix)]
+        let mut group = Group(child.id().map(|pid| pid as i32));
+        #[cfg(unix)]
+        group.watch();
         let (to, mut from) = tokio::sync::mpsc::unbounded_channel();
         if let Some(out) = child.stdout.take() {
             forward(out, to.clone());
@@ -247,8 +256,76 @@ pub fn run(task: TaskSpec) -> impl iced::futures::Stream<Item = Event> {
             }
         }
         let code = child.wait().await.ok().and_then(|s| s.code());
+        // Ended by itself: what it left running on purpose stays.
+        #[cfg(unix)]
+        group.disarm();
         let _ = output.send(Event::Done(code)).await;
     })
+}
+
+/// How long a stopped task has to end on SIGTERM before SIGKILL.
+#[cfg(unix)]
+const GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The process groups of the tasks that run, for [`stop_all`].
+#[cfg(unix)]
+static RUNNING: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+
+/// The process group of a task, ended when dropped.
+#[cfg(unix)]
+struct Group(Option<i32>);
+
+#[cfg(unix)]
+impl Group {
+    fn watch(&self) {
+        if let (Some(id), Ok(mut running)) = (self.0, RUNNING.lock()) {
+            running.push(id);
+        }
+    }
+
+    fn disarm(&mut self) {
+        if let (Some(id), Ok(mut running)) = (self.0.take(), RUNNING.lock()) {
+            running.retain(|g| *g != id);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Group {
+    fn drop(&mut self) {
+        let Some(id) = self.0 else {
+            return;
+        };
+        self.disarm();
+        // Waiting for it here would hold up the runtime that drops the task.
+        std::thread::spawn(move || end_group(id, GRACE));
+    }
+}
+
+/// Asks a process group to end, then forces it after `grace`.
+#[cfg(unix)]
+fn end_group(id: i32, grace: std::time::Duration) {
+    let alive = || unsafe { libc::killpg(id, 0) } == 0;
+    unsafe { libc::killpg(id, libc::SIGTERM) };
+    let start = std::time::Instant::now();
+    while alive() && start.elapsed() < grace {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if alive() {
+        unsafe { libc::killpg(id, libc::SIGKILL) };
+    }
+}
+
+/// Ends the tasks that still run, for the app that quits: its exit would
+/// leave them running.
+pub fn stop_all() {
+    #[cfg(unix)]
+    {
+        let groups = RUNNING.lock().map(|mut r| std::mem::take(&mut *r));
+        for id in groups.unwrap_or_default() {
+            end_group(id, std::time::Duration::from_millis(300));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -353,6 +430,35 @@ mod tests {
             "{lines:?}"
         );
         assert_eq!(events.last(), Some(&Event::Done(Some(3))));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stop_ends_what_the_command_started_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // The shell prints the pid of a child it left in the background.
+        let pid: String = runtime.block_on(async {
+            let mut events = Box::pin(run(spec("t", "sleep 30 & echo $!; wait", dir.path())));
+            match events.next().await {
+                Some(Event::Line(line)) => line,
+                other => panic!("{other:?}"),
+            }
+            // The stream dropped here is the Stop button.
+        });
+        let gone = || {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                // A zombie has ended too, it only waits to be reaped.
+                .map_or(true, |stat| stat.contains(") Z "))
+        };
+        let start = std::time::Instant::now();
+        while !gone() && start.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(gone(), "the background child {pid} still runs");
     }
 
     #[test]

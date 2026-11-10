@@ -167,6 +167,7 @@ fn configuration(family: &str, section: &str, trusted: bool) -> Value {
 /// Stops every server: they start again, with the settings of now, when
 /// next needed.
 pub async fn restart_servers() {
+    forget_usable();
     let Some(servers) = SERVERS.get() else {
         return;
     };
@@ -255,14 +256,38 @@ pub(crate) fn usable(name: &str) -> bool {
     let Some(path) = find_executable(name) else {
         return false;
     };
-    name != "rust-analyzer"
-        || std::process::Command::new(path)
-            .arg("--version")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
+    name != "rust-analyzer" || runs(&path)
+}
+
+/// What [`runs`] found, by program: running it again at each completion,
+/// hover or lint (on the UI thread for the last) costs a process each time.
+static RUNS: OnceLock<StdMutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+
+/// Whether `path --version` succeeds, asked once until [`forget_usable`].
+fn runs(path: &Path) -> bool {
+    let store = RUNS.get_or_init(Default::default);
+    if let Some(known) = store.lock().ok().and_then(|m| m.get(path).copied()) {
+        return known;
+    }
+    let ok = std::process::Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if let Ok(mut known) = store.lock() {
+        known.insert(path.to_path_buf(), ok);
+    }
+    ok
+}
+
+/// Asks [`usable`] again from scratch: after a server is installed or
+/// removed, or the servers are restarted.
+pub(crate) fn forget_usable() {
+    if let Some(Ok(mut known)) = RUNS.get().map(|m| m.lock()) {
+        known.clear();
+    }
 }
 
 /// Longest wait for an answer, indexing included.
@@ -1975,6 +2000,33 @@ mod tests {
         assert_eq!(uri, "file:///tmp/mon%20dossier/%C3%A9%231.rs");
         assert_eq!(uri_to_path(&uri).as_deref(), Some(path));
         assert_eq!(uri_to_path("http://x"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_program_is_run_once_to_know_whether_it_works_until_forgotten() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let count = dir.path().join("count");
+        let program = dir.path().join("fake-server");
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\necho run >> '{}'\n", count.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runs_so_far = || {
+            std::fs::read_to_string(&count)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        assert!(runs(&program));
+        assert!(runs(&program));
+        assert_eq!(runs_so_far(), 1, "the second answer comes from the cache");
+        forget_usable();
+        assert!(runs(&program));
+        assert_eq!(runs_so_far(), 2, "forgotten, it is asked again");
     }
 
     #[test]

@@ -230,6 +230,7 @@ pub async fn install(binary: &'static str) -> Result<(), String> {
         return Err(tail(&String::from_utf8_lossy(&output.stderr)));
     }
     // The tool can succeed without leaving a program that runs.
+    crate::lsp::forget_usable();
     let usable = tokio::task::spawn_blocking(move || crate::lsp::usable(binary))
         .await
         .unwrap_or(false);
@@ -290,6 +291,7 @@ pub async fn uninstall(binary: &'static str) -> Result<(), String> {
         .await
         .map_err(|_| "timeout".to_string())?
         .map_err(|e| e.to_string())?;
+    crate::lsp::forget_usable();
     if output.status.success() {
         Ok(())
     } else {

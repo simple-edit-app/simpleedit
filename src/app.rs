@@ -654,6 +654,8 @@ pub enum Message {
         ctrl: bool,
         shift: bool,
         alt: bool,
+        /// A widget (a text field, an editor) already acted on the key.
+        captured: bool,
     },
     EscapePressed,
     /// Enter pressed while a search field might own it; `shift` goes back.
@@ -987,6 +989,9 @@ pub struct SimpleEditApp {
     /// Whether the next edit should open a new undo group.
     /// True at start, after whitespace, after a cursor move, after delete.
     undo_new_group: bool,
+    /// The kind of deletion (Backspace or Delete) the open undo group is
+    /// made of, so that the next one of the same kind joins it.
+    undo_deletion: Option<std::mem::Discriminant<text_editor::Edit>>,
     /// How the editor pane renders the buffer (Markdown / JSON files only).
     view_mode: ViewMode,
     /// Parsed preview of the buffer, rebuilt only when the text changes.
@@ -1221,6 +1226,7 @@ impl SimpleEditApp {
             file_size: None,
             size_for: None,
             undo_new_group: true,
+            undo_deletion: None,
             view_mode: ViewMode::Raw,
             preview: PreviewDoc::None,
             selection_info: None,
@@ -1461,6 +1467,7 @@ impl SimpleEditApp {
                 ctrl: modifiers.command(),
                 shift: modifiers.shift(),
                 alt: modifiers.alt(),
+                captured: !ignored,
             })
         });
 
@@ -2564,11 +2571,18 @@ impl SimpleEditApp {
                     let content = if origin == self.current_file {
                         crate::editor::buffer_text(&self.editor.content)
                     } else {
-                        origin
+                        let text = origin
                             .as_ref()
                             .and_then(|o| self.file_cache.get(o))
-                            .and_then(CachedBuffer::text)
-                            .unwrap_or_default()
+                            .and_then(CachedBuffer::text);
+                        // The tab was closed while the dialog was open, or its
+                        // text is no longer loaded: an empty text would wipe
+                        // the chosen file.
+                        let Some(text) = text else {
+                            self.set_status(t!("status.save_as_tab_closed"), true);
+                            return Task::none();
+                        };
+                        text
                     };
                     let format = if origin == self.current_file {
                         self.format
@@ -3782,6 +3796,14 @@ impl SimpleEditApp {
                     self.set_status(t!("status.err_reload_dirty"), true);
                     return Task::none();
                 }
+                // A large file is shown in parts: reading it whole here would
+                // freeze the window and could run out of memory.
+                let too_large =
+                    std::fs::metadata(&path).is_ok_and(|meta| meta.len() > MAX_OPEN_BYTES);
+                if self.large_view().is_some() || too_large {
+                    self.set_status(t!("large.read_only"), true);
+                    return Task::none();
+                }
                 let Some(raw) = std::fs::read(&path)
                     .ok()
                     .and_then(|bytes| encoding.decode(&bytes))
@@ -4201,6 +4223,7 @@ impl SimpleEditApp {
             Message::Quit => match self.save_session_now() {
                 Ok(()) => {
                     self.config.save();
+                    crate::tasks::stop_all();
                     std::process::exit(0)
                 }
                 // Unsaved buffers live on in the session file; if it can't be
@@ -4212,6 +4235,7 @@ impl SimpleEditApp {
             },
             Message::QuitAnyway => {
                 self.config.save();
+                crate::tasks::stop_all();
                 std::process::exit(0)
             }
             Message::ContextCopy => {
@@ -4627,9 +4651,13 @@ impl SimpleEditApp {
                 ctrl,
                 shift,
                 alt,
+                captured,
             } => {
-                // The keys of a table in front: arrows, F2, copy.
-                if self.capturing.is_none() {
+                // The keys of a table in front: arrows, F2, copy. A key a
+                // text field already used (Cmd/Ctrl+C on its selection,
+                // Option+Delete for a word) is not the grid's too; the app's
+                // own shortcuts below still see it.
+                if self.capturing.is_none() && !captured {
                     if let Some(task) = self.db_key(&key, ctrl, shift, alt) {
                         return task;
                     }
@@ -5621,24 +5649,44 @@ impl SimpleEditApp {
                 }
                 match edit {
                     text_editor::Edit::Insert(ch) => {
+                        // Typing right after deletions is a step of its own.
+                        let after_deletion =
+                            self.undo_deletion.take().is_some() && !self.undo_new_group;
                         if self.editor.content.selection().is_some() {
                             // Typing over a selection is a step of its own.
                             self.push_undo();
                             self.undo_new_group = ch.is_whitespace();
                         } else if ch.is_whitespace() {
+                            if after_deletion {
+                                self.push_undo();
+                            }
                             // Whitespace ends the current word group; next non-ws starts a new one
                             self.undo_new_group = true;
-                        } else if self.undo_new_group {
+                        } else if self.undo_new_group || after_deletion {
                             // First non-whitespace of a new group: snapshot now
                             self.push_undo();
                             self.undo_new_group = false;
                         }
                         // else: mid-word, stay in current group
                     }
+                    text_editor::Edit::Backspace | text_editor::Edit::Delete
+                        if self.editor.content.selection().is_none() =>
+                    {
+                        // Backspaces in a row (or Deletes in a row) are one
+                        // step, as the letters of a typed word are; a move
+                        // or another edit in between opens a new one.
+                        let kind = std::mem::discriminant(edit);
+                        if self.undo_new_group || self.undo_deletion != Some(kind) {
+                            self.push_undo();
+                            self.undo_new_group = false;
+                            self.undo_deletion = Some(kind);
+                        }
+                    }
                     _ => {
-                        // Backspace, Delete, Enter, Paste: always their own undo point
+                        // Enter, Paste, a deleted selection: always their own undo point
                         self.push_undo();
                         self.undo_new_group = true;
+                        self.undo_deletion = None;
                     }
                 }
                 if let text_editor::Edit::Paste(text) = edit {
@@ -6845,6 +6893,15 @@ impl SimpleEditApp {
                 return Task::none();
             }
             let (repo, relative, text) = (tab.repo.clone(), tab.path.clone(), tab.merge.render());
+            // The merge was read from the disk: changes not saved in an
+            // editor tab of the same file would be lost under it.
+            if self.is_path_dirty(&repo.join(&relative)) {
+                self.set_status(
+                    t!("git.merge_buffer_unsaved", name = relative.as_str()),
+                    true,
+                );
+                return Task::none();
+            }
             return Task::perform(
                 async move { crate::git::resolve_with(&repo, &relative, &text).await },
                 move |result| Message::MergeApplied(path.clone(), result),

@@ -357,15 +357,46 @@ pub enum Unavailable {
     NotMergeable,
 }
 
+impl Merge {
+    /// The whole file as one side has it: the common text with that side of
+    /// every conflict.
+    fn side_lines(&self, side: Side) -> Vec<&str> {
+        let mut lines = Vec::new();
+        for segment in &self.segments {
+            match segment {
+                Segment::Text(text) => lines.extend(text.iter().map(String::as_str)),
+                Segment::Conflict(c) => {
+                    let taken = if side == Side::Yours {
+                        &c.yours
+                    } else {
+                        &c.theirs
+                    };
+                    lines.extend(taken.iter().map(String::as_str));
+                }
+            }
+        }
+        lines
+    }
+
+    /// Both hold the same two sides, whatever the conflicts' boundaries (git
+    /// and `merge-file` may cut them differently): the file on disk was not
+    /// touched since git wrote it.
+    fn same_sides(&self, other: &Merge) -> bool {
+        [Side::Yours, Side::Theirs]
+            .into_iter()
+            .all(|side| self.side_lines(side) == other.side_lines(side))
+    }
+}
+
 /// The conflicts to settle for a file: rebuilt from the three versions git
-/// keeps (so each knows its base), unless the file on disk has fewer of
-/// them, which means some were already settled by hand and that work must
-/// not be thrown away.
+/// keeps (so each knows its base), unless the file on disk says something
+/// else (a conflict settled by hand, common lines or the inside of a
+/// conflict edited): that work must not be thrown away.
 pub fn choose(rebuilt: Option<&str>, disk: Option<&str>, swap: bool) -> Result<Merge, Unavailable> {
     let from_rebuilt = rebuilt.and_then(|t| parse(t, swap));
     let from_disk = disk.and_then(|t| parse(t, swap));
     match (from_rebuilt, from_disk) {
-        (Some(r), Some(d)) if d.conflicts().count() < r.conflicts().count() => Ok(d),
+        (Some(r), Some(d)) if !d.same_sides(&r) => Ok(d),
         (Some(r), _) if disk.is_none_or(|t| t.lines().any(|l| l.starts_with("<<<<<<<"))) => Ok(r),
         // Markers gone: the file was settled by hand.
         (Some(_), None) => Err(Unavailable::Settled),
@@ -551,5 +582,33 @@ end
         );
         // The disk can't be read: the rebuilt text.
         assert!(choose(Some(TWO), None, false).is_ok());
+    }
+
+    #[test]
+    fn edits_made_by_hand_around_or_inside_the_markers_are_kept() {
+        let rebuilt = "a\n<<<<<<< yours\nx\n||||||| base\nb\n=======\ny\n>>>>>>> theirs\nz\n";
+        // Untouched (git cut it without the base): the rebuilt text, with it.
+        let merge = choose(
+            Some(rebuilt),
+            Some("a\n<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> t\nz\n"),
+            false,
+        )
+        .unwrap();
+        assert!(merge.conflicts().next().unwrap().base.is_some());
+        // A common line fixed by hand, markers left in: the disk's.
+        let common = "a fixed\n<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> t\nz\n";
+        let merge = choose(Some(rebuilt), Some(common), false).unwrap();
+        assert_eq!(
+            merge.render(),
+            "a fixed\n<<<<<<< yours\nx\n=======\ny\n>>>>>>> theirs\nz\n"
+        );
+        // The inside of a conflict edited: the disk's too.
+        let inside = "a\n<<<<<<< HEAD\nx edited\n=======\ny\n>>>>>>> t\nz\n";
+        let merge = choose(Some(rebuilt), Some(inside), false).unwrap();
+        assert_eq!(merge.conflicts().next().unwrap().yours, vec!["x edited"]);
+        // Conflicts cut elsewhere, same text on each side: still untouched.
+        let wider = "<<<<<<< HEAD\na\nx\n=======\na\ny\n>>>>>>> t\nz\n";
+        let merge = choose(Some(rebuilt), Some(wider), false).unwrap();
+        assert!(merge.conflicts().next().unwrap().base.is_some());
     }
 }

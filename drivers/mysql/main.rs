@@ -13,7 +13,7 @@ mod common;
 mod tunnel;
 
 use common::{Engine, Row, Shape};
-use mysql::consts::ColumnType;
+use mysql::consts::{CapabilityFlags, ColumnType};
 use mysql::prelude::Queryable;
 use mysql::{Conn, OptsBuilder, SslOpts, Value};
 use protocol::{
@@ -73,7 +73,11 @@ impl Session {
             .pass(password)
             .db_name(Some(target.database.clone()).filter(|d| !d.is_empty()))
             .prefer_socket(false)
-            .tcp_connect_timeout(Some(std::time::Duration::from_secs(15)));
+            .tcp_connect_timeout(Some(std::time::Duration::from_secs(15)))
+            // The rows a change finds, not only those whose value differs:
+            // `2.50` saved again as `2.5` touches its row, it is not taken for
+            // a row changed by someone else.
+            .additional_capabilities(CapabilityFlags::CLIENT_FOUND_ROWS);
         let ssl = &target.ssl;
         if ssl.mode != SslMode::Disable {
             let mut opts = SslOpts::default();
@@ -436,6 +440,25 @@ impl Engine for Session {
         self.in_tx
     }
 
+    fn alive(&mut self) -> bool {
+        self.conn.ping().is_ok()
+    }
+
+    fn session_id(&mut self) -> Option<i64> {
+        Some(i64::from(self.conn.connection_id()))
+    }
+
+    fn cancel(&mut self, id: i64) -> Result<bool, String> {
+        // From another connection: the driver of the session is stopped by
+        // the app, but MySQL would finish the statement and keep what it did.
+        match self.conn.query_drop(format!("KILL QUERY {id}")) {
+            Ok(()) => Ok(true),
+            // No such session: there is nothing left to stop.
+            Err(mysql::Error::MySqlError(e)) if e.code == 1094 => Ok(false),
+            Err(e) => Err(clean(e)),
+        }
+    }
+
     fn structure(&mut self, schema: &str, table: &str) -> Result<Structure, String> {
         let name = format!("{}.{}", quote(schema), quote(table));
         let (s, t) = (literal(schema), literal(table));
@@ -748,6 +771,13 @@ mod tests {
         .unwrap();
         // A backslash and a quote in a value stay what they are.
         assert_eq!(page["rows"][0][1], "A\\nn'");
+        // A value saved again as it was (2.50 as 2.5) still finds its row.
+        let same = call(
+            json!({"op": "apply", "schema": db, "table": "se_items", "changes": [
+            {"kind": "update", "key": [["id", "1"]], "set": [["qty", "2.5"]]}]}),
+        )
+        .unwrap();
+        assert_eq!(same["applied"], 1);
         assert!(call(
             json!({"op": "apply", "schema": db, "table": "se_people", "changes": [
             {"kind": "update", "key": [["id", "404"]], "set": [["name", "x"]]}]})
@@ -780,13 +810,16 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("CREATE TABLE `se_people`"));
-        // The console: a reading is left to the tab, a writing is counted, a transaction stays open.
-        let q = call(
-            json!({"op": "query", "statements": ["SELECT 1", "UPDATE se_people SET note = 'n'"]}),
-        )
+        // The console: a reading followed by a writing is read at once, a
+        // writing is counted, a last reading is left to the tab, a
+        // transaction stays open.
+        let q = call(json!({"op": "query", "statements": [
+            "SELECT 1", "UPDATE se_people SET note = 'n'", "SELECT 2"
+        ]}))
         .unwrap();
-        assert_eq!(q["results"][0]["deferred"], true);
+        assert_eq!(q["results"][0]["deferred"], false);
         assert_eq!(q["results"][1]["affected"], 3);
+        assert_eq!(q["results"][2]["deferred"], true);
         let open_tx = call(
             json!({"op": "query", "statements": ["START TRANSACTION", "DELETE FROM se_items"]}),
         )
@@ -812,5 +845,87 @@ mod tests {
         let _ = std::fs::remove_file(out);
         call(json!({"op": "query", "statements": ["DROP TABLE se_items", "DROP TABLE se_people"]}))
             .unwrap();
+    }
+
+    /// Against a real server, as above: a session the server closed, and a
+    /// statement stopped from another connection.
+    #[test]
+    fn a_lost_session_is_opened_again_and_a_long_statement_is_stopped() {
+        let Ok(spec) = std::env::var("SIMPLEEDIT_TEST_MYSQL") else {
+            eprintln!("no SIMPLEEDIT_TEST_MYSQL: skipped");
+            return;
+        };
+        let parts: Vec<&str> = spec.split(':').collect();
+        let target = json!({
+            "dialect": "mysql", "host": parts[0], "port": parts[1].parse::<u16>().unwrap(),
+            "user": parts[2], "password": parts[3], "database": parts[4],
+        });
+        let open = |r: &Request| Session::open(r).map(|s| Box::new(s) as Box<dyn Engine>);
+        let ask = |slot: &mut Option<(String, Box<dyn Engine>)>, request: Json| {
+            let mut request = request;
+            request["target"] = target.clone();
+            common::run(&request.to_string(), slot, &open, true)
+        };
+        let id_of = |slot: &mut Option<(String, Box<dyn Engine>)>| {
+            slot.as_mut().unwrap().1.session_id().unwrap()
+        };
+        let mut session = None;
+        let mut other = None;
+        let kill = |other: &mut Option<(String, Box<dyn Engine>)>, id: i64| {
+            ask(
+                other,
+                json!({"op": "query", "statements": [format!("KILL {id}")]}),
+            )
+            .unwrap();
+        };
+        // Closed while idle: the next request opens another session.
+        ask(&mut session, json!({"op": "test"})).unwrap();
+        let first = id_of(&mut session);
+        kill(&mut other, first);
+        ask(&mut session, json!({"op": "test"})).unwrap();
+        assert_ne!(id_of(&mut session), first);
+        // Closed in a transaction: that is said, once.
+        let began = ask(
+            &mut session,
+            json!({"op": "query", "statements": ["START TRANSACTION"]}),
+        )
+        .unwrap();
+        assert_eq!(began["in_transaction"], true);
+        kill(&mut other, id_of(&mut session));
+        let lost = ask(
+            &mut session,
+            json!({"op": "query", "statements": ["SELECT 1"]}),
+        );
+        assert!(lost.unwrap_err().contains("transaction was rolled back"));
+        let again = ask(
+            &mut session,
+            json!({"op": "query", "statements": ["SELECT 1"]}),
+        )
+        .unwrap();
+        assert_eq!(again["in_transaction"], false);
+        // Stopped from another connection, as the app does.
+        let started = std::time::Instant::now();
+        let sleeping = std::thread::spawn({
+            let target = target.clone();
+            move || {
+                let open = |r: &Request| Session::open(r).map(|s| Box::new(s) as Box<dyn Engine>);
+                let mut slot = None;
+                let request = json!({"op": "query", "target": target,
+                    "statements": ["DO SLEEP(30)"]});
+                common::run(&request.to_string(), &mut slot, &open, true)
+            }
+        });
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let list = ask(
+            &mut other,
+            json!({"op": "rows", "limit": 10,
+            "sql": "SELECT id FROM information_schema.processlist WHERE info = 'DO SLEEP(30)'"}),
+        )
+        .unwrap();
+        let id: i64 = list["rows"][0][0].as_str().unwrap().parse().unwrap();
+        let stopped = ask(&mut None, json!({"op": "cancel", "pid": id})).unwrap();
+        assert_eq!(stopped["stopped"], true);
+        sleeping.join().unwrap().unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(20));
     }
 }

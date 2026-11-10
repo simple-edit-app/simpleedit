@@ -525,6 +525,7 @@ mod tests {
                 ctrl: false,
                 shift: false,
                 alt: false,
+                captured: false,
             });
         };
         app.panels.projects = true;

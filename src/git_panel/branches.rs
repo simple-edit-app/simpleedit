@@ -71,6 +71,9 @@ pub struct State {
     pub tag_message: String,
     /// The action waiting for its second click.
     pub confirm: Option<RefAction>,
+    /// The branch git refused to delete because it is not merged: the click
+    /// on Delete right after the refusal deletes it anyway.
+    pub force_delete: Option<String>,
     /// The popin open to name a new branch or tag.
     pub dialog: Option<RefDialog>,
     /// Width of the actions on the right (dragged by their left edge).
@@ -191,9 +194,12 @@ impl Panel {
         }
         if action.asks_twice() && self.branches.confirm != Some(action) {
             self.branches.confirm = Some(action);
+            // Asked afresh: a refusal seen earlier no longer forces anything.
+            self.branches.force_delete = None;
             return Task::none();
         }
         self.branches.confirm = None;
+        let force_delete = self.branches.force_delete.take();
         let selected = self.branches.selected.clone();
         let branch = self.picked_branch().cloned();
         match (action, selected, branch) {
@@ -265,11 +271,18 @@ impl Panel {
             }
             (RefAction::Delete, _, Some(b)) => {
                 self.branches.selected = None;
+                let force = force_delete.as_deref() == Some(b.name.as_str());
                 self.act(move |repo| async move {
                     if b.remote {
                         history::delete_remote_branch(&repo, &b.name).await?;
                     } else {
-                        history::delete_branch(&repo, &b.name).await?;
+                        match history::delete_branch(&repo, &b.name, force).await {
+                            // Not an error: the user is told and may force it.
+                            Err(e) if e == history::NOT_MERGED => {
+                                return Ok(format!("\u{d}{}", b.name));
+                            }
+                            result => result?,
+                        }
                     }
                     Ok(String::new())
                 })
@@ -629,7 +642,11 @@ impl Panel {
                 confirming(RefAction::ForcePush)
             ),
             act(
-                confirm_or(RefAction::Delete, t!("git.branch_delete").to_string()),
+                if confirming(RefAction::Delete) && self.branches.force_delete.is_some() {
+                    t!("git.branch_force_delete").to_string()
+                } else {
+                    confirm_or(RefAction::Delete, t!("git.branch_delete").to_string())
+                },
                 RefAction::Delete,
                 confirming(RefAction::Delete)
             ),

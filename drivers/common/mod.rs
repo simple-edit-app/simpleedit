@@ -65,6 +65,20 @@ pub trait Engine {
     fn definition(&mut self, request: &Request) -> Result<String, String>;
     fn catalog(&mut self, request: &Request)
         -> Result<(Vec<TableColumn>, Vec<ForeignKey>), String>;
+    /// Whether the server is still there: a session left idle may have been
+    /// closed by it (MySQL's `wait_timeout`, a restart).
+    fn alive(&mut self) -> bool {
+        true
+    }
+    /// What the server calls the session, for stopping its statement from
+    /// another connection.
+    fn session_id(&mut self) -> Option<i64> {
+        None
+    }
+    /// Stops the statement the session `id` runs: whether there was one.
+    fn cancel(&mut self, _id: i64) -> Result<bool, String> {
+        Ok(false)
+    }
 }
 
 thread_local! {
@@ -147,9 +161,34 @@ pub fn run(
 ) -> Result<Value, String> {
     let request: Request = serde_json::from_str(input).map_err(|e| e.to_string())?;
     let key = serde_json::to_string(&request.target).unwrap_or_default();
+    if let Some((k, engine)) = slot {
+        if *k == key && !engine.alive() {
+            // A transaction of the session is gone with it: going on in a new
+            // session would write what follows at once, and a ROLLBACK would
+            // undo nothing. The next request opens another.
+            let lost = engine.in_transaction();
+            *slot = None;
+            if lost {
+                return Err(
+                    "the connection to the server was lost: its open transaction was rolled back"
+                        .to_string(),
+                );
+            }
+        }
+    }
     if !matches!(slot, Some((k, _)) if *k == key) {
         *slot = None;
         *slot = Some((key, open(&request)?));
+        if serving {
+            // Said at once, before the request is answered, as the PostgreSQL
+            // driver does: whoever wants to stop a long statement needs it
+            // while the statement runs.
+            if let Some(id) = slot.as_mut().and_then(|(_, engine)| engine.session_id()) {
+                let mut out = std::io::stdout();
+                let _ = writeln!(out, "{}", json!({ "backend_pid": id }));
+                let _ = out.flush();
+            }
+        }
     }
     let engine = slot.as_mut().expect("just opened").1.as_mut();
     let answer = answer(engine, &request);
@@ -197,7 +236,7 @@ fn answer(engine: &mut dyn Engine, request: &Request) -> Result<Value, String> {
             Ok(json!({ "structure": structure }))
         }
         "definition" => Ok(json!({ "definition": engine.definition(request)? })),
-        "cancel" => Ok(json!({ "stopped": false })),
+        "cancel" => Ok(json!({ "stopped": engine.cancel(request.pid)? })),
         "health" | "dump" | "restore" | "import" => Err(format!(
             "{} is not available for this kind of data source",
             request.op
@@ -498,7 +537,12 @@ fn apply(engine: &mut dyn Engine, request: &Request) -> Result<Value, String> {
             }
         }
     }
-    engine.commit()?;
+    // A commit that fails (a lock waited for in vain) can leave the
+    // transaction open: replayed in it, the changes would be made twice.
+    if let Err(message) = engine.commit() {
+        let _ = engine.rollback();
+        return Err(message);
+    }
     Ok(json!({ "applied": done }))
 }
 
@@ -608,12 +652,13 @@ fn query(engine: &mut dyn Engine, request: &Request) -> Result<Value, String> {
         }
     }
     if wrapped {
-        let end = if failed.is_some() {
-            engine.rollback()
-        } else {
-            engine.commit()
-        };
-        end?;
+        if failed.is_some() {
+            engine.rollback()?;
+        } else if let Err(message) = engine.commit() {
+            // Not left open by a commit that failed, as in `apply`.
+            let _ = engine.rollback();
+            return Err(message);
+        }
     }
     Ok(json!({ "results": results, "failed": failed }))
 }

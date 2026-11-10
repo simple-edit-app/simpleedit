@@ -2257,7 +2257,7 @@ fn grid<'a>(path: &'a Path, tab: &'a TableTab, dark: bool) -> Element<'a, Messag
                     .padding([2, 6])
                     .style(se_theme::Field::new(dark).style())
                     .into(),
-                (None, Cell::Value(text_value)) => text(text_value)
+                (None, Cell::Value(text_value)) => text(super::grid::shown(text_value))
                     .size(12.5)
                     .color(if deleted { p.muted } else { p.text })
                     .wrapping(iced::widget::text::Wrapping::None)

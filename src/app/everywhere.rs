@@ -1154,6 +1154,10 @@ impl SimpleEditApp {
             _ => self.everywhere.rows.clone(),
         };
         rows.retain(|r| matches!(r, Row::File(..) | Row::Symbol(_) | Row::Text(_)));
+        // A short query matches every file of a large project: the list,
+        // drawn whole, would freeze the window.
+        let cut = rows.len() > crate::finder::MAX_HITS;
+        rows.truncate(crate::finder::MAX_HITS);
         let hits: Vec<TextHit> = rows
             .into_iter()
             .map(|r| match r {
@@ -1198,6 +1202,10 @@ impl SimpleEditApp {
         let title = t!("results.everywhere", query = q, results = results).to_string();
         self.results_add(title, None, occurrences);
         self.overlay = ActiveOverlay::None;
+        if cut {
+            let n = crate::finder::MAX_HITS;
+            self.set_status(t!("everywhere.export_cut", n = n), false);
+        }
         Task::none()
     }
 
@@ -1856,6 +1864,7 @@ mod tests {
             ctrl,
             shift,
             alt,
+            captured: false,
         });
     }
 
@@ -2105,6 +2114,29 @@ mod tests {
         assert_eq!(app.overlay, ActiveOverlay::None);
         assert!(app.results.open);
         assert_eq!(app.results.tabs[0].hits.len(), 2);
+    }
+
+    #[test]
+    fn an_export_of_every_file_of_a_large_project_is_cut_and_says_so() {
+        let dir = project();
+        let mut app = app_on(dir.path());
+        let _ = app.update(Message::OpenEverywhere(Tab::Files));
+        let many = crate::finder::MAX_HITS + 50;
+        let files = (0..many)
+            .map(|i| {
+                let rel = format!("src/f{i}.rs");
+                (dir.path().join(&rel), rel)
+            })
+            .collect();
+        let generation = app.everywhere.files_generation;
+        let _ = app.update(Message::EverywhereFiles(generation, files));
+        typed(&mut app, "f");
+        let _ = app.update(Message::EverywhereExport);
+        assert_eq!(app.results.tabs[0].hits.len(), crate::finder::MAX_HITS);
+        assert_eq!(
+            app.status_message,
+            t!("everywhere.export_cut", n = crate::finder::MAX_HITS).to_string()
+        );
     }
 
     #[test]
