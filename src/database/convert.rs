@@ -70,37 +70,86 @@ fn sql_literal(value: &Option<String>, dialect: Dialect) -> String {
     }
 }
 
-/// `INSERT` statements for the rows (the first of `rows` names the
-/// columns), a hundred rows to a statement.
-pub fn to_inserts(table: &str, rows: &[Vec<Option<String>>], dialect: Dialect) -> String {
-    let Some((header, body)) = rows.split_first() else {
-        return String::new();
+/// The records of a CSV, one at a time: a record goes on over the lines
+/// while a quote is open.
+pub fn csv_records<R: std::io::BufRead>(
+    mut reader: R,
+) -> impl Iterator<Item = std::io::Result<Vec<Option<String>>>> {
+    std::iter::from_fn(move || {
+        let mut text = String::new();
+        loop {
+            match reader.read_line(&mut text) {
+                Err(e) => return Some(Err(e)),
+                Ok(0) => break,
+                Ok(_) => {
+                    if text.matches('"').count().is_multiple_of(2) {
+                        break;
+                    }
+                }
+            }
+        }
+        if text.is_empty() {
+            return None;
+        }
+        Some(Ok(parse_csv(&text).into_iter().next().unwrap_or_default()))
+    })
+}
+
+type Records<'a> = &'a mut dyn Iterator<Item = std::io::Result<Vec<Option<String>>>>;
+
+/// `INSERT` statements for the records (the first names the columns), a
+/// hundred rows to a statement, written as they come.
+pub fn write_inserts(
+    out: &mut impl std::io::Write,
+    table: &str,
+    rows: Records,
+    dialect: Dialect,
+) -> std::io::Result<()> {
+    let Some(header) = rows.next().transpose()? else {
+        return Ok(());
     };
     let columns = header
         .iter()
         .map(|c| super::protocol::quote_ident_in(dialect, c.as_deref().unwrap_or("")))
         .collect::<Vec<_>>()
         .join(", ");
-    let mut out = String::new();
-    for chunk in body.chunks(100) {
-        out.push_str(&format!("INSERT INTO {table} ({columns}) VALUES\n"));
-        let lines: Vec<String> = chunk
-            .iter()
-            .map(|row| {
-                let values: Vec<String> = row.iter().map(|v| sql_literal(v, dialect)).collect();
-                format!("  ({})", values.join(", "))
-            })
-            .collect();
-        out.push_str(&lines.join(",\n"));
-        out.push_str(";\n");
+    let mut lines: Vec<String> = Vec::new();
+    let mut flush = |lines: &mut Vec<String>| -> std::io::Result<()> {
+        if lines.is_empty() {
+            return Ok(());
+        }
+        write!(
+            out,
+            "INSERT INTO {table} ({columns}) VALUES\n{};\n",
+            lines.join(",\n")
+        )?;
+        lines.clear();
+        Ok(())
+    };
+    for row in rows {
+        let values: Vec<String> = row?.iter().map(|v| sql_literal(v, dialect)).collect();
+        lines.push(format!("  ({})", values.join(", ")));
+        if lines.len() == 100 {
+            flush(&mut lines)?;
+        }
     }
-    out
+    flush(&mut lines)
+}
+
+/// `INSERT` statements for the rows (the first of `rows` names the
+/// columns), a hundred rows to a statement.
+#[cfg(test)]
+pub fn to_inserts(table: &str, rows: &[Vec<Option<String>>], dialect: Dialect) -> String {
+    let mut out = Vec::new();
+    let mut records = rows.iter().cloned().map(Ok);
+    let _ = write_inserts(&mut out, table, &mut records, dialect);
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// A Markdown table: `|` and line breaks inside a value are escaped.
-pub fn to_markdown(rows: &[Vec<Option<String>>]) -> String {
-    let Some((header, body)) = rows.split_first() else {
-        return String::new();
+pub fn write_markdown(out: &mut impl std::io::Write, rows: Records) -> std::io::Result<()> {
+    let Some(header) = rows.next().transpose()? else {
+        return Ok(());
     };
     let cell = |v: &Option<String>| match v {
         None => "*NULL*".to_string(),
@@ -112,12 +161,20 @@ pub fn to_markdown(rows: &[Vec<Option<String>>]) -> String {
             row.iter().map(cell).collect::<Vec<_>>().join(" | ")
         )
     };
-    let mut out = line(header);
-    out.push_str(&format!("|{}\n", " --- |".repeat(header.len())));
-    for row in body {
-        out.push_str(&line(row));
+    out.write_all(line(&header).as_bytes())?;
+    writeln!(out, "|{}", " --- |".repeat(header.len()))?;
+    for row in rows {
+        out.write_all(line(&row?).as_bytes())?;
     }
-    out
+    Ok(())
+}
+
+#[cfg(test)]
+pub fn to_markdown(rows: &[Vec<Option<String>>]) -> String {
+    let mut out = Vec::new();
+    let mut records = rows.iter().cloned().map(Ok);
+    let _ = write_markdown(&mut out, &mut records);
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Whether a text is a number a sheet should hold as one (no leading zero:

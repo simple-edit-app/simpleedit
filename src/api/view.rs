@@ -616,7 +616,7 @@ pub fn tab<'a>(
     dark: bool,
 ) -> Element<'a, Message> {
     let p = se_theme::palette(dark);
-    let resolved = tab.request.resolve(&state.variables());
+    let missing = tab.request.missing(&state.variables());
 
     // The name, and what can be done with the request as a whole.
     let name_path = path.to_path_buf();
@@ -718,10 +718,10 @@ pub fn tab<'a>(
         upper =
             upper.push(container(text(notice.as_str()).size(12).color(p.muted)).padding([0, 12]));
     }
-    if !resolved.missing.is_empty() {
+    if !missing.is_empty() {
         upper = upper.push(
             container(
-                text(t!("api.missing_vars", names = resolved.missing.join(", ")).to_string())
+                text(t!("api.missing_vars", names = missing.join(", ")).to_string())
                     .size(12)
                     .color(se_theme::error_color(dark)),
             )
@@ -1101,8 +1101,7 @@ fn body_section<'a>(path: &Path, tab: &'a ApiTab, dark: bool) -> Element<'a, Mes
                 .height(Length::Fixed(260.0));
             let mut col = column![editor].spacing(6);
             if json {
-                let valid =
-                    serde_json::from_str::<serde_json::Value>(&tab.request.body.text).is_ok();
+                let valid = tab.body_is_json();
                 let empty = tab.request.body.text.trim().is_empty();
                 col = col.push(
                     row![

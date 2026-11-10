@@ -59,6 +59,53 @@ fn write(path: &std::path::Path, text: &str) {
     let _ = crate::fsutil::write_atomic(path, text.as_bytes(), true);
 }
 
+/// What the keychain is known to hold, by owner and name: every call to it
+/// is a synchronous D-Bus round trip (and a locked keychain asks a question),
+/// so a secret that is already as it should be is not asked about again.
+fn keychain_known() -> &'static std::sync::Mutex<std::collections::HashMap<(u64, String), String>> {
+    static KNOWN: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(u64, String), String>>,
+    > = std::sync::OnceLock::new();
+    KNOWN.get_or_init(Default::default)
+}
+
+/// `secrets::save`, skipped when the keychain already holds that (an empty
+/// value is "nothing kept").
+fn keychain_save(id: u64, name: &str, value: &str) -> bool {
+    let key = (id, name.to_string());
+    if keychain_known()
+        .lock()
+        .is_ok_and(|known| known.get(&key).is_some_and(|v| v == value))
+    {
+        return true;
+    }
+    let kept = crate::database::secrets::save(id, name, value);
+    // An empty write over an unreadable secret kept it: that is not known.
+    if kept && !(value.is_empty() && crate::database::secrets::is_unreadable(id, name)) {
+        if let Ok(mut known) = keychain_known().lock() {
+            known.insert(key, value.to_string());
+        }
+    }
+    kept
+}
+
+/// `secrets::load`, asking the keychain once for what it is known to hold.
+fn keychain_load(id: u64, name: &str) -> Option<String> {
+    let key = (id, name.to_string());
+    if let Some(value) = keychain_known()
+        .lock()
+        .ok()
+        .and_then(|known| known.get(&key).cloned())
+    {
+        return (!value.is_empty()).then_some(value);
+    }
+    let found = crate::database::secrets::load(id, name);
+    if let (Some(value), Ok(mut known)) = (&found, keychain_known().lock()) {
+        known.insert(key, value.clone());
+    }
+    found
+}
+
 /// The name a secret goes by in the keychain.
 fn secret_name(key: &str) -> String {
     format!("api:{key}")
@@ -104,8 +151,8 @@ fn move_auth_to_keychain(collection: &mut Collection) {
         for (name, value) in auth_secrets(request) {
             if value.is_empty() || only_variables(value) {
                 // Nothing to hide; an older secret is not to come back.
-                let _ = crate::database::secrets::save(id, name, "");
-            } else if crate::database::secrets::save(id, name, value) {
+                let _ = keychain_save(id, name, "");
+            } else if keychain_save(id, name, value) {
                 value.clear();
             }
         }
@@ -118,7 +165,7 @@ fn restore_auth_from_keychain(collection: &mut Collection) {
         let id = request.id;
         for (name, value) in auth_secrets(request) {
             if id != 0 && value.is_empty() {
-                if let Some(secret) = crate::database::secrets::load(id, name) {
+                if let Some(secret) = keychain_load(id, name) {
                     *value = secret;
                 }
             }
@@ -173,8 +220,7 @@ pub fn load() -> Stored {
                 .iter_mut()
                 .filter(|v| v.secret && v.value.is_empty())
             {
-                if let Some(secret) = crate::database::secrets::load(env.id, &secret_name(&var.key))
-                {
+                if let Some(secret) = keychain_load(env.id, &secret_name(&var.key)) {
                     var.value = secret;
                 }
             }
@@ -219,7 +265,7 @@ pub fn delete_collection(id: u64) {
             each_request(&mut collection.items, &mut |request| {
                 let rid = request.id;
                 for (name, _) in auth_secrets(request) {
-                    let _ = crate::database::secrets::save(rid, name, "");
+                    let _ = keychain_save(rid, name, "");
                 }
             });
         }
@@ -235,7 +281,7 @@ pub fn save_environments(environments: &[Environment], active: Option<u64>, next
         .map(|env| {
             let mut env = env.clone();
             for var in env.vars.iter_mut().filter(|v| v.secret) {
-                if crate::database::secrets::save(env.id, &secret_name(&var.key), &var.value) {
+                if keychain_save(env.id, &secret_name(&var.key), &var.value) {
                     var.value.clear();
                 }
             }
@@ -254,13 +300,13 @@ pub fn save_environments(environments: &[Environment], active: Option<u64>, next
 
 /// Forgets one secret variable's entry in the keychain.
 pub fn forget_secret(env_id: u64, key: &str) {
-    let _ = crate::database::secrets::save(env_id, &secret_name(key), "");
+    let _ = keychain_save(env_id, &secret_name(key), "");
 }
 
 /// Forgets the secrets of an environment that was deleted.
 pub fn forget_secrets(env: &Environment) {
     for var in env.vars.iter().filter(|v| v.secret) {
-        let _ = crate::database::secrets::save(env.id, &secret_name(&var.key), "");
+        let _ = keychain_save(env.id, &secret_name(&var.key), "");
     }
 }
 

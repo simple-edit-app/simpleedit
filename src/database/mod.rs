@@ -895,6 +895,26 @@ pub fn downloaded_driver_of(dialect: protocol::Dialect) -> Option<PathBuf> {
     })
 }
 
+/// The file next to a downloaded driver that holds the version of the app
+/// it was downloaded for.
+fn version_file_of(driver: &Path) -> PathBuf {
+    let mut name = driver.as_os_str().to_os_string();
+    name.push(".version");
+    PathBuf::from(name)
+}
+
+/// Whether a driver the app downloaded is the one of this version of the
+/// app. A driver found elsewhere (picked, override, next to the app) is the
+/// user's own and is never judged.
+fn is_current_download(path: &Path, dialect: protocol::Dialect, version: &str) -> bool {
+    match downloaded_driver_of(dialect) {
+        Some(downloaded) if downloaded == path => {
+            std::fs::read_to_string(version_file_of(path)).is_ok_and(|said| said.trim() == version)
+        }
+        _ => true,
+    }
+}
+
 /// The asset of a release that holds the driver for this system.
 fn driver_asset(version: &str, dialect: protocol::Dialect) -> Option<String> {
     let target = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
@@ -910,7 +930,7 @@ fn driver_asset(version: &str, dialect: protocol::Dialect) -> Option<String> {
 /// The same for the driver of a system.
 pub async fn find_driver_for(dialect: protocol::Dialect, picked: &str) -> Option<PathBuf> {
     for path in driver_candidates(picked, dialect) {
-        if !path.is_file() {
+        if !path.is_file() || !is_current_download(&path, dialect, env!("CARGO_PKG_VERSION")) {
             continue;
         }
         let answer = tokio::time::timeout(
@@ -948,11 +968,17 @@ pub async fn download_driver_of(dialect: protocol::Dialect) -> Result<(), String
         crate::updater::download_verified(version, &asset, MAX_DRIVER, Duration::from_secs(120))
             .await?;
     let dest = downloaded_driver_of(dialect).ok_or_else(|| t!("db.err_platform").to_string())?;
+    let version = version.to_string();
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         if let Some(dir) = dest.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
+        // The old version mark goes first: a failure in between leaves a
+        // driver that is downloaded again, not one that is kept stale.
+        let _ = std::fs::remove_file(version_file_of(&dest));
         crate::fsutil::write_atomic(&dest, &bytes, true).map_err(|e| e.to_string())?;
+        crate::fsutil::write_atomic(&version_file_of(&dest), version.as_bytes(), true)
+            .map_err(|e| e.to_string())?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1757,16 +1783,27 @@ pub async fn export_converted(
         let target = path.clone();
         let source = temp.clone();
         let converted = tokio::task::spawn_blocking(move || -> Result<String, String> {
-            let text = std::fs::read_to_string(&source).map_err(|e| e.to_string())?;
-            let rows = convert::parse_csv(&text);
-            match format.as_str() {
-                "sql" => std::fs::write(&target, convert::to_inserts(&name, &rows, dialect)),
-                "md" => std::fs::write(&target, convert::to_markdown(&rows)),
-                "xlsx" => return convert::write_xlsx(Path::new(&target), &rows).map(|_| target),
-                other => return Err(format!("no format {other}")),
+            let fail = |e: std::io::Error| format!("{target}: {e}");
+            if format == "xlsx" {
+                let text = std::fs::read_to_string(&source).map_err(|e| e.to_string())?;
+                let rows = convert::parse_csv(&text);
+                return convert::write_xlsx(Path::new(&target), &rows).map(|_| target);
             }
+            if !matches!(format.as_str(), "sql" | "md") {
+                return Err(format!("no format {format}"));
+            }
+            // The others are read and written a record at a time.
+            let input = std::fs::File::open(&source).map_err(|e| e.to_string())?;
+            let mut records = convert::csv_records(std::io::BufReader::new(input));
+            let mut out = std::io::BufWriter::new(std::fs::File::create(&target).map_err(fail)?);
+            match format.as_str() {
+                "sql" => convert::write_inserts(&mut out, &name, &mut records, dialect),
+                "md" => convert::write_markdown(&mut out, &mut records),
+                _ => Ok(()),
+            }
+            .and_then(|_| std::io::Write::flush(&mut out))
             .map(|_| target.clone())
-            .map_err(|e| format!("{target}: {e}"))
+            .map_err(fail)
         })
         .await
         .unwrap_or_else(|e| Err(e.to_string()));
@@ -2732,6 +2769,24 @@ impl State {
 mod tests {
     use super::protocol::Column;
     use super::*;
+
+    #[test]
+    fn a_downloaded_driver_is_current_only_for_its_version() {
+        let dialect = protocol::Dialect::Postgres;
+        let Some(path) = downloaded_driver_of(dialect) else {
+            return;
+        };
+        let mark = version_file_of(&path);
+        assert!(mark.to_string_lossy().ends_with(".version"));
+        // Without a mark, or with another version's, it is stale.
+        assert!(!is_current_download(&path, dialect, "0.0.0-test"));
+        // A driver of the user's own is never judged.
+        assert!(is_current_download(
+            Path::new("/somewhere/else"),
+            dialect,
+            "0.0.0-test"
+        ));
+    }
 
     fn filled() -> Dialog {
         let mut d = Dialog::new();

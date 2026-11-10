@@ -382,30 +382,33 @@ impl Engine for Session {
             (filter.replace("table_schema", "routine_schema")
                 + &only.replace("table_schema", "routine_schema"))
         ))?;
+        // Grouped by schema once, not searched for each schema.
+        let mut tables_of: std::collections::HashMap<String, Vec<Table>> =
+            std::collections::HashMap::new();
+        for t in &tables {
+            tables_of.entry(cell(t, 0)).or_default().push(Table {
+                name: cell(t, 1),
+                kind: if cell(t, 2).contains("VIEW") {
+                    Kind::View
+                } else {
+                    Kind::Table
+                },
+            });
+        }
+        let mut routines_of: std::collections::HashMap<String, Vec<Routine>> =
+            std::collections::HashMap::new();
+        for r in &routines {
+            routines_of.entry(cell(r, 0)).or_default().push(Routine {
+                name: cell(r, 1),
+                args: String::new(),
+                procedure: cell(r, 2) == "PROCEDURE",
+            });
+        }
         let schemas: Vec<Schema> = names
             .into_iter()
             .map(|name| Schema {
-                tables: tables
-                    .iter()
-                    .filter(|t| cell(t, 0) == name)
-                    .map(|t| Table {
-                        name: cell(t, 1),
-                        kind: if cell(t, 2).contains("VIEW") {
-                            Kind::View
-                        } else {
-                            Kind::Table
-                        },
-                    })
-                    .collect(),
-                routines: routines
-                    .iter()
-                    .filter(|r| cell(r, 0) == name)
-                    .map(|r| Routine {
-                        name: cell(r, 1),
-                        args: String::new(),
-                        procedure: cell(r, 2) == "PROCEDURE",
-                    })
-                    .collect(),
+                tables: tables_of.remove(&name).unwrap_or_default(),
+                routines: routines_of.remove(&name).unwrap_or_default(),
                 name,
                 ..Schema::default()
             })

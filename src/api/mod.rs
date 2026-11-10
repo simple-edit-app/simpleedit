@@ -12,7 +12,8 @@ pub mod store;
 pub mod testing;
 pub mod view;
 
-use std::collections::HashSet;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use iced::widget::text_editor;
@@ -94,7 +95,7 @@ pub enum Act {
     Send,
     Cancel,
     /// The answer to a request: the number of the sending, and what came.
-    Sent(u64, Box<Result<Response, String>>),
+    Sent(u64, Box<Result<Processed, String>>),
     Resp(RespSection),
     Pretty(bool),
     /// Moving or selecting in the answer (it cannot be typed in).
@@ -163,6 +164,8 @@ pub struct ApiTab {
     pub kept: Request,
     pub section: ReqSection,
     pub body_editor: text_editor::Content,
+    /// Whether the body is JSON, until it changes (`None`: not known yet).
+    body_valid: Cell<Option<bool>>,
     pub response: Option<ResponseView>,
     pub sending: bool,
     /// The number of the sending that counts: an older answer is dropped.
@@ -188,6 +191,8 @@ pub struct ResponseView {
     pub cut: bool,
     /// How the tests of the request went on this answer.
     pub outcomes: Vec<checks::Outcome>,
+    /// What `matches` found for the text searched, until the body changes.
+    match_cache: RefCell<Option<(String, usize)>>,
 }
 
 /// Most of a body that is put in the viewer.
@@ -195,30 +200,63 @@ pub const MAX_SHOWN: usize = 2 * 1024 * 1024;
 /// The size up to which a body is parsed to be laid out.
 const MAX_PRETTY: usize = 8 * MAX_SHOWN;
 
+/// An answer with everything that costs time already worked out: made off
+/// the interface thread, then turned into a `ResponseView` there.
+#[derive(Debug, Clone)]
+pub struct Processed {
+    pub response: Response,
+    kind: http::Kind,
+    pretty: Option<String>,
+    pub outcomes: Vec<checks::Outcome>,
+    /// The values to keep: the name of the variable, and the value or why
+    /// there is none.
+    pub kept: Vec<(String, Result<String, String>)>,
+}
+
+/// Parses the body once for everything: its kind, its layout, the tests and
+/// the values kept.
+pub fn process(
+    response: Response,
+    tests: &[model::Check],
+    extracts: &[model::Extract],
+    vars: &HashMap<String, String>,
+) -> Processed {
+    let kind = http::kind_of(response.header("content-type"), &response.body);
+    // A minified body is laid out even when it is long: a single line of
+    // megabytes freezes the viewer, and only the start of it is shown.
+    let pretty = if kind == http::Kind::Binary || response.body.len() > MAX_PRETTY {
+        None
+    } else {
+        http::pretty(kind, &response.text())
+    };
+    let json = if tests.iter().any(|c| c.enabled) || extracts.iter().any(|e| e.enabled) {
+        checks::parse(&response)
+    } else {
+        None
+    };
+    let outcomes = checks::evaluate_with(tests, &response, vars, &json);
+    let kept = checks::extract_with(extracts, &response, &json);
+    Processed {
+        response,
+        kind,
+        pretty,
+        outcomes,
+        kept,
+    }
+}
+
 impl ResponseView {
-    pub fn new(response: Response) -> ResponseView {
-        let kind = http::kind_of(response.header("content-type"), &response.body);
-        let text = if kind == http::Kind::Binary {
-            String::new()
-        } else {
-            response.text()
-        };
-        // A minified body is laid out even when it is long: a single line of
-        // megabytes freezes the viewer, and only the start of it is shown.
-        let pretty = if text.len() <= MAX_PRETTY {
-            http::pretty(kind, &text)
-        } else {
-            None
-        };
+    pub fn new(done: Processed) -> ResponseView {
         let mut view = ResponseView {
-            response,
-            kind,
-            show_pretty: pretty.is_some(),
-            pretty,
+            response: done.response,
+            kind: done.kind,
+            show_pretty: done.pretty.is_some(),
+            pretty: done.pretty,
             editor: text_editor::Content::new(),
             search: String::new(),
             cut: false,
-            outcomes: Vec::new(),
+            outcomes: done.outcomes,
+            match_cache: RefCell::new(None),
         };
         view.show();
         view
@@ -226,26 +264,24 @@ impl ResponseView {
 
     /// Puts the body, laid out or as it came, in the viewer.
     pub fn show(&mut self) {
-        let raw = if self.kind == http::Kind::Binary {
-            String::new()
-        } else {
-            self.response.text()
-        };
-        let shown = match (&self.pretty, self.show_pretty) {
-            (Some(pretty), true) => pretty.clone(),
-            _ => raw,
+        let raw;
+        let shown: &str = match (&self.pretty, self.show_pretty) {
+            (Some(pretty), true) => pretty,
+            _ if self.kind == http::Kind::Binary => "",
+            _ => {
+                // Only the start is shown: only the start is decoded.
+                let end = self.response.body.len().min(MAX_SHOWN + 4);
+                raw = String::from_utf8_lossy(&self.response.body[..end]).into_owned();
+                &raw
+            }
         };
         self.cut = shown.len() > MAX_SHOWN;
-        let shown = if self.cut {
-            let mut end = MAX_SHOWN;
-            while !shown.is_char_boundary(end) {
-                end -= 1;
-            }
-            shown[..end].to_string()
-        } else {
-            shown
-        };
-        self.editor = text_editor::Content::with_text(&shown);
+        let mut end = shown.len().min(MAX_SHOWN);
+        while !shown.is_char_boundary(end) {
+            end -= 1;
+        }
+        self.editor = text_editor::Content::with_text(&shown[..end]);
+        *self.match_cache.borrow_mut() = None;
     }
 
     /// How many times what is searched is in the body.
@@ -254,11 +290,19 @@ impl ResponseView {
         if needle.is_empty() {
             return 0;
         }
-        self.editor
+        if let Some((cached, count)) = &*self.match_cache.borrow() {
+            if *cached == needle {
+                return *count;
+            }
+        }
+        let count = self
+            .editor
             .text()
             .to_ascii_lowercase()
             .matches(&needle)
-            .count()
+            .count();
+        *self.match_cache.borrow_mut() = Some((needle, count));
+        count
     }
 }
 
@@ -271,6 +315,7 @@ impl ApiTab {
             origin,
             section: ReqSection::Params,
             body_editor: text_editor::Content::with_text(&body),
+            body_valid: Cell::new(None),
             response: None,
             sending: false,
             token: 0,
@@ -280,6 +325,21 @@ impl ApiTab {
             resp_section: RespSection::Body,
             save_target: None,
         }
+    }
+
+    /// The body is valid JSON (parsed once per change, not once per frame).
+    pub fn body_is_json(&self) -> bool {
+        if let Some(valid) = self.body_valid.get() {
+            return valid;
+        }
+        let valid = serde_json::from_str::<serde_json::Value>(&self.request.body.text).is_ok();
+        self.body_valid.set(Some(valid));
+        valid
+    }
+
+    /// The body was changed: what is known about it is not.
+    pub fn body_changed(&self) {
+        self.body_valid.set(None);
     }
 
     /// Something changed since the request was kept.

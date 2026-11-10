@@ -655,8 +655,9 @@ fn project_tree<'a>(
             let bookmarked = marked.contains(&path);
             let hide_ignored = projects.hide_ignored;
             let menu_path = path.clone();
-            let lbl = ProjectMenuLabels::new(bookmarked, hide_ignored);
             let with_menu = crate::pointer_area::context_menu(entry, move || {
+                // Built when the menu opens, not for every line of every view.
+                let lbl = ProjectMenuLabels::new(bookmarked, hide_ignored);
                 let item = |label: String, msg: Message| -> Element<'static, Message> {
                     button(text(label).size(13))
                         .padding([7, 10])

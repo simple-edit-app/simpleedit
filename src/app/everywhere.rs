@@ -609,24 +609,52 @@ impl SimpleEditApp {
         let (name, place) = ew::location(query);
         let name = name.trim();
         let excluded = &self.everywhere.excluded;
-        let mut scored: Vec<(i64, Row)> = self
+        let query = crate::finder::prepare_query(name);
+        // Only the scores and positions are kept: the rows are cloned for
+        // the best `limit` alone.
+        let mut scored: Vec<(i64, bool, usize)> = self
             .everywhere
             .files
             .iter()
-            .filter(|(p, _)| !excluded.contains(&file_type(p)))
-            .filter_map(|(p, shown)| {
-                crate::finder::score(name, shown)
-                    .map(|s| (s, Row::File(p.clone(), shown.clone(), place)))
+            .enumerate()
+            .filter(|(_, (p, _))| excluded.is_empty() || !excluded.contains(&file_type(p)))
+            .filter_map(|(i, (_, shown))| {
+                crate::finder::score_prepared(&query, shown).map(|s| (s, true, i))
             })
             .collect();
         if place.is_none() {
-            scored.extend(self.everywhere.dirs.iter().filter_map(|(p, shown)| {
-                crate::finder::score(name, shown.trim_end_matches('/'))
-                    .map(|s| (s, Row::Dir(p.clone(), shown.clone())))
-            }));
+            scored.extend(
+                self.everywhere
+                    .dirs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, (_, shown))| {
+                        crate::finder::score_prepared(&query, shown.trim_end_matches('/'))
+                            .map(|s| (s, false, i))
+                    }),
+            );
         }
-        scored.sort_by_key(|a| std::cmp::Reverse(a.0));
-        scored.into_iter().take(limit).map(|(_, r)| r).collect()
+        // Best first; the order of the list for equal scores (files first).
+        let best = |a: &(i64, bool, usize), b: &(i64, bool, usize)| {
+            b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2))
+        };
+        if scored.len() > limit {
+            scored.select_nth_unstable_by(limit, best);
+            scored.truncate(limit);
+        }
+        scored.sort_by(best);
+        scored
+            .into_iter()
+            .map(|(_, is_file, i)| {
+                if is_file {
+                    let (p, shown) = &self.everywhere.files[i];
+                    Row::File(p.clone(), shown.clone(), place)
+                } else {
+                    let (p, shown) = &self.everywhere.dirs[i];
+                    Row::Dir(p.clone(), shown.clone())
+                }
+            })
+            .collect()
     }
 
     /// The recently opened files (an empty query).

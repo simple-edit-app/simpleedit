@@ -24,32 +24,41 @@ pub struct Outcome {
 /// name.
 pub fn json_path(root: &Value, path: &str) -> Option<Value> {
     let path = path.trim().trim_start_matches('$').trim_start_matches('.');
-    let mut current = root.clone();
+    // Walked by reference: only the value found is copied.
+    let mut current = root;
     if path.is_empty() {
-        return Some(current);
+        return Some(current.clone());
     }
-    for part in path.split('.') {
+    let parts: Vec<&str> = path.split('.').collect();
+    for (n, part) in parts.iter().enumerate() {
         let (name, mut rest) = match part.find('[') {
             Some(at) => (&part[..at], &part[at..]),
-            None => (part, ""),
+            None => (*part, ""),
         };
         if !name.is_empty() {
-            current = match (&current, name) {
-                (Value::Object(map), _) if map.contains_key(name) => map[name].clone(),
-                (Value::Array(list), "length") => Value::from(list.len()),
-                (Value::String(text), "length") => Value::from(text.chars().count()),
-                (Value::Object(map), "length") => Value::from(map.len()),
+            let size = match (current, name) {
+                (Value::Object(map), _) if map.contains_key(name) => {
+                    current = &map[name];
+                    None
+                }
+                (Value::Array(list), "length") => Some(list.len()),
+                (Value::String(text), "length") => Some(text.chars().count()),
+                (Value::Object(map), "length") => Some(map.len()),
                 _ => return None,
             };
+            if let Some(size) = size {
+                // A size is a number: nothing follows it.
+                return (n + 1 == parts.len() && rest.is_empty()).then(|| Value::from(size));
+            }
         }
         while let Some(open) = rest.strip_prefix('[') {
             let close = open.find(']')?;
             let index: usize = open[..close].trim().parse().ok()?;
-            current = current.get(index)?.clone();
+            current = current.get(index)?;
             rest = &open[close + 1..];
         }
     }
-    Some(current)
+    Some(current.clone())
 }
 
 /// A value as a text: a string as it is, the rest as JSON.
@@ -110,13 +119,27 @@ pub fn evaluate(
     response: &Response,
     vars: &HashMap<String, String>,
 ) -> Vec<Outcome> {
-    let json: Option<Value> = serde_json::from_slice(&response.body).ok();
+    evaluate_with(checks, response, vars, &parse(response))
+}
+
+/// The body as JSON, parsed once for the tests and the values kept.
+pub fn parse(response: &Response) -> Option<Value> {
+    serde_json::from_slice(&response.body).ok()
+}
+
+/// `evaluate`, with the body already parsed.
+pub fn evaluate_with(
+    checks: &[Check],
+    response: &Response,
+    vars: &HashMap<String, String>,
+    json: &Option<Value>,
+) -> Vec<Outcome> {
     checks
         .iter()
         .filter(|c| c.enabled)
         .map(|check| {
             let expected = substitute(&check.expected, vars, &mut Vec::new());
-            let actual = actual_of(check, response, &json);
+            let actual = actual_of(check, response, json);
             let passed = holds(check.op, actual.as_deref(), &expected);
             let subject = match check.source {
                 CheckSource::Header | CheckSource::Json if !check.name.trim().is_empty() => {
@@ -145,7 +168,15 @@ pub fn evaluate(
 /// The values to keep: the name of the variable and the value, or why
 /// there is none.
 pub fn extract(extracts: &[Extract], response: &Response) -> Vec<(String, Result<String, String>)> {
-    let json: Option<Value> = serde_json::from_slice(&response.body).ok();
+    extract_with(extracts, response, &parse(response))
+}
+
+/// `extract`, with the body already parsed.
+pub fn extract_with(
+    extracts: &[Extract],
+    response: &Response,
+    json: &Option<Value>,
+) -> Vec<(String, Result<String, String>)> {
     extracts
         .iter()
         .filter(|e| e.enabled && !e.variable.trim().is_empty())
@@ -215,6 +246,7 @@ mod tests {
         assert_eq!(json_path(&v, "$.a.b[1].c"), Some(Value::from("x")));
         assert_eq!(json_path(&v, "a.b.length"), Some(Value::from(2)));
         assert_eq!(json_path(&v, "s.length"), Some(Value::from(3)));
+        assert_eq!(json_path(&v, "a.b.length.x"), None);
         assert_eq!(json_path(&v, "a.nope"), None);
         assert_eq!(json_path(&v, "a.b[5]"), None);
         assert!(json_path(&v, "").is_some());

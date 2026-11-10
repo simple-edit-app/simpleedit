@@ -186,11 +186,21 @@ fn walk(dir: &Path, exclude: &[String], found: &mut Vec<PathBuf>) {
 /// its letters in order, better when they are in the file's name, follow
 /// each other, or start words. `None`: they are not all there.
 pub fn score(query: &str, path: &str) -> Option<i64> {
-    let query: Vec<char> = query
+    score_prepared(&prepare_query(query), path)
+}
+
+/// The letters of a query, lowercased and without spaces, ready for
+/// `score_prepared` (so a list is ranked without redoing it per path).
+pub fn prepare_query(query: &str) -> Vec<char> {
+    query
         .chars()
         .filter(|c| !c.is_whitespace())
         .flat_map(char::to_lowercase)
-        .collect();
+        .collect()
+}
+
+/// `score` for a query made by `prepare_query`.
+pub fn score_prepared(query: &[char], path: &str) -> Option<i64> {
     if query.is_empty() {
         return Some(0);
     }
@@ -198,9 +208,9 @@ pub fn score(query: &str, path: &str) -> Option<i64> {
     let original: Vec<char> = path.chars().collect();
     if lower.len() != original.len() {
         // A character that lowercases to several: compare as is.
-        return score_chars(&query, &original, &original);
+        return score_chars(query, &original, &original);
     }
-    score_chars(&query, &lower, &original)
+    score_chars(query, &lower, &original)
 }
 
 fn score_chars(query: &[char], lower: &[char], original: &[char]) -> Option<i64> {
@@ -648,6 +658,8 @@ mod tests {
         assert_eq!(rank("", &paths, 2).len(), 2, "nothing typed: everything");
         // Upper case typed or not: the same.
         assert_eq!(score("APP", "src/app.rs"), score("app", "src/app.rs"));
+        let q = prepare_query(" A pp ");
+        assert_eq!(score_prepared(&q, "src/app.rs"), score("app", "src/app.rs"));
     }
 
     #[test]

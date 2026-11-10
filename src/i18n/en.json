@@ -14,6 +14,7 @@
   "menu.file_new": "New file",
   "menu.file_open": "Open…",
   "menu.file_save": "Save",
+  "menu.file_save_all": "Save all",
   "menu.file_save_as": "Save as…",
   "menu.file_close": "Close",
   "menu.file_close_others": "Close Other Tabs",

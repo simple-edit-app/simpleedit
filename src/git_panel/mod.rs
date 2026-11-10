@@ -65,6 +65,11 @@ pub struct Viewer {
     /// The id of this viewer's last request: a late answer for another file
     /// (or another viewer) is ignored.
     token: u64,
+    /// Bumped each time `diff` really changes: the syntax colors follow it,
+    /// not the request token (a quiet look that finds nothing new keeps them).
+    diff_rev: u64,
+    /// What drawing the diff needs that costs a walk through its text.
+    layout: diff_view::LayoutCache,
     /// Where its diff scrolls.
     pub scroll: iced::widget::Id,
     /// How many characters a side of the side-by-side view holds on a line,
@@ -193,6 +198,8 @@ impl Default for Viewer {
             land: None,
             silent: false,
             token: 0,
+            diff_rev: 0,
+            layout: std::cell::RefCell::new(None),
             scroll: iced::widget::Id::unique(),
             columns: std::cell::Cell::new(0),
             view_top: std::cell::Cell::new(0.0),
@@ -215,14 +222,18 @@ impl Viewer {
         let path = &self.current()?.change.path;
         let mut cache = self.syntax.borrow_mut();
         match &*cache {
-            Some((was_dark, token, spans)) if *was_dark == dark && *token == self.token => {
+            Some((was_dark, token, spans)) if *was_dark == dark && *token == self.diff_rev => {
                 return Some(spans.clone());
             }
             _ => {}
         }
         let spans = std::sync::Arc::new(diff_syntax::highlight(diff, path, dark));
-        *cache = Some((dark, self.token, spans.clone()));
+        *cache = Some((dark, self.diff_rev, spans.clone()));
         Some(spans)
+    }
+
+    pub fn diff_rev(&self) -> u64 {
+        self.diff_rev
     }
 
     pub fn options(&self) -> git::DiffOptions {
@@ -435,7 +446,11 @@ impl Viewer {
     /// so rows are not all as tall.
     fn row_top(&self, row: usize) -> f32 {
         match (self.side_by_side, self.file_diff()) {
-            (true, Some(diff)) => diff_view::side_top(diff, row, self.columns.get()),
+            (true, Some(diff)) => {
+                let layout =
+                    diff_view::layout(&self.layout, self.diff_rev, diff, self.columns.get(), true);
+                diff_view::side_top(&layout, row)
+            }
             _ => row as f32 * diff_view::ROW_HEIGHT,
         }
     }
@@ -551,12 +566,14 @@ impl Viewer {
                 return Task::none();
             }
             self.diff = Some(result);
+            self.diff_rev += 1;
             // What was picked may be other lines now.
             self.selection = None;
             self.change = self.change.min(self.changes().saturating_sub(1));
             return Task::none();
         }
         self.diff = Some(result);
+        self.diff_rev += 1;
         let count = self.changes();
         match self.land.take() {
             Some(Land::Last) => self.change = count.saturating_sub(1),
@@ -571,6 +588,7 @@ impl Viewer {
         self.entries = vec![entry];
         self.index = Some(0);
         self.diff = Some(Ok(diff));
+        self.diff_rev += 1;
         self.change = 0;
         self.selection = None;
         self.view_top.set(0.0);
@@ -668,6 +686,9 @@ pub struct Panel {
     /// The commit is of this file only (from its Git menu).
     pub only: Option<String>,
     pub busy: bool,
+    /// When the timer last asked for a status that has not come back yet:
+    /// a slow `git status` is not asked again on top of itself.
+    polling: Option<std::time::Instant>,
     pub branches: branches::State,
     /// How a pull and a merge are made (the Preferences, changed here too).
     pub pull_mode: git::PullMode,
@@ -705,6 +726,7 @@ impl Default for Panel {
             commit_options_shown: false,
             only: None,
             busy: false,
+            polling: None,
             branches: branches::State::default(),
             pull_mode: git::PullMode::default(),
             merge_mode: git::MergeMode::default(),
@@ -933,6 +955,9 @@ pub enum GitMsg {
     DialogOk,
     DialogCancel,
 }
+
+/// How long a status is waited for before the timer asks again.
+const POLL_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl GitMsg {
     /// An answer or a timer, not something the user did: it must not close
@@ -1211,6 +1236,12 @@ impl Panel {
                 if self.busy {
                     return Task::none();
                 }
+                // Still waiting for the last look (a big repository): wait
+                // too, unless it was lost long ago.
+                if self.polling.is_some_and(|at| at.elapsed() < POLL_PATIENCE) {
+                    return Task::none();
+                }
+                self.polling = Some(std::time::Instant::now());
                 self.look_again(ctx)
             }
             GitMsg::Refresh => self.look_again(ctx),
@@ -1227,6 +1258,7 @@ impl Panel {
             // Another repository's answer, late: not for this one.
             GitMsg::StatusLoaded(repo, _) if self.repo.as_ref() != Some(&repo) => Task::none(),
             GitMsg::StatusLoaded(_, result) => {
+                self.polling = None;
                 match result {
                     Ok(status) => {
                         if self.status.as_ref() != Some(&status) {
@@ -2166,6 +2198,20 @@ mod tests {
         let _ = viewer.refresh(Path::new("/no/such/repo"));
         let _ = viewer.loaded(token, Ok(diff(&["x", "y"])));
         assert_eq!(viewer.file_diff().unwrap().added(), 1);
+    }
+
+    #[test]
+    fn a_quiet_refresh_that_finds_nothing_new_keeps_the_diff_revision() {
+        let mut viewer = viewer_on(diff(&["one"]));
+        let rev = viewer.diff_rev();
+        let _ = viewer.refresh(Path::new("/no/such/repo"));
+        let token = viewer.token;
+        let _ = viewer.loaded(token, Ok(diff(&["one"])));
+        assert_eq!(viewer.diff_rev(), rev, "same diff, same colors");
+        let _ = viewer.refresh(Path::new("/no/such/repo"));
+        let token = viewer.token;
+        let _ = viewer.loaded(token, Ok(diff(&["one", "two"])));
+        assert_ne!(viewer.diff_rev(), rev);
     }
 
     #[test]

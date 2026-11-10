@@ -89,7 +89,17 @@ fn serve() {
 thread_local! {
     /// The commands run so far, for the log of the app.
     static LOG: RefCell<Vec<Executed>> = const { RefCell::new(Vec::new()) };
+    /// What `source_of` found for a query, so that paging, sorting and
+    /// refreshing one don't ask the catalog again (3 round trips each). Kept
+    /// while the session is; anything that may change a table empties it.
+    static SOURCES: RefCell<std::collections::HashMap<String, SourceInfo>> =
+        RefCell::new(std::collections::HashMap::new());
 }
+
+type SourceInfo = (Vec<String>, bool, Option<protocol::Source>);
+
+/// How many queries `SOURCES` remembers.
+const MAX_SOURCES: usize = 64;
 
 fn record(sql: &str, started: Instant, rows: Option<u64>, error: Option<String>) {
     log(sql, started, rows, error, false);
@@ -147,6 +157,24 @@ fn run(input: &str, slot: &mut Option<(String, Session)>, serving: bool) -> Resu
     };
     let key = serde_json::to_string(&(&request.target, database)).unwrap_or_default();
     let usable = matches!(slot, Some((k, s)) if *k == key && !s.client.is_closed());
+    // Only reading operations leave the tables as they were.
+    if !usable
+        || !matches!(
+            request.op.as_str(),
+            "rows"
+                | "export"
+                | "tree"
+                | "columns"
+                | "choices"
+                | "health"
+                | "structure"
+                | "definition"
+                | "test"
+                | "cancel"
+        )
+    {
+        SOURCES.with(|s| s.borrow_mut().clear());
+    }
     if !usable {
         // A transaction died with its session: opening another one would run
         // the next statement on its own, outside of what the user began.
@@ -296,6 +324,8 @@ struct Session {
     tunnel_port: Option<u16>,
     /// Whether the last statement left a transaction open.
     in_transaction: bool,
+    /// The connections the tree opened to the other databases of the server.
+    others: std::collections::HashMap<String, Session>,
 }
 
 impl Session {
@@ -378,6 +408,7 @@ impl Session {
             _tunnel: tunnel,
             tunnel_port,
             in_transaction: false,
+            others: std::collections::HashMap::new(),
         })
     }
 }
@@ -794,8 +825,16 @@ fn tree(session: &mut Session, request: &Request) -> Result<Value, String> {
         let schemas = if name == current {
             schemas_of(&mut session.client, scope, &filters, wanted.as_deref())?
         } else {
-            let mut other = Session::open_via(&request.target, &name, session.tunnel_port)?;
-            schemas_of(&mut other.client, scope, &filters, wanted.as_deref())?
+            // The connection to another database is kept for the next
+            // refresh, not opened again with its TLS handshake.
+            let kept = session.others.remove(&name);
+            let mut other = match kept.filter(|s| !s.client.is_closed()) {
+                Some(open) => open,
+                None => Session::open_via(&request.target, &name, session.tunnel_port)?,
+            };
+            let found = schemas_of(&mut other.client, scope, &filters, wanted.as_deref())?;
+            session.others.insert(name.clone(), other);
+            found
         };
         databases.push(Database {
             current: name == current,
@@ -872,14 +911,28 @@ fn schemas_of(
         &[],
     )
     .map_err(clean)?;
+    // The rows grouped by schema once, not searched for each schema.
+    let group = |rows: &[postgres::Row]| {
+        let mut by: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, r) in rows.iter().enumerate() {
+            by.entry(r.get::<_, String>(0)).or_default().push(i);
+        }
+        by
+    };
+    let (tables_by, routines_by) = (group(&tables), group(&routines));
+    let (sequences_by, types_by) = (group(&sequences), group(&types));
+    let none: Vec<usize> = Vec::new();
     Ok(schemas
         .iter()
         .map(|r| r.get::<_, String>(0))
         .filter(|name| wanted.is_none_or(|w| w.contains(name)))
         .map(|name| {
-            let mine = tables
+            let mine = tables_by
+                .get(&name)
+                .unwrap_or(&none)
                 .iter()
-                .filter(|t| t.get::<_, String>(0) == name)
+                .map(|&i| &tables[i])
                 .filter_map(|t| {
                     let kind = match t.get::<_, String>(2).as_str() {
                         "v" => Kind::View,
@@ -893,25 +946,32 @@ fn schemas_of(
                         .then_some(Table { name: table, kind })
                 })
                 .collect();
-            let in_schema = |rows: &[postgres::Row]| -> Vec<String> {
-                rows.iter()
-                    .filter(|r| r.get::<_, String>(0) == name)
-                    .map(|r| r.get::<_, String>(1))
+            let in_schema = |by: &std::collections::HashMap<String, Vec<usize>>,
+                             rows: &[postgres::Row]|
+             -> Vec<String> {
+                by.get(&name)
+                    .unwrap_or(&none)
+                    .iter()
+                    .map(|&i| rows[i].get::<_, String>(1))
                     .collect()
             };
             Schema {
                 tables: mine,
-                routines: routines
+                routines: routines_by
+                    .get(&name)
+                    .unwrap_or(&none)
                     .iter()
-                    .filter(|r| r.get::<_, String>(0) == name)
-                    .map(|r| protocol::Routine {
-                        name: r.get(1),
-                        args: r.get(2),
-                        procedure: r.get::<_, String>(3) == "p",
+                    .map(|&i| {
+                        let r = &routines[i];
+                        protocol::Routine {
+                            name: r.get(1),
+                            args: r.get(2),
+                            procedure: r.get::<_, String>(3) == "p",
+                        }
                     })
                     .collect(),
-                sequences: in_schema(&sequences),
-                types: in_schema(&types),
+                sequences: in_schema(&sequences_by, &sequences),
+                types: in_schema(&types_by, &types),
                 name,
             }
         })
@@ -1195,7 +1255,23 @@ fn result_rows(client: &mut Client, request: &Request) -> Result<Value, String> 
     let (primary_key, editable, source) = if request.target.read_only {
         (Vec::new(), false, None)
     } else {
-        source_of(client, statement.columns()).unwrap_or_default()
+        let known = SOURCES.with(|s| s.borrow().get(&sql).cloned());
+        match known {
+            Some(found) => found,
+            None => match source_of(client, statement.columns()) {
+                Some(found) => {
+                    SOURCES.with(|s| {
+                        let mut cache = s.borrow_mut();
+                        if cache.len() >= MAX_SOURCES {
+                            cache.clear();
+                        }
+                        cache.insert(sql.clone(), found.clone());
+                    });
+                    found
+                }
+                None => Default::default(),
+            },
+        }
     };
     Ok(json!({
         "columns": columns,

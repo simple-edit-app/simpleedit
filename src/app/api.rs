@@ -688,6 +688,7 @@ impl SimpleEditApp {
                 if edits {
                     let text = tab.body_editor.text();
                     tab.request.body.text = text.strip_suffix('\n').unwrap_or(&text).to_string();
+                    tab.body_changed();
                 }
             }
             Act::BodyFormat => {
@@ -696,6 +697,7 @@ impl SimpleEditApp {
                     if let Ok(laid) = serde_json::to_string_pretty(&value) {
                         tab.body_editor = text_editor::Content::with_text(&laid);
                         tab.request.body.text = laid;
+                        tab.body_changed();
                     }
                 }
             }
@@ -746,7 +748,20 @@ impl SimpleEditApp {
                 tab.notice = None;
                 let token = tab.token;
                 let target = path.clone();
-                let (task, handle) = Task::perform(http::send(resolved), move |result| {
+                // The body is read, laid out and tested off the interface
+                // thread: a big answer must not freeze it.
+                let checks = tab.request.checks.clone();
+                let extracts = tab.request.extracts.clone();
+                let vars = variables.clone();
+                let work = async move {
+                    let response = http::send(resolved).await?;
+                    tokio::task::spawn_blocking(move || {
+                        api::process(response, &checks, &extracts, &vars)
+                    })
+                    .await
+                    .map_err(|e| e.to_string())
+                };
+                let (task, handle) = Task::perform(work, move |result| {
                     Message::Api(ApiMsg::Tab(
                         target.clone(),
                         Act::Sent(token, Box::new(result)),
@@ -773,19 +788,16 @@ impl SimpleEditApp {
                 let request = tab.request.clone();
                 let mut kept: Vec<(String, Result<String, String>)> = Vec::new();
                 let entry = match *result {
-                    Ok(response) => {
+                    Ok(mut done) => {
                         let entry = HistoryEntry {
                             time: now(),
                             request,
-                            status: Some(response.status),
-                            ms: response.ms,
+                            status: Some(done.response.status),
+                            ms: done.response.ms,
                             error: None,
                         };
-                        let outcomes = checks::evaluate(&tab.request.checks, &response, &variables);
-                        kept = checks::extract(&tab.request.extracts, &response);
-                        let mut view = ResponseView::new(response);
-                        view.outcomes = outcomes;
-                        tab.response = Some(view);
+                        kept = std::mem::take(&mut done.kept);
+                        tab.response = Some(ResponseView::new(done));
                         tab.error = None;
                         tab.resp_section = api::RespSection::Body;
                         entry
@@ -1047,6 +1059,7 @@ impl SimpleEditApp {
                 self.api.save_collection(collection);
                 if let Some(tab) = self.api_tabs.get_mut(&path) {
                     tab.request = kept.clone();
+                    tab.body_changed();
                     tab.kept = kept;
                     tab.origin = Some((collection, id));
                 }

@@ -247,6 +247,7 @@ pub enum Message {
     /// The open file changed on disk and was read again.
     FileReloaded(Result<Loaded, String>),
     SaveFile,
+    SaveAll,
     SaveFileAs,
     /// The path picked in "Save as", with the tab it was started from.
     SaveAsChosen(Option<PathBuf>, Result<PathBuf, String>),
@@ -678,6 +679,8 @@ pub enum Message {
     PreviewTick,
     /// The window was resized (kept for the next start).
     WindowResized(f32, f32),
+    /// The window gained or lost the focus.
+    WindowFocus(bool),
     // Overlays
     CloseOverlay,
     OpenGotoLine,
@@ -900,6 +903,9 @@ pub struct SimpleEditApp {
     /// A save by itself is under way (it says nothing in the status bar).
     autosaving: bool,
     ticks: u32,
+    /// Whether the window has the focus: the periodic checks of the disk and
+    /// of Git wait while it has not.
+    window_focused: bool,
     /// The last right click on the editor was in the gutter.
     gutter_click: bool,
     /// The line of the gutter that was right-clicked (for the blame menu).
@@ -1187,6 +1193,7 @@ impl SimpleEditApp {
             last_edit: std::time::Instant::now(),
             autosaving: false,
             ticks: 0,
+            window_focused: true,
             gutter_click: false,
             gutter_line: None,
             revert: None,
@@ -1356,13 +1363,14 @@ impl SimpleEditApp {
                     | Message::TerminalTick
                     | Message::TaskScrolled(..)
                     | Message::WindowResized(..)
+                    | Message::WindowFocus(_)
                     | Message::Git(crate::git_panel::GitMsg::Pick(_))
                     | Message::DiffTab(DiffNav::Pick(_) | DiffNav::Scrolled(..))
             );
         let edits_text = !passive && !matches!(&message, Message::EditorAction(a) if !a.is_edit());
-        if edits_text {
-            self.text_rev += 1;
-        }
+        // The preview and the split copies follow the text only when it
+        // really changed (see below).
+        let stamp_before = self.buffer_stamp();
         if !passive {
             self.rev += 1;
         }
@@ -1402,6 +1410,9 @@ impl SimpleEditApp {
         } else {
             Task::batch([command, self.completion_prepare()])
         };
+        if edits_text && self.buffer_stamp() != stamp_before {
+            self.text_rev += 1;
+        }
         self.sync_split();
         let marks_task = self.after_message(edits_text, status_before, git_done);
         self.track_mru();
@@ -1504,6 +1515,10 @@ impl SimpleEditApp {
             }
             // The window is closed through the app so the session is saved.
             iced::Event::Window(iced::window::Event::CloseRequested) => Some(Message::Quit),
+            iced::Event::Window(iced::window::Event::Focused) => Some(Message::WindowFocus(true)),
+            iced::Event::Window(iced::window::Event::Unfocused) => {
+                Some(Message::WindowFocus(false))
+            }
             iced::Event::Window(iced::window::Event::Resized(size)) => {
                 Some(Message::WindowResized(size.width, size.height))
             }
@@ -2348,6 +2363,7 @@ impl SimpleEditApp {
                     | Message::TerminalTick
                     | Message::TaskScrolled(..)
                     | Message::WindowResized(..)
+                    | Message::WindowFocus(_)
             );
         if closes_menu || matches!(message, Message::ToggleMenu(_) | Message::HoverMenu(_)) {
             self.recents_open = false;
@@ -2557,6 +2573,19 @@ impl SimpleEditApp {
                     Some(_) => self.start_save_as(origin),
                     None => Task::none(),
                 }
+            }
+            Message::SaveAll => {
+                let mut tasks = Vec::new();
+                // The tab on screen goes through the usual save; a tab
+                // without a file waits for the user to name it.
+                let on_screen = self.current_file.as_ref().is_some_and(|p| {
+                    !is_untitled(p) && !is_virtual(p) && !self.api_tabs.contains_key(p)
+                });
+                if self.is_dirty && on_screen {
+                    tasks.push(self.handle(Message::SaveFile));
+                }
+                tasks.extend(self.save_cached_tabs());
+                Task::batch(tasks)
             }
             Message::SaveFileAs => self.start_save_as(self.current_file.clone()),
             Message::SaveAsChosen(origin, result) => match result {
@@ -4147,6 +4176,14 @@ impl SimpleEditApp {
                 }
                 Task::done(Message::Git(crate::git_panel::GitMsg::Refresh))
             }
+            Message::WindowFocus(focused) => {
+                self.window_focused = focused;
+                // What changed meanwhile is looked at right away.
+                if focused {
+                    return self.check_external_change();
+                }
+                Task::none()
+            }
             Message::WindowResized(width, height) => {
                 // Remembered, and written with the next autosave tick.
                 if (self.config.window_width, self.config.window_height) != (width, height) {
@@ -4530,13 +4567,21 @@ impl SimpleEditApp {
                 }
                 // The tree follows what happens on the disk, and its colors
                 // what Git says (now and then).
-                self.projects.refresh(false);
-                let states = if self.ticks.is_multiple_of(3) {
+                // Not while the window is in the background.
+                let watching = self.window_focused;
+                if watching && self.ticks.is_multiple_of(2) {
+                    self.projects.refresh(false);
+                }
+                let states = if watching && self.ticks.is_multiple_of(3) {
                     self.refresh_file_states()
                 } else {
                     Task::none()
                 };
-                let external = self.check_external_change();
+                let external = if watching {
+                    self.check_external_change()
+                } else {
+                    Task::none()
+                };
                 self.history_tick();
                 if self.ticks == 5 {
                     self.history_prune();
@@ -4551,7 +4596,8 @@ impl SimpleEditApp {
                 };
                 // With the Git panel closed, the status is still looked at now
                 // and then, to notice conflicts.
-                let probe = if !self.git.open
+                let probe = if watching
+                    && !self.git.open
                     && self.ticks.is_multiple_of(5)
                     && self.current_file.as_deref().is_some_and(|p| !is_virtual(p))
                 {
@@ -4561,7 +4607,8 @@ impl SimpleEditApp {
                 };
                 // What the remotes have is looked at now and then, in the background.
                 let minutes = u64::from(self.config.git_auto_fetch_minutes);
-                let fetch = if minutes > 0
+                let fetch = if watching
+                    && minutes > 0
                     && (self.ticks as u64).is_multiple_of(minutes * 60)
                     && self.git.repo.is_some()
                 {
@@ -4577,7 +4624,9 @@ impl SimpleEditApp {
                     fetch,
                     states,
                 ]);
-                if self.rev == self.session_rev {
+                // The session is built (on this thread) every third tick at
+                // most.
+                if self.rev == self.session_rev || !self.ticks.is_multiple_of(3) {
                     return external;
                 }
                 match self.session_write_job() {
@@ -6576,6 +6625,28 @@ impl SimpleEditApp {
 
     /// Writes the modified files that have a place on disk, a moment after
     /// the last edit (never over a file that changed under us).
+    /// Writes the tabs that hold their text aside and have unsaved changes
+    /// (a file changed on the disk meanwhile is left alone).
+    fn save_cached_tabs(&self) -> Vec<Task<Message>> {
+        let mut tasks = Vec::new();
+        for (path, entry) in &self.file_cache {
+            if entry.dirty
+                && !is_untitled(path)
+                && !self.large.contains_key(path)
+                && entry.stamp.is_some()
+                && DiskStamp::of(path) == entry.stamp
+            {
+                if let Some(content) = entry.text() {
+                    tasks.push(save_command(
+                        Some(path.clone()),
+                        save_file(path.clone(), content, entry.format),
+                    ));
+                }
+            }
+        }
+        tasks
+    }
+
     fn auto_save_files(&mut self) -> Task<Message> {
         if !self.config.auto_save
             || self.autosaving
@@ -6597,22 +6668,7 @@ impl SimpleEditApp {
                 ));
             }
         }
-        // The other tabs hold their text aside.
-        for (path, entry) in &self.file_cache {
-            if entry.dirty
-                && !is_untitled(path)
-                && !self.large.contains_key(path)
-                && entry.stamp.is_some()
-                && DiskStamp::of(path) == entry.stamp
-            {
-                if let Some(content) = entry.text() {
-                    tasks.push(save_command(
-                        Some(path.clone()),
-                        save_file(path.clone(), content, entry.format),
-                    ));
-                }
-            }
-        }
+        tasks.extend(self.save_cached_tabs());
         if tasks.is_empty() {
             return Task::none();
         }

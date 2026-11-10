@@ -692,6 +692,23 @@ pub fn substitute(text: &str, vars: &HashMap<String, String>, missing: &mut Vec<
     out
 }
 
+/// Notes the variables a text asks for that nobody defined, without
+/// building the filled text.
+fn note_missing(text: &str, vars: &HashMap<String, String>, missing: &mut Vec<String>) {
+    let mut rest = text;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            return;
+        };
+        let name = after[..end].trim();
+        if !vars.contains_key(name) && !name.is_empty() && !missing.iter().any(|m| m == name) {
+            missing.push(name.to_string());
+        }
+        rest = &after[end + 2..];
+    }
+}
+
 /// A text for an address: only what cannot be mistaken is left as it is.
 pub fn percent_encode(text: &str, plus_for_space: bool) -> String {
     let mut out = String::new();
@@ -768,6 +785,59 @@ pub fn with_query(url: &str, query: &[(String, String)]) -> String {
 impl Request {
     /// The request as it goes: variables filled in, parameters in the address,
     /// the sign-in and the type of the body in the headers.
+    /// What `resolve(vars).missing` gives, without copying the whole request
+    /// (it is asked for at every frame).
+    pub fn missing(&self, vars: &HashMap<String, String>) -> Vec<String> {
+        let mut missing = Vec::new();
+        let mut note = |text: &str| note_missing(text, vars, &mut missing);
+        note(self.url.trim());
+        for p in self
+            .params
+            .iter()
+            .filter(|p| p.enabled && !p.key.trim().is_empty())
+        {
+            note(p.key.trim());
+            note(&p.value);
+        }
+        for h in self
+            .headers
+            .iter()
+            .filter(|h| h.enabled && !h.key.trim().is_empty())
+        {
+            note(h.key.trim());
+            note(&h.value);
+        }
+        match self.auth.kind {
+            AuthKind::None => {}
+            AuthKind::Bearer => note(self.auth.token.trim()),
+            AuthKind::Basic => {
+                note(&self.auth.username);
+                note(&self.auth.password);
+            }
+            AuthKind::ApiKey => {
+                note(self.auth.key_name.trim());
+                note(&self.auth.key_value);
+            }
+        }
+        match self.body.kind {
+            BodyKind::None => {}
+            BodyKind::Json | BodyKind::Text => note(&self.body.text),
+            BodyKind::Form => {
+                for f in self
+                    .body
+                    .form
+                    .iter()
+                    .filter(|f| f.enabled && !f.key.trim().is_empty())
+                {
+                    note(f.key.trim());
+                    note(&f.value);
+                }
+            }
+            BodyKind::File => note(self.body.file.trim()),
+        }
+        missing
+    }
+
     pub fn resolve(&self, vars: &HashMap<String, String>) -> Resolved {
         let mut missing = Vec::new();
         let mut sub = |text: &str| substitute(text, vars, &mut missing);
@@ -1163,6 +1233,20 @@ mod tests {
             ],
         };
         assert_eq!(env.values(), vars(&[("host", "a")]));
+    }
+
+    #[test]
+    fn the_missing_variables_are_the_same_without_filling_in_the_request() {
+        let mut r = Request::new("x");
+        r.url = "{{host}}/a?b={{one}}".into();
+        r.headers.push(Pair::new("{{hk}}", "{{two}}"));
+        r.auth.kind = AuthKind::Bearer;
+        r.auth.token = "{{tok}}".into();
+        r.body.kind = BodyKind::Json;
+        r.body.text = "{\"a\": \"{{three}} {{ one }} {{host}} {{\"}".into();
+        let v = vars(&[("host", "h")]);
+        assert_eq!(r.missing(&v), r.resolve(&v).missing);
+        assert_eq!(r.missing(&v), vec!["one", "hk", "two", "tok", "three"]);
     }
 
     #[test]

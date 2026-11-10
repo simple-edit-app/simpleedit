@@ -240,9 +240,58 @@ fn side_heights(diff: &FileDiff, columns: usize) -> Vec<usize> {
         .collect()
 }
 
+/// What a diff's drawing needs that costs a walk through all its text.
+pub struct DiffLayout {
+    /// The height of each row of the side-by-side view (empty in the other).
+    pub heights: Vec<usize>,
+    /// The longest line of the one-column view, in cells.
+    pub longest: usize,
+}
+
+/// The cache of a [`Layout`]: for one diff (its revision) and one width.
+pub type LayoutCache = std::cell::RefCell<Option<(u64, usize, bool, std::sync::Arc<DiffLayout>)>>;
+
+/// The layout of a diff, made again only when the diff, the width or the
+/// view changed (not at each frame).
+pub fn layout(
+    cache: &LayoutCache,
+    rev: u64,
+    diff: &FileDiff,
+    columns: usize,
+    side_by_side: bool,
+) -> std::sync::Arc<DiffLayout> {
+    if let Some((r, c, s, layout)) = &*cache.borrow() {
+        if (*r, *c, *s) == (rev, columns, side_by_side) {
+            return layout.clone();
+        }
+    }
+    let layout = std::sync::Arc::new(if side_by_side {
+        DiffLayout {
+            heights: side_heights(diff, columns),
+            longest: 0,
+        }
+    } else {
+        let longest = diff
+            .rows()
+            .iter()
+            .filter_map(|r| match r {
+                Row::Line(line) => Some(expand(&line.text).chars().count()),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        DiffLayout {
+            heights: Vec::new(),
+            longest,
+        }
+    });
+    *cache.borrow_mut() = Some((rev, columns, side_by_side, layout.clone()));
+    layout
+}
+
 /// Where a row of the side-by-side view starts, from the top.
-pub fn side_top(diff: &FileDiff, row: usize, columns: usize) -> f32 {
-    side_heights(diff, columns).iter().take(row).sum::<usize>() as f32 * ROW_HEIGHT
+pub fn side_top(layout: &DiffLayout, row: usize) -> f32 {
+    layout.heights.iter().take(row).sum::<usize>() as f32 * ROW_HEIGHT
 }
 
 fn cell<'a>(
@@ -537,6 +586,7 @@ struct Body<'a> {
     stage: Option<StageButton>,
     /// The syntax colors of the lines.
     syntax: Option<std::sync::Arc<diff_syntax::Spans>>,
+    layout: std::sync::Arc<DiffLayout>,
     /// Characters per line of a side (side by side).
     columns: usize,
     select: Sel,
@@ -586,6 +636,7 @@ fn body<'a>(args: Body<'a>) -> Element<'a, Message> {
         rollback,
         stage,
         syntax,
+        layout,
         columns,
         select,
         top,
@@ -596,7 +647,6 @@ fn body<'a>(args: Body<'a>) -> Element<'a, Message> {
     let c = colors(dark);
     let p = se_theme::palette(dark);
     let mut rows: Vec<Element<'a, Message>> = Vec::new();
-    let mut longest = 0usize;
     // In front of each row: the buttons of the block it opens (stage, roll back).
     let column_w = arrows_w(rollback.is_some(), stage.is_some());
     let small = |label: &'static str, tip: String, msg: Message| -> Element<'a, Message> {
@@ -668,7 +718,7 @@ fn body<'a>(args: Body<'a>) -> Element<'a, Message> {
     let truncated = if side_by_side {
         let side = diff.side_rows();
         let blocks = diff.side_row_blocks();
-        let heights = side_heights(diff, columns);
+        let heights = &layout.heights;
         let pixels: Vec<f32> = heights
             .iter()
             .take(MAX_ROWS)
@@ -800,12 +850,7 @@ fn body<'a>(args: Body<'a>) -> Element<'a, Message> {
     } else {
         let flat = diff.rows();
         let blocks = diff.row_blocks();
-        for row_ in &flat {
-            if let Row::Line(line) = row_ {
-                longest = longest.max(expand(&line.text).chars().count());
-            }
-        }
-        let width = NUMBER_W * 2.0 + 16.0 + longest.max(40) as f32 * CHAR_W + 24.0;
+        let width = NUMBER_W * 2.0 + 16.0 + layout.longest.max(40) as f32 * CHAR_W + 24.0;
         let partners = partners(&flat);
         let pixels = vec![ROW_HEIGHT; flat.len().min(MAX_ROWS)];
         let (first, last, before, after) = visible(&pixels, top, height);
@@ -1139,7 +1184,10 @@ pub fn view<'a>(viewer: &'a Viewer, nav: &Nav, dark: bool, empty: String) -> Ele
                 .filter(|_| !viewer.ignore_blanks)
                 .map(|undo| (nav.stage_block, undo));
             let syntax = viewer.syntax_spans(dark);
+            let layout_cache = &viewer.layout;
+            let rev = viewer.diff_rev();
             let args = Body {
+                layout: layout(layout_cache, rev, diff, 0, false),
                 diff,
                 current: viewer.change,
                 side_by_side: viewer.side_by_side,
@@ -1162,6 +1210,7 @@ pub fn view<'a>(viewer: &'a Viewer, nav: &Nav, dark: bool, empty: String) -> Ele
                         columns_for(size.width, arrows_w(rollback.is_some(), stage.is_some()));
                     columns.set(cols);
                     body(Body {
+                        layout: layout(layout_cache, rev, diff, cols, true),
                         columns: cols,
                         ..args.clone()
                     })
@@ -1182,8 +1231,9 @@ pub fn view<'a>(viewer: &'a Viewer, nav: &Nav, dark: bool, empty: String) -> Ele
         let can_copy = viewer.has_selection();
         let (copy, select_all) = (nav.copy.clone(), nav.select_all.clone());
         // Stage (or unstage) the changed lines picked.
-        let stage_lines = viewer
-            .index_patch(None)
+        let stage_lines = Some(viewer)
+            .filter(|v| v.has_selection())
+            .and_then(|v| v.index_patch(None))
             .map(|(_, undo)| (undo, nav.stage_selection.clone()));
         let key = |letter: &str| {
             if cfg!(target_os = "macos") {
@@ -1307,10 +1357,14 @@ mod tests {
         // The hunk header, the context line, then the changed pair.
         assert_eq!(heights, vec![1, 1, 4]);
         // Rows below start after the wrapped ones.
-        assert_eq!(side_top(&diff, 2, 50), 2.0 * ROW_HEIGHT);
-        assert_eq!(side_top(&diff, 3, 50), 6.0 * ROW_HEIGHT);
+        let layout = |columns| DiffLayout {
+            heights: side_heights(&diff, columns),
+            longest: 0,
+        };
+        assert_eq!(side_top(&layout(50), 2), 2.0 * ROW_HEIGHT);
+        assert_eq!(side_top(&layout(50), 3), 6.0 * ROW_HEIGHT);
         // Without a known width, one line per row.
-        assert_eq!(side_top(&diff, 3, 0), 3.0 * ROW_HEIGHT);
+        assert_eq!(side_top(&layout(0), 3), 3.0 * ROW_HEIGHT);
     }
 
     fn viewer_on(text: &str, side_by_side: bool) -> Viewer {

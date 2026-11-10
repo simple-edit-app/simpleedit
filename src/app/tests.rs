@@ -1637,6 +1637,18 @@ mod behavior_tests {
     }
 
     #[test]
+    fn the_text_revision_moves_with_the_text_only() {
+        let mut app = app_with_autosave_off();
+        let before = app.text_rev;
+        let _ = app.update(Message::OpenGotoLine);
+        assert_eq!(app.text_rev, before, "a click is not an edit");
+        let _ = app.update(Message::EditorAction(text_editor::Action::Edit(
+            text_editor::Edit::Insert('x'),
+        )));
+        assert!(app.text_rev > before, "typing is");
+    }
+
+    #[test]
     fn a_modified_file_is_saved_by_itself_after_a_pause() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = app();
@@ -3066,6 +3078,21 @@ mod behavior_tests {
         }
     }
 
+    /// An answer as the sending hands it over, its tests done.
+    fn api_done(
+        app: &SimpleEditApp,
+        path: &std::path::Path,
+        response: crate::api::http::Response,
+    ) -> Result<crate::api::Processed, String> {
+        let request = &app.api_tabs[path].request;
+        Ok(crate::api::process(
+            response,
+            &request.checks,
+            &request.extracts,
+            &app.api.variables(),
+        ))
+    }
+
     #[test]
     fn the_tests_of_a_request_run_on_the_answer_and_its_values_are_kept() {
         use crate::api::model::{CheckOp, CheckSource, Environment, ExtractSource};
@@ -3099,16 +3126,12 @@ mod behavior_tests {
         act(&mut app, Act::ExtractPath(1, "Content-Type".into()));
         act(&mut app, Act::Send);
         let token = app.api_tabs[&path].token;
-        act(
-            &mut app,
-            Act::Sent(
-                token,
-                Box::new(Ok(api_answer(
-                    200,
-                    r#"{"data": {"token": "abc", "name": "ann"}}"#,
-                ))),
-            ),
+        let done = api_done(
+            &app,
+            &path,
+            api_answer(200, r#"{"data": {"token": "abc", "name": "ann"}}"#),
         );
+        act(&mut app, Act::Sent(token, Box::new(done)));
         // The default check (status 200) passes, the one on the name fails.
         let view = app.api_tabs[&path].response.as_ref().unwrap();
         let passed: Vec<bool> = view.outcomes.iter().map(|o| o.passed).collect();
@@ -3132,13 +3155,12 @@ mod behavior_tests {
         app.api.active_env = None;
         act(&mut app, Act::Send);
         let token = app.api_tabs[&path].token;
-        act(
-            &mut app,
-            Act::Sent(
-                token,
-                Box::new(Ok(api_answer(200, r#"{"data": {"token": "xyz"}}"#))),
-            ),
+        let done = api_done(
+            &app,
+            &path,
+            api_answer(200, r#"{"data": {"token": "xyz"}}"#),
         );
+        act(&mut app, Act::Sent(token, Box::new(done)));
         assert!(app.api_tabs[&path]
             .notice
             .as_deref()
@@ -3200,15 +3222,11 @@ mod behavior_tests {
         act(&mut app, Act::Send);
         assert_eq!(app.api_tabs[&path].token, token);
         // An answer of an older sending is dropped.
-        act(
-            &mut app,
-            Act::Sent(token + 7, Box::new(Ok(api_answer(500, "old")))),
-        );
+        let done = api_done(&app, &path, api_answer(500, "old"));
+        act(&mut app, Act::Sent(token + 7, Box::new(done)));
         assert!(app.api_tabs[&path].sending);
-        act(
-            &mut app,
-            Act::Sent(token, Box::new(Ok(api_answer(200, "{\"a\":1}")))),
-        );
+        let done = api_done(&app, &path, api_answer(200, "{\"a\":1}"));
+        act(&mut app, Act::Sent(token, Box::new(done)));
         let tab = &app.api_tabs[&path];
         assert!(!tab.sending && tab.error.is_none());
         let view = tab.response.as_ref().unwrap();
@@ -3245,10 +3263,8 @@ mod behavior_tests {
         let token = app.api_tabs[&path].token;
         act(&mut app, Act::Cancel);
         assert!(!app.api_tabs[&path].sending);
-        act(
-            &mut app,
-            Act::Sent(token, Box::new(Ok(api_answer(200, "late")))),
-        );
+        let done = api_done(&app, &path, api_answer(200, "late"));
+        act(&mut app, Act::Sent(token, Box::new(done)));
         assert!(app.api_tabs[&path].response.is_none());
         // Closing the tab forgets it.
         let _ = app.close_path(path.clone());

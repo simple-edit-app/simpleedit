@@ -111,7 +111,7 @@ fn mark(id: u64, kind: &str, on: bool) {
     }
 }
 
-fn is_unreadable(id: u64, kind: &str) -> bool {
+pub(crate) fn is_unreadable(id: u64, kind: &str) -> bool {
     unreadable()
         .lock()
         .is_ok_and(|set| set.contains(&account(id, kind)))

@@ -20,6 +20,7 @@ pub enum PaletteCommand {
     Complete,
     ParameterInfo,
     SaveFile,
+    SaveAll,
     SaveFileAs,
     CloseFile,
     CloseOtherTabs,
@@ -198,6 +199,7 @@ impl PaletteCommand {
             PaletteCommand::ToggleTerminal => Message::ToggleTerminal,
             PaletteCommand::ToggleGit => Message::ToggleGit,
             PaletteCommand::SaveFile => Message::SaveFile,
+            PaletteCommand::SaveAll => Message::SaveAll,
             PaletteCommand::SaveFileAs => Message::SaveFileAs,
             PaletteCommand::CloseFile => Message::CloseFile,
             PaletteCommand::CloseOtherTabs => Message::CloseOtherTabs,
@@ -427,6 +429,12 @@ pub fn entries(config: &Config, has_formatter: bool, language_enabled: bool) -> 
             PaletteCommand::SaveFile,
             t!("menu.file_save").to_string(),
             Some(sh.save_file.display()),
+            true,
+        ),
+        entry(
+            PaletteCommand::SaveAll,
+            t!("menu.file_save_all").to_string(),
+            None,
             true,
         ),
         entry(
