@@ -642,6 +642,7 @@ mod tests {
             has_more: false,
             primary_key: vec!["id".into()],
             ctids: Vec::new(),
+            truncated: Vec::new(),
             editable: true,
             source: None,
             offset: 0,

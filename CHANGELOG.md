@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.26.0] - 2026-11-11
+
+### Added
+- Files: the project tree, the Git marks and the open file follow the disk through a file watcher instead of being polled; deleted files go to the system trash; a closed untitled tab with text can be reopened (Ctrl+Shift+T); a file deleted behind an open tab is said when the tab is shown.
+- Editor: Backspace takes the auto-closed pair, a closing bracket typed on its own line steps back one indentation, the other places of the word under the cursor are marked, Ctrl+Space lists the words of the file (and the user's snippets, written in the config file) without a language server, Alt+Delete leaves a match out of "Replace all" and every line has a box for it, undo brings the other cursors back.
+- Language servers: names of the file (command palette), go to type and implementations, organize imports, formatting of a selection, a valid answer to `workspace/applyEdit`.
+- Terminal: the mouse reaches the programs that ask for it, cursor position and terminal queries are answered, Cmd/Ctrl+click opens `file:line`, search in the history.
+- Git: sign-in dialog for pushes and pulls, clone, the reflog in the log, `git clean` with a preview, submodules and worktrees, "staged only" stash, the verification of a commit's signature.
+- Databases: table designer, import, backup and restore, emptying and dropping for MySQL and SQLite; query parameters (`:name`, `?`) in the console; "Filter by this value" and hidden columns in the grid; Stop while a page loads; SQLite stops a query that runs past its time limit; confirmation of the key of an unknown SSH server.
+- API: multipart bodies (also in curl and Postman), cookies kept between requests, stopping a collection run, a Network page in the Preferences (certificate authorities, client certificate, proxy).
+- Tasks: the errors and warnings of the output become problems of their files.
+
+### Changed
+- The SSH tunnel of a data source no longer accepts a host it does not know without asking.
+- Language servers are installed with pinned versions and without install scripts.
+- The database drivers are built apart from the editor (`--no-default-features` builds the editor alone); the API client trusts the system's certificate authorities.
+- Many lists and views do less work: only the lines and columns in view are built, the session is written in the background, the PostgreSQL driver asks about transactions only when needed.
+
 ## [1.25.0] - 2026-11-09
 
 ### Added

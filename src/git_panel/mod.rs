@@ -915,6 +915,7 @@ pub enum GitMsg {
     StashDrop(usize),
     StashMessage(String),
     StashKeepIndex(bool),
+    StashStaged(bool),
     StashBranchName(String),
     StashBranch(usize),
     StashPush,
@@ -923,15 +924,12 @@ pub enum GitMsg {
     BranchClicked(String),
     ToggleGroup(String),
     BranchFilter(String),
-    LogLoaded(
-        u64,
-        String,
-        Result<(Vec<git::graph::Commit>, std::collections::HashSet<String>), String>,
-    ),
+    LogLoaded(u64, String, Result<log::LogAnswer, String>),
     SelectCommit(usize),
     SelectForMenu(usize),
     CommitFilesLoaded(String, Result<Vec<Change>, String>),
     CommitInfoLoaded(String, Result<(String, Vec<String>), String>),
+    CommitSignature(String, Option<String>),
     LoadMoreCommits,
     Checkout(String),
     BranchDiff(String),
@@ -984,6 +982,7 @@ impl GitMsg {
                 | GitMsg::LogLoaded(..)
                 | GitMsg::CommitFilesLoaded(..)
                 | GitMsg::CommitInfoLoaded(..)
+                | GitMsg::CommitSignature(..)
                 | GitMsg::RewriteReady(..)
                 | GitMsg::GuardReady(..)
                 | GitMsg::Done(_)
@@ -2048,6 +2047,10 @@ impl Panel {
                 self.stash.keep_index = on;
                 Task::none()
             }
+            GitMsg::StashStaged(on) => {
+                self.stash.staged = on;
+                Task::none()
+            }
             GitMsg::StashBranchName(text) => {
                 self.typing = true;
                 self.stash.branch = text;
@@ -2072,6 +2075,10 @@ impl Panel {
             GitMsg::SelectCommit(index) => self.select_commit(index, ctx.ctrl, ctx.shift),
             GitMsg::SelectForMenu(index) => self.select_for_menu(index),
             GitMsg::CommitFilesLoaded(sha, result) => self.commit_files_loaded(sha, result),
+            GitMsg::CommitSignature(sha, signature) => {
+                self.commit_signature(sha, signature);
+                Task::none()
+            }
             GitMsg::CommitInfoLoaded(sha, result) => {
                 self.commit_info_loaded(sha, result);
                 Task::none()

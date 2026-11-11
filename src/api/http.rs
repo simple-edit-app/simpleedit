@@ -59,6 +59,60 @@ pub fn parse_cookie(line: &str) -> Option<Cookie> {
     })
 }
 
+/// What the client trusts and goes through, from the preferences.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Network {
+    pub ca_file: String,
+    pub client_cert: String,
+    pub proxy: String,
+}
+
+static NETWORK: std::sync::RwLock<Network> = std::sync::RwLock::new(Network {
+    ca_file: String::new(),
+    client_cert: String::new(),
+    proxy: String::new(),
+});
+
+pub fn set_network(network: Network) {
+    if let Ok(mut current) = NETWORK.write() {
+        *current = network;
+    }
+}
+
+/// The client builder with the certificates and the proxy of the preferences.
+fn with_network(builder: reqwest::ClientBuilder) -> Result<reqwest::ClientBuilder, String> {
+    let network = NETWORK.read().map(|n| n.clone()).unwrap_or_default();
+    apply_network(builder, &network)
+}
+
+fn apply_network(
+    mut builder: reqwest::ClientBuilder,
+    network: &Network,
+) -> Result<reqwest::ClientBuilder, String> {
+    if !network.ca_file.trim().is_empty() {
+        let pem = std::fs::read(network.ca_file.trim())
+            .map_err(|e| format!("{}: {e}", network.ca_file.trim()))?;
+        let certs = reqwest::Certificate::from_pem_bundle(&pem).map_err(|e| e.to_string())?;
+        if certs.is_empty() {
+            return Err(format!("{}: no certificate in it", network.ca_file.trim()));
+        }
+        for cert in certs {
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+    if !network.client_cert.trim().is_empty() {
+        let pem = std::fs::read(network.client_cert.trim())
+            .map_err(|e| format!("{}: {e}", network.client_cert.trim()))?;
+        let identity = reqwest::Identity::from_pem(&pem).map_err(|e| e.to_string())?;
+        builder = builder.identity(identity);
+    }
+    if !network.proxy.trim().is_empty() {
+        let proxy = reqwest::Proxy::all(network.proxy.trim()).map_err(|e| e.to_string())?;
+        builder = builder.proxy(proxy);
+    }
+    Ok(builder)
+}
+
 /// Sends a request and waits for the whole answer.
 pub async fn send(request: Resolved) -> Result<Response, String> {
     let url = request.url.trim();
@@ -79,7 +133,7 @@ pub async fn send(request: Resolved) -> Result<Response, String> {
     if request.settings.timeout_secs > 0 {
         client = client.timeout(Duration::from_secs(request.settings.timeout_secs));
     }
-    let client = client.build().map_err(|e| e.to_string())?;
+    let client = with_network(client)?.build().map_err(|e| e.to_string())?;
     let mut method = reqwest::Method::from_bytes(request.method.as_str().as_bytes())
         .map_err(|e| e.to_string())?;
     let mut headers_out: Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)> =
@@ -91,9 +145,14 @@ pub async fn send(request: Resolved) -> Result<Response, String> {
             .map_err(|_| t!("api.err_header_value", name = shown).to_string())?;
         headers_out.push((name, value));
     }
+    let mut parts: Option<Vec<MultipartField>> = None;
     let mut body: Option<Vec<u8>> = match request.body {
         ResolvedBody::None => None,
         ResolvedBody::Bytes(bytes) => Some(bytes),
+        ResolvedBody::Multipart(fields) => {
+            parts = Some(read_multipart(fields).await?);
+            None
+        }
         ResolvedBody::File(path) if path.trim().is_empty() => {
             return Err(t!("api.err_file_not_chosen").to_string());
         }
@@ -111,14 +170,27 @@ pub async fn send(request: Resolved) -> Result<Response, String> {
         for (name, value) in &headers_out {
             builder = builder.header(name.clone(), value.clone());
         }
+        // The cookies the server gave before (a sign-in, then a call).
+        if !headers_out
+            .iter()
+            .any(|(n, _)| n == reqwest::header::COOKIE)
+        {
+            if let Some(line) = jar_header(&target) {
+                builder = builder.header(reqwest::header::COOKIE, line);
+            }
+        }
         if let Some(bytes) = &body {
             builder = builder.body(bytes.clone());
+        }
+        if let Some(fields) = &parts {
+            builder = builder.multipart(multipart_form(fields));
         }
         let response = builder
             .send()
             .await
             .map_err(|e| explain(&e, &request.settings))?;
         let status = response.status();
+        remember_cookies(&target, response.headers());
         let next = response
             .headers()
             .get(reqwest::header::LOCATION)
@@ -143,12 +215,14 @@ pub async fn send(request: Resolved) -> Result<Response, String> {
                 method = reqwest::Method::GET;
             }
             body = None;
+            parts = None;
             headers_out.retain(|(n, _)| !n.as_str().starts_with("content-"));
         }
         if !same_origin(&target, &next) {
             headers_out.retain(|(n, _)| safe_across_sites(n.as_str()));
-            if body.is_some() && !matches!(status.as_u16(), 307 | 308) {
+            if (body.is_some() || parts.is_some()) && !matches!(status.as_u16(), 307 | 308) {
                 body = None;
+                parts = None;
             }
         }
         target = next;
@@ -193,6 +267,143 @@ pub async fn send(request: Resolved) -> Result<Response, String> {
         ms: started.elapsed().as_millis() as u64,
         url: final_url,
     })
+}
+
+/// A cookie the servers set, kept for the host that set it.
+#[derive(Debug, Clone, PartialEq)]
+struct Stored {
+    name: String,
+    value: String,
+    path: String,
+    secure: bool,
+}
+
+/// The cookies of the session, by host (not shared with other hosts, not
+/// kept once the app is closed).
+fn jar() -> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<Stored>>> {
+    static JAR: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<String, Vec<Stored>>>,
+    > = std::sync::LazyLock::new(Default::default);
+    &JAR
+}
+
+/// Whose cookies they are: the host and the port (two local servers on
+/// different ports do not share a sign-in).
+fn jar_key(url: &reqwest::Url) -> Option<String> {
+    Some(format!(
+        "{}:{}",
+        url.host_str()?.to_ascii_lowercase(),
+        url.port_or_known_default()?
+    ))
+}
+
+/// The `Cookie` header for a request to `url`, if the jar has some for it.
+fn jar_header(url: &reqwest::Url) -> Option<String> {
+    let host = jar_key(url)?;
+    let jar = jar().lock().ok()?;
+    let line: Vec<String> = jar
+        .get(&host)?
+        .iter()
+        .filter(|c| (!c.secure || url.scheme() == "https") && url.path().starts_with(&c.path))
+        .map(|c| format!("{}={}", c.name, c.value))
+        .collect();
+    (!line.is_empty()).then(|| line.join("; "))
+}
+
+/// Keeps the `Set-Cookie` of an answer; `Max-Age=0` forgets the cookie.
+fn remember_cookies(url: &reqwest::Url, headers: &reqwest::header::HeaderMap) {
+    let Some(host) = jar_key(url) else {
+        return;
+    };
+    let Ok(mut jar) = jar().lock() else {
+        return;
+    };
+    for value in headers.get_all(reqwest::header::SET_COOKIE) {
+        let text = String::from_utf8_lossy(value.as_bytes()).into_owned();
+        let Some(cookie) = parse_cookie(&text) else {
+            continue;
+        };
+        let mut path = "/".to_string();
+        let mut secure = false;
+        let mut gone = false;
+        for attribute in cookie.attributes.split(';') {
+            let (key, v) = attribute.split_once('=').unwrap_or((attribute, ""));
+            match key.trim().to_ascii_lowercase().as_str() {
+                "path" if v.trim().starts_with('/') => path = v.trim().to_string(),
+                "secure" => secure = true,
+                "max-age" => gone |= v.trim().parse::<i64>().is_ok_and(|n| n <= 0),
+                _ => {}
+            }
+        }
+        let list = jar.entry(host.clone()).or_default();
+        list.retain(|c| !(c.name == cookie.name && c.path == path));
+        if !gone {
+            list.push(Stored {
+                name: cookie.name,
+                value: cookie.value,
+                path,
+                secure,
+            });
+        }
+    }
+}
+
+/// A field of a multipart body, its file (if it is one) already read.
+struct MultipartField {
+    name: String,
+    value: Vec<u8>,
+    file_name: Option<String>,
+}
+
+/// Reads the files of a multipart body: a value that starts with `@` is the
+/// path of one.
+async fn read_multipart(fields: Vec<(String, String)>) -> Result<Vec<MultipartField>, String> {
+    let mut out = Vec::new();
+    for (name, value) in fields {
+        match value.strip_prefix('@') {
+            Some(path) if path.trim().is_empty() => {
+                return Err(t!("api.err_file_not_chosen").to_string());
+            }
+            Some(path) => {
+                let bytes = tokio::fs::read(path)
+                    .await
+                    .map_err(|e| format!("{path}: {e}"))?;
+                let file_name = std::path::Path::new(path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "file".into());
+                out.push(MultipartField {
+                    name,
+                    value: bytes,
+                    file_name: Some(file_name),
+                });
+            }
+            None => out.push(MultipartField {
+                name,
+                value: value.into_bytes(),
+                file_name: None,
+            }),
+        }
+    }
+    Ok(out)
+}
+
+/// The body to send (rebuilt for each hop: a form is used up by sending).
+fn multipart_form(fields: &[MultipartField]) -> reqwest::multipart::Form {
+    let mut form = reqwest::multipart::Form::new();
+    for field in fields {
+        form = match &field.file_name {
+            Some(file) => form.part(
+                field.name.clone(),
+                reqwest::multipart::Part::bytes(field.value.clone()).file_name(file.clone()),
+            ),
+            None => form.part(
+                field.name.clone(),
+                reqwest::multipart::Part::bytes(field.value.clone()),
+            ),
+        };
+    }
+    form
 }
 
 /// Whether two addresses have the same scheme, host and port.
@@ -422,6 +633,36 @@ pub fn class_of(status: u16) -> Class {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_certificates_and_the_proxy_of_the_preferences_are_read_or_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let build = |n: Network| apply_network(reqwest::Client::builder(), &n).map(|_| ());
+        assert!(build(Network::default()).is_ok());
+        // A file that is not there, or not a certificate, is said.
+        let missing = Network {
+            ca_file: dir.path().join("nope.pem").to_string_lossy().into_owned(),
+            ..Network::default()
+        };
+        assert!(build(missing).is_err());
+        let junk = dir.path().join("junk.pem");
+        std::fs::write(&junk, "not a certificate").unwrap();
+        let bad_ca = Network {
+            ca_file: junk.to_string_lossy().into_owned(),
+            ..Network::default()
+        };
+        assert!(build(bad_ca).is_err());
+        let proxy = Network {
+            proxy: "http://127.0.0.1:3128".into(),
+            ..Network::default()
+        };
+        assert!(build(proxy).is_ok());
+        let bad_proxy = Network {
+            proxy: "::not a url".into(),
+            ..Network::default()
+        };
+        assert!(build(bad_proxy).is_err());
+    }
+
     use super::*;
     use crate::api::model::{Method, Settings};
     use std::net::TcpListener;
@@ -589,6 +830,67 @@ mod tests {
         assert_eq!(seen[1].body, b"a+b=c%26d");
         assert_eq!(seen[2].request_line, "PATCH /file HTTP/1.1");
         assert_eq!(seen[2].body, vec![0u8, 1, 2, 255]);
+    }
+
+    #[test]
+    fn a_multipart_body_sends_its_fields_and_its_files() {
+        use crate::api::model::{Body, BodyKind, Pair, Request};
+        use std::collections::HashMap;
+        let (port, seen) = serve(|_| vec![answer("200 OK", &[], "ok")]);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note.txt");
+        std::fs::write(&file, "file text").unwrap();
+        let mut request = Request::new("m");
+        request.method = Method::Post;
+        request.url = format!("http://127.0.0.1:{port}/up");
+        request.body = Body {
+            kind: BodyKind::Multipart,
+            form: vec![
+                Pair::new("title", "hello"),
+                Pair::new("doc", &format!("@{}", file.display())),
+            ],
+            ..Body::default()
+        };
+        assert_eq!(
+            run(send(request.resolve(&HashMap::new()))).unwrap().text(),
+            "ok"
+        );
+        let seen = seen.lock().unwrap();
+        let content_type = seen[0].header("content-type").unwrap();
+        assert!(content_type.starts_with("multipart/form-data; boundary="));
+        let body = String::from_utf8_lossy(&seen[0].body).into_owned();
+        assert!(body.contains("name=\"title\"") && body.contains("hello"));
+        assert!(body.contains("name=\"doc\"; filename=\"note.txt\""));
+        assert!(body.contains("file text"));
+        // A file that was not chosen is an error, not an empty part.
+        let mut empty = Request::new("e");
+        empty.url = format!("http://127.0.0.1:{port}/up");
+        empty.body = Body {
+            kind: BodyKind::Multipart,
+            form: vec![Pair::new("doc", "@")],
+            ..Body::default()
+        };
+        assert!(run(send(empty.resolve(&HashMap::new()))).is_err());
+    }
+
+    #[test]
+    fn a_cookie_set_by_a_server_is_sent_back_to_it() {
+        let (port, seen) = serve(|_| {
+            vec![
+                answer(
+                    "200 OK",
+                    &["Set-Cookie: sid=abc123; Path=/; HttpOnly"],
+                    "in",
+                ),
+                answer("200 OK", &[], "again"),
+            ]
+        });
+        let url = format!("http://127.0.0.1:{port}/");
+        run(send(resolved(Method::Get, url.clone()))).unwrap();
+        run(send(resolved(Method::Get, url))).unwrap();
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0].header("cookie"), None);
+        assert_eq!(seen[1].header("cookie"), Some("sid=abc123"));
     }
 
     #[test]

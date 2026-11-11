@@ -13,14 +13,17 @@ use super::postman::Imported;
 fn parse(text: &str) -> Option<Value> {
     serde_json::from_str::<Value>(text)
         .ok()
-        .or_else(|| serde_yaml::from_str::<Value>(text).ok())
+        .or_else(|| serde_norway::from_str::<Value>(text).ok())
 }
 
 /// Whether the text is an OpenAPI or a Swagger description.
+#[cfg(test)]
 pub fn is_openapi(text: &str) -> bool {
-    parse(text).is_some_and(|v| {
-        (v.get("openapi").is_some() || v.get("swagger").is_some()) && v["paths"].is_object()
-    })
+    parse(text).is_some_and(|v| is_openapi_value(&v))
+}
+
+fn is_openapi_value(v: &Value) -> bool {
+    (v.get("openapi").is_some() || v.get("swagger").is_some()) && v["paths"].is_object()
 }
 
 /// A `$ref` (`#/components/schemas/Name`) followed, up to a few steps.
@@ -43,7 +46,16 @@ fn resolve<'a>(root: &'a Value, mut value: &'a Value) -> &'a Value {
 /// An example value for a schema: its own example, its default, the first
 /// of its enumeration, or something of the right type.
 fn example(root: &Value, schema: &Value, depth: usize) -> Value {
+    NODES_LEFT.set(MAX_EXAMPLE_NODES);
     example_in(root, schema, depth, &mut Vec::new())
+}
+
+/// The most nodes one example may have: a wide schema, nested a few levels
+/// deep, would otherwise grow to millions of them.
+const MAX_EXAMPLE_NODES: usize = 5_000;
+
+thread_local! {
+    static NODES_LEFT: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_EXAMPLE_NODES) };
 }
 
 /// `example`, knowing which `$ref` are being expanded: a schema that contains
@@ -62,9 +74,10 @@ fn example_in(root: &Value, schema: &Value, depth: usize, open: &mut Vec<String>
 }
 
 fn example_of(root: &Value, schema: &Value, depth: usize, open: &mut Vec<String>) -> Value {
-    if depth > 6 {
+    if depth > 6 || NODES_LEFT.get() == 0 {
         return Value::Null;
     }
+    NODES_LEFT.set(NODES_LEFT.get() - 1);
     for key in ["example", "default"] {
         if let Some(v) = schema.get(key) {
             return v.clone();
@@ -263,8 +276,20 @@ fn auth_of(root: &Value, security: &Value, variables: &mut Vec<Variable>) -> Aut
     }
 }
 
+#[cfg(test)]
 pub fn import(text: &str) -> Result<Imported, String> {
     let root = parse(text).ok_or_else(|| t!("api.err_not_json_yaml").to_string())?;
+    import_value(root)
+}
+
+/// The import of a text that may be a description: `None` when it is not
+/// one, so that the file is parsed only once.
+pub fn import_if_openapi(text: &str) -> Option<Result<Imported, String>> {
+    let root = parse(text)?;
+    is_openapi_value(&root).then(|| import_value(root))
+}
+
+fn import_value(root: Value) -> Result<Imported, String> {
     let paths = root["paths"]
         .as_object()
         .ok_or_else(|| t!("api.err_not_openapi").to_string())?;

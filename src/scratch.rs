@@ -87,8 +87,37 @@ pub fn next_name(dir: &Path, ext: &str) -> String {
         .expect("an unbounded range")
 }
 
+type LastName = Option<(PathBuf, String, std::time::Instant, String)>;
+static LAST_NAME: std::sync::Mutex<LastName> = std::sync::Mutex::new(None);
+
+/// [`next_name`] for showing: looked up again after two seconds only, since
+/// it looks at the folder and is asked at every frame.
+pub fn suggested_name(dir: &Path, ext: &str) -> String {
+    use std::time::{Duration, Instant};
+    if let Ok(mut last) = LAST_NAME.lock() {
+        if let Some((d, e, at, name)) = last.as_ref() {
+            if d == dir && e == ext && at.elapsed() < Duration::from_secs(2) {
+                return name.clone();
+            }
+        }
+        let name = next_name(dir, ext);
+        *last = Some((
+            dir.to_path_buf(),
+            ext.to_string(),
+            Instant::now(),
+            name.clone(),
+        ));
+        return name;
+    }
+    next_name(dir, ext)
+}
+
 /// Creates an empty scratch file; an existing one is never overwritten.
 pub fn create(dir: &Path, name: &str, ext: &str) -> Result<PathBuf, String> {
+    // The next free name is not the one that was shown.
+    if let Ok(mut last) = LAST_NAME.lock() {
+        *last = None;
+    }
     let file = file_name(name, ext)?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let _ = std::fs::write(dir.join(MARKER), "");
@@ -210,12 +239,15 @@ pub struct Ext(pub Option<&'static str>);
 
 impl Ext {
     /// "No extension" first, then every extension in alphabetical order.
-    pub fn all() -> Vec<Ext> {
-        let mut sorted = EXTENSIONS.to_vec();
-        sorted.sort_unstable();
-        std::iter::once(Ext(None))
-            .chain(sorted.into_iter().map(|e| Ext(Some(e))))
-            .collect()
+    pub fn all() -> &'static [Ext] {
+        static ALL: std::sync::LazyLock<Vec<Ext>> = std::sync::LazyLock::new(|| {
+            let mut sorted = EXTENSIONS.to_vec();
+            sorted.sort_unstable();
+            std::iter::once(Ext(None))
+                .chain(sorted.into_iter().map(|e| Ext(Some(e))))
+                .collect()
+        });
+        &ALL
     }
 
     pub fn as_str(self) -> &'static str {

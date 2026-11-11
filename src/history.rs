@@ -14,6 +14,8 @@ use crate::editor::line_replacement;
 pub struct Snapshot {
     pub text: String,
     pub cursor: (usize, usize),
+    /// The other cursors of a multi-cursor edit.
+    pub extras: Vec<crate::code_editor::Caret>,
 }
 
 #[derive(Debug, Clone)]
@@ -23,6 +25,7 @@ enum Entry {
     /// the `new_lines` lines found at `first_line` in the text above.
     Delta {
         cursor: (usize, usize),
+        extras: Vec<crate::code_editor::Caret>,
         first_line: usize,
         new_lines: usize,
         old: String,
@@ -64,6 +67,14 @@ impl History {
         self.bytes
     }
 
+    /// The size of the text the newest entry holds.
+    pub fn newest_len(&self) -> Option<usize> {
+        match self.entries.back()? {
+            Entry::Full(s) => Some(s.text.len()),
+            Entry::Delta { .. } => None,
+        }
+    }
+
     pub fn push_back(&mut self, snapshot: Snapshot) {
         if let Some(Entry::Full(below)) = self.entries.back() {
             if let Some(delta) = compress(below, &snapshot.text) {
@@ -89,6 +100,7 @@ impl History {
                 Entry::Full(Snapshot {
                     text: String::new(),
                     cursor: (0, 0),
+                    extras: Vec::new(),
                 }),
             );
             self.bytes -= delta.bytes();
@@ -123,6 +135,7 @@ fn compress(below: &Snapshot, above: &str) -> Option<Entry> {
     }
     Some(Entry::Delta {
         cursor: below.cursor,
+        extras: below.extras.clone(),
         first_line: change.first_line,
         new_lines: change.new_text.split('\n').count(),
         old: change.old_text,
@@ -132,6 +145,7 @@ fn compress(below: &Snapshot, above: &str) -> Option<Entry> {
 fn expand(delta: &Entry, above: &str) -> Snapshot {
     let Entry::Delta {
         cursor,
+        extras,
         first_line,
         new_lines,
         old,
@@ -159,6 +173,7 @@ fn expand(delta: &Entry, above: &str) -> Snapshot {
     Snapshot {
         text,
         cursor: *cursor,
+        extras: extras.clone(),
     }
 }
 
@@ -170,6 +185,7 @@ mod tests {
         Snapshot {
             text: text.to_string(),
             cursor: (0, 0),
+            extras: Vec::new(),
         }
     }
 

@@ -7,7 +7,7 @@ use iced::widget::{
 };
 use iced::{Alignment, Element, Length};
 
-use super::designer::{Designer, DesignerTab, Load, Problem, COMMON_TYPES, ON_DELETE};
+use super::designer::{common_types, Designer, DesignerTab, Load, Problem, ON_DELETE};
 use super::protocol::ConstraintKind;
 use super::{ColField, ConField, Confirm, ConfirmAction, DbMsg, DesignerMsg, IdxField, Kind};
 use crate::app::Message;
@@ -113,7 +113,8 @@ pub fn confirm<'a>(c: &'a Confirm, dark: bool) -> Element<'a, Message> {
             .style(se_theme::rule(dark)),
     ]
     .spacing(10);
-    if c.action == ConfirmAction::Drop {
+    if c.action == ConfirmAction::Drop && c.dialect == crate::database::protocol::Dialect::Postgres
+    {
         body = body.push(
             checkbox(c.cascade)
                 .label(t!("db.confirm_cascade").to_string())
@@ -152,6 +153,65 @@ pub fn confirm<'a>(c: &'a Confirm, dark: bool) -> Element<'a, Message> {
         .into()
 }
 
+/// The fingerprints of an SSH server that is not known: trusted or not.
+pub fn ssh_trust<'a>(t: &'a super::SshTrust, dark: bool) -> Element<'a, Message> {
+    let p = se_theme::palette(dark);
+    let mut keys = column![].spacing(4);
+    for key in &t.keys {
+        keys = keys.push(
+            text(key.fingerprint.as_str())
+                .size(12.5)
+                .font(se_theme::MONO),
+        );
+    }
+    let mut body = column![
+        head(
+            t!("db.ssh_trust_title", host = t.host.as_str(), port = t.port).to_string(),
+            Message::Db(DbMsg::SshTrustNo),
+            dark
+        ),
+        text(t!("db.ssh_trust_text").to_string())
+            .size(12.5)
+            .color(p.muted),
+        container(keys)
+            .padding([6, 10])
+            .width(Length::Fill)
+            .style(se_theme::rule(dark)),
+    ]
+    .spacing(10);
+    if t.scanning {
+        body = body.push(
+            text(t!("db.ssh_scanning").to_string())
+                .size(12)
+                .color(p.muted),
+        );
+    }
+    if let Some(error) = &t.error {
+        body = body.push(
+            text(error.as_str())
+                .size(12.5)
+                .color(se_theme::error_color(dark)),
+        );
+    }
+    body = body.push(
+        row![
+            button(text(t!("db.ssh_trust_yes").to_string()).size(12.5))
+                .padding([5, 16])
+                .on_press_maybe((!t.keys.is_empty()).then_some(Message::Db(DbMsg::SshTrustYes)))
+                .style((se_theme::Primary { dark }).style()),
+            button(text(t!("db.guard_cancel").to_string()).size(12.5))
+                .padding([5, 16])
+                .on_press(Message::Db(DbMsg::SshTrustNo))
+                .style((se_theme::Outline { dark }).style()),
+        ]
+        .spacing(10),
+    );
+    container(body.width(Length::Fixed(520.0)))
+        .padding(16)
+        .style(se_theme::card(dark))
+        .into()
+}
+
 // ----------------------------------------------------------------- designer
 
 fn tab_label(tab: DesignerTab) -> String {
@@ -177,6 +237,7 @@ fn problem_text(problem: &Problem) -> String {
         Problem::NeedsReference => t!("db.dp_needs_reference").to_string(),
         Problem::NeedsExpression => t!("db.dp_needs_expression").to_string(),
         Problem::SeveralKeys => t!("db.dp_several_keys").to_string(),
+        Problem::SqliteLimit => t!("db.dp_sqlite_limit").to_string(),
     }
 }
 
@@ -381,7 +442,7 @@ fn columns_tab<'a>(d: &'a Designer, dark: bool) -> Element<'a, Message> {
                 )
                 .font(se_theme::MONO)
                 .width(140),
-                pick_list(COMMON_TYPES.to_vec(), None::<&str>, move |t| {
+                pick_list(common_types(d.dialect), None::<&str>, move |t| {
                     say(DesignerMsg::Col(i, ColField::Type, t.to_string()))
                 })
                 .placeholder("")
@@ -1372,7 +1433,8 @@ pub fn backup<'a>(b: &'a super::Backup, production: bool, dark: bool) -> Element
         t!("db.backup_title", scope = scope.as_str()).to_string()
     };
     let mut options = column![].spacing(6);
-    if !b.restore {
+    let postgres = b.dialect == super::protocol::Dialect::Postgres;
+    if !b.restore && postgres {
         options = options.push(flag(
             t!("db.backup_plain").to_string(),
             b.spec.format == "plain",
@@ -1389,18 +1451,21 @@ pub fn backup<'a>(b: &'a super::Backup, production: bool, dark: bool) -> Element
             t!("db.backup_data_only").to_string(),
             b.spec.data_only,
             BackupFlag::DataOnly,
-        ))
-        .push(flag(
-            t!("db.backup_no_owner").to_string(),
-            b.spec.no_owner,
-            BackupFlag::NoOwner,
-        ))
-        .push(flag(
-            t!("db.backup_no_privileges").to_string(),
-            b.spec.no_privileges,
-            BackupFlag::NoPrivileges,
         ));
-    if b.restore {
+    if postgres {
+        options = options
+            .push(flag(
+                t!("db.backup_no_owner").to_string(),
+                b.spec.no_owner,
+                BackupFlag::NoOwner,
+            ))
+            .push(flag(
+                t!("db.backup_no_privileges").to_string(),
+                b.spec.no_privileges,
+                BackupFlag::NoPrivileges,
+            ));
+    }
+    if b.restore && postgres {
         options = options
             .push(flag(
                 t!("db.restore_clean").to_string(),

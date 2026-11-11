@@ -660,10 +660,68 @@ pub struct Page {
     /// For the rows of a query that come from one table: which.
     #[serde(default)]
     pub source: Option<Source>,
+    /// The cells (row, column) whose value was cut because the page is too
+    /// big: they cannot be changed from here.
+    #[serde(default)]
+    pub truncated: Vec<(usize, usize)>,
     /// The query can be sorted, filtered and paged (its rows were asked with
     /// `rows`); otherwise it gave all it has, at most `MAX_RESULT_ROWS`.
     #[serde(default, skip_serializing)]
     pub offset: u64,
+}
+
+/// What a page may weigh before the big values in it are cut.
+pub const PAGE_BUDGET: usize = 32 * 1024 * 1024;
+/// A value that is cut keeps this much.
+pub const CUT_KEEPS: usize = 16 * 1024;
+
+/// Keeps a page from growing without bound: after `PAGE_BUDGET` bytes of
+/// values, each value longer than `CUT_KEEPS` is cut to that. The cells that
+/// were cut are given back (row, column), to be shown as cut and not changed.
+pub fn cap_page(rows: &mut [Vec<Option<String>>]) -> Vec<(usize, usize)> {
+    let mut used = 0usize;
+    let mut cut = Vec::new();
+    for (r, row) in rows.iter_mut().enumerate() {
+        for (c, cell) in row.iter_mut().enumerate() {
+            let Some(text) = cell else { continue };
+            if used > PAGE_BUDGET && text.len() > CUT_KEEPS {
+                let mut end = CUT_KEEPS;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+                cut.push((r, c));
+            }
+            used += text.len();
+        }
+    }
+    cut
+}
+
+/// [`cap_page`] for rows that are already JSON (arrays of strings and nulls).
+pub fn cap_page_json(rows: &mut [serde_json::Value]) -> Vec<(usize, usize)> {
+    let mut used = 0usize;
+    let mut cut = Vec::new();
+    for (r, row) in rows.iter_mut().enumerate() {
+        let Some(cells) = row.as_array_mut() else {
+            continue;
+        };
+        for (c, cell) in cells.iter_mut().enumerate() {
+            let serde_json::Value::String(text) = cell else {
+                continue;
+            };
+            if used > PAGE_BUDGET && text.len() > CUT_KEEPS {
+                let mut end = CUT_KEEPS;
+                while !text.is_char_boundary(end) {
+                    end -= 1;
+                }
+                text.truncate(end);
+                cut.push((r, c));
+            }
+            used += text.len();
+        }
+    }
+    cut
 }
 
 // -------------------------------------------------------------- the display
@@ -1396,6 +1454,31 @@ pub fn ssl_mode_of(key: &str, value: &str) -> Option<SslMode> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_page_past_its_budget_has_its_big_values_cut() {
+        let big = "é".repeat(CUT_KEEPS); // 2 bytes each
+        let mut rows = vec![
+            vec![Some("x".repeat(PAGE_BUDGET + 1)), None],
+            vec![Some(big.clone()), Some("small".into())],
+        ];
+        let cut = cap_page(&mut rows);
+        assert_eq!(cut, vec![(1, 0)]);
+        assert_eq!(rows[0][0].as_ref().unwrap().len(), PAGE_BUDGET + 1);
+        // Cut on a character boundary, and the small ones stay as they are.
+        assert!(rows[1][0].as_ref().unwrap().len() <= CUT_KEEPS);
+        assert!(big.starts_with(rows[1][0].as_ref().unwrap()));
+        assert_eq!(rows[1][1].as_deref(), Some("small"));
+        // The same for rows that are JSON already.
+        let mut json = vec![
+            serde_json::json!(["y".repeat(PAGE_BUDGET + 1)]),
+            serde_json::json!([big, null]),
+        ];
+        assert_eq!(cap_page_json(&mut json), vec![(1, 0)]);
+        // Under the budget nothing is touched.
+        let mut few = vec![vec![Some("z".repeat(CUT_KEEPS * 4))]];
+        assert!(cap_page(&mut few).is_empty());
+    }
+
     use super::*;
 
     #[test]

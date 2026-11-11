@@ -1191,6 +1191,68 @@ mod behavior_tests {
     }
 
     #[test]
+    fn backspace_takes_the_auto_closed_pair_and_a_closer_dedents() {
+        let mut first = app();
+        type_text(&mut first, "f(");
+        assert_eq!(text(&first), "f()\n");
+        let _ = first.handle(Message::EditorAction(Action::Edit(Edit::Backspace)));
+        assert_eq!(text(&first), "f\n");
+        // A closer typed after indentation alone steps one level back.
+        let mut second = app();
+        second.editor.content = crate::code_editor::Content::with_text("{\n    ");
+        second.editor.content.select_bytes(1, 4, 0);
+        let _ = second.handle(Message::EditorAction(Action::Edit(Edit::Insert('}'))));
+        assert_eq!(text(&second), "{\n}\n");
+    }
+
+    #[test]
+    fn a_closed_untitled_tab_with_text_comes_back_with_its_text() {
+        let mut app = app();
+        type_text(&mut app, "draft");
+        let path = app.current_file.clone().unwrap();
+        let _ = app.close_path(path);
+        let _ = app.handle(Message::ReopenTab);
+        assert_eq!(text(&app), "draft\n");
+        assert!(app.is_dirty);
+    }
+
+    #[test]
+    fn undo_brings_the_other_cursors_back() {
+        let mut app = app();
+        app.editor.content = crate::code_editor::Content::with_text("a\nb\nc\n");
+        app.editor.content.select_bytes(0, 0, 0);
+        app.editor.content.add_cursor(1, 0);
+        app.editor.content.add_cursor(2, 0);
+        assert_eq!(app.editor.content.cursor_count(), 3);
+        let _ = app.handle(Message::EditorAction(Action::Edit(Edit::Insert('x'))));
+        assert_eq!(text(&app), "xa\nxb\nxc\n");
+        let _ = app.handle(Message::Undo);
+        assert_eq!(text(&app), "a\nb\nc\n");
+        assert_eq!(app.editor.content.cursor_count(), 3);
+    }
+
+    #[test]
+    fn on_a_big_file_the_steps_of_the_same_second_are_one() {
+        let mut app = app();
+        let big: String = "x".repeat(79) + "\n";
+        app.editor.content = crate::code_editor::Content::with_text(&big.repeat(30_000));
+        app.editor.content.select_bytes(0, 0, 0);
+        let _ = app.handle(Message::EditorAction(Action::Edit(Edit::Enter)));
+        let steps = app.undo_stack.len();
+        for _ in 0..5 {
+            let _ = app.handle(Message::EditorAction(Action::Edit(Edit::Enter)));
+        }
+        // The first made one; the next ones came within the second.
+        assert!(
+            app.undo_stack.len() <= steps + 1,
+            "{}",
+            app.undo_stack.len()
+        );
+        let _ = app.handle(Message::Undo);
+        assert!(app.undo_stack.len() <= steps);
+    }
+
+    #[test]
     fn reverting_throws_the_changes_away_and_stays_undoable() {
         let mut app = app();
         // A tab without a file has nothing to go back to.
@@ -1981,11 +2043,18 @@ mod behavior_tests {
     #[test]
     fn a_failed_session_write_is_reported_and_retried() {
         let mut app = app();
-        app.last_session = 7;
+        app.last_session
+            .store(7, std::sync::atomic::Ordering::Relaxed);
         app.session_rev = 3;
         let _ = app.handle(Message::SessionWritten(Err("disk full".into())));
         assert!(app.status_is_error);
-        assert_eq!((app.last_session, app.session_rev), (0, 0));
+        assert_eq!(
+            (
+                app.last_session.load(std::sync::atomic::Ordering::Relaxed),
+                app.session_rev
+            ),
+            (0, 0)
+        );
     }
 
     #[test]
@@ -2246,6 +2315,7 @@ mod behavior_tests {
             has_more: false,
             primary_key: vec!["id".into()],
             ctids: Vec::new(),
+            truncated: Vec::new(),
             editable,
             source: None,
             offset: 0,
@@ -2404,6 +2474,44 @@ mod behavior_tests {
         assert_eq!(app.db_tabs[&path].filter, "id > 1");
         let _ = app.update(Message::Db(DbMsg::ClearFilter(path.clone())));
         assert!(app.db_tabs[&path].filter.is_empty() && app.db_tabs[&path].filter_text.is_empty());
+    }
+
+    #[test]
+    fn a_cell_gives_the_filter_that_keeps_its_value() {
+        use crate::database::DbMsg;
+        let (mut app, path) = db_app(true);
+        let name = app.db_tabs[&path].page.as_ref().unwrap().columns[1]
+            .name
+            .clone();
+        let value = {
+            let tab = &app.db_tabs[&path];
+            tab.pending
+                .value(tab.page.as_ref().unwrap(), 0, 1)
+                .map(str::to_string)
+        };
+        let _ = app.update(Message::Db(DbMsg::FilterByCell(path.clone(), 0, 1)));
+        let tab = &app.db_tabs[&path];
+        let expected = match value {
+            Some(v) => format!("= {v}"),
+            None => "null".to_string(),
+        };
+        assert_eq!(tab.column_filters.get(&name), Some(&expected));
+        assert!(tab.show_filters);
+    }
+
+    #[test]
+    fn a_column_is_hidden_and_shown_again_but_never_all_of_them() {
+        use crate::database::DbMsg;
+        let (mut app, path) = db_app(true);
+        let count = app.db_tabs[&path].page.as_ref().unwrap().columns.len();
+        let _ = app.update(Message::Db(DbMsg::HideColumn(path.clone(), 1)));
+        assert_eq!(app.db_tabs[&path].hidden.len(), 1);
+        for c in 0..count {
+            let _ = app.update(Message::Db(DbMsg::HideColumn(path.clone(), c)));
+        }
+        assert_eq!(app.db_tabs[&path].hidden.len(), count - 1);
+        let _ = app.update(Message::Db(DbMsg::ShowColumns(path.clone())));
+        assert!(app.db_tabs[&path].hidden.is_empty());
     }
 
     #[test]
@@ -3262,18 +3370,29 @@ mod behavior_tests {
         assert_eq!(app.api_tabs[&path].request.checks.len(), 1);
     }
 
+    /// Picks a file to import, as the dialog does, and waits for what the
+    /// background read gives (done here, in place).
+    fn import_text(app: &mut SimpleEditApp, name: &str, text: &str) {
+        use crate::api::{openapi, postman, ApiMsg};
+        let _ = app.update(Message::Api(ApiMsg::Imported(Some((
+            PathBuf::from(name),
+            Ok(text.to_string()),
+        )))));
+        if !postman::is_environment(text) {
+            let read = openapi::import_if_openapi(text)
+                .unwrap_or_else(|| postman::import_collection(text));
+            let _ = app.update(Message::Api(ApiMsg::ImportRead(read)));
+        }
+    }
+
     #[test]
     fn an_openapi_file_is_imported_as_a_collection() {
-        use crate::api::ApiMsg;
         let (mut app, _guard) = api_app();
         let spec = r#"{"openapi": "3.0.0", "info": {"title": "Shop"},
             "servers": [{"url": "https://shop.test"}],
             "paths": {"/items": {"get": {"summary": "List"}}}}"#;
         let before = app.api.collections.len();
-        let _ = app.update(Message::Api(ApiMsg::Imported(Some((
-            PathBuf::from("shop.json"),
-            Ok(spec.into()),
-        )))));
+        import_text(&mut app, "shop.json", spec);
         assert_eq!(app.api.collections.len(), before + 1);
         let imported = app.api.collections.last().unwrap();
         assert_eq!((imported.name.as_str(), imported.count()), ("Shop", 1));
@@ -3536,10 +3655,7 @@ mod behavior_tests {
           "variable":[{"key":"base","value":"https://s.test"}],
           "item":[{"name":"List","request":{"method":"GET","url":"{{base}}/items"}},
                   {"name":"Oauth","request":{"method":"GET","url":"{{base}}/o","auth":{"type":"oauth2"}}}]}"#;
-        let _ = app.update(Message::Api(ApiMsg::Imported(Some((
-            "shop.json".into(),
-            Ok(collection.to_string()),
-        )))));
+        import_text(&mut app, "shop.json", collection);
         assert_eq!(app.api.collections.len(), 1);
         assert_eq!(app.api.collections[0].count(), 2);
         assert_eq!(app.api.environments.len(), 1);
@@ -3551,15 +3667,9 @@ mod behavior_tests {
         let _ = app.update(Message::Api(ApiMsg::DialogClose));
         // An environment of Postman, and a file that is not JSON.
         let env = r#"{"name":"staging","values":[{"key":"k","value":"v","enabled":true}]}"#;
-        let _ = app.update(Message::Api(ApiMsg::Imported(Some((
-            "e.json".into(),
-            Ok(env.into()),
-        )))));
+        import_text(&mut app, "e.json", env);
         assert_eq!(app.api.environments.len(), 2);
-        let _ = app.update(Message::Api(ApiMsg::Imported(Some((
-            "bad.json".into(),
-            Ok("nope".into()),
-        )))));
+        import_text(&mut app, "bad.json", "nope");
         let Some(Dialog::Report(lines)) = &app.api.dialog else {
             panic!("a report")
         };
@@ -4656,6 +4766,7 @@ mod look_tests {
                 has_more: true,
                 primary_key: vec!["id".into()],
                 ctids: Vec::new(),
+                truncated: Vec::new(),
                 editable: true,
                 source: None,
                 offset: 0,
@@ -4873,6 +4984,7 @@ mod look_tests {
             schema: "public".into(),
             table: "customers".into(),
             kind: crate::database::Kind::Table,
+            dialect: crate::database::protocol::Dialect::Postgres,
             action: crate::database::ConfirmAction::Drop,
             cascade: false,
             running: false,

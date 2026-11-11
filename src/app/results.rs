@@ -25,6 +25,7 @@ pub enum ResultsMsg {
     Close(usize),
     Pin(usize),
     Group,
+    Scrolled(f32, f32),
     NewTab,
     Hide,
     /// The next (or previous) match, opened.
@@ -53,9 +54,16 @@ pub struct Results {
     /// Clicked last: its keys are its own.
     pub focus: bool,
     generation: u64,
+    /// How far the list is scrolled, and how high it is (only the lines in
+    /// view are widgets).
+    pub scrolled: f32,
+    pub view_height: f32,
 }
 
 const ROW: f32 = 26.0;
+/// The height of a line that names a folder, and of one that names a file.
+const DIR_ROW: f32 = 24.0;
+const FILE_ROW: f32 = 26.0;
 
 /// How many matches each file has, in one pass: counted file by file, a
 /// list of every file of a project took seconds to draw.
@@ -97,6 +105,7 @@ impl SimpleEditApp {
             _ => {
                 r.tabs.push(tab);
                 r.active = r.tabs.len() - 1;
+                r.scrolled = 0.0;
             }
         }
         r.open = true;
@@ -308,6 +317,7 @@ impl SimpleEditApp {
             ResultsMsg::Tab(i) => {
                 if i < self.results.tabs.len() {
                     self.results.active = i;
+                    self.results.scrolled = 0.0;
                 }
                 Task::none()
             }
@@ -318,6 +328,7 @@ impl SimpleEditApp {
                         .results
                         .active
                         .min(self.results.tabs.len().saturating_sub(1));
+                    self.results.scrolled = 0.0;
                 }
                 if self.results.tabs.is_empty() {
                     self.results.open = false;
@@ -329,6 +340,11 @@ impl SimpleEditApp {
                 if let Some(tab) = self.results.tabs.get_mut(i) {
                     tab.pinned = !tab.pinned;
                 }
+                Task::none()
+            }
+            ResultsMsg::Scrolled(offset, height) => {
+                self.results.scrolled = offset;
+                self.results.view_height = height;
                 Task::none()
             }
             ResultsMsg::Group => {
@@ -507,80 +523,129 @@ impl SimpleEditApp {
 
         let mut list = column![].spacing(0);
         if let Some(t) = tab {
-            let mut last_dir: Option<&Path> = None;
-            let mut last_file: Option<&Path> = None;
             let per_file = per_file(&t.hits);
-            for (i, o) in t.hits.iter().enumerate() {
-                let path = o.hit.path.as_path();
-                if r.group_dirs {
-                    let dir = path.parent();
-                    if dir != last_dir {
-                        last_dir = dir;
-                        list = list.push(
-                            container(
-                                row![
-                                    crate::file_icons::folder(true, dark),
-                                    text(dir.map(display_path).unwrap_or_default())
-                                        .size(12)
-                                        .color(p.muted)
-                                ]
-                                .spacing(6)
-                                .align_y(Alignment::Center),
+            // First the layout, in numbers: each line has a height that does
+            // not depend on what it holds, so that only the lines in view
+            // (and a few around) are made into widgets.
+            enum Line<'x> {
+                Dir(Option<&'x Path>),
+                File(&'x Path, usize),
+                Hit(usize),
+            }
+            let mut layout: Vec<(Line, f32)> = Vec::with_capacity(t.hits.len() * 2);
+            {
+                let mut last_dir: Option<&Path> = None;
+                let mut last_file: Option<&Path> = None;
+                for (i, o) in t.hits.iter().enumerate() {
+                    let path = o.hit.path.as_path();
+                    if r.group_dirs {
+                        let dir = path.parent();
+                        if dir != last_dir {
+                            last_dir = dir;
+                            layout.push((Line::Dir(dir), DIR_ROW));
+                        }
+                    }
+                    if Some(path) != last_file {
+                        last_file = Some(path);
+                        let in_file = per_file.get(path).copied().unwrap_or(0);
+                        layout.push((Line::File(path, in_file), FILE_ROW));
+                    }
+                    layout.push((Line::Hit(i), ROW));
+                }
+            }
+            let (offset, height) = (r.scrolled, r.view_height.max(120.0));
+            let margin = 6.0 * ROW;
+            let mut top = 0.0f32;
+            let mut above = 0.0f32;
+            let mut below = 0.0f32;
+            for (line, h) in &layout {
+                let bottom = top + h;
+                if bottom < offset - margin {
+                    above += h;
+                } else if top > offset + height + margin {
+                    below += h;
+                } else {
+                    match line {
+                        Line::Dir(dir) => {
+                            list = list.push(
+                                container(
+                                    row![
+                                        crate::file_icons::folder(true, dark),
+                                        text(dir.map(display_path).unwrap_or_default())
+                                            .size(12)
+                                            .color(p.muted)
+                                    ]
+                                    .spacing(6)
+                                    .align_y(Alignment::Center),
+                                )
+                                .height(Length::Fixed(DIR_ROW))
+                                .center_y(Length::Fixed(DIR_ROW))
+                                .padding([0, 8]),
+                            );
+                        }
+                        Line::File(path, in_file) => {
+                            let name = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            let shown = if r.group_dirs {
+                                name
+                            } else {
+                                display_path(path)
+                            };
+                            list = list.push(
+                                container(
+                                    row![
+                                        crate::file_icons::file(path, dark),
+                                        text(shown)
+                                            .size(12.5)
+                                            .font(se_theme::UI_MEDIUM)
+                                            .color(p.text),
+                                        text(matches_text(*in_file)).size(11.5).color(p.muted),
+                                    ]
+                                    .spacing(6)
+                                    .align_y(Alignment::Center),
+                                )
+                                .height(Length::Fixed(FILE_ROW))
+                                .center_y(Length::Fixed(FILE_ROW))
+                                .padding(iced::Padding {
+                                    top: 0.0,
+                                    bottom: 0.0,
+                                    left: if r.group_dirs { 22.0 } else { 8.0 },
+                                    right: 8.0,
+                                }),
+                            );
+                        }
+                        Line::Hit(i) => {
+                            let o = &t.hits[*i];
+                            let selected = *i == t.selected;
+                            let row_view = button(
+                                container(self.occurrence_line(o, dark, selected))
+                                    .center_y(Length::Fixed(ROW)),
                             )
-                            .padding([3, 8]),
-                        );
+                            .padding(iced::Padding {
+                                top: 0.0,
+                                bottom: 0.0,
+                                left: if r.group_dirs { 36.0 } else { 22.0 },
+                                right: 8.0,
+                            })
+                            .width(Length::Fill)
+                            .on_press(Message::Results(ResultsMsg::Select(*i)))
+                            .style((se_theme::SidebarRow { dark, selected }).style());
+                            list = list.push(
+                                mouse_area(row_view)
+                                    .on_double_click(Message::Results(ResultsMsg::Open(*i))),
+                            );
+                        }
                     }
                 }
-                if Some(path) != last_file {
-                    last_file = Some(path);
-                    let in_file = per_file.get(path).copied().unwrap_or(0);
-                    let name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    let shown = if r.group_dirs {
-                        name
-                    } else {
-                        display_path(path)
-                    };
-                    list = list.push(
-                        container(
-                            row![
-                                crate::file_icons::file(path, dark),
-                                text(shown)
-                                    .size(12.5)
-                                    .font(se_theme::UI_MEDIUM)
-                                    .color(p.text),
-                                text(matches_text(in_file)).size(11.5).color(p.muted),
-                            ]
-                            .spacing(6)
-                            .align_y(Alignment::Center),
-                        )
-                        .padding(iced::Padding {
-                            top: 4.0,
-                            bottom: 2.0,
-                            left: if r.group_dirs { 22.0 } else { 8.0 },
-                            right: 8.0,
-                        }),
-                    );
-                }
-                let selected = i == t.selected;
-                let row_view = button(
-                    container(self.occurrence_line(o, dark, selected)).center_y(Length::Fixed(ROW)),
-                )
-                .padding(iced::Padding {
-                    top: 0.0,
-                    bottom: 0.0,
-                    left: if r.group_dirs { 36.0 } else { 22.0 },
-                    right: 8.0,
-                })
-                .width(Length::Fill)
-                .on_press(Message::Results(ResultsMsg::Select(i)))
-                .style((se_theme::SidebarRow { dark, selected }).style());
-                list = list.push(
-                    mouse_area(row_view).on_double_click(Message::Results(ResultsMsg::Open(i))),
-                );
+                top = bottom;
             }
+            list = column![
+                Space::new().height(Length::Fixed(above)),
+                list,
+                Space::new().height(Length::Fixed(below)),
+            ];
             if t.hits.is_empty() {
                 list = list.push(
                     container(
@@ -627,6 +692,10 @@ impl SimpleEditApp {
                 column![
                     header,
                     scrollable(list)
+                        .on_scroll(|v| Message::Results(ResultsMsg::Scrolled(
+                            v.absolute_offset().y,
+                            v.bounds().height
+                        )))
                         .style(se_theme::Scrollbar { dark }.style())
                         .height(Length::Fill),
                     footer,

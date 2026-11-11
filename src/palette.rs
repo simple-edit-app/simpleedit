@@ -63,6 +63,11 @@ pub enum PaletteCommand {
     SetLineEnding,
     SetIndent,
     RenameSymbol,
+    /// The names the file declares.
+    FileOutline,
+    GotoTypeDefinition,
+    GotoImplementation,
+    OrganizeImports,
     UndoRename,
     NewWindow,
     RunTask,
@@ -241,6 +246,10 @@ impl PaletteCommand {
             }
             PaletteCommand::SetIndent => Message::OpenTextOptions(crate::app::TextOption::Indent),
             PaletteCommand::RenameSymbol => Message::RenameSymbol,
+            PaletteCommand::FileOutline => Message::OpenOutline,
+            PaletteCommand::GotoTypeDefinition => Message::GotoTypeDefinition,
+            PaletteCommand::OrganizeImports => Message::OrganizeImports,
+            PaletteCommand::GotoImplementation => Message::GotoImplementation,
             PaletteCommand::NewWindow => Message::NewWindow,
             PaletteCommand::RunTask => Message::OpenTaskPicker,
             PaletteCommand::Todos => Message::OpenTodos,
@@ -612,6 +621,30 @@ pub fn entries(config: &Config, has_formatter: bool, language_enabled: bool) -> 
         entry(
             PaletteCommand::NewWindow,
             t!("palette.new_window").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::GotoTypeDefinition,
+            t!("palette.type_definition").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::OrganizeImports,
+            t!("palette.organize_imports").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::GotoImplementation,
+            t!("palette.implementation").to_string(),
+            None,
+            true,
+        ),
+        entry(
+            PaletteCommand::FileOutline,
+            t!("palette.outline").to_string(),
             None,
             true,
         ),

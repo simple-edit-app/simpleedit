@@ -51,7 +51,11 @@ impl Tunnel {
             .args(["-p", &ssh.port.to_string()])
             .args(["-o", "ExitOnForwardFailure=yes"])
             .args(["-o", "ConnectTimeout=10"])
-            .args(["-o", "StrictHostKeyChecking=accept-new"])
+            // A tunnel that a firewall drops silently is noticed (and closed)
+            // within a couple of minutes instead of hanging the queries.
+            .args(["-o", "ServerAliveInterval=30"])
+            .args(["-o", "ServerAliveCountMax=3"])
+            .args(["-o", "StrictHostKeyChecking=yes"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());

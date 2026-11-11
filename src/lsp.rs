@@ -33,6 +33,10 @@ pub struct Reference {
 enum Kind {
     Definition,
     References,
+    /// Where the type of the name is declared.
+    TypeDefinition,
+    /// What implements the trait, the interface or the method.
+    Implementation,
 }
 
 /// Most references kept: a list longer than that is no use to read.
@@ -441,6 +445,28 @@ pub async fn references(
     ask(Kind::References, language, path, text, line, col).await
 }
 
+/// Where the type of the name at (`line`, `col`) is declared.
+pub async fn type_definition(
+    language: &str,
+    path: &Path,
+    text: &str,
+    line: usize,
+    col: usize,
+) -> Outcome {
+    ask(Kind::TypeDefinition, language, path, text, line, col).await
+}
+
+/// What implements the name at (`line`, `col`).
+pub async fn implementation(
+    language: &str,
+    path: &Path,
+    text: &str,
+    line: usize,
+    col: usize,
+) -> Outcome {
+    ask(Kind::Implementation, language, path, text, line, col).await
+}
+
 async fn ask(
     kind: Kind,
     language: &str,
@@ -516,6 +542,8 @@ async fn query(
             params["context"] = json!({ "includeDeclaration": false });
             "textDocument/references"
         }
+        Kind::TypeDefinition => "textDocument/typeDefinition",
+        Kind::Implementation => "textDocument/implementation",
     };
     loop {
         match server.request(method, params.clone()).await {
@@ -524,13 +552,13 @@ async fn query(
             Err(e) => return Err(e.message),
             Ok(value) => {
                 let found = targets(&value);
-                if kind == Kind::References && !found.is_empty() {
+                if matches!(kind, Kind::References | Kind::Implementation) && !found.is_empty() {
                     return Ok(Outcome::References(references_of(&found, path, text)));
                 }
                 if let Some(target) = found
                     .into_iter()
                     .next()
-                    .filter(|_| kind == Kind::Definition)
+                    .filter(|_| matches!(kind, Kind::Definition | Kind::TypeDefinition))
                 {
                     return Ok(resolve(&target, path, text, line, col));
                 }
@@ -1045,6 +1073,53 @@ pub async fn code_actions(
     fixes_of(&server, &uri, text, params).await
 }
 
+/// `text` with its imports put in order (and the unused ones taken out) by
+/// its language server: the `source.organizeImports` action.
+pub async fn organize_imports(ext: &str, path: &Path, text: &str) -> Result<String, String> {
+    let (server, language_id, _) = connect(ext, path).await?;
+    let uri = path_to_uri(path);
+    server.sync(&uri, language_id, text).await?;
+    let lines = text.split('\n').count();
+    let last = text
+        .split('\n')
+        .next_back()
+        .map_or(0, |l| l.encode_utf16().count());
+    let params = json!({
+        "textDocument": { "uri": uri },
+        "range": {
+            "start": { "line": 0, "character": 0 },
+            "end": { "line": lines - 1, "character": last },
+        },
+        "context": { "diagnostics": [], "only": ["source.organizeImports"] },
+    });
+    let answer = request_retrying(&server, "textDocument/codeAction", params).await?;
+    let action = answer
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|a| {
+            a.get("kind")
+                .and_then(Value::as_str)
+                .is_some_and(|k| k.starts_with("source.organizeImports"))
+        })
+        .ok_or("this language server has nothing to organize")?;
+    let Some(edit) = action.get("edit") else {
+        return Err("this action runs a command of the server, which is not supported".into());
+    };
+    let files = workspace_files(edit, &uri, text)?;
+    // Only this file: an action that touches others is not followed.
+    let own: Vec<&FileEdits> = files.iter().filter(|f| f.path == path).collect();
+    if own.is_empty() {
+        return Ok(text.to_string());
+    }
+    let fix = crate::lint::Fix {
+        title: String::new(),
+        edits: own[0].edits.clone(),
+        safe: true,
+    };
+    Ok(crate::lint::apply(text, &[&fix]).0)
+}
+
 // ---- Rename, hover, formatting -----------------------------------------------
 
 /// What a rename changes in one file.
@@ -1289,6 +1364,89 @@ async fn format_on(
         safe: true,
     };
     Ok(crate::lint::apply(text, &[&fix]).0)
+}
+
+/// The part of `text` between `start` and `end` ((line, byte column) each),
+/// laid out by the language server (`rangeFormatting`).
+pub async fn format_range(
+    ext: &str,
+    path: &Path,
+    text: &str,
+    start: (usize, usize),
+    end: (usize, usize),
+    spaces: bool,
+    width: usize,
+) -> Result<String, String> {
+    let (server, language_id, _) = connect(ext, path).await?;
+    let provider = server.capability(&["documentRangeFormattingProvider"]);
+    if provider.is_null() || provider == json!(false) {
+        return Err("this language server cannot format a selection".into());
+    }
+    let uri = path_to_uri(path);
+    server.sync(&uri, language_id, text).await?;
+    let params = json!({
+        "textDocument": { "uri": uri },
+        "range": {
+            "start": { "line": start.0, "character": utf16_col(text, start.0, start.1) },
+            "end": { "line": end.0, "character": utf16_col(text, end.0, end.1) },
+        },
+        "options": { "tabSize": width, "insertSpaces": spaces },
+    });
+    let answer = request_retrying(&server, "textDocument/rangeFormatting", params).await?;
+    let Some(list) = answer.as_array() else {
+        return Ok(slice_between(text, start, end).to_string());
+    };
+    let fix = crate::lint::Fix {
+        title: String::new(),
+        edits: text_edit_list(list, text),
+        safe: true,
+    };
+    let formatted = crate::lint::apply(text, &[&fix]).0;
+    selection_after(text, &formatted, start, end)
+}
+
+/// The byte offset of (`line`, `col`) in `text`.
+fn offset_of(text: &str, line: usize, col: usize) -> usize {
+    text.split('\n')
+        .take(line)
+        .map(|l| l.len() + 1)
+        .sum::<usize>()
+        + col
+}
+
+fn slice_between(text: &str, start: (usize, usize), end: (usize, usize)) -> &str {
+    let (a, b) = (
+        offset_of(text, start.0, start.1),
+        offset_of(text, end.0, end.1),
+    );
+    text.get(a..b).unwrap_or("")
+}
+
+/// What the selection became once the server's edits were made: the text
+/// before it and after it must be as they were (a server that moved things
+/// outside what was asked is not followed).
+fn selection_after(
+    before: &str,
+    after: &str,
+    start: (usize, usize),
+    end: (usize, usize),
+) -> Result<String, String> {
+    let (a, b) = (
+        offset_of(before, start.0, start.1),
+        offset_of(before, end.0, end.1),
+    );
+    let tail = before.len().checked_sub(b).ok_or("bad selection")?;
+    let stop = after.len().checked_sub(tail).filter(|s| *s >= a);
+    match stop {
+        Some(stop)
+            if before.get(..a) == after.get(..a)
+                && before.get(b..) == after.get(stop..)
+                && after.get(a..stop).is_some() =>
+        {
+            Ok(after[a..stop].to_string())
+        }
+        _ => Err("the server changed more than the selection".into()),
+    }
 }
 
 // ---- Completion -----------------------------------------------------------
@@ -1582,6 +1740,75 @@ fn symbols_of(value: &Value, texts: &mut HashMap<PathBuf, String>) -> Vec<Symbol
             })
         })
         .collect()
+}
+
+/// The names a file declares, as its server lists them (`documentSymbol`),
+/// in the order of the file: each with the name of what holds it.
+pub async fn document_symbols(
+    ext: &str,
+    path: &Path,
+    text: &str,
+) -> Result<Vec<SymbolHit>, String> {
+    let (server, language_id, _) = connect(ext, path).await?;
+    let provider = server.capability(&["documentSymbolProvider"]);
+    if provider.is_null() || provider == json!(false) {
+        return Err("this language server does not list the names of a file".into());
+    }
+    let uri = path_to_uri(path);
+    server.sync(&uri, language_id, text).await?;
+    let answer = request_retrying(
+        &server,
+        "textDocument/documentSymbol",
+        json!({ "textDocument": { "uri": uri } }),
+    )
+    .await?;
+    let mut hits = Vec::new();
+    flatten_symbols(&answer, path, text, None, &mut hits);
+    Ok(hits)
+}
+
+/// The two shapes of the answer: a tree (`DocumentSymbol`) or a flat list
+/// (`SymbolInformation`, with a location).
+fn flatten_symbols(
+    value: &Value,
+    path: &Path,
+    text: &str,
+    container: Option<&str>,
+    out: &mut Vec<SymbolHit>,
+) {
+    for s in value.as_array().into_iter().flatten() {
+        let Some(name) = s.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let start = s
+            .get("selectionRange")
+            .or_else(|| s.get("range"))
+            .or_else(|| s.get("location").and_then(|l| l.get("range")))
+            .and_then(|r| r.get("start"));
+        let number = |key: &str| {
+            start
+                .and_then(|p| p.get(key))
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize
+        };
+        let (line, character) = (number("line"), number("character"));
+        out.push(SymbolHit {
+            name: name.to_string(),
+            kind: s.get("kind").and_then(Value::as_u64).unwrap_or(0),
+            container: container.map(str::to_string).or_else(|| {
+                s.get("containerName")
+                    .and_then(Value::as_str)
+                    .filter(|c| !c.is_empty())
+                    .map(str::to_string)
+            }),
+            path: path.to_path_buf(),
+            line,
+            col: byte_col(text.split('\n').nth(line).unwrap_or(""), character),
+        });
+        if let Some(children) = s.get("children") {
+            flatten_symbols(children, path, text, Some(name), out);
+        }
+    }
 }
 
 /// The names matching `query` in the projects, from their servers: each is
@@ -2100,6 +2327,10 @@ impl Server {
                             })
                             .collect(),
                     )
+                } else if method == "workspace/applyEdit" {
+                    // Edits asked by the server on its own are not made
+                    // here: it is told so (the answer has a shape of its own).
+                    json!({ "applied": false, "failureReason": "not supported" })
                 } else {
                     Value::Null
                 };
@@ -2234,6 +2465,55 @@ async fn read_message<R: AsyncBufRead + Unpin>(reader: &mut R) -> Option<Value> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_names_of_a_file_come_from_a_tree_or_from_a_flat_list() {
+        let text = "struct A {\n    fn_x: u8,\n}\nfn é() {}\n";
+        let tree = json!([
+            { "name": "A", "kind": 23, "range": {"start": {"line": 0, "character": 0}, "end": {"line": 2, "character": 1}},
+              "selectionRange": {"start": {"line": 0, "character": 7}, "end": {"line": 0, "character": 8}},
+              "children": [
+                { "name": "fn_x", "kind": 8,
+                  "range": {"start": {"line": 1, "character": 4}, "end": {"line": 1, "character": 13}},
+                  "selectionRange": {"start": {"line": 1, "character": 4}, "end": {"line": 1, "character": 8}} } ] },
+            { "name": "é", "kind": 12,
+              "range": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 10}},
+              "selectionRange": {"start": {"line": 3, "character": 3}, "end": {"line": 3, "character": 4}} }
+        ]);
+        let mut hits = Vec::new();
+        flatten_symbols(&tree, Path::new("/p/a.rs"), text, None, &mut hits);
+        let shown: Vec<_> = hits
+            .iter()
+            .map(|h| (h.name.as_str(), h.container.as_deref(), h.line, h.col))
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                ("A", None, 0, 7),
+                ("fn_x", Some("A"), 1, 4),
+                ("é", None, 3, 3)
+            ]
+        );
+        let flat = json!([{ "name": "f", "kind": 12, "containerName": "m",
+            "location": {"uri": "file:///p/a.rs",
+                "range": {"start": {"line": 3, "character": 3}, "end": {"line": 3, "character": 4}}} }]);
+        let mut hits = Vec::new();
+        flatten_symbols(&flat, Path::new("/p/a.rs"), text, None, &mut hits);
+        assert_eq!((hits[0].container.as_deref(), hits[0].line), (Some("m"), 3));
+    }
+
+    #[test]
+    fn a_formatted_selection_is_cut_out_of_the_formatted_file() {
+        let before = "a\n  if x {y}\nz\n";
+        let after = "a\n  if x { y }\nz\n";
+        assert_eq!(
+            selection_after(before, after, (1, 2), (1, 10)).unwrap(),
+            "if x { y }"
+        );
+        // Moved outside what was asked: refused.
+        let moved = "A\n  if x { y }\nz\n";
+        assert!(selection_after(before, moved, (1, 2), (1, 10)).is_err());
+        assert_eq!(slice_between(before, (1, 2), (1, 10)), "if x {y}");
+    }
     use super::*;
 
     #[test]
@@ -3033,6 +3313,59 @@ while True:
     }
 
     /// Against a real rust-analyzer, on a project made for the test:
+    /// The names of a file, by a real
+    /// rust-analyzer: `cargo test -- --ignored real_rust_analyzer_outline`.
+    #[test]
+    #[ignore]
+    fn real_rust_analyzer_outline_and_range_formatting() {
+        if find_executable("rust-analyzer")
+            .filter(|_| usable("rust-analyzer"))
+            .is_none()
+        {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let path = dir.path().join("src/lib.rs");
+        let text = "pub struct A { pub x: u8 }\nimpl A { pub fn go(&self) -> u8 { self.x } }\nfn  messy( a:u8,b:u8 )->u8{a+b}\nfn mk() -> A { A { x: 1 } }\nfn f() { let v = mk(); let _ = v; }\n";
+        std::fs::write(&path, text).unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut names = Vec::new();
+            for _ in 0..30 {
+                if let Ok(hits) = document_symbols("rs", &path, text).await {
+                    names = hits.into_iter().map(|h| h.name).collect();
+                    if !names.is_empty() {
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            assert!(names.iter().any(|n| n == "A"), "{names:?}");
+            assert!(names.iter().any(|n| n == "messy"), "{names:?}");
+            // The type of a variable is where its struct is declared.
+            let col = text.lines().nth(4).unwrap().find("v =").unwrap();
+            match type_definition("rs", &path, text, 4, col).await {
+                Outcome::Found(hit) => assert_eq!(hit.line, 0, "{hit:?}"),
+                other => panic!("{other:?}"),
+            }
+            // It has no organize action: said, not guessed.
+            assert!(organize_imports("rs", &path, text).await.is_err());
+            // rust-analyzer formats a range only when asked to by a setting:
+            // the answer is then an error that says so, not a changed text.
+            let formatted = format_range("rs", &path, text, (2, 0), (2, 31), true, 4).await;
+            assert!(formatted.is_err_and(|e| e.contains("cannot format a selection")));
+        });
+    }
+
     /// `cargo test -- --ignored real_rust_analyzer_completion`.
     #[test]
     #[ignore]

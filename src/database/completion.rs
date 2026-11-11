@@ -288,6 +288,40 @@ pub fn quoted(name: &str, dialect: Dialect) -> String {
 /// What the text at the caret could be completed with. Without `force`, there
 /// has to be something typed (or a `.` just before).
 pub fn suggest(text: &str, caret: usize, known: &Known, force: bool) -> Option<Suggestions> {
+    // A console of thousands of lines is not tokenised whole for each key:
+    // the lines around the caret are enough to know the statement it is in
+    // (one longer than that gets the completion of what is in the window).
+    const BEFORE: usize = 6_000;
+    const AFTER: usize = 2_000;
+    if text.len() > BEFORE + AFTER {
+        let caret = caret.min(text.len());
+        let boundary = |mut at: usize| {
+            while !text.is_char_boundary(at) {
+                at -= 1;
+            }
+            at
+        };
+        let mut from = boundary(caret.saturating_sub(BEFORE));
+        let mut to = boundary((caret + AFTER).min(text.len()));
+        // On whole lines (and so on characters), starting at a statement of
+        // its own when one begins there.
+        from = text[from..]
+            .find('\n')
+            .map_or(from, |n| from + n + 1)
+            .min(caret);
+        to = text[to..].find('\n').map_or(text.len(), |n| to + n);
+        if from > 0 || to < text.len() {
+            let found = suggest_in(&text[from..to], caret - from, known, force)?;
+            return Some(Suggestions {
+                start: found.start + from,
+                items: found.items,
+            });
+        }
+    }
+    suggest_in(text, caret, known, force)
+}
+
+fn suggest_in(text: &str, caret: usize, known: &Known, force: bool) -> Option<Suggestions> {
     let caret = caret.min(text.len());
     if !text.is_char_boundary(caret) {
         return None;
@@ -839,6 +873,32 @@ fn resolve(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_very_long_console_is_completed_from_the_lines_around_the_caret() {
+        let known = Known::default();
+        let filler = "-- é filler line to make the console long\n".repeat(600);
+        let text = format!("{filler}SELECT * FROM cust\n{filler}");
+        let caret = filler.len() + "SELECT * FROM cust".len();
+        let near = suggest(&text, caret, &known, true);
+        let small = suggest(
+            "SELECT * FROM cust\n",
+            "SELECT * FROM cust".len(),
+            &known,
+            true,
+        );
+        assert_eq!(
+            near.as_ref().map(|s| s.items.len()),
+            small.as_ref().map(|s| s.items.len())
+        );
+        // The place it gives is in the whole text, whatever was cut.
+        if let Some(found) = near {
+            assert_eq!(&text[found.start..caret], "cust");
+        }
+        // A caret in the middle of multi-byte text does not make it panic.
+        let wide = "é".repeat(20_000);
+        let _ = suggest(&wide, 10_001 - 1, &known, true);
+    }
+
     use super::*;
 
     fn known() -> Known {

@@ -126,6 +126,15 @@ pub enum DbMsg {
     /// The search field, a field under a column, and the row of those.
     SearchText(PathBuf, String),
     ColumnFilter(PathBuf, String, String),
+    /// Keep the rows whose cell has this value (row, column of the page).
+    FilterByCell(PathBuf, usize, usize),
+    /// The keys an SSH server offered (or why not).
+    SshScanned(Result<Vec<crate::ssh_trust::HostKey>, String>),
+    SshTrustYes,
+    SshTrustNo,
+    /// Stop showing the column (of the page) / show them all again.
+    HideColumn(PathBuf, usize),
+    ShowColumns(PathBuf),
     ToggleColumnFilters(PathBuf),
     /// A row as a form: open it, close it, go to the row before or after,
     /// type in a field, make it NULL, lay out its JSON.
@@ -295,6 +304,14 @@ pub enum DbMsg {
     LogReuse(usize),
     GuardRun,
     GuardCancel,
+    /// Show more of the older entries of the log.
+    LogMore,
+    /// Stops the page the tab is reading.
+    StopLoad(PathBuf),
+    /// The value of the parameter at this place was typed.
+    BindValue(usize, String),
+    BindRun,
+    BindCancel,
     ClearLog,
     /// An entry of the log was clicked, or is copied.
     SelectLog(usize),
@@ -318,6 +335,8 @@ pub enum DbMsg {
     DismissNotice(PathBuf),
     /// The grid of a tab scrolled: offset and height of what is seen.
     Scrolled(PathBuf, f32, f32),
+    /// The grid was scrolled sideways: how far, and how wide it is.
+    ScrolledAcross(PathBuf, f32, f32),
 }
 
 /// A table: connection, database, schema, table.
@@ -455,6 +474,7 @@ pub struct Confirm {
     pub schema: String,
     pub table: String,
     pub kind: Kind,
+    pub dialect: protocol::Dialect,
     pub action: ConfirmAction,
     /// For a drop: what depends on it goes too.
     pub cascade: bool,
@@ -473,8 +493,8 @@ impl Confirm {
     pub fn statement(&self) -> String {
         let name = format!(
             "{}.{}",
-            protocol::quote_ident(&self.schema),
-            protocol::quote_ident(&self.table)
+            protocol::quote_ident_in(self.dialect, &self.schema),
+            protocol::quote_ident_in(self.dialect, &self.table)
         );
         match self.action {
             ConfirmAction::Empty => format!("DELETE FROM {name}"),
@@ -485,13 +505,26 @@ impl Confirm {
                     Kind::Matview => "MATERIALIZED VIEW",
                     Kind::Foreign => "FOREIGN TABLE",
                 };
+                // Only PostgreSQL has CASCADE (MySQL accepts and ignores it).
+                let cascade = self.cascade && self.dialect == protocol::Dialect::Postgres;
                 format!(
                     "DROP {what} {name}{}",
-                    if self.cascade { " CASCADE" } else { "" }
+                    if cascade { " CASCADE" } else { "" }
                 )
             }
         }
     }
+}
+
+/// A host key to trust or not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshTrust {
+    pub host: String,
+    pub port: u16,
+    pub keys: Vec<crate::ssh_trust::HostKey>,
+    /// Looking at the server (the keys are not there yet).
+    pub scanning: bool,
+    pub error: Option<String>,
 }
 
 /// Which text of the table designer is edited.
@@ -936,11 +969,35 @@ fn driver_asset(version: &str, dialect: protocol::Dialect) -> Option<String> {
     Some(format!("{}-v{version}-{target}", dialect.driver_name()))
 }
 
+type DriverStamp = (u64, Option<std::time::SystemTime>);
+
+/// The drivers whose protocol was checked, with the size and date they had.
+fn verified_drivers() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, DriverStamp>>
+{
+    static VERIFIED: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, DriverStamp>>,
+    > = std::sync::LazyLock::new(Default::default);
+    &VERIFIED
+}
+
 /// The same for the driver of a system.
 pub async fn find_driver_for(dialect: protocol::Dialect, picked: &str) -> Option<PathBuf> {
     for path in driver_candidates(picked, dialect) {
         if !path.is_file() || !is_current_download(&path, dialect, env!("CARGO_PKG_VERSION")) {
             continue;
+        }
+        // A binary already asked for its protocol (and not replaced since)
+        // is not run again for every page, sort or refresh.
+        let stamp = std::fs::metadata(&path)
+            .ok()
+            .map(|m| (m.len(), m.modified().ok()));
+        if let Some(stamp) = stamp {
+            if verified_drivers()
+                .lock()
+                .is_ok_and(|v| v.get(&path) == Some(&stamp))
+            {
+                return Some(path);
+            }
         }
         let answer = tokio::time::timeout(
             Duration::from_secs(5),
@@ -953,6 +1010,9 @@ pub async fn find_driver_for(dialect: protocol::Dialect, picked: &str) -> Option
         if let Ok(Ok(out)) = answer {
             let said = String::from_utf8_lossy(&out.stdout);
             if said.trim().parse::<u32>() == Ok(DRIVER_PROTOCOL) {
+                if let (Some(stamp), Ok(mut v)) = (stamp, verified_drivers().lock()) {
+                    v.insert(path.clone(), stamp);
+                }
                 return Some(path);
             }
         }
@@ -1151,6 +1211,9 @@ pub struct Live(
     std::sync::Arc<tokio::sync::Mutex<Option<LiveProcess>>>,
     /// The backend of the server the session is (0: not known yet).
     std::sync::Arc<std::sync::atomic::AtomicI64>,
+    /// A request is on its way (or was dropped on the way: the answer that
+    /// is still to come would be taken for the next one's).
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
 );
 
 impl Live {
@@ -1182,6 +1245,13 @@ async fn call_live(
             .map_err(|_| t!("db.err_timeout").to_string())?,
         None => live.0.lock().await,
     };
+    // The call before this one was stopped (its task dropped) before the
+    // answer was read: the process would answer it first. It is left.
+    if live.2.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        *guard = None;
+        pid_cell.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+    let done_flag = live.2.clone();
     let mut line = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
     line.push(b'\n');
     let work = async {
@@ -1242,12 +1312,16 @@ async fn call_live(
         None => Ok(work.await),
     };
     match out {
-        Ok(Ok(out)) => read_answer(&out),
+        Ok(Ok(out)) => {
+            done_flag.store(false, std::sync::atomic::Ordering::SeqCst);
+            read_answer(&out)
+        }
         // The process can't be trusted any more (it may still be at work, or
         // gone): the next request starts another.
         Ok(Err(error)) | Err(error) => {
             *guard = None;
             pid_cell.store(0, std::sync::atomic::Ordering::Relaxed);
+            done_flag.store(false, std::sync::atomic::Ordering::SeqCst);
             Err(error)
         }
     }
@@ -1381,12 +1455,24 @@ pub async fn count(live: Option<Live>, params: Params, table: TableRef, query: Q
 }
 
 /// Makes the changes in the table, all or none; how many rows were touched.
-pub async fn apply(params: Params, table: TableRef, changes: Vec<protocol::Change>) -> Done<u64> {
+/// The changes of a table's rows, in one transaction. The rows of a result
+/// that the console read are changed in the session of the console (with its
+/// transaction, its temporary tables), the others in the session of the tree.
+pub async fn apply(
+    live: Option<Live>,
+    params: Params,
+    table: TableRef,
+    changes: Vec<protocol::Change>,
+) -> Done<u64> {
     let mut request = table_request(&params, "apply", &table);
     request.changes = changes;
-    call_with(params.browse.clone(), params.driver.clone(), request)
-        .await
-        .map(|answer| Ok(answer["applied"].as_u64().unwrap_or(0)))
+    call_with(
+        live.or_else(|| params.browse.clone()),
+        params.driver.clone(),
+        request,
+    )
+    .await
+    .map(|answer| Ok(answer["applied"].as_u64().unwrap_or(0)))
 }
 
 /// The columns of every table of the database, for the completion.
@@ -1553,6 +1639,8 @@ pub enum BackupFlag {
 #[derive(Debug, Clone)]
 pub struct Backup {
     pub conn: u64,
+    /// The system of the source: only PostgreSQL has the choice of formats.
+    pub dialect: protocol::Dialect,
     pub database: String,
     /// What is backed up: all the database, a schema, or a table.
     pub schema: String,
@@ -1865,6 +1953,7 @@ pub fn result_page(result: &QueryResult) -> Page {
         has_more: result.truncated,
         primary_key: Vec::new(),
         ctids: Vec::new(),
+        truncated: Vec::new(),
         editable: false,
         source: None,
         offset: 0,
@@ -1893,11 +1982,15 @@ pub struct TableTab {
     pub table: String,
     pub page: Option<Page>,
     pub loading: bool,
+    /// Stops the page being read.
+    pub stop: Option<iced::task::Handle>,
     /// The number of the last loading asked for: only its answer counts.
     pub load_no: u64,
     pub error: Option<String>,
     /// What the grid shows: the offset and the height of its viewport.
     pub scroll: (f32, f32),
+    /// The same sideways (only the columns in view are widgets).
+    pub scroll_x: (f32, f32),
     /// The width of each column, worked out when a page arrives.
     pub widths: Vec<f32>,
     /// What is typed in the WHERE field, and what was applied of it.
@@ -1909,6 +2002,8 @@ pub struct TableTab {
     pub search: String,
     pub column_text: std::collections::BTreeMap<String, String>,
     pub column_filters: std::collections::BTreeMap<String, String>,
+    /// The columns that are not shown (by name).
+    pub hidden: std::collections::BTreeSet<String>,
     /// The fields under the column names are shown.
     pub show_filters: bool,
     /// The row shown as a form, if one is.
@@ -1990,9 +2085,11 @@ impl TableTab {
             table,
             page: None,
             loading: true,
+            stop: None,
             load_no: 0,
             error: None,
             scroll: (0.0, 900.0),
+            scroll_x: (0.0, 2400.0),
             widths: Vec::new(),
             custom_widths: HashMap::new(),
             total: None,
@@ -2003,6 +2100,7 @@ impl TableTab {
             search: String::new(),
             column_text: Default::default(),
             column_filters: Default::default(),
+            hidden: Default::default(),
             show_filters: false,
             form: None,
             choices: None,
@@ -2468,6 +2566,8 @@ pub struct State {
     pub copy_table: Option<CopyTable>,
     pub backup: Option<Backup>,
     pub confirm: Option<Confirm>,
+    /// An SSH server whose key is not known yet, waiting for a yes.
+    pub ssh_trust: Option<SshTrust>,
     /// What each table is made of, read when a table of the tree opens.
     pub structures: HashMap<TableKey, protocol::Structure>,
     /// What is typed to find a table in the tree.
@@ -2529,6 +2629,7 @@ impl State {
             copy_table: None,
             backup: None,
             confirm: None,
+            ssh_trust: None,
             structures: HashMap::new(),
             tree_filter: String::new(),
             text: None,
@@ -2806,6 +2907,31 @@ impl State {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn emptying_and_dropping_are_written_in_the_dialect_of_the_source() {
+        use protocol::Dialect;
+        let confirm = |dialect, action, kind, cascade| Confirm {
+            conn: 1,
+            database: String::new(),
+            schema: "shop".into(),
+            table: "it`s".into(),
+            kind,
+            dialect,
+            action,
+            cascade,
+            running: false,
+            error: None,
+        };
+        let c = confirm(Dialect::Mysql, ConfirmAction::Empty, Kind::Table, false);
+        assert_eq!(c.statement(), "DELETE FROM `shop`.`it``s`");
+        let c = confirm(Dialect::Mysql, ConfirmAction::Drop, Kind::Table, true);
+        assert_eq!(c.statement(), "DROP TABLE `shop`.`it``s`");
+        let c = confirm(Dialect::Sqlite, ConfirmAction::Drop, Kind::View, false);
+        assert!(c.statement().starts_with("DROP VIEW "));
+        let c = confirm(Dialect::Postgres, ConfirmAction::Drop, Kind::Table, true);
+        assert_eq!(c.statement(), "DROP TABLE \"shop\".\"it`s\" CASCADE");
+    }
+
     #[test]
     fn table_pages_and_edits_never_wait_for_ever() {
         for op in ["rows", "count", "apply", "export"] {
@@ -3152,6 +3278,7 @@ mod tests {
             has_more: false,
             primary_key: vec![],
             ctids: Vec::new(),
+            truncated: Vec::new(),
             editable: false,
             source: None,
             offset: 0,
@@ -3279,6 +3406,7 @@ mod tests {
             has_more: false,
             primary_key: Vec::new(),
             ctids: Vec::new(),
+            truncated: Vec::new(),
             editable: false,
             source: None,
             offset: 0,
@@ -3324,6 +3452,7 @@ mod tests {
             has_more: false,
             primary_key: vec![],
             ctids: Vec::new(),
+            truncated: Vec::new(),
             editable: false,
             source: None,
             offset: 0,
@@ -3431,6 +3560,31 @@ mod tests {
             assert!(stopped
                 .failed
                 .is_some_and(|(_, e)| e.contains("canceling statement")));
+
+            // A call whose task was dropped on its way (Stop) leaves no answer
+            // behind to be taken for the next one's.
+            let dropped = Live::default();
+            let running = tokio::spawn(run_with(
+                Some(dropped.clone()),
+                params.clone(),
+                String::new(),
+                sql(&["DO $$ BEGIN PERFORM pg_sleep(20); END $$"]),
+                false,
+            ));
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            running.abort();
+            let _ = running.await;
+            let after = run_with(
+                Some(dropped.clone()),
+                params.clone(),
+                String::new(),
+                sql(&["SELECT 7"]),
+                false,
+            )
+            .await
+            .result
+            .unwrap();
+            assert_eq!(after.results[0].sql, "SELECT 7");
 
             // The SQL of a function and of a view.
             run_statements(
@@ -3706,7 +3860,7 @@ mod tests {
             pending.set(&filtered, 0, 3, None);
             let changes = pending.changes(&filtered);
             assert_eq!(
-                apply(params.clone(), table.clone(), changes).await.result,
+                apply(None, params.clone(), table.clone(), changes).await.result,
                 Ok(2)
             );
             let all = Query {
@@ -3723,12 +3877,12 @@ mod tests {
             assert_eq!(after.rows[2][3], None);
             let mut gone = grid::Pending::default();
             gone.delete(&after, 0);
-            let removed = apply(params.clone(), table.clone(), gone.changes(&after))
+            let removed = apply(None, params.clone(), table.clone(), gone.changes(&after))
                 .await
                 .result;
             assert_eq!(removed, Ok(1));
             // The same row again: nothing to delete, and nothing is done.
-            let again = apply(params.clone(), table.clone(), gone.changes(&after))
+            let again = apply(None, params.clone(), table.clone(), gone.changes(&after))
                 .await
                 .result;
             assert!(again.unwrap_err().contains("0 rows"));
@@ -3750,7 +3904,7 @@ mod tests {
             let second = added.add_row(&before);
             added.set(&before, second, 0, Some("11".into()));
             added.set(&before, second, 1, None);
-            let done = apply(params.clone(), table.clone(), added.changes(&before)).await;
+            let done = apply(None, params.clone(), table.clone(), added.changes(&before)).await;
             assert_eq!(done.result, Ok(2));
             let after_add = rows(params.clone(), table.clone(), all.clone())
                 .await
@@ -3775,7 +3929,7 @@ mod tests {
             clash.set(&after_add, fresh, 0, Some("12".into()));
             let again = clash.add_row(&after_add);
             clash.set(&after_add, again, 0, Some("10".into()));
-            let refused = apply(params.clone(), table.clone(), clash.changes(&after_add)).await;
+            let refused = apply(None, params.clone(), table.clone(), clash.changes(&after_add)).await;
             assert!(refused.result.is_err());
             let still = rows(params.clone(), table.clone(), all.clone())
                 .await
@@ -3801,7 +3955,7 @@ mod tests {
             let mut pending = grid::Pending::default();
             pending.set(&page, 0, 1, Some("changed".into()));
             pending.delete(&page, 2);
-            let done = apply(params.clone(), loose.clone(), pending.changes(&page)).await;
+            let done = apply(None, params.clone(), loose.clone(), pending.changes(&page)).await;
             assert_eq!(done.result, Ok(2));
             assert!(done.executed.iter().any(|e| e.sql.contains("ctid")));
             let after = rows(params.clone(), loose.clone(), at(0))
@@ -3827,7 +3981,7 @@ mod tests {
             let mut other = params.clone();
             other.target.startup_script = "UPDATE live_nokey SET b = 'theirs'".into();
             test(other).await.result.unwrap();
-            let refused = apply(params.clone(), loose.clone(), stale.changes(&after)).await;
+            let refused = apply(None, params.clone(), loose.clone(), stale.changes(&after)).await;
             assert!(refused.result.unwrap_err().contains("0 rows"));
             // A row added to a table that has no key.
             let current = rows(params.clone(), loose.clone(), at(0))
@@ -3838,7 +3992,7 @@ mod tests {
             let new = added.add_row(&current);
             added.set(&current, new, 0, Some("7".into()));
             assert_eq!(
-                apply(params.clone(), loose.clone(), added.changes(&current))
+                apply(None, params.clone(), loose.clone(), added.changes(&current))
                     .await
                     .result,
                 Ok(1)
@@ -4096,6 +4250,7 @@ mod tests {
                 schema: "public".into(),
                 table: "live_ddl2".into(),
                 kind: Kind::Table,
+                dialect: protocol::Dialect::Postgres,
                 action,
                 cascade,
                 running: false,
@@ -4149,16 +4304,19 @@ mod tests {
                 ],
             )
             .await;
-            // What ran is in the log, the failure too; a SELECT is left to the
-            // tab that pages it, so it is not run here.
-            assert_eq!(ran.executed.len(), 4);
-            assert!(ran.executed[3].error.is_some());
+            // What ran is in the log, the failure too (the SELECT is logged
+            // with its first rows; the tab that pages it reads them again).
+            assert_eq!(ran.executed.len(), 5);
+            assert!(ran.executed[4].error.is_some());
             assert_eq!(ran.executed[1].rows, Some(2));
             let ran = ran.result.unwrap();
             assert_eq!(ran.results.len(), 4);
             assert_eq!(ran.failed.as_ref().map(|f| f.0), Some(4));
             let select = &ran.results[2];
-            assert!(select.has_rows && select.deferred && select.rows.is_empty());
+            // A statement after it writes the same table: it is not left to
+            // the tab (that would read the rows as the UPDATE left them).
+            assert!(select.has_rows && !select.deferred);
+            assert_eq!(select.rows.len(), 2);
             assert_eq!(select.columns, vec!["a".to_string(), "b".to_string()]);
             assert!(!ran.results[3].has_rows);
             assert_eq!(ran.results[3].affected, 1);
@@ -4381,6 +4539,7 @@ mod other_systems_tests {
         built.is_file().then_some(built)
     }
 
+    #[cfg(feature = "drivers")]
     #[test]
     fn a_sqlite_file_is_read_changed_and_exported_through_the_apps_own_calls() {
         let Some(driver) = sqlite_driver() else {
@@ -4440,6 +4599,7 @@ mod other_systems_tests {
             assert_eq!(page.rows[1][1].as_deref(), Some("O'Neil"));
             assert!(page.editable && page.primary_key == vec!["id".to_string()]);
             let done = apply(
+                None,
                 params.clone(),
                 table.clone(),
                 vec![protocol::Change {

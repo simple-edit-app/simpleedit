@@ -54,6 +54,25 @@ impl SimpleEditApp {
         Task::none()
     }
 
+    /// Asks whether to trust the key of an SSH server: its fingerprints are
+    /// read first.
+    fn ask_ssh_trust(&mut self, host: String, port: u16) -> Task<Message> {
+        if self.db.ssh_trust.is_some() {
+            return Task::none();
+        }
+        self.db.ssh_trust = Some(database::SshTrust {
+            host: host.clone(),
+            port,
+            keys: Vec::new(),
+            scanning: true,
+            error: None,
+        });
+        Task::perform(
+            async move { crate::ssh_trust::scan(&host, port).await },
+            |r| Message::Db(DbMsg::SshScanned(r)),
+        )
+    }
+
     pub(super) fn db_load_rows(&mut self, path: PathBuf, offset: u64) -> Task<Message> {
         let Some(tab) = self.db_tabs.get(&path) else {
             return Task::none();
@@ -82,10 +101,18 @@ impl SimpleEditApp {
             tab.load_no += 1;
             no = tab.load_no;
         }
-        Task::perform(
-            database::rows_with(live, params, table, query),
-            move |done| Message::Db(DbMsg::RowsFor(path.clone(), no, done)),
-        )
+        let (task, handle) = Task::perform(database::rows_with(live, params, table, query), {
+            let path = path.clone();
+            move |done| Message::Db(DbMsg::RowsFor(path.clone(), no, done))
+        })
+        .abortable();
+        if let Some(tab) = self.db_tabs.get_mut(&path) {
+            // The page asked for before is no more wanted.
+            if let Some(old) = tab.stop.replace(handle) {
+                old.abort();
+            }
+        }
+        task
     }
 
     /// Puts what the driver ran in the log of the console, and shows the end.
@@ -284,6 +311,24 @@ impl SimpleEditApp {
             self.db.console.last = Some((false, t!("db.console_nothing").to_string()));
             return Task::none();
         }
+        // Parameters (`:name`, `?`) are asked for before anything runs.
+        let names = database::console::placeholders(&statements, self.db.console.dialect);
+        if !names.is_empty() {
+            self.db.console.last = None;
+            self.db.console.binds = Some(database::console::Binds {
+                conn,
+                statements,
+                values: vec![String::new(); names.len()],
+                names,
+            });
+            return Task::none();
+        }
+        self.db_run_checked(conn, statements)
+    }
+
+    /// Runs statements whose parameters are known: after the question about
+    /// the risk of them, if they have one.
+    fn db_run_checked(&mut self, conn: u64, statements: Vec<String>) -> Task<Message> {
         let production = self.db.connection(conn).is_some_and(|c| c.production);
         let risk = statements
             .iter()
@@ -811,6 +856,18 @@ impl SimpleEditApp {
             }
             DbMsg::Tested(done) => {
                 let mut label = String::new();
+                // An SSH server whose key is not known: its fingerprint is asked about.
+                let unknown = done
+                    .result
+                    .as_ref()
+                    .err()
+                    .filter(|e| crate::ssh_trust::is_unknown_host(e))
+                    .and(self.db.dialog.as_ref())
+                    .map(|f| (f.draft.ssh.host.clone(), f.draft.ssh.port));
+                if let Some((host, port)) = unknown.filter(|(h, _)| !h.is_empty()) {
+                    let log = self.db_log_as(&label, &done.executed);
+                    return Task::batch([log, self.ask_ssh_trust(host, port)]);
+                }
                 if let Some(form) = &mut self.db.dialog {
                     label = form.draft.label();
                     form.test = match done.result {
@@ -919,6 +976,18 @@ impl SimpleEditApp {
             }
             DbMsg::TreeLoaded(id, done) => {
                 let log = self.db_log(id, &done.executed);
+                let unknown = done
+                    .result
+                    .as_ref()
+                    .err()
+                    .filter(|e| crate::ssh_trust::is_unknown_host(e))
+                    .and(self.db.connection(id))
+                    .map(|c| (c.ssh.host.clone(), c.ssh.port));
+                let ask = match unknown.filter(|(h, _)| !h.is_empty()) {
+                    Some((host, port)) => self.ask_ssh_trust(host, port),
+                    None => Task::none(),
+                };
+                let log = Task::batch([log, ask]);
                 let read_columns = done.result.is_ok();
                 self.db.forget_known();
                 if self.db.connection(id).is_some() {
@@ -963,6 +1032,9 @@ impl SimpleEditApp {
                 // Answers can come in any order: only the last asked counts.
                 let current = self.db_tabs.get(&path).is_some_and(|t| t.load_no == no);
                 if current {
+                    if let Some(tab) = self.db_tabs.get_mut(&path) {
+                        tab.stop = None;
+                    }
                     return self.db_message(DbMsg::Rows(path, done));
                 }
                 match self.db_tabs.get(&path).map(|t| t.conn) {
@@ -1187,6 +1259,74 @@ impl SimpleEditApp {
                 }
                 Task::none()
             }
+            DbMsg::HideColumn(path, col) => {
+                if let Some(tab) = self.db_tabs.get_mut(&path) {
+                    let name = tab
+                        .page
+                        .as_ref()
+                        .and_then(|p| p.columns.get(col))
+                        .map(|c| c.name.clone());
+                    let count = tab.page.as_ref().map_or(0, |p| p.columns.len());
+                    // One column at least stays.
+                    if let Some(name) = name.filter(|_| tab.hidden.len() + 1 < count) {
+                        tab.hidden.insert(name);
+                    }
+                }
+                Task::none()
+            }
+            DbMsg::ShowColumns(path) => {
+                if let Some(tab) = self.db_tabs.get_mut(&path) {
+                    tab.hidden.clear();
+                }
+                Task::none()
+            }
+            DbMsg::SshScanned(result) => {
+                if let Some(trust) = self.db.ssh_trust.as_mut() {
+                    trust.scanning = false;
+                    match result {
+                        Ok(keys) => trust.keys = keys,
+                        Err(e) => trust.error = Some(e),
+                    }
+                }
+                Task::none()
+            }
+            DbMsg::SshTrustNo => {
+                self.db.ssh_trust = None;
+                Task::none()
+            }
+            DbMsg::SshTrustYes => {
+                let Some(trust) = self.db.ssh_trust.take() else {
+                    return Task::none();
+                };
+                match crate::ssh_trust::trust(&trust.keys) {
+                    Ok(()) => {
+                        self.set_status(t!("db.ssh_trusted", host = trust.host.as_str()), false)
+                    }
+                    Err(e) => self.set_status(e, true),
+                }
+                Task::none()
+            }
+            DbMsg::FilterByCell(path, row, col) => {
+                let Some(tab) = self.db_tabs.get_mut(&path) else {
+                    return Task::none();
+                };
+                let found = tab.page.as_ref().and_then(|page| {
+                    let name = page.columns.get(col)?.name.clone();
+                    let value = tab.pending.value(page, row, col).map(str::to_string);
+                    Some((name, value))
+                });
+                let Some((column, value)) = found else {
+                    return Task::none();
+                };
+                // An empty cell is NULL here: the same filter finds it.
+                let text = match value {
+                    Some(v) => format!("= {v}"),
+                    None => "null".to_string(),
+                };
+                tab.column_text.insert(column, text);
+                tab.show_filters = true;
+                self.db_message(DbMsg::ApplyFilter(path))
+            }
             DbMsg::ToggleColumnFilters(path) => {
                 if let Some(tab) = self.db_tabs.get_mut(&path) {
                     tab.show_filters = !tab.show_filters;
@@ -1268,6 +1408,11 @@ impl SimpleEditApp {
                     return Task::none();
                 };
                 if tab.pending.is_deleted(row) || row >= tab.pending.rows(page) {
+                    return Task::none();
+                }
+                // A value that was cut would be written cut.
+                if page.truncated.contains(&(row, col)) {
+                    tab.notice = Some(t!("db.cell_cut").to_string());
                     return Task::none();
                 }
                 let text = tab
@@ -1391,6 +1536,7 @@ impl SimpleEditApp {
                     return Task::none();
                 }
                 let (conn, table) = (tab.conn, tab.table_ref());
+                let live = tab.live.then(|| self.db.live.get(&conn).cloned()).flatten();
                 let Some(params) = self.db_params(conn, false) else {
                     return self.db_ask_password(conn);
                 };
@@ -1398,9 +1544,10 @@ impl SimpleEditApp {
                     tab.committing = true;
                     tab.notice = None;
                 }
-                Task::perform(database::apply(params, table, changes), move |result| {
-                    Message::Db(DbMsg::Committed(path.clone(), result))
-                })
+                Task::perform(
+                    database::apply(live, params, table, changes),
+                    move |result| Message::Db(DbMsg::Committed(path.clone(), result)),
+                )
             }
             DbMsg::Preview(path, on) => {
                 if let Some(tab) = self.db_tabs.get_mut(&path) {
@@ -1656,16 +1803,6 @@ impl SimpleEditApp {
                 }
                 Task::none()
             }
-            // The designer writes PostgreSQL's DDL only.
-            DbMsg::OpenDesigner(conn, ..)
-                if self
-                    .db
-                    .connection(conn)
-                    .is_some_and(|c| c.dialect != database::protocol::Dialect::Postgres) =>
-            {
-                self.set_status(t!("db.designer_pg_only"), true);
-                Task::none()
-            }
             DbMsg::OpenDesigner(conn, database, schema, table) => {
                 self.admin_open_designer((conn, database, schema, table))
             }
@@ -1766,6 +1903,7 @@ impl SimpleEditApp {
             }
             DbMsg::Run(all) => {
                 self.db.console.guard = None;
+                self.db.console.binds = None;
                 self.db_run(all)
             }
             DbMsg::GuardRun => match self.db.console.guard.take() {
@@ -1807,10 +1945,54 @@ impl SimpleEditApp {
                 }
                 Task::none()
             }
+            DbMsg::LogMore => {
+                self.db.console.log_limit += 200;
+                Task::none()
+            }
             DbMsg::GuardCancel => {
                 self.db.console.guard = None;
                 Task::none()
             }
+            DbMsg::StopLoad(path) => {
+                if let Some(tab) = self.db_tabs.get_mut(&path) {
+                    if let Some(handle) = tab.stop.take() {
+                        handle.abort();
+                    }
+                    // Whatever answer was on its way is not wanted.
+                    tab.load_no += 1;
+                    tab.loading = false;
+                    tab.error = Some(t!("db.load_stopped").to_string());
+                }
+                Task::none()
+            }
+            DbMsg::BindValue(at, text) => {
+                if let Some(value) = self
+                    .db
+                    .console
+                    .binds
+                    .as_mut()
+                    .and_then(|b| b.values.get_mut(at))
+                {
+                    *value = text;
+                }
+                Task::none()
+            }
+            DbMsg::BindCancel => {
+                self.db.console.binds = None;
+                Task::none()
+            }
+            DbMsg::BindRun => match self.db.console.binds.take() {
+                Some(binds) if !self.db.console.running => {
+                    let statements = database::console::bind(
+                        &binds.statements,
+                        self.db.console.dialect,
+                        &binds.names,
+                        &binds.values,
+                    );
+                    self.db_run_checked(binds.conn, statements)
+                }
+                _ => Task::none(),
+            },
             DbMsg::Cancel => {
                 // The task is dropped, so is the driver: the server sees the
                 // connection go and stops the query.
@@ -1948,6 +2130,12 @@ impl SimpleEditApp {
             DbMsg::DismissNotice(path) => {
                 if let Some(tab) = self.db_tabs.get_mut(&path) {
                     tab.notice = None;
+                }
+                Task::none()
+            }
+            DbMsg::ScrolledAcross(path, offset, width) => {
+                if let Some(tab) = self.db_tabs.get_mut(&path) {
+                    tab.scroll_x = (offset, width);
                 }
                 Task::none()
             }

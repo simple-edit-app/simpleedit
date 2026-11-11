@@ -224,6 +224,21 @@ pub fn score_prepared(query: &[char], path: &str) -> Option<i64> {
     if query.is_empty() {
         return Some(0);
     }
+    // Most paths do not hold the letters at all: found out without making
+    // any list of characters.
+    let mut wanted = query.iter();
+    let mut next = wanted.next();
+    for c in path.chars().flat_map(char::to_lowercase) {
+        if next == Some(&c) {
+            next = wanted.next();
+            if next.is_none() {
+                break;
+            }
+        }
+    }
+    if next.is_some() {
+        return None;
+    }
     let lower: Vec<char> = path.chars().flat_map(char::to_lowercase).collect();
     let original: Vec<char> = path.chars().collect();
     if lower.len() != original.len() {
@@ -538,6 +553,30 @@ fn excerpt(line: &str, start: usize, len: usize) -> (String, (usize, usize)) {
 
 #[cfg(test)]
 mod tests {
+    /// A big project: the whole list is ranked for a query within a frame.
+    #[test]
+    fn two_hundred_thousand_paths_are_ranked_fast_enough_for_a_keystroke() {
+        let paths: Vec<String> = (0..200_000)
+            .map(|i| {
+                format!(
+                    "crates/module_{}/src/component_{}/file_{i}.rs",
+                    i % 97,
+                    i % 1013
+                )
+            })
+            .collect();
+        let query = prepare_query("mod42cmp7file9");
+        let started = std::time::Instant::now();
+        let hits = paths
+            .iter()
+            .filter_map(|p| score_prepared(&query, p))
+            .count();
+        let took = started.elapsed();
+        assert!(hits > 0);
+        // Unoptimised test builds are the slowest: still well under a second.
+        assert!(took < std::time::Duration::from_millis(1500), "{took:?}");
+    }
+
     #[test]
     fn binary_files_are_counted_as_skipped() {
         let dir = tempfile::tempdir().unwrap();

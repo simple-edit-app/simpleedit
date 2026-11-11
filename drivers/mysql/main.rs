@@ -9,6 +9,10 @@ mod protocol;
 
 #[path = "../common/mod.rs"]
 mod common;
+
+#[allow(dead_code)]
+#[path = "../../src/database/import.rs"]
+mod import;
 #[path = "../common/tunnel.rs"]
 mod tunnel;
 

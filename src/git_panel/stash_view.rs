@@ -127,6 +127,11 @@ impl Panel {
                 .size(14)
                 .text_size(12.5)
                 .on_toggle(|on| Message::Git(GitMsg::StashKeepIndex(on))),
+            checkbox(state.staged)
+                .label(t!("git.stash_staged").to_string())
+                .size(14)
+                .text_size(12.5)
+                .on_toggle(|on| Message::Git(GitMsg::StashStaged(on))),
             Space::new().width(Length::Fill),
             text_input(&t!("git.stash_branch_name"), &state.branch)
                 .on_input(|t| Message::Git(GitMsg::StashBranchName(t)))

@@ -225,6 +225,7 @@ pub fn parse(command: &str) -> Result<Request, String> {
     let mut method: Option<Method> = None;
     let mut data: Vec<String> = Vec::new();
     let mut urlencoded: Vec<Pair> = Vec::new();
+    let mut multipart: Vec<Pair> = Vec::new();
     let mut file_body: Option<String> = None;
     let mut get = false;
     let mut json_flag = false;
@@ -268,6 +269,18 @@ pub fn parse(command: &str) -> Result<Request, String> {
                     _ => data.push(text),
                 }
             }
+            "-F" | "--form" | "--form-string" => {
+                let text = value(&flag)?;
+                let (name, v) = text.split_once('=').unwrap_or((&text, ""));
+                // A file named by a command from elsewhere is chosen again,
+                // by hand (`@` alone), as for the other bodies.
+                let v = if flag != "--form-string" && v.starts_with(['@', '<']) {
+                    "@"
+                } else {
+                    v
+                };
+                multipart.push(Pair::new(name, v));
+            }
             "--data-urlencode" => {
                 let text = value(&flag)?;
                 let (name, v) = text.split_once('=').unwrap_or(("", &text));
@@ -307,9 +320,6 @@ pub fn parse(command: &str) -> Result<Request, String> {
             "-I" | "--head" => method = Some(Method::Head),
             "-L" | "--location" => request.settings.follow_redirects = true,
             "-k" | "--insecure" => request.settings.verify_tls = false,
-            "-F" | "--form" | "--form-string" => {
-                return Err(t!("api.err_multipart").to_string());
-            }
             f if SKIPPED_WITH_VALUE.contains(&f) => {
                 value(f)?;
             }
@@ -388,7 +398,17 @@ pub fn parse(command: &str) -> Result<Request, String> {
         .find(|h| h.key.eq_ignore_ascii_case("content-type"))
         .map(|h| h.value.to_lowercase())
         .unwrap_or_default();
-    if file_body.is_some() {
+    if !multipart.is_empty() {
+        request.body = Body {
+            kind: BodyKind::Multipart,
+            form: multipart,
+            ..Body::default()
+        };
+        // The client writes the boundary: a header that names it is wrong.
+        request
+            .headers
+            .retain(|h| !h.key.eq_ignore_ascii_case("content-type"));
+    } else if file_body.is_some() {
         // A command from elsewhere does not get to pick a file of this
         // machine to send: the file is chosen again, by hand.
         request.body = Body {
@@ -493,6 +513,11 @@ pub fn export(request: &Resolved) -> String {
         }
         ResolvedBody::File(path) => {
             parts.push(format!("--data-binary {}", quote(&format!("@{path}"))))
+        }
+        ResolvedBody::Multipart(fields) => {
+            for (name, value) in fields {
+                parts.push(format!("-F {}", quote(&format!("{name}={value}"))));
+            }
         }
     }
     parts.join(" \\\n  ")
@@ -629,9 +654,11 @@ mod tests {
             .contains("NOPE"));
         assert!(parse("curl -H").unwrap_err().contains("needs a value"));
         assert!(parse("curl -X POST").unwrap_err().contains("no address"));
-        assert!(parse("curl https://x -F a=@f")
-            .unwrap_err()
-            .contains("multipart"));
+        // A multipart form is read; the file it names is chosen again.
+        let multi = parse("curl https://x -F a=@/etc/passwd -F b=text").unwrap();
+        assert_eq!(multi.body.kind, BodyKind::Multipart);
+        assert_eq!(multi.body.form[0].value, "@");
+        assert_eq!(multi.body.form[1].value, "text");
         // The word curl is not needed.
         assert_eq!(parse("https://x/only").unwrap().url, "https://x/only");
     }

@@ -148,6 +148,33 @@ pub struct Row {
     pub root: bool,
 }
 
+/// A number for the names of a listing (and whether each is a folder).
+fn list_fingerprint(list: &[Entry]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for e in list {
+        e.name.hash(&mut hasher);
+        e.is_dir.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// When the files that say what Git ignores were changed: the `.gitignore` of
+/// the folder and of those above it up to the repository, and its
+/// `info/exclude`.
+fn ignore_stamps(dir: &Path) -> Vec<Option<SystemTime>> {
+    let mut stamps = Vec::new();
+    for folder in dir.ancestors() {
+        stamps.push(modified(&folder.join(".gitignore")));
+        let git = folder.join(".git");
+        if git.exists() {
+            stamps.push(modified(&git.join("info").join("exclude")));
+            break;
+        }
+    }
+    stamps
+}
+
 /// Which of `entries` (of the folder `dir`) Git ignores. Nothing is, when
 /// the folder is not in a repository or Git is not there.
 fn ignored_of(dir: &Path, entries: &[Entry]) -> std::collections::HashSet<PathBuf> {
@@ -225,6 +252,14 @@ pub fn color_of(
     iced::Color::from_rgb8(r, g, b)
 }
 
+/// What Git said of a folder: for which listing (a number), under which
+/// ignore files (their dates), the ignored paths.
+type IgnoredAnswer = (
+    u64,
+    Vec<Option<SystemTime>>,
+    std::collections::HashSet<PathBuf>,
+);
+
 #[derive(Debug, Default)]
 pub struct Projects {
     /// What Git ignores is left out.
@@ -239,6 +274,9 @@ pub struct Projects {
     pub drop_target: Option<PathBuf>,
     /// The content of the folders that were read, and when they changed.
     children: HashMap<PathBuf, (Option<SystemTime>, Vec<Entry>)>,
+    /// What Git said of a folder, for the names it had and the ignore files
+    /// it was said under: not asked again while none of that changed.
+    ignored_cache: HashMap<PathBuf, IgnoredAnswer>,
 }
 
 impl Projects {
@@ -255,6 +293,7 @@ impl Projects {
             roots,
             expanded: expanded.into_iter().collect(),
             children: HashMap::new(),
+            ignored_cache: HashMap::new(),
             selected: None,
             drop_target: None,
         };
@@ -273,7 +312,22 @@ impl Projects {
         let mut list = read_children(dir);
         list.retain(|e| !crate::finder::excluded(&e.name, e.is_dir, &self.exclude));
         if self.hide_ignored {
-            let ignored = ignored_of(dir, &list);
+            let names = list_fingerprint(&list);
+            let stamps = ignore_stamps(dir);
+            let cached = self
+                .ignored_cache
+                .get(dir)
+                .filter(|(n, s, _)| *n == names && *s == stamps)
+                .map(|(_, _, set)| set.clone());
+            let ignored = match cached {
+                Some(set) => set,
+                None => {
+                    let set = ignored_of(dir, &list);
+                    self.ignored_cache
+                        .insert(dir.to_path_buf(), (names, stamps, set.clone()));
+                    set
+                }
+            };
             list.retain(|e| !ignored.contains(&e.path));
         }
         self.children
@@ -677,6 +731,26 @@ mod tests {
         let mut projects = Projects::new(vec![plain.path().to_path_buf()], vec![], true, vec![]);
         assert!(names(&projects.rows()).iter().any(|n| n.contains("b.txt")));
         projects.set_hide_ignored(false);
+    }
+
+    #[test]
+    fn what_git_said_is_kept_until_the_listing_or_the_ignore_files_change() {
+        let dir = tree();
+        git(dir.path(), &["init", "-q"]);
+        std::fs::write(dir.path().join(".gitignore"), "*.txt\n").unwrap();
+        let mut projects = Projects::new(vec![dir.path().to_path_buf()], vec![], true, vec![]);
+        assert!(!names(&projects.rows()).iter().any(|n| n.contains("b.txt")));
+        assert_eq!(projects.ignored_cache.len(), 1);
+        // The same listing again: the answer is the kept one.
+        projects.refresh(true);
+        assert!(!names(&projects.rows()).iter().any(|n| n.contains("b.txt")));
+        // The ignore file changed: asked again, and its news is seen.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(dir.path().join(".gitignore"), "*.md\n").unwrap();
+        projects.refresh(true);
+        let shown = names(&projects.rows());
+        assert!(shown.iter().any(|n| n.contains("b.txt")), "{shown:?}");
+        assert!(!shown.iter().any(|n| n.contains("A.md")), "{shown:?}");
     }
 
     #[test]

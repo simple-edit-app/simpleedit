@@ -128,6 +128,8 @@ pub struct FinderState {
     preview_edited: bool,
     /// The next results keep the selected row (after "Replace" of one match).
     keep_selected: bool,
+    /// How far the list is scrolled (only the rows in view are built).
+    pub scrolled: f32,
     /// Set to stop the search that is running.
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The files the running search left out (binary, too big, unreadable).
@@ -173,6 +175,7 @@ impl Default for FinderState {
             preview: None,
             preview_edited: false,
             keep_selected: false,
+            scrolled: 0.0,
             cancel: Default::default(),
             skipped: Default::default(),
             last_click: None,
@@ -375,6 +378,7 @@ impl SimpleEditApp {
     pub(super) fn open_finder(&mut self, replace: bool) -> Task<Message> {
         self.finder.replace_mode = replace;
         self.finder.selected = 0;
+        self.finder.scrolled = 0.0;
         self.finder.error = None;
         self.finder.menu = None;
         self.finder.confirm_all = false;
@@ -770,6 +774,13 @@ impl SimpleEditApp {
         })
     }
 
+    /// Leave the selected match out of "Replace all", or put it back.
+    pub(super) fn finder_toggle_exclude(&mut self) {
+        if let Some(o) = self.finder.hits.get_mut(self.finder.selected) {
+            o.excluded = !o.excluded;
+        }
+    }
+
     /// The arrows move in the list.
     pub(super) fn finder_step(&mut self, delta: i32) -> Task<Message> {
         if self.overlay != ActiveOverlay::FindInFiles {
@@ -1015,6 +1026,7 @@ impl SimpleEditApp {
                 undo.push_back(Snapshot {
                     text: text.to_string(),
                     cursor: (0, 0),
+                    extras: Vec::new(),
                 });
                 redo.clear();
             }
@@ -1562,21 +1574,47 @@ impl SimpleEditApp {
         );
 
         // The matches.
+        // Only the rows in view, and some around them, are widgets.
+        let stride = ROW + 1.0;
+        let first = ((f.scrolled / stride) as usize).saturating_sub(12);
+        let last = (((f.scrolled + 250.0) / stride).ceil() as usize + 12).min(f.hits.len());
+        let first = first.min(last);
         let rows: Vec<Element<Message>> = f
             .hits
             .iter()
             .enumerate()
+            .skip(first)
+            .take(last - first)
             .map(|(i, o)| {
                 let highlighted = i == f.selected;
-                self.finder_row(
+                let line = self.finder_row(
                     dark,
                     highlighted,
                     self.occurrence_line(o, dark, highlighted),
                     Message::FindSelect(i),
-                )
+                );
+                // Replacing: a match can be left out with the mouse too.
+                if f.replace_mode {
+                    row![
+                        line,
+                        button(text(if o.excluded { "☐" } else { "☑" }).size(13))
+                            .padding([0, 8])
+                            .on_press(Message::FindExcludeAt(i))
+                            .style(ghost(false)),
+                    ]
+                    .align_y(Alignment::Center)
+                    .into()
+                } else {
+                    line
+                }
             })
             .collect();
-        let mut list = column(rows).spacing(1).padding(6);
+        let mut list = column![
+            Space::new().height(Length::Fixed(first as f32 * stride)),
+            column(rows).spacing(1),
+            Space::new().height(Length::Fixed((f.hits.len() - last) as f32 * stride)),
+        ]
+        .padding(6);
         let note = if let Some(error) = &f.error {
             error.clone()
         } else if self.finder_roots().is_empty() && f.scope == Scope::Project {
@@ -1611,6 +1649,7 @@ impl SimpleEditApp {
             .push(
                 scrollable(list)
                     .id(list_id())
+                    .on_scroll(|v| Message::FindScrolled(v.absolute_offset().y))
                     .style(se_theme::Scrollbar { dark }.style())
                     .height(Length::Fixed(250.0)),
             )
@@ -1900,7 +1939,9 @@ mod tests {
         assert_eq!(app.finder.hits.len(), 2);
         assert!(std::fs::read_to_string(&first).unwrap().contains("Resume"));
         // All the others, but one left out; after a confirmation.
-        app.finder.hits[0].excluded = true;
+        app.finder.selected = 0;
+        app.finder_toggle_exclude();
+        assert!(app.finder.hits[0].excluded);
         let _ = app.update(Message::FindReplaceAll);
         assert!(app.finder.confirm_all);
         let _ = app.update(Message::FindReplaceConfirm(true));

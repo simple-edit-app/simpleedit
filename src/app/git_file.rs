@@ -718,19 +718,21 @@ mod tests {
         let _ = app.update(Message::Git(GitMsg::LogLoaded(
             app.git.log.request,
             "HEAD".into(),
-            Ok((
-                vec![commit("0123456789", "feat: a new thing")],
-                Default::default(),
-            )),
+            {
+                let commits = vec![commit("0123456789", "feat: a new thing")];
+                let rows = crate::git::graph::layout(&commits);
+                Ok((commits, Default::default(), rows))
+            },
         )));
         app.git.log.shown = Some("HEAD".into());
         let _ = app.update(Message::Git(GitMsg::LogLoaded(
             app.git.log.request,
             "HEAD".into(),
-            Ok((
-                vec![commit("0123456789", "feat: a new thing")],
-                Default::default(),
-            )),
+            {
+                let commits = vec![commit("0123456789", "feat: a new thing")];
+                let rows = crate::git::graph::layout(&commits);
+                Ok((commits, Default::default(), rows))
+            },
         )));
         shoot(&app, "log");
     }

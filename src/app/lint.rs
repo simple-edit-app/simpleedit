@@ -215,6 +215,18 @@ impl SimpleEditApp {
                     d
                 }),
         );
+        // What the last task said about this file too, unless a tool already
+        // says it on that line.
+        if let Some(file) = &self.lint.file {
+            for p in self.tasks.problems.get(file).into_iter().flatten() {
+                if !found
+                    .iter()
+                    .any(|d| d.line == p.line && d.severity == p.severity)
+                {
+                    found.push(p.clone());
+                }
+            }
+        }
         found.sort_by_key(|d| (d.line, d.col));
         self.lint.diagnostics = found;
         self.lint.key = Some(key);

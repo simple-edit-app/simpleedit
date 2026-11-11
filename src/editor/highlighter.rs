@@ -10,7 +10,7 @@ use std::str::FromStr;
 
 use iced::advanced::text::{self, highlighter::Format};
 use iced::{Color, Font};
-use once_cell::sync::Lazy;
+use std::sync::LazyLock as Lazy;
 use syntect::highlighting::{
     self, Color as SynColor, ScopeSelectors, StyleModifier, ThemeItem, ThemeSettings,
 };

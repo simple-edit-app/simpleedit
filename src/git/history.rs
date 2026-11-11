@@ -102,6 +102,50 @@ impl LogFilter {
     }
 }
 
+/// What stands in the place of a revision to list the reflog: where HEAD
+/// was, most recent first. A commit lost by a reset, a deleted branch or a
+/// dropped stash is found there, and the menu of a commit makes a branch of
+/// it.
+pub const REFLOG: &str = "@reflog";
+
+/// How a commit's signature checks out, as a line to show: `None` when it
+/// is not signed (or git cannot tell).
+pub async fn signature(repo: &Path, sha: &str) -> Option<String> {
+    let out = run(
+        repo,
+        &[
+            "log",
+            "-1",
+            "--format=%G?%x1f%GS%x1f%GK",
+            "--end-of-options",
+            sha,
+        ],
+    )
+    .await
+    .ok()?;
+    let mut parts = out.trim_end().split('\x1f');
+    let (status, signer, key) = (
+        parts.next()?,
+        parts.next().unwrap_or(""),
+        parts.next().unwrap_or(""),
+    );
+    let word = match status {
+        "G" => t!("git.sig_good"),
+        "U" => t!("git.sig_unknown_validity"),
+        "X" | "Y" => t!("git.sig_expired"),
+        "R" => t!("git.sig_revoked"),
+        "E" => t!("git.sig_missing_key"),
+        "B" => t!("git.sig_bad"),
+        _ => return None,
+    };
+    let who = if signer.is_empty() { key } else { signer };
+    Some(if who.is_empty() {
+        word.to_string()
+    } else {
+        format!("{word}: {who}")
+    })
+}
+
 /// [`log`] restricted by a search `(what to look at, the text)`.
 pub async fn log_matching(
     repo: &Path,
@@ -130,10 +174,16 @@ pub async fn log_filtered(
     {
         return Ok(Vec::new());
     }
+    let reflog = rev == REFLOG;
+    let rev = if reflog { "HEAD" } else { rev };
     let max = format!("--max-count={limit}");
     let mut args = vec![
         "log",
-        "--topo-order",
+        if reflog {
+            "--walk-reflogs"
+        } else {
+            "--topo-order"
+        },
         &max,
         "--format=%H%x1f%P%x1f%an%x1f%ae%x1f%at%x1f%s%x1f%D%x1e",
     ];
@@ -183,7 +233,7 @@ pub async fn log_filtered(
     }
     let out = run(repo, &args).await?;
     let mut commits = parse_log(&out);
-    if path.is_some() || !folder.is_empty() || filter.lines.is_some() {
+    if reflog || path.is_some() || !folder.is_empty() || filter.lines.is_some() {
         // `%P` names the real parents, which the filtered list mostly lacks:
         // each commit is drawn on top of the next one listed.
         let shas: Vec<String> = commits.iter().map(|c| c.sha.clone()).collect();
@@ -648,10 +698,22 @@ pub fn parse_stashes(out: &str) -> Vec<Stash> {
         .collect()
 }
 
-pub async fn stash_push(repo: &Path, message: &str, keep_index: bool) -> Result<(), String> {
-    let mut args = vec!["stash", "push", "--include-untracked"];
-    if keep_index {
-        args.push("--keep-index");
+pub async fn stash_push(
+    repo: &Path,
+    message: &str,
+    keep_index: bool,
+    staged: bool,
+) -> Result<(), String> {
+    // `--staged` stashes the index alone: git does not mix it with the
+    // untracked files or with keeping the index.
+    let mut args = vec!["stash", "push"];
+    if staged {
+        args.push("--staged");
+    } else {
+        args.push("--include-untracked");
+        if keep_index {
+            args.push("--keep-index");
+        }
     }
     if !message.trim().is_empty() {
         args.push("-m");
@@ -1375,7 +1437,7 @@ mod tests {
         let repo = four_commits();
         repo.write("one.txt", "changed\n");
         repo.write("untracked.txt", "u\n");
-        block(stash_push(repo.path(), "my work", false)).unwrap();
+        block(stash_push(repo.path(), "my work", false, false)).unwrap();
         assert_eq!(
             std::fs::read_to_string(repo.path().join("one.txt")).unwrap(),
             "0\n"
@@ -1407,9 +1469,72 @@ mod tests {
         block(stash_pop(repo.path(), 0)).unwrap();
         assert!(block(stashes(repo.path())).unwrap().is_empty());
 
-        block(stash_push(repo.path(), "", false)).unwrap();
+        block(stash_push(repo.path(), "", false, false)).unwrap();
         block(stash_drop(repo.path(), 0)).unwrap();
         assert!(block(stashes(repo.path())).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_signature_of_a_commit_is_told_only_when_it_has_one() {
+        let repo = four_commits();
+        let head = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        assert_eq!(block(signature(repo.path(), &head)), None);
+        // Signed with an SSH key, which needs no gpg: checked against a list.
+        let keys = tempfile::tempdir().unwrap();
+        let key = keys.path().join("k");
+        let made = std::process::Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+            .arg(&key)
+            .status();
+        if !made.is_ok_and(|s| s.success()) {
+            return;
+        }
+        let public = std::fs::read_to_string(keys.path().join("k.pub")).unwrap();
+        let allowed = keys.path().join("allowed");
+        std::fs::write(&allowed, format!("tester@example.com {public}")).unwrap();
+        repo.git(&["config", "gpg.format", "ssh"]);
+        repo.git(&["config", "user.signingkey", &key.to_string_lossy()]);
+        repo.git(&[
+            "config",
+            "gpg.ssh.allowedSignersFile",
+            &allowed.to_string_lossy(),
+        ]);
+        repo.write("five.txt", "5\n");
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-q", "-S", "-m", "five"]);
+        let signed = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        let told = block(signature(repo.path(), &signed)).expect("a signature");
+        assert!(told.contains("Signature verified"), "{told}");
+    }
+
+    #[test]
+    fn the_reflog_lists_a_commit_that_a_reset_made_unreachable() {
+        let repo = four_commits();
+        let lost = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        repo.git(&["reset", "--hard", "-q", "HEAD~2"]);
+        let reachable = block(log_matching(repo.path(), "HEAD", 50, None, None)).unwrap();
+        assert!(reachable.iter().all(|c| c.sha != lost));
+        let listed = block(log_matching(repo.path(), REFLOG, 50, None, None)).unwrap();
+        assert!(listed.iter().any(|c| c.sha == lost));
+    }
+
+    #[test]
+    fn a_stash_can_hold_the_staged_changes_alone() {
+        let repo = four_commits();
+        repo.write("one.txt", "staged\n");
+        repo.git(&["add", "one.txt"]);
+        repo.write("two.txt", "not staged\n");
+        block(stash_push(repo.path(), "", false, true)).unwrap();
+        // The staged change went; the other one stayed in the tree.
+        assert_ne!(
+            std::fs::read_to_string(repo.path().join("one.txt")).unwrap(),
+            "staged\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("two.txt")).unwrap(),
+            "not staged\n"
+        );
+        assert_eq!(block(stashes(repo.path())).unwrap().len(), 1);
     }
 
     #[test]
@@ -1417,7 +1542,7 @@ mod tests {
         let repo = four_commits();
         repo.write("one.txt", "staged\n");
         repo.git(&["add", "one.txt"]);
-        block(stash_push(repo.path(), "", true)).unwrap();
+        block(stash_push(repo.path(), "", true, false)).unwrap();
         // The staged change stays in the index and the working tree.
         assert_eq!(
             std::fs::read_to_string(repo.path().join("one.txt")).unwrap(),
@@ -1610,7 +1735,7 @@ mod tests {
         repo.write("f.txt", "base\n");
         repo.commit_all("base");
         repo.write("f.txt", "mine\n");
-        block(stash_push(repo.path(), "", false)).unwrap();
+        block(stash_push(repo.path(), "", false, false)).unwrap();
         repo.write("f.txt", "theirs\n");
         repo.commit_all("other");
         let error = block(stash_pop(repo.path(), 0)).unwrap_err();

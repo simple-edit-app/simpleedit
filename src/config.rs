@@ -490,6 +490,16 @@ fn first_keymap() -> u32 {
     1
 }
 
+/// A snippet the user wrote.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UserSnippet {
+    pub trigger: String,
+    pub body: String,
+    /// The file extensions it is for (`rs`, `py`…); empty: every file.
+    #[serde(default)]
+    pub languages: Vec<String>,
+}
+
 /// Every field has a default, so a config written by an older version (or
 /// one with extra legacy keys, which are ignored) still loads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -526,6 +536,12 @@ pub struct Config {
     pub show_whitespace: bool,
     /// A box around the bracket at the cursor and its mate.
     pub match_brackets: bool,
+    /// The other places of the word under the cursor are marked.
+    pub highlight_word: bool,
+    /// The user's snippets: a word that Ctrl+Space (or the list of a language
+    /// server) offers, and the text it becomes (`${1:place}` and `$0` as in
+    /// the language server protocol). They are written in the config file.
+    pub snippets: Vec<UserSnippet>,
     pub page_guide_column: usize,
     /// A miniature of the whole file along the editor's right edge.
     pub show_minimap: bool,
@@ -626,6 +642,12 @@ pub struct Config {
     pub projects_exclude: Vec<String>,
     /// Where scratch files are kept; empty: the default folder.
     pub scratch_dir: String,
+    /// The API client: a file of certificate authorities (PEM) to trust
+    /// besides the system's, a client certificate with its key (PEM) for
+    /// mutual TLS, and a proxy address (empty: the system's).
+    pub api_ca_file: String,
+    pub api_client_cert: String,
+    pub api_proxy: String,
 }
 
 impl Default for Config {
@@ -650,6 +672,8 @@ impl Default for Config {
             show_indent_guides: true,
             show_whitespace: false,
             match_brackets: true,
+            highlight_word: true,
+            snippets: Vec::new(),
             page_guide_column: 80,
             show_minimap: true,
             word_wrap: true,
@@ -701,6 +725,9 @@ impl Default for Config {
             projects_hide_ignored: false,
             projects_exclude: Vec::new(),
             scratch_dir: String::new(),
+            api_ca_file: String::new(),
+            api_client_cert: String::new(),
+            api_proxy: String::new(),
         }
     }
 }
@@ -941,6 +968,23 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_snippets_of_the_user_are_read_from_the_config_file() {
+        let config: Config = serde_json::from_str(
+            r#"{"snippets": [{"trigger": "fnmain", "body": "fn main() {}", "languages": ["rs"]},
+                             {"trigger": "todo", "body": "// TODO: $0"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(config.snippets.len(), 2);
+        assert_eq!(config.snippets[0].languages, vec!["rs".to_string()]);
+        assert!(config.snippets[1].languages.is_empty());
+        // Without any, the file of an older version still reads.
+        assert!(serde_json::from_str::<Config>("{}")
+            .unwrap()
+            .snippets
+            .is_empty());
+    }
+
     use super::*;
 
     #[test]

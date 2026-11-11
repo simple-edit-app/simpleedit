@@ -22,12 +22,18 @@ impl SimpleEditApp {
         action: ConfirmAction,
     ) -> Task<Message> {
         let (conn, database, schema, table) = target;
+        let dialect = self
+            .db
+            .connection(conn)
+            .map(|c| c.dialect)
+            .unwrap_or_default();
         self.db.confirm = Some(Confirm {
             conn,
             database,
             schema,
             table,
             kind,
+            dialect,
             action,
             cascade: false,
             running: false,
@@ -198,12 +204,15 @@ impl SimpleEditApp {
         target: (u64, String, String, String),
     ) -> Task<Message> {
         let (conn, database, schema, table) = target;
-        self.db.designer = Some(Designer::new(
-            conn,
-            database.clone(),
-            schema.clone(),
-            table.clone(),
-        ));
+        let dialect = self
+            .db
+            .connection(conn)
+            .map(|c| c.dialect)
+            .unwrap_or_default();
+        self.db.designer = Some(
+            Designer::new(conn, database.clone(), schema.clone(), table.clone())
+                .for_dialect(dialect),
+        );
         let Some(params) = self.db_params(conn, false) else {
             self.db.designer = None;
             return self.db_ask_password(conn);

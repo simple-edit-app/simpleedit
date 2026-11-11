@@ -287,6 +287,9 @@ impl SimpleEditApp {
     /// Asks the server for the list at the cursor.
     pub(super) fn completion_request(&mut self, trigger: Trigger, manual: bool) -> Task<Message> {
         let Some((path, ext)) = self.completion_target() else {
+            if manual && self.config.completion_enabled {
+                return self.completion_from_words();
+            }
             if manual {
                 let ext = self
                     .current_file
@@ -353,6 +356,63 @@ impl SimpleEditApp {
         )
     }
 
+    /// With the shortcut and no language server: the words of the file.
+    fn completion_from_words(&mut self) -> Task<Message> {
+        let Some(path) = self.current_file.clone() else {
+            return Task::none();
+        };
+        let text = crate::editor::buffer_text(&self.editor.content);
+        let origin = self.editor.content.cursor_position();
+        self.completion.generation += 1;
+        let generation = self.completion.generation;
+        let base = Base {
+            text: text.clone(),
+            origin,
+        };
+        let start = base.word_start();
+        let prefix = text
+            .lines()
+            .nth(origin.0)
+            .and_then(|l| l.get(start..origin.1.min(l.len())))
+            .unwrap_or_default()
+            .to_string();
+        self.completion.session = Some(Session {
+            by_name: false,
+            path,
+            // No server: this is what says the list is made of words.
+            ext: String::new(),
+            base: base.clone(),
+            items: Vec::new(),
+            ranked: Vec::new(),
+            selected: 0,
+            top: 0,
+            incomplete: false,
+            busy: false,
+            manual: true,
+            items_of: 0,
+            anchor: (origin.0, start),
+            anchor_at: None,
+            resolving: HashSet::new(),
+        });
+        let ext = self
+            .current_file
+            .as_deref()
+            .and_then(Path::extension)
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        let mut items = cmp::snippet_items(&self.config.snippets, &ext, &prefix);
+        items.extend(cmp::buffer_words(&text, &prefix));
+        self.completion_answer(
+            generation,
+            base,
+            Ok(lsp::Completions {
+                items,
+                incomplete: false,
+                busy: false,
+            }),
+        )
+    }
+
     /// The server answered: the list, kept for what was typed since.
     pub(super) fn completion_answer(
         &mut self,
@@ -382,7 +442,23 @@ impl SimpleEditApp {
                 return Task::none();
             }
         };
-        session.items = found.items;
+        let mut items = found.items;
+        // What the user wrote is in the list whichever server answered.
+        if !session.ext.is_empty() {
+            let prefix = base
+                .text
+                .lines()
+                .nth(base.origin.0)
+                .and_then(|l| l.get(base.word_start()..base.origin.1.min(l.len())))
+                .unwrap_or_default()
+                .to_string();
+            items.extend(cmp::snippet_items(
+                &self.config.snippets,
+                &session.ext,
+                &prefix,
+            ));
+        }
+        session.items = items;
         session.base = base;
         session.incomplete = found.incomplete;
         session.busy = found.busy;
@@ -501,6 +577,25 @@ impl SimpleEditApp {
 
     fn completion_typed(&mut self, c: char) -> Task<Message> {
         let Some((path, ext)) = self.completion_target() else {
+            // A list of the file's words narrows as one types.
+            if cmp::is_word_char(c)
+                && self
+                    .completion
+                    .session
+                    .as_ref()
+                    .is_some_and(|s| s.ext.is_empty())
+            {
+                self.completion_refilter();
+                if self
+                    .completion
+                    .session
+                    .as_ref()
+                    .is_some_and(|s| s.ranked.is_empty())
+                {
+                    self.completion_close();
+                }
+                return Task::none();
+            }
             self.completion_close();
             return Task::none();
         };
@@ -1693,12 +1788,44 @@ mod tests {
         type_text(&mut app, "ab");
         assert_eq!(app.completion.generation, 0);
         let _ = app.update(Message::CompletionInvoke);
-        assert!(app.status_is_error, "the shortcut says there is no server");
+        assert!(!app.status_is_error, "the shortcut falls back to the words");
+        assert!(app.completion.session.is_none(), "no other word, no list");
         // Turned off: never asked.
         let (mut app, _path, _dir) = app_with("\n", "a.rs");
         app.config.completion_enabled = false;
         type_text(&mut app, "ab");
         assert_eq!(app.completion.generation, 0);
+    }
+
+    #[test]
+    fn without_a_server_the_shortcut_lists_the_words_of_the_file() {
+        let (mut app, _path, _dir) = app_with("alphabet alpine beta\nal\n", "a.xyz");
+        app.completion.installed.insert("xyz".into(), false);
+        app.editor.content.select_bytes(1, 2, 0);
+        let _ = app.update(Message::CompletionInvoke);
+        assert_eq!(
+            shown(&app),
+            vec!["alphabet".to_string(), "alpine".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_snippets_of_the_user_are_offered_and_expand_with_their_places() {
+        // `fnm` is what is typed: the snippet answers to it.
+        let (mut app, _path, _dir) = app_with("fnm\n", "a.xyz");
+        app.completion.installed.insert("xyz".into(), false);
+        app.config.snippets = vec![crate::config::UserSnippet {
+            trigger: "fnmain".into(),
+            body: "fn main() {\n    $0\n}".into(),
+            languages: vec!["xyz".into()],
+        }];
+        app.editor.content.select_bytes(0, 3, 0);
+        let _ = app.update(Message::CompletionInvoke);
+        assert_eq!(shown(&app), vec!["fnmain".to_string()]);
+        // Not for another language.
+        let items = cmp::snippet_items(&app.config.snippets, "rs", "fn");
+        assert!(items.is_empty());
+        assert_eq!(cmp::snippet_items(&app.config.snippets, "XYZ", "").len(), 1);
     }
 
     #[test]

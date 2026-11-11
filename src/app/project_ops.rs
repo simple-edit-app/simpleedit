@@ -293,8 +293,11 @@ impl SimpleEditApp {
                         store.record_tree(&dir, crate::local_history::now());
                     }
                 }
-                tokio::fs::remove_dir_all(&dir)
+                let target = dir.clone();
+                tokio::task::spawn_blocking(move || crate::fsutil::trash_or_remove(&target))
                     .await
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+                    .and_then(|r| r)
                     .map(|()| dir.clone())
                     .map_err(|e| format!("{}: {e}", dir.display()))
             },

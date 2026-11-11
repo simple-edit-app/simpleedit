@@ -1319,6 +1319,8 @@ struct Internal {
     regions: Arc<Regions>,
     /// (revision, kind) the regions were found for.
     regions_key: Option<(u64, Kind)>,
+    /// When the blocks were last worked out.
+    regions_at: Option<std::time::Instant>,
     /// The cursor must not stay in folded lines: set by an edit or a jump,
     /// acted on once the regions are up to date.
     reveal_cursor: bool,
@@ -1438,7 +1440,18 @@ impl Internal {
     /// Brings the blocks up to date with the text, drops the folds that lost
     /// their block, and tells the editor which lines are folded away.
     fn refresh_folds(&mut self, kind: Kind) {
-        if self.regions_key != Some((self.revision, kind)) {
+        // A big file is not scanned again at every keystroke: while nothing
+        // is folded, the blocks (only marks in the margin then) wait a moment.
+        let big = self.editor.line_count() > 5_000;
+        let recent = self
+            .regions_at
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(300));
+        let waits = big
+            && recent
+            && self.folds.is_empty()
+            && self.regions_key.is_some_and(|(_, k)| k == kind);
+        if self.regions_key != Some((self.revision, kind)) && !waits {
+            self.regions_at = Some(std::time::Instant::now());
             let count = self.editor.line_count();
             self.regions = Arc::new(if count > folding::MAX_LINES {
                 Regions::default()
@@ -1522,6 +1535,7 @@ impl Content {
             folds: Folds::default(),
             regions: Arc::default(),
             regions_key: None,
+            regions_at: None,
             reveal_cursor: false,
             extras: Vec::new(),
             extras_revision: 0,
@@ -1552,6 +1566,25 @@ impl Content {
         } else {
             Vec::new()
         }
+    }
+
+    /// Puts the other cursors back (as an undo restores them): those that
+    /// are not in the text any more, or on the main cursor, are left out.
+    pub fn set_extra_carets(&self, carets: &[Caret]) {
+        let valid = |(line, col): (usize, usize)| {
+            self.line(line)
+                .is_some_and(|t| col <= t.len() && t.is_char_boundary(col))
+        };
+        let main = self.cursor_position();
+        let kept: Vec<Caret> = carets
+            .iter()
+            .filter(|c| valid(c.position) && c.position != main)
+            .filter(|c| c.anchor.is_none_or(valid))
+            .copied()
+            .collect();
+        let mut internal = self.0.borrow_mut();
+        internal.extras = kept;
+        internal.extras_revision = internal.revision;
     }
 
     /// How many cursors there are.

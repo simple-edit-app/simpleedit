@@ -58,8 +58,17 @@ pub fn file_name(locale: &str) -> &'static str {
     }
 }
 
-static EN_ENTRIES: once_cell::sync::Lazy<Vec<Entry>> = once_cell::sync::Lazy::new(|| parse(EN));
-static FR_ENTRIES: once_cell::sync::Lazy<Vec<Entry>> = once_cell::sync::Lazy::new(|| parse(FR));
+static EN_ENTRIES: std::sync::LazyLock<Vec<Entry>> = std::sync::LazyLock::new(|| parse(EN));
+static FR_ENTRIES: std::sync::LazyLock<Vec<Entry>> = std::sync::LazyLock::new(|| parse(FR));
+
+/// The compiled-in changelog, in the interface language, without copying it.
+pub fn embedded_ref() -> &'static [Entry] {
+    if rust_i18n::locale().starts_with("fr") {
+        &FR_ENTRIES
+    } else {
+        &EN_ENTRIES
+    }
+}
 
 /// The compiled-in changelog, in the interface language (parsed once).
 pub fn embedded() -> Vec<Entry> {

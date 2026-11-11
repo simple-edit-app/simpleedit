@@ -246,6 +246,12 @@ pub struct DiffLayout {
     pub heights: Vec<usize>,
     /// The longest line of the one-column view, in cells.
     pub longest: usize,
+    /// For each row (of the view shown): the block of changes it is in.
+    pub blocks: Vec<Option<usize>>,
+    /// The height in pixels of each row that is drawn.
+    pub pixels: Vec<f32>,
+    /// For each row of the one-column view: the row it is paired with.
+    pub partners: Vec<Option<usize>>,
 }
 
 /// The cache of a [`Layout`]: for one diff (its revision) and one width.
@@ -266,9 +272,18 @@ pub fn layout(
         }
     }
     let layout = std::sync::Arc::new(if side_by_side {
+        let heights = side_heights(diff, columns);
+        let pixels = heights
+            .iter()
+            .take(MAX_ROWS)
+            .map(|h| *h as f32 * ROW_HEIGHT)
+            .collect();
         DiffLayout {
-            heights: side_heights(diff, columns),
+            heights,
             longest: 0,
+            blocks: diff.side_row_blocks(),
+            pixels,
+            partners: Vec::new(),
         }
     } else {
         let longest = diff
@@ -280,9 +295,13 @@ pub fn layout(
             })
             .max()
             .unwrap_or(0);
+        let rows = diff.rows();
         DiffLayout {
             heights: Vec::new(),
             longest,
+            blocks: diff.row_blocks(),
+            pixels: vec![ROW_HEIGHT; rows.len().min(MAX_ROWS)],
+            partners: partners(&rows),
         }
     });
     *cache.borrow_mut() = Some((rev, columns, side_by_side, layout.clone()));
@@ -717,14 +736,9 @@ fn body<'a>(args: Body<'a>) -> Element<'a, Message> {
 
     let truncated = if side_by_side {
         let side = diff.side_rows();
-        let blocks = diff.side_row_blocks();
+        let blocks = &layout.blocks;
         let heights = &layout.heights;
-        let pixels: Vec<f32> = heights
-            .iter()
-            .take(MAX_ROWS)
-            .map(|h| *h as f32 * ROW_HEIGHT)
-            .collect();
-        let (first, last, before, after) = visible(&pixels, top, height);
+        let (first, last, before, after) = visible(&layout.pixels, top, height);
         rows.push(Space::new().height(before).into());
         for (i, row_) in side.iter().enumerate().skip(first).take(last - first) {
             let now = blocks.get(i).copied().flatten() == Some(current);
@@ -811,7 +825,7 @@ fn body<'a>(args: Body<'a>) -> Element<'a, Message> {
                         };
                     // The buttons of a change sit between the sides: stage it, or
                     // carry it across.
-                    let middle: Element<'a, Message> = match starts(&blocks, i) {
+                    let middle: Element<'a, Message> = match starts(blocks, i) {
                         Some(b) if column_w > 0.0 => {
                             let mut buttons = Vec::new();
                             if let Some((make, undo)) = stage {
@@ -849,11 +863,10 @@ fn body<'a>(args: Body<'a>) -> Element<'a, Message> {
         side.len() > MAX_ROWS
     } else {
         let flat = diff.rows();
-        let blocks = diff.row_blocks();
+        let blocks = &layout.blocks;
         let width = NUMBER_W * 2.0 + 16.0 + layout.longest.max(40) as f32 * CHAR_W + 24.0;
-        let partners = partners(&flat);
-        let pixels = vec![ROW_HEIGHT; flat.len().min(MAX_ROWS)];
-        let (first, last, before, after) = visible(&pixels, top, height);
+        let partners = &layout.partners;
+        let (first, last, before, after) = visible(&layout.pixels, top, height);
         rows.push(Space::new().height(before).into());
         for (i, row_) in flat.iter().enumerate().skip(first).take(last - first) {
             let now = blocks.get(i).copied().flatten() == Some(current);
@@ -930,7 +943,7 @@ fn body<'a>(args: Body<'a>) -> Element<'a, Message> {
                         true,
                         at,
                     );
-                    rows.push(with_arrow(line_cell, starts(&blocks, i)));
+                    rows.push(with_arrow(line_cell, starts(blocks, i)));
                 }
             }
         }
@@ -1360,6 +1373,9 @@ mod tests {
         let layout = |columns| DiffLayout {
             heights: side_heights(&diff, columns),
             longest: 0,
+            blocks: Vec::new(),
+            pixels: Vec::new(),
+            partners: Vec::new(),
         };
         assert_eq!(side_top(&layout(50), 2), 2.0 * ROW_HEIGHT);
         assert_eq!(side_top(&layout(50), 3), 6.0 * ROW_HEIGHT);

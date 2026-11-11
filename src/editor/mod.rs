@@ -82,18 +82,25 @@ pub fn line_replacement(old: &str, new: &str) -> Option<LineReplacement> {
     if old == new {
         return None;
     }
-    let o: Vec<&str> = old.strip_suffix('\n').unwrap_or(old).split('\n').collect();
-    let n: Vec<&str> = new.strip_suffix('\n').unwrap_or(new).split('\n').collect();
-    let mut prefix = o.iter().zip(&n).take_while(|(a, b)| a == b).count();
-    let max_suffix = o.len().min(n.len()) - prefix;
+    let o = old.strip_suffix('\n').unwrap_or(old);
+    let n = new.strip_suffix('\n').unwrap_or(new);
+    // No list of lines: the buffer may be tens of megabytes and this runs for
+    // every undo step.
+    let o_len = o.bytes().filter(|b| *b == b'\n').count() + 1;
+    let n_len = n.bytes().filter(|b| *b == b'\n').count() + 1;
+    let mut prefix = o
+        .split('\n')
+        .zip(n.split('\n'))
+        .take_while(|(a, b)| a == b)
+        .count();
+    let max_suffix = o_len.min(n_len) - prefix;
     let mut suffix = o
-        .iter()
-        .rev()
-        .zip(n.iter().rev())
+        .rsplit('\n')
+        .zip(n.rsplit('\n'))
         .take(max_suffix)
         .take_while(|(a, b)| a == b)
         .count();
-    while o.len() - prefix - suffix == 0 || n.len() - prefix - suffix == 0 {
+    while o_len - prefix - suffix == 0 || n_len - prefix - suffix == 0 {
         if prefix > 0 {
             prefix -= 1;
         } else if suffix > 0 {
@@ -102,11 +109,32 @@ pub fn line_replacement(old: &str, new: &str) -> Option<LineReplacement> {
             break;
         }
     }
+    let stretch = |text: &str, total: usize| -> String {
+        let start = line_start(text, prefix);
+        let end = if suffix == 0 {
+            text.len()
+        } else {
+            line_start(text, total - suffix) - 1
+        };
+        text[start..end.max(start)].to_string()
+    };
     Some(LineReplacement {
         first_line: prefix,
-        old_text: o[prefix..o.len() - suffix].join("\n"),
-        new_text: n[prefix..n.len() - suffix].join("\n"),
+        old_text: stretch(o, o_len),
+        new_text: stretch(n, n_len),
     })
+}
+
+/// The byte offset where line `k` (0-based) of `text` starts.
+fn line_start(text: &str, k: usize) -> usize {
+    if k == 0 {
+        return 0;
+    }
+    text.bytes()
+        .enumerate()
+        .filter(|(_, b)| *b == b'\n')
+        .nth(k - 1)
+        .map_or(text.len(), |(i, _)| i + 1)
 }
 
 /// Makes the buffer read `new_text`. Only the lines that differ are replaced,
@@ -231,6 +259,19 @@ impl EditorState {
         editor.padding(padding(config)).into()
     }
 
+    /// The word the cursor is in or touches, when it is a name of some
+    /// length and nothing is selected.
+    fn word_under_cursor(&self) -> Option<String> {
+        if self.content.selection().is_some() {
+            return None;
+        }
+        let (line, col) = self.content.cursor_position();
+        let text = self.content.line(line)?;
+        let word = crate::definition::word_at(&text, col.min(text.len()))?;
+        (word.chars().count() >= 2 && word.chars().any(char::is_alphabetic))
+            .then(|| word.to_string())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn view<'a>(
         &'a self,
@@ -277,6 +318,25 @@ impl EditorState {
                 },
                 current_border: p.accent,
             });
+        }
+        // Without a search, the word under the cursor is marked where else it
+        // is, as the usages of a name are in an IDE.
+        if config.highlight_word && search.and_then(SearchState::highlight_query).is_none() {
+            if let Some(word) = self.word_under_cursor() {
+                editor = editor.search(crate::code_editor::SearchPaint {
+                    regex: word_regex(&word),
+                    query: word,
+                    case_sensitive: true,
+                    use_regex: true,
+                    current: None,
+                    color: iced::Color {
+                        a: 0.22,
+                        ..p.search_match
+                    },
+                    current_color: p.search_match,
+                    current_border: p.accent,
+                });
+            }
         }
         if config.highlight_current_line {
             editor = editor.line_highlight(crate::code_editor::LineHighlight {
@@ -718,8 +778,103 @@ pub mod statusbar {
     }
 }
 
+/// `\bword\b`, compiled once for as long as the cursor stays on the word.
+fn word_regex(word: &str) -> Option<std::sync::Arc<regex::Regex>> {
+    use std::sync::{Arc, Mutex};
+    static LAST: Mutex<Option<(String, Arc<regex::Regex>)>> = Mutex::new(None);
+    let mut last = LAST.lock().ok()?;
+    if let Some((w, r)) = last.as_ref() {
+        if w == word {
+            return Some(r.clone());
+        }
+    }
+    let made = Arc::new(regex::Regex::new(&format!(r"\b{}\b", regex::escape(word))).ok()?);
+    *last = Some((word.to_string(), made.clone()));
+    Some(made)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_word_under_the_cursor_is_marked_as_a_whole_word() {
+        let regex = word_regex("count").unwrap();
+        assert!(regex.is_match("let count = 1;"));
+        assert!(!regex.is_match("let counter = 1;"));
+        assert!(!regex.is_match("recount"));
+        // The same word again is the same regex, not another one.
+        assert!(std::sync::Arc::ptr_eq(
+            &regex,
+            &word_regex("count").unwrap()
+        ));
+        let mut state = EditorState::new();
+        state.content = crate::code_editor::Content::with_text("let count = 1;\n");
+        state.content.select_bytes(0, 6, 0);
+        assert_eq!(state.word_under_cursor().as_deref(), Some("count"));
+        // Nothing for a short word, a number, or a selection.
+        state.content.select_bytes(0, 0, 0);
+        assert_eq!(state.word_under_cursor().as_deref(), Some("let"));
+        state.content.select_bytes(0, 4, 5);
+        assert_eq!(state.word_under_cursor(), None);
+    }
+
+    /// The version with lists of lines, as it was written first.
+    fn by_lists(old: &str, new: &str) -> Option<super::LineReplacement> {
+        if old == new {
+            return None;
+        }
+        let o: Vec<&str> = old.strip_suffix('\n').unwrap_or(old).split('\n').collect();
+        let n: Vec<&str> = new.strip_suffix('\n').unwrap_or(new).split('\n').collect();
+        let mut prefix = o.iter().zip(&n).take_while(|(a, b)| a == b).count();
+        let max_suffix = o.len().min(n.len()) - prefix;
+        let mut suffix = o
+            .iter()
+            .rev()
+            .zip(n.iter().rev())
+            .take(max_suffix)
+            .take_while(|(a, b)| a == b)
+            .count();
+        while o.len() - prefix - suffix == 0 || n.len() - prefix - suffix == 0 {
+            if prefix > 0 {
+                prefix -= 1;
+            } else if suffix > 0 {
+                suffix -= 1;
+            } else {
+                break;
+            }
+        }
+        Some(super::LineReplacement {
+            first_line: prefix,
+            old_text: o[prefix..o.len() - suffix].join("\n"),
+            new_text: n[prefix..n.len() - suffix].join("\n"),
+        })
+    }
+
+    #[test]
+    fn the_line_diff_without_lists_gives_what_the_one_with_lists_gave() {
+        // Small alphabets and short texts make every shape of change come up.
+        let mut seed = 12345u64;
+        let mut next = |m: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % m
+        };
+        let mut text = |len: u64| -> String {
+            (0..next(len))
+                .map(|_| ['a', 'b', '\n'][next(3) as usize])
+                .collect()
+        };
+        for _ in 0..20_000 {
+            let (a, b) = (text(12), text(12));
+            let (x, y) = (super::line_replacement(&a, &b), by_lists(&a, &b));
+            assert_eq!(
+                x.as_ref().map(|r| (r.first_line, &r.old_text, &r.new_text)),
+                y.as_ref().map(|r| (r.first_line, &r.old_text, &r.new_text)),
+                "{a:?} -> {b:?}"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

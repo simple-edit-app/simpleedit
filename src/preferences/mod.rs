@@ -29,6 +29,9 @@ pub enum PreferencesMessage {
     CompletionOption(String, bool),
     EverywhereTextToggled(bool),
     HistoryDays(u32),
+    NetCa(String),
+    NetCert(String),
+    NetProxy(String),
     EverywhereGitToggled(bool),
     AutocompleteBracketsToggled(bool),
     AutocompleteQuotesToggled(bool),
@@ -41,6 +44,7 @@ pub enum PreferencesMessage {
     HighContrastToggled(bool),
     ShowWhitespaceToggled(bool),
     MatchBracketsToggled(bool),
+    HighlightWordToggled(bool),
     AutoSaveToggled(bool),
     PageGuideColumnChanged(usize),
     ShowMinimapToggled(bool),
@@ -60,11 +64,12 @@ pub enum PrefsPage {
     Git,
     Lint,
     Servers,
+    Network,
     Updates,
 }
 
 impl PrefsPage {
-    pub(crate) const ALL: [PrefsPage; 8] = [
+    pub(crate) const ALL: [PrefsPage; 9] = [
         PrefsPage::Editor,
         PrefsPage::Appearance,
         PrefsPage::Shortcuts,
@@ -72,6 +77,7 @@ impl PrefsPage {
         PrefsPage::Git,
         PrefsPage::Lint,
         PrefsPage::Servers,
+        PrefsPage::Network,
         PrefsPage::Updates,
     ];
 
@@ -84,6 +90,7 @@ impl PrefsPage {
             PrefsPage::Git => t!("prefs.nav_git"),
             PrefsPage::Lint => t!("prefs.nav_lint"),
             PrefsPage::Servers => t!("prefs.nav_servers"),
+            PrefsPage::Network => t!("prefs.nav_network"),
             PrefsPage::Updates => t!("prefs.nav_updates"),
         }
         .to_string()
@@ -236,6 +243,9 @@ impl PreferencesState {
             PreferencesMessage::CompletionOption(key, v) => {
                 config.completion_options.insert(key, v);
             }
+            PreferencesMessage::NetCa(v) => config.api_ca_file = v,
+            PreferencesMessage::NetCert(v) => config.api_client_cert = v,
+            PreferencesMessage::NetProxy(v) => config.api_proxy = v,
             PreferencesMessage::HistoryDays(days) => {
                 config.local_history_days = days;
             }
@@ -277,6 +287,9 @@ impl PreferencesState {
             }
             PreferencesMessage::ShowWhitespaceToggled(v) => {
                 config.show_whitespace = v;
+            }
+            PreferencesMessage::HighlightWordToggled(v) => {
+                config.highlight_word = v;
             }
             PreferencesMessage::MatchBracketsToggled(v) => {
                 config.match_brackets = v;
@@ -390,6 +403,7 @@ impl PreferencesState {
             PrefsPage::Git => self.git_card(config, dark),
             PrefsPage::Lint => lint_page(config, dark, near),
             PrefsPage::Servers => self.servers_page(dark, servers),
+            PrefsPage::Network => self.network_card(config, dark),
             PrefsPage::Updates => self.updates_card(dark),
         };
 
@@ -619,6 +633,11 @@ impl PreferencesState {
                 t!("prefs.show_whitespace").to_string(),
                 config.show_whitespace,
                 PreferencesMessage::ShowWhitespaceToggled,
+            ),
+            toggle(
+                t!("prefs.highlight_word").to_string(),
+                config.highlight_word,
+                PreferencesMessage::HighlightWordToggled,
             ),
             toggle(
                 t!("prefs.match_brackets").to_string(),
@@ -882,6 +901,50 @@ impl PreferencesState {
         ]
         .spacing(12)
         .into()
+    }
+
+    /// What the API client trusts and goes through.
+    fn network_card(&self, config: &Config, dark: bool) -> Element<'_, Message> {
+        let field = |hint: String, value: &str, on: fn(String) -> PreferencesMessage| {
+            text_input(&hint, value)
+                .on_input(move |v| Message::Preferences(on(v)))
+                .padding([6, 10])
+                .size(13)
+                .width(320)
+                .style(theme::Field::new(dark).style())
+        };
+        card_of_rows(
+            dark,
+            vec![
+                setting_row(
+                    t!("prefs.net_ca").to_string(),
+                    field(
+                        "/path/ca.pem".into(),
+                        &config.api_ca_file,
+                        PreferencesMessage::NetCa,
+                    )
+                    .into(),
+                ),
+                setting_row(
+                    t!("prefs.net_cert").to_string(),
+                    field(
+                        "/path/client.pem".into(),
+                        &config.api_client_cert,
+                        PreferencesMessage::NetCert,
+                    )
+                    .into(),
+                ),
+                setting_row(
+                    t!("prefs.net_proxy").to_string(),
+                    field(
+                        "http://proxy:3128".into(),
+                        &config.api_proxy,
+                        PreferencesMessage::NetProxy,
+                    )
+                    .into(),
+                ),
+            ],
+        )
     }
 
     fn updates_card(&self, dark: bool) -> Element<'_, Message> {

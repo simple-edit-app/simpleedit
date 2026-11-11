@@ -511,15 +511,47 @@ fn schema_menu(
     dialect: protocol::Dialect,
     dark: bool,
 ) -> Element<'static, Message> {
-    // Making tables and schemas, the health, the backups: PostgreSQL's.
+    // Making schemas, the health, the backups: PostgreSQL's.
     if dialect != protocol::Dialect::Postgres {
         return container(
-            column![menu_bar::item(
-                t!("db.diagram").to_string(),
-                None,
-                dark,
-                Message::Db(DbMsg::ShowDiagram(conn, database, schema)),
-            )]
+            column![
+                menu_bar::item(
+                    t!("db.new_table").to_string(),
+                    None,
+                    dark,
+                    Message::Db(DbMsg::NewTable(conn, database.clone(), schema.clone())),
+                ),
+                menu_bar::item(
+                    t!("db.diagram").to_string(),
+                    None,
+                    dark,
+                    Message::Db(DbMsg::ShowDiagram(conn, database.clone(), schema.clone())),
+                ),
+                menu_bar::item(
+                    t!("db.backup").to_string(),
+                    None,
+                    dark,
+                    Message::Db(DbMsg::BackupOpen(
+                        conn,
+                        database.clone(),
+                        schema,
+                        String::new(),
+                        false,
+                    )),
+                ),
+                menu_bar::item(
+                    t!("db.restore").to_string(),
+                    None,
+                    dark,
+                    Message::Db(DbMsg::BackupOpen(
+                        conn,
+                        database,
+                        String::new(),
+                        String::new(),
+                        true,
+                    )),
+                ),
+            ]
             .spacing(1)
             .padding(6)
             .width(230),
@@ -1554,6 +1586,20 @@ pub fn table<'a>(path: &'a Path, tab: &'a TableTab, dark: bool) -> Element<'a, M
         t!("db.reload").to_string(),
         (!tab.loading).then(|| Message::Db(DbMsg::Refresh(owned()))),
     ));
+    if !tab.hidden.is_empty() {
+        bar = bar.push(nav(
+            "◫",
+            t!("db.show_columns", n = tab.hidden.len()).to_string(),
+            Some(Message::Db(DbMsg::ShowColumns(owned()))),
+        ));
+    }
+    if tab.loading && tab.stop.is_some() {
+        bar = bar.push(nav(
+            "■",
+            t!("db.stop_load").to_string(),
+            Some(Message::Db(DbMsg::StopLoad(owned()))),
+        ));
+    }
     // All the rows with the filter and the sort, not only this page (what a
     // query that cannot be paged gave is on show already).
     if tab.query.is_none() || tab.paged {
@@ -1977,6 +2023,20 @@ fn cell_menu(
             Message::Db(DbMsg::CopyCell(path.clone(), row, col)),
         ));
     }
+    items.push(menu_bar::item(
+        t!("db.hide_column").to_string(),
+        None,
+        dark,
+        Message::Db(DbMsg::HideColumn(path.clone(), col)),
+    ));
+    if !new_row {
+        items.push(menu_bar::item(
+            t!("db.filter_by_value").to_string(),
+            None,
+            dark,
+            Message::Db(DbMsg::FilterByCell(path.clone(), row, col)),
+        ));
+    }
     for (label, format) in [
         (t!("db.copy_csv"), CopyFormat::Csv),
         (t!("db.copy_insert"), CopyFormat::Insert),
@@ -2114,7 +2174,14 @@ fn grid<'a>(path: &'a Path, tab: &'a TableTab, dark: bool) -> Element<'a, Messag
         return Space::new().into();
     };
     let editable = page.editable;
-    let total_width: f32 = tab.widths.iter().sum::<f32>() + 56.0;
+    let total_width: f32 = tab
+        .widths
+        .iter()
+        .zip(&page.columns)
+        .filter(|(_, c)| !tab.hidden.contains(&c.name))
+        .map(|(w, _)| *w)
+        .sum::<f32>()
+        + 56.0;
     let cell = |content: Element<'a, Message>, width: f32| {
         container(content)
             .width(Length::Fixed(width))
@@ -2138,6 +2205,9 @@ fn grid<'a>(path: &'a Path, tab: &'a TableTab, dark: bool) -> Element<'a, Messag
     // The header: a click sorts by the column, as in a JetBrains IDE.
     let mut header = row![gutter(String::new())];
     for (i, (column, width)) in page.columns.iter().zip(&tab.widths).enumerate() {
+        if tab.hidden.contains(&column.name) {
+            continue;
+        }
         let marker = tab.order.iter().position(|(name, _)| *name == column.name);
         let arrow = marker.map(|at| {
             let desc = tab.order[at].1;
@@ -2204,6 +2274,9 @@ fn grid<'a>(path: &'a Path, tab: &'a TableTab, dark: bool) -> Element<'a, Messag
     let filters: Option<Element<'a, Message>> = tab.show_filters.then(|| {
         let mut line = row![gutter(String::new())];
         for (column, width) in page.columns.iter().zip(&tab.widths) {
+            if tab.hidden.contains(&column.name) {
+                continue;
+            }
             let name = column.name.clone();
             let shown = tab
                 .column_text
@@ -2254,7 +2327,28 @@ fn grid<'a>(path: &'a Path, tab: &'a TableTab, dark: bool) -> Element<'a, Messag
                 p.gutter
             }
         )];
+        // Only the columns in view (and the one being typed in) are widgets;
+        // the others are a gap of their width.
+        let mut gap = 0.0f32;
+        let mut x = 0.0f32;
         for (c, width) in tab.widths.iter().enumerate().take(page.columns.len()) {
+            if tab.hidden.contains(&page.columns[c].name) {
+                continue;
+            }
+            let (from, wide) = (x, *width);
+            x += wide;
+            let (offset, view_w) = tab.scroll_x;
+            let in_view = from + wide >= offset - 400.0 && from <= offset + view_w + 400.0;
+            let wanted = tab.editing.as_ref().is_some_and(|e| e.col == c)
+                || tab.selected.is_some_and(|(_, sc)| sc == c);
+            if !in_view && !wanted {
+                gap += wide;
+                continue;
+            }
+            if gap > 0.0 {
+                line = line.push(Space::new().width(Length::Fixed(gap)));
+                gap = 0.0;
+            }
             let edited = tab.pending.is_edited(i, c);
             let value = tab.pending.cell(page, i, c);
             let typing = tab.editing.as_ref().filter(|e| e.row == i && e.col == c);
@@ -2270,6 +2364,13 @@ fn grid<'a>(path: &'a Path, tab: &'a TableTab, dark: bool) -> Element<'a, Messag
                     .padding([2, 6])
                     .style(se_theme::Field::new(dark).style())
                     .into(),
+                (None, Cell::Value(text_value)) if page.truncated.contains(&(i, c)) => {
+                    text(format!("{} …", super::grid::shown(text_value)))
+                        .size(12.5)
+                        .color(p.muted)
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .into()
+                }
                 (None, Cell::Value(text_value)) => text(super::grid::shown(text_value))
                     .size(12.5)
                     .color(if deleted { p.muted } else { p.text })
@@ -2365,6 +2466,9 @@ fn grid<'a>(path: &'a Path, tab: &'a TableTab, dark: bool) -> Element<'a, Messag
                 .on_right_press(select);
             line = line.push(element);
         }
+        if gap > 0.0 {
+            line = line.push(Space::new().width(Length::Fixed(gap)));
+        }
         rows = rows.push(
             container(line).style(move |_: &iced::Theme| container::Style {
                 background: if deleted {
@@ -2407,10 +2511,18 @@ fn grid<'a>(path: &'a Path, tab: &'a TableTab, dark: bool) -> Element<'a, Messag
     if let Some(filters) = filters {
         top = top.push(filters);
     }
+    let across = path.to_path_buf();
     scrollable(top.push(vertical))
         .direction(scrollable::Direction::Horizontal(
             scrollable::Scrollbar::new(),
         ))
+        .on_scroll(move |v| {
+            Message::Db(DbMsg::ScrolledAcross(
+                across.clone(),
+                v.absolute_offset().x,
+                v.bounds().width,
+            ))
+        })
         .style(se_theme::Scrollbar { dark }.style())
         .width(Length::Fill)
         .height(Length::Fill)
@@ -2770,12 +2882,22 @@ fn log_view<'a>(state: &'a State, dark: bool) -> Element<'a, Message> {
         .into();
     }
     let mut list = column![].spacing(2).padding([6, 8]);
-    for (at, entry) in log
+    let kept: Vec<(usize, &super::console::LogEntry)> = log
         .iter()
         .enumerate()
         .filter(|(_, entry)| state.console.show_internal || !entry.internal)
         .filter(|(_, entry)| state.console.matches(entry))
-    {
+        .collect();
+    let older = kept.len().saturating_sub(state.console.log_limit);
+    if older > 0 {
+        list = list.push(
+            button(text(t!("db.log_older", n = older).to_string()).size(12))
+                .padding([4, 10])
+                .on_press(Message::Db(DbMsg::LogMore))
+                .style(ghost(dark, false)),
+        );
+    }
+    for (at, entry) in kept.into_iter().skip(older) {
         let ok = entry.error.is_none();
         let mut head = row![
             text(entry.time.as_str())
@@ -3005,6 +3127,45 @@ fn queries_view<'a>(state: &'a State, dark: bool) -> Element<'a, Message> {
         None => editor,
     };
     let status: Element<Message> = match &c.last {
+        _ if c.binds.is_some() => {
+            let mut inputs = row![].spacing(8).align_y(Alignment::Center);
+            for (at, name) in c.binds.iter().flat_map(|b| b.names.iter().enumerate()) {
+                let value = c
+                    .binds
+                    .as_ref()
+                    .map(|b| b.values[at].as_str())
+                    .unwrap_or("");
+                inputs = inputs.push(
+                    text(name.as_str())
+                        .size(12)
+                        .font(se_theme::MONO)
+                        .color(p.muted),
+                );
+                inputs = inputs.push(
+                    text_input("", value)
+                        .on_input(move |t| Message::Db(DbMsg::BindValue(at, t)))
+                        .on_submit(Message::Db(DbMsg::BindRun))
+                        .size(12.5)
+                        .padding([3, 6])
+                        .width(Length::Fixed(120.0))
+                        .style(se_theme::Field::new(dark).style()),
+                );
+            }
+            row![
+                inputs,
+                button(text(t!("db.bind_run").to_string()).size(12.5))
+                    .padding([3, 12])
+                    .on_press(Message::Db(DbMsg::BindRun))
+                    .style((se_theme::Primary { dark }).style()),
+                button(text(t!("db.guard_cancel").to_string()).size(12.5))
+                    .padding([3, 12])
+                    .on_press(Message::Db(DbMsg::BindCancel))
+                    .style((se_theme::Outline { dark }).style()),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center)
+            .into()
+        }
         _ if c.guard.is_some() => {
             let risk = c.guard.as_ref().map(|g| g.risk);
             let message = match risk {
@@ -3190,35 +3351,89 @@ fn table_menu(
     dark: bool,
 ) -> Element<'static, Message> {
     let (id, database, schema, table) = target;
-    // The designer, the import, the backups, dropping and emptying write
-    // PostgreSQL; for the others the table opens and its definition shows.
+    // The designer and the backups write PostgreSQL; for the others the table
+    // opens, its definition shows, a file can be imported, the rows can be
+    // deleted and the table dropped.
     if dialect != protocol::Dialect::Postgres {
-        return container(
-            column![
+        let at = || (id, database.clone(), schema.clone(), table.clone());
+        let mut items: Vec<Element<'static, Message>> = vec![
+            menu_bar::item(
+                t!("db.table_open").to_string(),
+                None,
+                dark,
+                Message::Db(DbMsg::OpenTable(
+                    id,
+                    database.clone(),
+                    schema.clone(),
+                    table.clone(),
+                )),
+            ),
+            menu_bar::item(
+                t!("db.table_ddl").to_string(),
+                None,
+                dark,
+                Message::Db(DbMsg::ShowDefinition(
+                    id,
+                    database.clone(),
+                    schema.clone(),
+                    table.clone(),
+                    kind,
+                )),
+            ),
+        ];
+        if kind == Kind::Table {
+            let (a, b, c, d) = at();
+            items.insert(
+                1,
                 menu_bar::item(
-                    t!("db.table_open").to_string(),
+                    t!("db.table_modify").to_string(),
                     None,
                     dark,
-                    Message::Db(DbMsg::OpenTable(
-                        id,
-                        database.clone(),
-                        schema.clone(),
-                        table.clone()
-                    )),
+                    Message::Db(DbMsg::OpenDesigner(a, b, c, d)),
                 ),
-                menu_bar::item(
-                    t!("db.table_ddl").to_string(),
-                    None,
-                    dark,
-                    Message::Db(DbMsg::ShowDefinition(id, database, schema, table, kind)),
-                ),
-            ]
-            .spacing(1)
-            .padding(6)
-            .width(230),
-        )
-        .style(se_theme::card(dark))
-        .into();
+            );
+        }
+        if kind == Kind::Table {
+            let (a, b, c, d) = at();
+            items.push(menu_bar::item(
+                t!("db.import").to_string(),
+                None,
+                dark,
+                Message::Db(DbMsg::ImportOpen(a, b, c, d)),
+            ));
+        }
+        if kind == Kind::Table {
+            let (a, b, c, d) = at();
+            items.push(menu_bar::item(
+                t!("db.backup").to_string(),
+                None,
+                dark,
+                Message::Db(DbMsg::BackupOpen(a, b, c, d, false)),
+            ));
+        }
+        items.push(menu_bar::separator(dark));
+        if kind == Kind::Table {
+            let (a, b, c, d) = at();
+            items.push(menu_bar::item(
+                t!("db.table_empty").to_string(),
+                None,
+                dark,
+                Message::Db(DbMsg::AskEmpty(a, b, c, d)),
+            ));
+        }
+        let drop_label = match kind {
+            Kind::Table => t!("db.table_drop"),
+            _ => t!("db.view_drop"),
+        };
+        items.push(menu_bar::item(
+            drop_label.to_string(),
+            None,
+            dark,
+            Message::Db(DbMsg::AskDrop(id, database, schema, table, kind)),
+        ));
+        return container(column(items).spacing(1).padding(6).width(230))
+            .style(se_theme::card(dark))
+            .into();
     }
     let mut items: Vec<Element<'static, Message>> = vec![menu_bar::item(
         t!("db.table_open").to_string(),

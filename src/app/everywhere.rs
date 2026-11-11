@@ -163,6 +163,9 @@ pub struct Everywhere {
     files_loading: bool,
     files_generation: u64,
     symbols: Vec<SymbolHit>,
+    /// The names of the file shown: the list of the Symbols tab then, in the
+    /// order of the file, instead of what the servers know of the projects.
+    pub outline: Option<Vec<SymbolHit>>,
     symbols_busy: bool,
     symbols_waiting: bool,
     symbols_generation: u64,
@@ -246,7 +249,54 @@ impl SimpleEditApp {
 
     /// Opens the search on `tab`; asked again for the same tab (Shift twice
     /// again, the tab's shortcut again), it looks beyond the project too.
+    /// The names of the file shown, asked of its language server.
+    pub(super) fn open_outline(&mut self) -> Task<Message> {
+        let (Some(path), Some(ext)) = (self.current_file.clone(), self.editor.language.clone())
+        else {
+            return Task::none();
+        };
+        if is_untitled(&path) || is_virtual(&path) || crate::lsp::server_of(&ext).is_none() {
+            self.set_status(t!("outline.no_server"), true);
+            return Task::none();
+        }
+        let text = crate::editor::buffer_text(&self.editor.content);
+        Task::perform(
+            {
+                let path = path.clone();
+                async move { crate::lsp::document_symbols(&ext, &path, &text).await }
+            },
+            move |result| Message::OutlineLoaded(path.clone(), result),
+        )
+    }
+
+    pub(super) fn outline_loaded(
+        &mut self,
+        path: PathBuf,
+        result: Result<Vec<crate::lsp::SymbolHit>, String>,
+    ) -> Task<Message> {
+        if self.current_file.as_ref() != Some(&path) {
+            return Task::none();
+        }
+        match result {
+            Ok(hits) if hits.is_empty() => {
+                self.set_status(t!("outline.empty"), false);
+                Task::none()
+            }
+            Ok(hits) => {
+                let task = self.open_everywhere(Tab::Symbols);
+                self.everywhere.outline = Some(hits);
+                self.everywhere_refresh();
+                task
+            }
+            Err(e) => {
+                self.set_status(format!("{}: {e}", t!("status.error")), true);
+                Task::none()
+            }
+        }
+    }
+
     pub(super) fn open_everywhere(&mut self, tab: Tab) -> Task<Message> {
+        self.everywhere.outline = None;
         if self.overlay == ActiveOverlay::Everywhere && self.everywhere.tab == Some(tab) {
             return self.everywhere_non_project();
         }
@@ -456,6 +506,7 @@ impl SimpleEditApp {
         let query = self.everywhere.query.trim().to_string();
         let mut tasks = Vec::new();
         let names = matches!(tab, Tab::All | Tab::Classes | Tab::Symbols)
+            && self.everywhere.outline.is_none()
             && !query.is_empty()
             && !query.starts_with('/')
             && ew::calculation(&query).is_none();
@@ -708,6 +759,29 @@ impl SimpleEditApp {
             .collect()
     }
 
+    /// The names of the file: all of them in its order, or those that match.
+    fn everywhere_outline_rows(&self, query: &str, limit: usize) -> Vec<Row> {
+        let hits = self.everywhere.outline.as_deref().unwrap_or_default();
+        let name = query.trim();
+        if name.is_empty() {
+            return hits.iter().take(limit).cloned().map(Row::Symbol).collect();
+        }
+        let mut kept: Vec<(crate::completion::Score, &SymbolHit)> = hits
+            .iter()
+            .filter_map(|h| crate::completion::fuzzy(name, &h.name).map(|s| (s, h)))
+            .collect();
+        kept.sort_by(|(a, x), (b, y)| {
+            a.tier
+                .cmp(&b.tier)
+                .then(b.same_case.cmp(&a.same_case))
+                .then(x.line.cmp(&y.line))
+        });
+        kept.into_iter()
+            .take(limit)
+            .map(|(_, h)| Row::Symbol(h.clone()))
+            .collect()
+    }
+
     /// The actions and the settings matching the query, best first; `/`
     /// first lists the pages and the settings.
     fn everywhere_action_rows(&self, query: &str, limit: usize) -> Vec<Row> {
@@ -859,6 +933,9 @@ impl SimpleEditApp {
             Tab::Files if query.is_empty() => rows = self.everywhere_recent_rows(),
             Tab::Files => rows = self.everywhere_file_rows(&query, MOST),
             Tab::Classes => rows = self.everywhere_symbol_rows(&query, true, MOST),
+            Tab::Symbols if self.everywhere.outline.is_some() => {
+                rows = self.everywhere_outline_rows(&query, MOST)
+            }
             Tab::Symbols => rows = self.everywhere_symbol_rows(&query, false, MOST),
             Tab::Actions => rows = self.everywhere_action_rows(&query, MOST),
             Tab::Text => {

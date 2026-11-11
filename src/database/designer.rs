@@ -4,8 +4,8 @@
 
 use super::completion::quoted;
 use super::protocol::{
-    quote_ident, quote_literal, ColumnDef, ConstraintDef, ConstraintKind, Dialect, IndexDef,
-    Structure,
+    quote_ident_in, quote_literal, quote_literal_in, ColumnDef, ConstraintDef, ConstraintKind,
+    Dialect, IndexDef, Structure,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,6 +186,8 @@ pub enum Problem {
     NeedsExpression,
     SeveralKeys,
     NoColumns,
+    /// SQLite cannot make this change to a table that exists.
+    SqliteLimit,
 }
 
 pub struct Designer {
@@ -207,6 +209,8 @@ pub struct Designer {
     pub columns: Vec<EditColumn>,
     pub constraints: Vec<EditConstraint>,
     pub indexes: Vec<EditIndex>,
+    /// The system the table is in: the statements are written for it.
+    pub dialect: Dialect,
 }
 
 /// The actions of a foreign key on deletion.
@@ -243,6 +247,35 @@ pub const COMMON_TYPES: [&str; 22] = [
     "bytea",
     "text[]",
 ];
+
+/// The types that are often wanted, for the system of the table.
+pub fn common_types(dialect: Dialect) -> Vec<&'static str> {
+    match dialect {
+        Dialect::Postgres => COMMON_TYPES.to_vec(),
+        Dialect::Mysql => vec![
+            "INT",
+            "BIGINT",
+            "SMALLINT",
+            "TINYINT(1)",
+            "DECIMAL(10,2)",
+            "FLOAT",
+            "DOUBLE",
+            "VARCHAR(255)",
+            "CHAR(1)",
+            "TEXT",
+            "LONGTEXT",
+            "DATE",
+            "TIME",
+            "DATETIME",
+            "TIMESTAMP",
+            "JSON",
+            "BLOB",
+            "BOOLEAN",
+            "ENUM('a','b')",
+        ],
+        Dialect::Sqlite => vec!["INTEGER", "TEXT", "REAL", "NUMERIC", "BLOB"],
+    }
+}
 
 // ---------------------------------------------------------------- parsing
 
@@ -477,17 +510,17 @@ pub fn list(text: &str) -> Vec<String> {
 }
 
 /// The columns of a key: names, quoted where they have to be.
-fn columns_sql(text: &str) -> String {
+fn columns_sql(text: &str, d: Dialect) -> String {
     list(text)
         .iter()
-        .map(|c| quoted(c, Dialect::Postgres))
+        .map(|c| quoted(c, d))
         .collect::<Vec<_>>()
         .join(", ")
 }
 
 /// The columns of an index: names are quoted where they have to be, what is
 /// more than a name (`lower(a)`, `a DESC`) stays as it was typed.
-fn index_columns_sql(text: &str) -> String {
+fn index_columns_sql(text: &str, d: Dialect) -> String {
     split_top(text)
         .iter()
         .map(|c| {
@@ -495,7 +528,7 @@ fn index_columns_sql(text: &str) -> String {
                 .chars()
                 .all(|ch| ch.is_alphanumeric() || ch == '_' || ch == '"');
             if plain {
-                quoted(c.trim_matches('"'), Dialect::Postgres)
+                quoted(c.trim_matches('"'), d)
             } else {
                 c.clone()
             }
@@ -505,9 +538,9 @@ fn index_columns_sql(text: &str) -> String {
 }
 
 /// A table named `schema.table` or `table`, quoted where it has to be.
-fn table_sql(text: &str) -> String {
+fn table_sql(text: &str, d: Dialect) -> String {
     text.split('.')
-        .map(|part| quoted(part.trim().trim_matches('"'), Dialect::Postgres))
+        .map(|part| quoted(part.trim().trim_matches('"'), d))
         .collect::<Vec<_>>()
         .join(".")
 }
@@ -533,7 +566,24 @@ impl Designer {
             columns: Vec::new(),
             constraints: Vec::new(),
             indexes: Vec::new(),
+            dialect: Dialect::Postgres,
         }
+    }
+
+    /// The same designer, for a table of another system.
+    pub fn for_dialect(mut self, dialect: Dialect) -> Self {
+        self.dialect = dialect;
+        // A new table of another system starts with its own kind of key.
+        if self.creating {
+            if let Some(id) = self.columns.first_mut() {
+                id.kind = match dialect {
+                    Dialect::Mysql => "INT AUTO_INCREMENT".to_string(),
+                    Dialect::Sqlite => "INTEGER".to_string(),
+                    Dialect::Postgres => id.kind.clone(),
+                };
+            }
+        }
+        self
     }
 
     /// The designer of a table that does not exist yet: it starts with an
@@ -580,7 +630,7 @@ impl Designer {
             .constraints
             .iter()
             .map(|c| {
-                let parsed = parse_constraint(c.kind, &c.definition);
+                let parsed = parse_constraint(c.kind, &c.definition.replace('`', "\""));
                 let mut edit = EditConstraint {
                     original: Some(c.clone()),
                     kind: c.kind,
@@ -610,7 +660,7 @@ impl Designer {
             .indexes
             .iter()
             .map(|i| {
-                let parsed = parse_index(&i.definition);
+                let parsed = parse_index(&i.definition.replace('`', "\""));
                 let mut edit = EditIndex {
                     original: Some(i.clone()),
                     name: i.name.clone(),
@@ -679,19 +729,24 @@ impl Designer {
 
     /// The table as it is named now, for what is run before it is moved.
     fn current(&self) -> String {
+        let d = self.dialect;
         if self.creating {
             return format!(
                 "{}.{}",
-                quote_ident(self.schema_to.trim()),
-                quote_ident(self.name.trim())
+                quote_ident_in(d, self.schema_to.trim()),
+                quote_ident_in(d, self.name.trim())
             );
         }
-        format!("{}.{}", quote_ident(&self.schema), quote_ident(&self.table))
+        format!(
+            "{}.{}",
+            quote_ident_in(d, &self.schema),
+            quote_ident_in(d, &self.table)
+        )
     }
 
     /// Whether the table is moved to another schema.
     pub fn moved(&self) -> bool {
-        !self.creating && self.schema_to.trim() != self.schema
+        self.dialect == Dialect::Postgres && !self.creating && self.schema_to.trim() != self.schema
     }
 
     /// What is wrong with what was edited, first thing first.
@@ -752,6 +807,9 @@ impl Designer {
             }
         }
         // A table has one primary key: the ones that stay or are made.
+        if self.dialect == Dialect::Sqlite && !self.creating && self.sqlite_needs_rebuild() {
+            return Some(Problem::SqliteLimit);
+        }
         let keys = self
             .constraints
             .iter()
@@ -768,6 +826,9 @@ impl Designer {
     /// made again or added, and the table is moved and renamed last. For a
     /// new table, the statements that make it.
     pub fn statements(&self) -> Vec<String> {
+        if self.dialect != Dialect::Postgres {
+            return self.statements_other();
+        }
         if self.creating {
             return self.create_statements();
         }
@@ -782,13 +843,13 @@ impl Designer {
             if c.dropped || (c.modified() && !c.renamed_only()) {
                 out.push(format!(
                     "ALTER TABLE {table} DROP CONSTRAINT {}",
-                    quote_ident(&original.name)
+                    quote_ident_in(Dialect::Postgres, &original.name)
                 ));
             } else if c.modified() && c.renamed_only() {
                 out.push(format!(
                     "ALTER TABLE {table} RENAME CONSTRAINT {} TO {}",
-                    quote_ident(&original.name),
-                    quote_ident(c.name.trim())
+                    quote_ident_in(Dialect::Postgres, &original.name),
+                    quote_ident_in(Dialect::Postgres, c.name.trim())
                 ));
             }
         }
@@ -798,15 +859,15 @@ impl Designer {
             };
             let index = format!(
                 "{}.{}",
-                quote_ident(&self.schema),
-                quote_ident(&original.name)
+                quote_ident_in(Dialect::Postgres, &self.schema),
+                quote_ident_in(Dialect::Postgres, &original.name)
             );
             if i.dropped || (i.modified() && !i.renamed_only()) {
                 out.push(format!("DROP INDEX {index}"));
             } else if i.modified() && i.renamed_only() {
                 out.push(format!(
                     "ALTER INDEX {index} RENAME TO {}",
-                    quote_ident(i.name.trim())
+                    quote_ident_in(Dialect::Postgres, i.name.trim())
                 ));
             }
         }
@@ -816,11 +877,11 @@ impl Designer {
             match (&c.original, c.dropped) {
                 (Some(original), true) => out.push(format!(
                     "ALTER TABLE {table} DROP COLUMN {}",
-                    quote_ident(&original.name)
+                    quote_ident_in(Dialect::Postgres, &original.name)
                 )),
                 (Some(original), false) => self.change_column(&table, original, c, &mut out),
                 (None, false) => {
-                    out.extend(add_column_sql(&table, c));
+                    out.extend(add_column_sql(&table, c, Dialect::Postgres));
                 }
                 (None, true) => {}
             }
@@ -843,14 +904,17 @@ impl Designer {
             }
             let again = c.original.is_some() && c.modified() && !c.renamed_only();
             if c.original.is_none() {
-                out.push(format!("ALTER TABLE {table} ADD {}", constraint_sql(c)));
-            } else if again {
-                let mut moved = c.clone();
-                moved.columns = rename_columns(&c.columns, &renames);
-                moved.expr = rename_columns(&c.expr, &renames);
                 out.push(format!(
                     "ALTER TABLE {table} ADD {}",
-                    constraint_sql(&moved)
+                    constraint_sql(c, Dialect::Postgres)
+                ));
+            } else if again {
+                let mut moved = c.clone();
+                moved.columns = rename_columns(&c.columns, &renames, Dialect::Postgres);
+                moved.expr = rename_columns(&c.expr, &renames, Dialect::Postgres);
+                out.push(format!(
+                    "ALTER TABLE {table} ADD {}",
+                    constraint_sql(&moved, Dialect::Postgres)
                 ));
             }
         }
@@ -860,12 +924,12 @@ impl Designer {
             }
             let again = i.original.is_some() && i.modified() && !i.renamed_only();
             if i.original.is_none() {
-                out.push(index_sql(i, &table));
+                out.push(index_sql(i, &table, Dialect::Postgres));
             } else if again {
                 let mut moved = i.clone();
-                moved.columns = rename_columns(&i.columns, &renames);
-                moved.extra = rename_columns(&i.extra, &renames);
-                out.push(index_sql(&moved, &table));
+                moved.columns = rename_columns(&i.columns, &renames, Dialect::Postgres);
+                moved.extra = rename_columns(&i.extra, &renames, Dialect::Postgres);
+                out.push(index_sql(&moved, &table, Dialect::Postgres));
             }
         }
 
@@ -878,22 +942,234 @@ impl Designer {
         if self.moved() {
             out.push(format!(
                 "ALTER TABLE {at} SET SCHEMA {}",
-                quote_ident(self.schema_to.trim())
+                quote_ident_in(Dialect::Postgres, self.schema_to.trim())
             ));
             at = format!(
                 "{}.{}",
-                quote_ident(self.schema_to.trim()),
-                quote_ident(&name)
+                quote_ident_in(Dialect::Postgres, self.schema_to.trim()),
+                quote_ident_in(Dialect::Postgres, &name)
             );
         }
         if self.name.trim() != self.table {
             out.push(format!(
                 "ALTER TABLE {at} RENAME TO {}",
-                quote_ident(self.name.trim())
+                quote_ident_in(Dialect::Postgres, self.name.trim())
             ));
             name = self.name.trim().to_string();
         }
         let _ = name;
+        out
+    }
+
+    /// SQLite has no ALTER for the type, the NULL or the default of a column,
+    /// nor for the constraints: such a change means making the table again.
+    fn sqlite_needs_rebuild(&self) -> bool {
+        let column_changed = self.columns.iter().any(|c| {
+            !c.dropped
+                && c.original.as_ref().is_some_and(|o| {
+                    o.kind != c.kind.trim()
+                        || o.nullable != c.nullable
+                        || o.default.clone().unwrap_or_default().trim() != c.default.trim()
+                })
+        });
+        let constraint_changed = self.constraints.iter().any(|c| {
+            (c.original.is_none() && !c.dropped)
+                || (c.original.is_some() && (c.dropped || c.modified()))
+        });
+        column_changed || constraint_changed
+    }
+
+    /// `statements` for MySQL, MariaDB and SQLite.
+    fn statements_other(&self) -> Vec<String> {
+        if self.creating {
+            return self.create_statements_other();
+        }
+        let d = self.dialect;
+        let mysql = d == Dialect::Mysql;
+        let q = |name: &str| quote_ident_in(d, name);
+        let table = self.current();
+        let mut out: Vec<String> = Vec::new();
+
+        // What is dropped, or made again, goes before the columns it uses.
+        // (Neither has a RENAME for a constraint: a new name is a new one.)
+        for c in &self.constraints {
+            let Some(original) = &c.original else {
+                continue;
+            };
+            if (c.dropped || c.modified()) && mysql {
+                out.push(match c.kind {
+                    ConstraintKind::Primary => format!("ALTER TABLE {table} DROP PRIMARY KEY"),
+                    ConstraintKind::Foreign => {
+                        format!("ALTER TABLE {table} DROP FOREIGN KEY {}", q(&original.name))
+                    }
+                    ConstraintKind::Unique => {
+                        format!("ALTER TABLE {table} DROP INDEX {}", q(&original.name))
+                    }
+                    ConstraintKind::Check | ConstraintKind::Other => {
+                        format!("ALTER TABLE {table} DROP CONSTRAINT {}", q(&original.name))
+                    }
+                });
+            }
+        }
+        for i in &self.indexes {
+            let Some(original) = &i.original else {
+                continue;
+            };
+            if i.dropped || i.modified() {
+                out.push(if mysql {
+                    format!("DROP INDEX {} ON {table}", q(&original.name))
+                } else {
+                    format!("DROP INDEX {}.{}", q(&self.schema), q(&original.name))
+                });
+            }
+        }
+
+        // The columns.
+        for c in &self.columns {
+            match (&c.original, c.dropped) {
+                (Some(original), true) => out.push(format!(
+                    "ALTER TABLE {table} DROP COLUMN {}",
+                    q(&original.name)
+                )),
+                (Some(original), false) => {
+                    let name = q(c.name.trim());
+                    if c.name.trim() != original.name {
+                        out.push(format!(
+                            "ALTER TABLE {table} RENAME COLUMN {} TO {name}",
+                            q(&original.name)
+                        ));
+                    }
+                    let changed = c.kind.trim() != original.kind
+                        || c.nullable != original.nullable
+                        || c.default.trim() != original.default.clone().unwrap_or_default().trim()
+                        || c.comment.trim() != original.comment.trim();
+                    if mysql && changed {
+                        let mut def =
+                            format!("ALTER TABLE {table} MODIFY COLUMN {name} {}", c.kind.trim());
+                        if !c.nullable {
+                            def.push_str(" NOT NULL");
+                        }
+                        if !c.default.trim().is_empty() && !original.generated {
+                            def.push_str(&format!(" DEFAULT {}", c.default.trim()));
+                        }
+                        if !original.identity.is_empty()
+                            && !c.kind.to_uppercase().contains("AUTO_INCREMENT")
+                        {
+                            def.push_str(" AUTO_INCREMENT");
+                        }
+                        if !c.comment.trim().is_empty() {
+                            def.push_str(&format!(
+                                " COMMENT {}",
+                                quote_literal_in(d, c.comment.trim())
+                            ));
+                        }
+                        out.push(def);
+                    }
+                }
+                (None, false) => out.extend(add_column_sql(&table, c, d)),
+                (None, true) => {}
+            }
+        }
+
+        // What is made again or added.
+        let renames: Vec<(&str, &str)> = self
+            .columns
+            .iter()
+            .filter(|c| !c.dropped)
+            .filter_map(|c| {
+                let original = c.original.as_ref()?;
+                (c.name.trim() != original.name).then(|| (original.name.as_str(), c.name.trim()))
+            })
+            .collect();
+        for c in &self.constraints {
+            if c.dropped {
+                continue;
+            }
+            let again = c.original.is_some() && c.modified();
+            if c.original.is_none() || again {
+                let mut made = c.clone();
+                if again {
+                    made.columns = rename_columns(&c.columns, &renames, d);
+                    made.expr = rename_columns(&c.expr, &renames, d);
+                }
+                out.push(format!(
+                    "ALTER TABLE {table} ADD {}",
+                    constraint_sql(&made, d)
+                ));
+            }
+        }
+        for i in &self.indexes {
+            if i.dropped {
+                continue;
+            }
+            let again = i.original.is_some() && i.modified();
+            if i.original.is_none() {
+                out.push(index_sql(i, &table, d));
+            } else if again {
+                let mut moved = i.clone();
+                moved.columns = rename_columns(&i.columns, &renames, d);
+                moved.extra = rename_columns(&i.extra, &renames, d);
+                out.push(index_sql(&moved, &table, d));
+            }
+        }
+
+        // The table: its comment (MySQL), then its name.
+        if mysql && self.comment.trim() != self.original.comment.trim() {
+            out.push(format!(
+                "ALTER TABLE {table} COMMENT = {}",
+                quote_literal_in(d, self.comment.trim())
+            ));
+        }
+        if self.name.trim() != self.table {
+            out.push(if mysql {
+                format!(
+                    "RENAME TABLE {table} TO {}.{}",
+                    q(&self.schema),
+                    q(self.name.trim())
+                )
+            } else {
+                format!("ALTER TABLE {table} RENAME TO {}", q(self.name.trim()))
+            });
+        }
+        out
+    }
+
+    /// `create_statements` for MySQL, MariaDB and SQLite.
+    fn create_statements_other(&self) -> Vec<String> {
+        let d = self.dialect;
+        let mysql = d == Dialect::Mysql;
+        let table = self.current();
+        let mut parts: Vec<String> = Vec::new();
+        for c in self.columns.iter().filter(|c| !c.dropped) {
+            let mut def = format!("{} {}", quote_ident_in(d, c.name.trim()), c.kind.trim());
+            if !c.nullable {
+                def.push_str(" NOT NULL");
+            }
+            if !c.default.trim().is_empty() {
+                def.push_str(&format!(" DEFAULT {}", c.default.trim()));
+            }
+            if mysql && !c.comment.trim().is_empty() {
+                def.push_str(&format!(
+                    " COMMENT {}",
+                    quote_literal_in(d, c.comment.trim())
+                ));
+            }
+            parts.push(def);
+        }
+        for c in self.constraints.iter().filter(|c| !c.dropped) {
+            parts.push(constraint_sql(c, d));
+        }
+        let mut create = format!("CREATE TABLE {table} (\n  {}\n)", parts.join(",\n  "));
+        if mysql && !self.comment.trim().is_empty() {
+            create.push_str(&format!(
+                " COMMENT = {}",
+                quote_literal_in(d, self.comment.trim())
+            ));
+        }
+        let mut out = vec![create];
+        for i in self.indexes.iter().filter(|i| !i.dropped) {
+            out.push(index_sql(i, &table, d));
+        }
         out
     }
 
@@ -902,7 +1178,11 @@ impl Designer {
         let table = self.current();
         let mut parts: Vec<String> = Vec::new();
         for c in self.columns.iter().filter(|c| !c.dropped) {
-            let mut def = format!("{} {}", quote_ident(c.name.trim()), c.kind.trim());
+            let mut def = format!(
+                "{} {}",
+                quote_ident_in(Dialect::Postgres, c.name.trim()),
+                c.kind.trim()
+            );
             if !c.nullable {
                 def.push_str(" NOT NULL");
             }
@@ -912,14 +1192,14 @@ impl Designer {
             parts.push(def);
         }
         for c in self.constraints.iter().filter(|c| !c.dropped) {
-            parts.push(constraint_sql(c));
+            parts.push(constraint_sql(c, Dialect::Postgres));
         }
         let mut out = vec![format!(
             "CREATE TABLE {table} (\n  {}\n)",
             parts.join(",\n  ")
         )];
         for i in self.indexes.iter().filter(|i| !i.dropped) {
-            out.push(index_sql(i, &table));
+            out.push(index_sql(i, &table, Dialect::Postgres));
         }
         if !self.comment.trim().is_empty() {
             out.push(table_comment(&table, &self.comment));
@@ -940,8 +1220,8 @@ impl Designer {
         c: &EditColumn,
         out: &mut Vec<String>,
     ) {
-        let old = quote_ident(&original.name);
-        let name = quote_ident(c.name.trim());
+        let old = quote_ident_in(Dialect::Postgres, &original.name);
+        let name = quote_ident_in(Dialect::Postgres, c.name.trim());
         if c.name.trim() != original.name {
             out.push(format!("ALTER TABLE {table} RENAME COLUMN {old} TO {name}"));
         }
@@ -999,10 +1279,10 @@ impl Designer {
     }
 }
 
-fn add_column_sql(table: &str, c: &EditColumn) -> Vec<String> {
+fn add_column_sql(table: &str, c: &EditColumn, d: Dialect) -> Vec<String> {
     let mut add = format!(
         "ALTER TABLE {table} ADD COLUMN {} {}",
-        quote_ident(c.name.trim()),
+        quote_ident_in(d, c.name.trim()),
         c.kind.trim()
     );
     if !c.nullable {
@@ -1011,8 +1291,16 @@ fn add_column_sql(table: &str, c: &EditColumn) -> Vec<String> {
     if !c.default.trim().is_empty() {
         add.push_str(&format!(" DEFAULT {}", c.default.trim()));
     }
+    // MySQL has the comment in the definition of the column; the others
+    // after it.
+    if d == Dialect::Mysql && !c.comment.trim().is_empty() {
+        add.push_str(&format!(
+            " COMMENT {}",
+            quote_literal_in(d, c.comment.trim())
+        ));
+    }
     let mut out = vec![add];
-    if !c.comment.trim().is_empty() {
+    if d == Dialect::Postgres && !c.comment.trim().is_empty() {
         out.push(column_comment(table, c.name.trim(), &c.comment));
     }
     out
@@ -1031,11 +1319,14 @@ fn table_comment(table: &str, comment: &str) -> String {
 
 fn column_comment(table: &str, column: &str, comment: &str) -> String {
     if comment.trim().is_empty() {
-        format!("COMMENT ON COLUMN {table}.{} IS NULL", quote_ident(column))
+        format!(
+            "COMMENT ON COLUMN {table}.{} IS NULL",
+            quote_ident_in(Dialect::Postgres, column)
+        )
     } else {
         format!(
             "COMMENT ON COLUMN {table}.{} IS {}",
-            quote_ident(column),
+            quote_ident_in(Dialect::Postgres, column),
             quote_literal(comment.trim())
         )
     }
@@ -1045,7 +1336,7 @@ fn column_comment(table: &str, column: &str, comment: &str) -> String {
 /// `text` (a list of columns, an expression) with the names of columns that
 /// were renamed put in place of the old ones, bare or quoted; quoted text and
 /// string literals are left alone. All at once, so that two columns can swap.
-fn rename_columns(text: &str, renames: &[(&str, &str)]) -> String {
+fn rename_columns(text: &str, renames: &[(&str, &str)], d: Dialect) -> String {
     if renames.is_empty() {
         return text.to_string();
     }
@@ -1070,7 +1361,7 @@ fn rename_columns(text: &str, renames: &[(&str, &str)]) -> String {
             let token: String = chars[at..end].iter().collect();
             let name = token.trim_matches('"');
             match renames.iter().find(|(old, _)| c == '"' && *old == name) {
-                Some((_, new)) => out.push_str(&quoted(new, Dialect::Postgres)),
+                Some((_, new)) => out.push_str(&quoted(new, d)),
                 None => out.push_str(&token),
             }
             at = end;
@@ -1081,7 +1372,7 @@ fn rename_columns(text: &str, renames: &[(&str, &str)]) -> String {
             }
             let word: String = chars[at..end].iter().collect();
             match renames.iter().find(|(old, _)| *old == word) {
-                Some((_, new)) => out.push_str(&quoted(new, Dialect::Postgres)),
+                Some((_, new)) => out.push_str(&quoted(new, d)),
                 None => out.push_str(&word),
             }
             at = end;
@@ -1093,13 +1384,13 @@ fn rename_columns(text: &str, renames: &[(&str, &str)]) -> String {
     out
 }
 
-fn index_sql(i: &EditIndex, table: &str) -> String {
+fn index_sql(i: &EditIndex, table: &str, d: Dialect) -> String {
     let name = if i.name.trim().is_empty() {
         String::new()
     } else {
-        format!("{} ", quote_ident(i.name.trim()))
+        format!("{} ", quote_ident_in(d, i.name.trim()))
     };
-    let method = if i.method == "btree" || i.method.is_empty() {
+    let method = if d != Dialect::Postgres || i.method == "btree" || i.method.is_empty() {
         String::new()
     } else {
         format!("USING {} ", i.method)
@@ -1112,18 +1403,19 @@ fn index_sql(i: &EditIndex, table: &str) -> String {
     format!(
         "CREATE {}INDEX {name}ON {table} {method}({}){extra}",
         if i.unique { "UNIQUE " } else { "" },
-        index_columns_sql(&i.columns)
+        index_columns_sql(&i.columns, d)
     )
 }
 
 /// The definition of a constraint that is made, after `ADD` (or in the
 /// middle of `CREATE TABLE`).
-fn constraint_sql(c: &EditConstraint) -> String {
-    let name = if c.name.trim().is_empty() {
-        String::new()
-    } else {
-        format!("CONSTRAINT {} ", quote_ident(c.name.trim()))
-    };
+fn constraint_sql(c: &EditConstraint, d: Dialect) -> String {
+    let name =
+        if c.name.trim().is_empty() || (d == Dialect::Mysql && c.kind == ConstraintKind::Primary) {
+            String::new()
+        } else {
+            format!("CONSTRAINT {} ", quote_ident_in(d, c.name.trim()))
+        };
     let extra = if c.extra.trim().is_empty() {
         String::new()
     } else {
@@ -1131,14 +1423,14 @@ fn constraint_sql(c: &EditConstraint) -> String {
     };
     match c.kind {
         ConstraintKind::Primary => {
-            format!("{name}PRIMARY KEY ({}){extra}", columns_sql(&c.columns))
+            format!("{name}PRIMARY KEY ({}){extra}", columns_sql(&c.columns, d))
         }
-        ConstraintKind::Unique => format!("{name}UNIQUE ({}){extra}", columns_sql(&c.columns)),
+        ConstraintKind::Unique => format!("{name}UNIQUE ({}){extra}", columns_sql(&c.columns, d)),
         ConstraintKind::Foreign => {
             let referenced = if list(&c.ref_columns).is_empty() {
                 String::new()
             } else {
-                format!(" ({})", columns_sql(&c.ref_columns))
+                format!(" ({})", columns_sql(&c.ref_columns, d))
             };
             let action = if c.on_delete == ON_DELETE[0] {
                 String::new()
@@ -1147,8 +1439,8 @@ fn constraint_sql(c: &EditConstraint) -> String {
             };
             format!(
                 "{name}FOREIGN KEY ({}) REFERENCES {}{referenced}{action}{extra}",
-                columns_sql(&c.columns),
-                table_sql(&c.reference)
+                columns_sql(&c.columns, d),
+                table_sql(&c.reference, d)
             )
         }
         ConstraintKind::Check => format!("{name}CHECK ({}){extra}", c.expr.trim()),
@@ -1158,6 +1450,98 @@ fn constraint_sql(c: &EditConstraint) -> String {
 
 #[cfg(test)]
 mod tests {
+    fn other(dialect: Dialect) -> Designer {
+        let mut d =
+            Designer::new(1, "shop".into(), "shop".into(), "items".into()).for_dialect(dialect);
+        d.load(Structure {
+            columns: vec![
+                column("id", "int", false, None),
+                column("label", "varchar(50)", false, None),
+            ],
+            constraints: vec![ConstraintDef {
+                name: "PRIMARY".into(),
+                kind: ConstraintKind::Primary,
+                definition: "PRIMARY KEY (`id`)".into(),
+            }],
+            indexes: vec![IndexDef {
+                name: "by_label".into(),
+                definition: "CREATE INDEX `by_label` ON `shop`.`items` (`label`)".into(),
+                unique: false,
+            }],
+            ..Structure::default()
+        });
+        d
+    }
+
+    #[test]
+    fn a_mysql_table_is_changed_with_its_own_statements() {
+        let mut d = other(Dialect::Mysql);
+        assert!(d.statements().is_empty(), "{:?}", d.statements());
+        d.columns[1].kind = "varchar(80)".into();
+        d.columns[1].name = "title".into();
+        d.indexes[0].dropped = true;
+        d.add_column();
+        let last = d.columns.len() - 1;
+        d.columns[last].name = "note".into();
+        d.columns[last].kind = "text".into();
+        d.name = "things".into();
+        assert_eq!(
+            d.statements(),
+            vec![
+                "DROP INDEX `by_label` ON `shop`.`items`",
+                "ALTER TABLE `shop`.`items` RENAME COLUMN `label` TO `title`",
+                "ALTER TABLE `shop`.`items` MODIFY COLUMN `title` varchar(80) NOT NULL",
+                "ALTER TABLE `shop`.`items` ADD COLUMN `note` text",
+                "RENAME TABLE `shop`.`items` TO `shop`.`things`",
+            ]
+        );
+        // The key goes with DROP PRIMARY KEY and comes back without a name.
+        let mut d = other(Dialect::Mysql);
+        d.constraints[0].columns = "id, label".into();
+        assert_eq!(
+            d.statements(),
+            vec![
+                "ALTER TABLE `shop`.`items` DROP PRIMARY KEY",
+                "ALTER TABLE `shop`.`items` ADD PRIMARY KEY (id, label)",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_new_mysql_or_sqlite_table_is_made_with_the_quotes_of_its_system() {
+        let mut d =
+            Designer::for_new_table(1, "shop".into(), "shop".into()).for_dialect(Dialect::Mysql);
+        d.name = "it's".into();
+        let sql = d.statements();
+        assert_eq!(
+            sql,
+            vec!["CREATE TABLE `shop`.`it's` (\n  `id` INT AUTO_INCREMENT NOT NULL,\n  PRIMARY KEY (id)\n)"]
+        );
+        let mut d =
+            Designer::for_new_table(1, "main".into(), "main".into()).for_dialect(Dialect::Sqlite);
+        d.name = "t".into();
+        assert_eq!(
+            d.statements(),
+            vec![
+                "CREATE TABLE \"main\".\"t\" (\n  \"id\" INTEGER NOT NULL,\n  PRIMARY KEY (id)\n)"
+            ]
+        );
+    }
+
+    #[test]
+    fn sqlite_refuses_what_only_a_rebuilt_table_can_do() {
+        let mut d = other(Dialect::Sqlite);
+        d.columns[1].kind = "text".into();
+        assert_eq!(d.problem(), Some(Problem::SqliteLimit));
+        d.columns[1].kind = "varchar(50)".into();
+        d.columns[1].name = "title".into();
+        assert_eq!(d.problem(), None);
+        assert_eq!(
+            d.statements(),
+            vec!["ALTER TABLE \"shop\".\"items\" RENAME COLUMN \"label\" TO \"title\""]
+        );
+    }
+
     use super::*;
 
     fn column(name: &str, kind: &str, nullable: bool, default: Option<&str>) -> ColumnDef {
@@ -1225,7 +1609,11 @@ mod tests {
         assert!(sql.contains("(title)"), "{sql}");
         assert!(!sql.contains("(label)"), "{sql}");
         assert_eq!(
-            rename_columns("a, \"b c\" > 'a'", &[("a", "b"), ("b c", "d e")]),
+            rename_columns(
+                "a, \"b c\" > 'a'",
+                &[("a", "b"), ("b c", "d e")],
+                Dialect::Postgres
+            ),
             "b, \"d e\" > 'a'"
         );
     }

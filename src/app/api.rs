@@ -343,6 +343,7 @@ impl SimpleEditApp {
                 },
                 |picked| Message::Api(ApiMsg::Imported(picked)),
             ),
+            ApiMsg::ImportRead(read) => self.api_imported(read),
             ApiMsg::Imported(picked) => {
                 let Some((path, text)) = picked else {
                     return Task::none();
@@ -371,14 +372,28 @@ impl SimpleEditApp {
                     t!("api.running", name = name.as_str(), n = requests.len()),
                     false,
                 );
-                Task::perform(
+                if self.api.run.is_some() {
+                    return Task::none();
+                }
+                let (task, handle) = Task::perform(
                     checks::run_all(requests, self.api.variables()),
                     move |(results, kept)| {
                         Message::Api(ApiMsg::RunDone(name.clone(), results, kept))
                     },
                 )
+                .abortable();
+                self.api.run = Some(handle);
+                task
+            }
+            ApiMsg::CancelRun => {
+                if let Some(handle) = self.api.run.take() {
+                    handle.abort();
+                    self.set_status(t!("api.run_stopped"), false);
+                }
+                Task::none()
             }
             ApiMsg::RunDone(name, results, kept) => {
+                self.api.run = None;
                 let mut lines = Vec::new();
                 let (mut ok, mut bad) = (0, 0);
                 for r in &results {
@@ -494,11 +509,23 @@ impl SimpleEditApp {
             }
             return Task::none();
         }
-        let read = if openapi::is_openapi(&text) {
-            openapi::import(&text)
-        } else {
-            postman::import_collection(&text)
-        };
+        // A big description takes time to read: not on the interface's thread.
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    openapi::import_if_openapi(&text)
+                        .unwrap_or_else(|| postman::import_collection(&text))
+                })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()))
+            },
+            |read| Message::Api(ApiMsg::ImportRead(read)),
+        )
+    }
+
+    /// What reading a collection or a description gave.
+    fn api_imported(&mut self, read: Result<postman::Imported, String>) -> Task<Message> {
+        let report = |lines: Vec<String>| Some(Dialog::Report(lines));
         match read {
             Ok(imported) => {
                 let mut collection = imported.collection;

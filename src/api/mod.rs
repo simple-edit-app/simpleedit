@@ -376,6 +376,8 @@ impl ApiTab {
 
 /// What the Api panel holds, and the windows over it.
 pub struct State {
+    /// Stops the run of a collection that is going.
+    pub run: Option<iced::task::Handle>,
     pub collections: Vec<Collection>,
     pub environments: Vec<Environment>,
     pub active_env: Option<u64>,
@@ -406,6 +408,7 @@ impl State {
 
     pub fn from(stored: store::Stored) -> State {
         let mut state = State {
+            run: None,
             collections: stored.collections,
             environments: stored.environments,
             active_env: stored.active_env,
@@ -563,6 +566,10 @@ pub enum ApiMsg {
     /// Sends all the requests of a collection, in order, and reports.
     RunCollection(u64),
     /// The results of a run, and the values it kept.
+    /// Stops the run that is going (the requests not yet sent are not sent).
+    CancelRun,
+    /// What reading a collection (or a description) gave.
+    ImportRead(Result<postman::Imported, String>),
     RunDone(String, Vec<checks::RunResult>, Vec<(String, String)>),
     ExportEnv(u64),
     Exported(Option<Result<String, String>>),

@@ -129,6 +129,8 @@ pub struct State {
     pub files_for: Option<String>,
     pub message: String,
     pub contained_in: Vec<String>,
+    /// How the signature of the commit checks out (none: not signed).
+    pub signature: Option<String>,
     last_click: Option<(String, Instant)>,
     pub dialog: Option<Dialog>,
     /// A commit to find and select once the log is there (from a blame).
@@ -237,6 +239,10 @@ impl State {
     }
 }
 
+/// What a reading of the log gives: the commits, those of HEAD, and the rows
+/// of the graph worked out from them.
+pub type LogAnswer = (Vec<Commit>, HashSet<String>, Vec<graph::GraphRow>);
+
 impl Panel {
     pub fn load_refs(&self) -> Task<Message> {
         let Some(repo) = self.repo.clone() else {
@@ -294,7 +300,11 @@ impl Panel {
                     ),
                     history::head_commits(&repo, 5000)
                 );
-                Ok::<_, String>((commits?, head.unwrap_or_default()))
+                let commits = commits?;
+                // The graph is drawn from the commits: worked out here, not
+                // on the interface's thread.
+                let rows = graph::layout(&commits);
+                Ok::<_, String>((commits, head.unwrap_or_default(), rows))
             },
             move |result| Message::Git(GitMsg::LogLoaded(token, asked.clone(), result)),
         )
@@ -304,7 +314,7 @@ impl Panel {
         &mut self,
         token: u64,
         rev: String,
-        result: Result<(Vec<Commit>, HashSet<String>), String>,
+        result: Result<LogAnswer, String>,
     ) -> Task<Message> {
         // The answer of a branch, a filter or a search that is no longer the
         // one shown.
@@ -312,14 +322,14 @@ impl Panel {
             return Task::none();
         }
         match result {
-            Ok((commits, head)) => {
+            Ok((commits, head, rows)) => {
                 let previous: Vec<String> = self
                     .log
                     .selected_commits()
                     .iter()
                     .map(|c| c.sha.clone())
                     .collect();
-                self.log.rows = graph::layout(&commits);
+                self.log.rows = rows;
                 self.log.lanes = graph::width(&self.log.rows);
                 self.log.commits = commits;
                 self.log.head_set = head;
@@ -444,13 +454,20 @@ impl Panel {
             self.log.files_for = None;
             self.log.message.clear();
             self.log.contained_in.clear();
+            self.log.signature = None;
             return Task::none();
         }
         let commit = chosen[0].clone();
         let sha = commit.sha.clone();
-        let (repo_files, repo_info) = (repo.clone(), repo);
+        let (repo_files, repo_info) = (repo.clone(), repo.clone());
         let (sha_files, sha_info) = (sha.clone(), sha.clone());
+        self.log.signature = None;
+        let (repo_sig, sha_sig, sha_for) = (repo, sha.clone(), sha.clone());
         Task::batch([
+            Task::perform(
+                async move { history::signature(&repo_sig, &sha_sig).await },
+                move |sig| Message::Git(GitMsg::CommitSignature(sha_for.clone(), sig)),
+            ),
             Task::perform(
                 async move { history::commit_files(&repo_files, &commit).await },
                 move |files| Message::Git(GitMsg::CommitFilesLoaded(sha_files.clone(), files)),
@@ -515,6 +532,13 @@ impl Panel {
         self.log.reveal = Some(Reveal { sha, path });
         self.log.limit = PAGE;
         Task::batch([self.load_refs(), self.show_log("HEAD")])
+    }
+
+    pub(super) fn commit_signature(&mut self, sha: String, signature: Option<String>) {
+        let still = self.log.selected_commits();
+        if still.len() == 1 && still[0].sha == sha {
+            self.log.signature = signature;
+        }
     }
 
     pub(super) fn commit_info_loaded(

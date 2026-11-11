@@ -59,6 +59,9 @@ pub struct Console {
     pub open: bool,
     pub tab: ConsoleTab,
     pub log: Vec<LogEntry>,
+    /// How many of the latest entries of the log are shown (the rest is one
+    /// click away): a log of a thousand entries is not a thousand widgets.
+    pub log_limit: usize,
     pub editor: text_editor::Content,
     /// The connection the queries run on.
     pub connection: Option<u64>,
@@ -81,6 +84,8 @@ pub struct Console {
     pub selected_log: Option<usize>,
     /// Statements that wait for a yes: they are risky.
     pub guard: Option<Guard>,
+    /// Statements that wait for the values of their parameters.
+    pub binds: Option<Binds>,
     /// What is typed to find an entry of the log.
     pub log_filter: String,
     /// The consoles: the first is the one whose queries are kept for the next
@@ -122,6 +127,205 @@ pub struct Guard {
     pub conn: u64,
     pub statements: Vec<String>,
     pub risk: super::protocol::Risk,
+}
+
+/// Statements that wait for the values of their parameters (`:name`, `?`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Binds {
+    pub conn: u64,
+    pub statements: Vec<String>,
+    /// What is asked for, in order: `:name` once for each name, `?` for each
+    /// mark.
+    pub names: Vec<String>,
+    pub values: Vec<String>,
+}
+
+/// A parameter of a statement: where it is, and what it is called (`None`
+/// for the mark `?`).
+struct Param {
+    start: usize,
+    end: usize,
+    name: Option<String>,
+}
+
+/// The parameters of a statement: `:name` anywhere but in a string, a quoted
+/// name, a comment, a PostgreSQL cast (`::`) or an assignment (`:=`); and,
+/// for MySQL and SQLite, the mark `?`.
+fn find_params(sql: &str, dialect: Dialect) -> Vec<Param> {
+    let bytes = sql.as_bytes();
+    let mut found = Vec::new();
+    let mut i = 0;
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    while i < bytes.len() {
+        let b = bytes[i];
+        match b {
+            b'\'' | b'"' | b'`' => {
+                // A quoted text or name: a doubled quote stays inside, and
+                // a backslash too for MySQL.
+                let mut j = i + 1;
+                while j < bytes.len() {
+                    if dialect == Dialect::Mysql && bytes[j] == b'\\' && b != b'`' {
+                        j += 2;
+                        continue;
+                    }
+                    if bytes[j] == b {
+                        if bytes.get(j + 1) == Some(&b) {
+                            j += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    j += 1;
+                }
+                i = j + 1;
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'#' if dialect == Dialect::Mysql => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+            }
+            b'$' if dialect == Dialect::Postgres => {
+                // $tag$ … $tag$
+                let tag_end = bytes[i + 1..]
+                    .iter()
+                    .position(|c| !(word(*c)))
+                    .map(|n| i + 1 + n);
+                match tag_end {
+                    Some(e) if bytes[e] == b'$' => {
+                        let tag = &sql[i..=e];
+                        i = match sql[e + 1..].find(tag) {
+                            Some(n) => e + 1 + n + tag.len(),
+                            None => bytes.len(),
+                        };
+                    }
+                    _ => i += 1,
+                }
+            }
+            b':' => {
+                let before = if i == 0 { b' ' } else { bytes[i - 1] };
+                let next = bytes.get(i + 1).copied().unwrap_or(b' ');
+                if before == b':' || next == b':' || next == b'=' {
+                    // `::`, `:=`: skip both characters.
+                    i += 2;
+                    continue;
+                }
+                if (next.is_ascii_alphabetic() || next == b'_') && !word(before) {
+                    let mut j = i + 1;
+                    while j < bytes.len() && word(bytes[j]) {
+                        j += 1;
+                    }
+                    found.push(Param {
+                        start: i,
+                        end: j,
+                        name: Some(sql[i + 1..j].to_string()),
+                    });
+                    i = j;
+                    continue;
+                }
+                i += 1;
+            }
+            b'?' if dialect != Dialect::Postgres => {
+                found.push(Param {
+                    start: i,
+                    end: i + 1,
+                    name: None,
+                });
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    found
+}
+
+/// What the statements ask for: each name once, each `?` as `?1`, `?2`…
+pub fn placeholders(statements: &[String], dialect: Dialect) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut marks = 0;
+    for sql in statements {
+        for p in find_params(sql, dialect) {
+            match p.name {
+                Some(name) => {
+                    if !names.contains(&format!(":{name}")) {
+                        names.push(format!(":{name}"));
+                    }
+                }
+                None => {
+                    marks += 1;
+                    names.push(format!("?{marks}"));
+                }
+            }
+        }
+    }
+    names
+}
+
+/// A value typed for a parameter, as SQL: a number as it is, `null` as NULL,
+/// anything else as a text.
+fn bound_literal(value: &str, dialect: Dialect) -> String {
+    let v = value.trim();
+    let number = !v.is_empty()
+        && v.parse::<f64>().is_ok()
+        && v.chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '-' | '+' | '.' | 'e' | 'E'));
+    if v.eq_ignore_ascii_case("null") {
+        "NULL".to_string()
+    } else if number {
+        v.to_string()
+    } else {
+        super::protocol::quote_literal_in(dialect, value)
+    }
+}
+
+/// The statements with the values put where the parameters are (`names` and
+/// `values` as `placeholders` gave them).
+pub fn bind(
+    statements: &[String],
+    dialect: Dialect,
+    names: &[String],
+    values: &[String],
+) -> Vec<String> {
+    let value_of = |name: &str| {
+        names
+            .iter()
+            .position(|n| n == name)
+            .and_then(|i| values.get(i))
+            .map(|v| bound_literal(v, dialect))
+            .unwrap_or_else(|| "NULL".to_string())
+    };
+    let mut marks = 0;
+    statements
+        .iter()
+        .map(|sql| {
+            let mut out = String::new();
+            let mut at = 0;
+            for p in find_params(sql, dialect) {
+                out.push_str(&sql[at..p.start]);
+                match &p.name {
+                    Some(name) => out.push_str(&value_of(&format!(":{name}"))),
+                    None => {
+                        marks += 1;
+                        out.push_str(&value_of(&format!("?{marks}")));
+                    }
+                }
+                at = p.end;
+            }
+            out.push_str(&sql[at..]);
+            out
+        })
+        .collect()
 }
 
 /// The proposals shown under the caret.
@@ -304,6 +508,7 @@ impl Console {
             open: false,
             tab: ConsoleTab::Queries,
             log: Vec::new(),
+            log_limit: 100,
             editor: text_editor::Content::with_text(&text),
             connection: None,
             dialect: super::protocol::Dialect::default(),
@@ -316,6 +521,7 @@ impl Console {
             completion: None,
             selected_log: None,
             guard: None,
+            binds: None,
             log_filter: String::new(),
             docs: vec![Doc {
                 title: t!("db.console_title", n = 1).to_string(),
@@ -612,6 +818,53 @@ pub fn caret_offset(text: &str, line: usize, column: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parameters_are_found_outside_texts_comments_casts_and_assignments() {
+        let sql = |t: &str| vec![t.to_string()];
+        let pg = Dialect::Postgres;
+        assert_eq!(
+            placeholders(
+                &sql("SELECT * FROM t WHERE a = :id AND b = :name AND c = :id"),
+                pg
+            ),
+            vec![":id", ":name"]
+        );
+        // Not a parameter: a cast, a text, a comment, a quoted name, a time.
+        for text in [
+            "SELECT a::int, 'x :y', \"c :d\" -- :e\n, '10:30'",
+            "/* :f */ SELECT 1",
+            "SELECT $$ :g $$",
+            "SELECT a[1:2]",
+        ] {
+            assert!(placeholders(&sql(text), pg).is_empty(), "{text}");
+        }
+        // `?` is a mark for MySQL and SQLite, an operator for PostgreSQL.
+        let marks = sql("SELECT * FROM t WHERE a = ? AND b = ?");
+        assert_eq!(placeholders(&marks, Dialect::Mysql), vec!["?1", "?2"]);
+        assert!(placeholders(&marks, pg).is_empty());
+        assert!(placeholders(&sql("SELECT '?'"), Dialect::Sqlite).is_empty());
+        assert!(placeholders(&sql("SET @a := 1"), Dialect::Mysql).is_empty());
+    }
+
+    #[test]
+    fn values_replace_parameters_as_numbers_nulls_or_texts() {
+        let statements = vec![
+            "SELECT :n, :s, :z, :n".to_string(),
+            "SELECT ?, ?".to_string(),
+        ];
+        let d = Dialect::Mysql;
+        let names = placeholders(&statements, d);
+        assert_eq!(names, vec![":n", ":s", ":z", "?1", "?2"]);
+        let values: Vec<String> = ["42", "it's", "NULL", "-1.5", "1e3x"]
+            .iter()
+            .map(|v| v.to_string())
+            .collect();
+        assert_eq!(
+            bind(&statements, d, &names, &values),
+            vec!["SELECT 42, 'it''s', NULL, 42", "SELECT -1.5, '1e3x'"]
+        );
+    }
+
     use super::*;
 
     fn statements(text: &str) -> Vec<&str> {

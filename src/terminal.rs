@@ -8,7 +8,7 @@
 
 use std::io::{Read, Write};
 use std::num::NonZeroU16;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -31,6 +31,76 @@ const SCROLLBACK: usize = 5_000;
 
 /// Counts what the shells print (and their ends): the repaint waits for it.
 static OUTPUT: AtomicU64 = AtomicU64::new(0);
+
+/// The replies to the queries found in what a program wrote: the position of
+/// the cursor (`CSI 6 n`), the status (`CSI 5 n`) and the kind of terminal
+/// (`CSI c`, `CSI > c`).
+fn queries_answered(chunk: &[u8], screen: &vt100::Screen) -> Vec<u8> {
+    let mut reply = Vec::new();
+    let has = |needle: &[u8]| chunk.windows(needle.len()).any(|w| w == needle);
+    if has(b"\x1b[6n") {
+        let (row, col) = screen.cursor_position();
+        reply.extend(format!("\x1b[{};{}R", row + 1, col + 1).bytes());
+    }
+    if has(b"\x1b[5n") {
+        reply.extend(b"\x1b[0n");
+    }
+    if has(b"\x1b[c") || has(b"\x1b[0c") {
+        reply.extend(b"\x1b[?1;2c");
+    }
+    if has(b"\x1b[>c") || has(b"\x1b[>0c") {
+        reply.extend(b"\x1b[>0;0;0c");
+    }
+    reply
+}
+
+/// The bytes that tell a program the mouse did something: `button` is the
+/// code of the xterm protocol (0 left, 64 and 65 the wheel, +32 for motion),
+/// `release` ends a press; the cell is counted from 0.
+fn mouse_report(
+    encoding: vt100::MouseProtocolEncoding,
+    button: u8,
+    release: bool,
+    (row, col): (u16, u16),
+) -> Vec<u8> {
+    let (x, y) = (col + 1, row + 1);
+    match encoding {
+        vt100::MouseProtocolEncoding::Sgr => {
+            format!("\x1b[<{button};{x};{y}{}", if release { 'm' } else { 'M' }).into_bytes()
+        }
+        // The older ways: a release has no button, and the places stop
+        // where a byte does.
+        _ => {
+            let code = if release { 3 } else { button };
+            let byte = |n: u16| (n.min(223) + 32) as u8;
+            vec![0x1b, b'[', b'M', code + 32, byte(x), byte(y)]
+        }
+    }
+}
+
+/// The word of a row of the screen at a column, without the punctuation
+/// that ends a sentence.
+fn word_at(row: &str, col: usize) -> Option<String> {
+    let chars: Vec<char> = row.chars().collect();
+    let at = col.min(chars.len().checked_sub(1)?);
+    if chars[at].is_whitespace() {
+        return None;
+    }
+    let mut start = at;
+    while start > 0 && !chars[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    let mut end = at;
+    while end + 1 < chars.len() && !chars[end + 1].is_whitespace() {
+        end += 1;
+    }
+    let word: String = chars[start..=end].iter().collect();
+    Some(
+        word.trim_matches(|c| matches!(c, ',' | ';' | '\'' | '"' | '`' | '(' | ')' | '[' | ']'))
+            .to_string(),
+    )
+    .filter(|w| !w.is_empty())
+}
 
 /// A message, at most every 33 ms, while some shell printed or ended: an idle
 /// terminal does not repaint the window.
@@ -65,6 +135,11 @@ pub struct Session {
     child: Mutex<Box<dyn Child + Send + Sync>>,
     alive: AtomicBool,
     size: Mutex<(u16, u16)>,
+    /// Where the shell was started: what a relative path of its output is
+    /// from.
+    cwd: Mutex<PathBuf>,
+    /// The line the last search found (counted from the bottom).
+    found: Mutex<Option<usize>>,
 }
 
 impl Session {
@@ -80,7 +155,16 @@ impl Session {
             command.arg("-l");
         }
         command.cwd(cwd);
-        Self::spawn_command(command, rows, cols)
+        let session = Self::spawn_command(command, rows, cols)?;
+        if let Ok(mut dir) = session.cwd.lock() {
+            *dir = cwd.to_path_buf();
+        }
+        Ok(session)
+    }
+
+    /// The folder the shell was started in.
+    pub fn start_dir(&self) -> PathBuf {
+        self.cwd.lock().map(|d| d.clone()).unwrap_or_default()
     }
 
     pub fn spawn_command(
@@ -113,6 +197,8 @@ impl Session {
             child: Mutex::new(child),
             alive: AtomicBool::new(true),
             size: Mutex::new((rows, cols)),
+            cwd: Mutex::new(PathBuf::new()),
+            found: Mutex::new(None),
         });
 
         // The thread holds only a weak reference: dropping the session kills
@@ -125,9 +211,19 @@ impl Session {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         let Some(session) = weak.upgrade() else { break };
-                        if let Ok(mut parser) = session.parser.lock() {
-                            parser.process(&buffer[..n]);
+                        let reply = match session.parser.lock() {
+                            Ok(mut parser) => {
+                                parser.process(&buffer[..n]);
+                                queries_answered(&buffer[..n], parser.screen())
+                            }
+                            Err(_) => Vec::new(),
                         };
+                        // What a program asks of the terminal (where the
+                        // cursor is, what the terminal is) is answered, or
+                        // it waits for a reply that never comes.
+                        if !reply.is_empty() {
+                            session.write(&reply);
+                        }
                         OUTPUT.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -183,6 +279,67 @@ impl Session {
     }
 
     /// Scrolls the history: positive goes up, towards older lines.
+    /// Looks for `query` (whatever the case) in the screen and what has gone
+    /// above it, before the last place found (`older`) or after it, and
+    /// scrolls to it. Whether there was one.
+    pub fn find(&self, query: &str, older: bool) -> bool {
+        let query = query.to_lowercase();
+        if query.is_empty() {
+            return false;
+        }
+        let Ok(mut parser) = self.parser.lock() else {
+            return false;
+        };
+        let screen = parser.screen_mut();
+        let (rows, cols) = (screen.size().0.get() as usize, screen.size().1.get());
+        let current = screen.scrollback();
+        // Every line that holds it, as its place counted from the bottom.
+        let mut lines: Vec<usize> = Vec::new();
+        let mut offset = 0;
+        loop {
+            screen.set_scrollback(offset);
+            let at = screen.scrollback();
+            for (r, line) in screen.rows(0, cols).enumerate() {
+                if line.to_lowercase().contains(&query) {
+                    lines.push(at + rows - 1 - r);
+                }
+            }
+            if at < offset || offset >= SCROLLBACK + rows {
+                break;
+            }
+            offset += rows;
+        }
+        lines.sort_unstable();
+        lines.dedup();
+        let last = self.found.lock().ok().and_then(|f| *f);
+        let from = last.map_or(current as isize - 1, |l| l as isize);
+        let target = if older {
+            lines.iter().copied().find(|l| *l as isize > from)
+        } else {
+            lines.iter().rev().copied().find(|l| (*l as isize) < from)
+        };
+        match target {
+            Some(line) => {
+                if let Ok(mut f) = self.found.lock() {
+                    *f = Some(line);
+                }
+                screen.set_scrollback(line.saturating_sub(rows / 2));
+                true
+            }
+            None => {
+                screen.set_scrollback(current);
+                false
+            }
+        }
+    }
+
+    /// The next search starts from the screen again.
+    pub fn forget_found(&self) {
+        if let Ok(mut f) = self.found.lock() {
+            *f = None;
+        }
+    }
+
     pub fn scroll(&self, lines: i32) {
         if let Ok(mut parser) = self.parser.lock() {
             let screen = parser.screen_mut();
@@ -224,6 +381,8 @@ pub struct Panel {
     pub active: usize,
     /// Whether the keyboard goes to the terminal.
     pub focused: bool,
+    /// What is typed in the search bar (none: no bar).
+    pub search: Option<String>,
     started: usize,
 }
 
@@ -470,11 +629,17 @@ fn resolve(color: vt100::Color, default: Color, dark: bool) -> Color {
 // ─── The canvas ─────────────────────────────────────────────────────────────
 
 /// The terminal on a canvas.
-pub fn view<'a>(session: &'a Arc<Session>, dark: bool, focused: bool) -> Element<'a, Message> {
+pub fn view<'a>(
+    session: &'a Arc<Session>,
+    dark: bool,
+    focused: bool,
+    search: &'a str,
+) -> Element<'a, Message> {
     Canvas::new(Screen {
         session,
         dark,
         focused,
+        search,
     })
     .width(Length::Fill)
     .height(Length::Fill)
@@ -485,6 +650,8 @@ struct Screen<'a> {
     session: &'a Arc<Session>,
     dark: bool,
     focused: bool,
+    /// What the search bar looks for (marked where it is on screen).
+    search: &'a str,
 }
 
 /// A selection by dragging, in cells (row, column) of the visible screen.
@@ -493,6 +660,9 @@ struct Drag {
     anchor: Option<(u16, u16)>,
     head: Option<(u16, u16)>,
     dragging: bool,
+    /// A program that asked for the mouse has the button down.
+    reported: bool,
+    modifiers: keyboard::Modifiers,
 }
 
 impl Drag {
@@ -529,7 +699,69 @@ impl canvas::Program<Message> for Screen<'_> {
         cursor: mouse::Cursor,
     ) -> Option<canvas::Action<Message>> {
         let (rows, cols) = grid_size(bounds.size());
+        // A program that asked for the mouse (vim, htop, tmux) gets it; the
+        // Shift key keeps the selection for the terminal.
+        let (mode, encoding) = self
+            .session
+            .with_screen(|s| (s.mouse_protocol_mode(), s.mouse_protocol_encoding()))
+            .unwrap_or((
+                vt100::MouseProtocolMode::None,
+                vt100::MouseProtocolEncoding::Default,
+            ));
+        let reporting = mode != vt100::MouseProtocolMode::None && !drag.modifiers.shift();
         match event {
+            iced::Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => {
+                drag.modifiers = *m;
+                None
+            }
+            iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                if reporting && self.focused && cursor.position_in(bounds).is_some() =>
+            {
+                let cell = cell_at(cursor.position_in(bounds)?, rows, cols);
+                self.session.write(&mouse_report(encoding, 0, false, cell));
+                drag.reported = true;
+                Some(canvas::Action::capture())
+            }
+            iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+                if drag.reported =>
+            {
+                drag.reported = false;
+                if mode != vt100::MouseProtocolMode::Press {
+                    if let Some(at) = cursor.position_in(bounds) {
+                        let cell = cell_at(at, rows, cols);
+                        self.session.write(&mouse_report(encoding, 0, true, cell));
+                    }
+                }
+                Some(canvas::Action::capture())
+            }
+            iced::Event::Mouse(mouse::Event::CursorMoved { position })
+                if drag.reported
+                    && matches!(
+                        mode,
+                        vt100::MouseProtocolMode::ButtonMotion
+                            | vt100::MouseProtocolMode::AnyMotion
+                    ) =>
+            {
+                let at = Point::new(position.x - bounds.x, position.y - bounds.y);
+                self.session
+                    .write(&mouse_report(encoding, 32, false, cell_at(at, rows, cols)));
+                Some(canvas::Action::capture())
+            }
+            iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                if drag.modifiers.command() && cursor.position_in(bounds).is_some() =>
+            {
+                // Command (Ctrl elsewhere) and a click on `file:line`: opens it.
+                let (row, col) = cell_at(cursor.position_in(bounds)?, rows, cols);
+                let line = self
+                    .session
+                    .with_screen(|s| s.contents_between(row, 0, row, cols))
+                    .unwrap_or_default();
+                let place = word_at(&line, col as usize).unwrap_or(line);
+                Some(
+                    canvas::Action::publish(Message::TerminalOpen(place, self.session.start_dir()))
+                        .and_capture(),
+                )
+            }
             iced::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 if let Some(at) = cursor.position_in(bounds) {
                     let cell = cell_at(at, rows, cols);
@@ -537,6 +769,8 @@ impl canvas::Program<Message> for Screen<'_> {
                         anchor: Some(cell),
                         head: Some(cell),
                         dragging: true,
+                        modifiers: drag.modifiers,
+                        reported: false,
                     };
                     let action = if self.focused {
                         canvas::Action::request_redraw()
@@ -573,6 +807,15 @@ impl canvas::Program<Message> for Screen<'_> {
                 let lines = lines.round() as i32;
                 if lines == 0 {
                     return None;
+                }
+                if reporting {
+                    let cell = cell_at(cursor.position_in(bounds)?, rows, cols);
+                    for _ in 0..lines.unsigned_abs().min(10) {
+                        let button = if lines > 0 { 64 } else { 65 };
+                        self.session
+                            .write(&mouse_report(encoding, button, false, cell));
+                    }
+                    return Some(canvas::Action::capture());
                 }
                 let alternate = self
                     .session
@@ -626,6 +869,12 @@ impl canvas::Program<Message> for Screen<'_> {
                                     canvas::Action::publish(Message::TerminalPaste).and_capture(),
                                 );
                             }
+                            "f" => {
+                                return Some(
+                                    canvas::Action::publish(Message::TerminalSearchToggle)
+                                        .and_capture(),
+                                );
+                            }
                             _ => {}
                         }
                     }
@@ -672,8 +921,23 @@ impl canvas::Program<Message> for Screen<'_> {
                 let show_cursor = !screen.hide_cursor() && screen.scrollback() == 0;
                 let shown_rows = rows.min(screen.size().0.get());
                 let shown_cols = cols.min(screen.size().1.get());
+                let needle = self.search.to_lowercase();
                 for row in 0..shown_rows {
                     let y = PAD_Y + f32::from(row) * CELL_H;
+                    // The columns of this row where the search text is.
+                    let marks: Vec<(u16, u16)> = if needle.is_empty() {
+                        Vec::new()
+                    } else {
+                        let line = screen
+                            .contents_between(row, 0, row, shown_cols)
+                            .to_lowercase();
+                        line.match_indices(&needle)
+                            .map(|(at, m)| {
+                                let start = line[..at].chars().count() as u16;
+                                (start, start + m.chars().count() as u16)
+                            })
+                            .collect()
+                    };
                     // The text run being built: where it starts, and how it looks.
                     let mut run: Option<(u16, String, Color, bool, bool, bool)> = None;
                     let flush = |frame: &mut Frame,
@@ -735,6 +999,10 @@ impl canvas::Program<Message> for Screen<'_> {
                         }
                         if show_cursor && self.focused && (row, col) == (cursor_row, cursor_col) {
                             bg = Some(p.text);
+                            fg = p.panel;
+                        }
+                        if marks.iter().any(|(a, b)| (*a..*b).contains(&col)) {
+                            bg = Some(p.accent);
                             fg = p.panel;
                         }
                         if selected(row, col) {
@@ -919,12 +1187,14 @@ mod tests {
             anchor: Some((3, 5)),
             head: Some((1, 2)),
             dragging: false,
+            ..Drag::default()
         };
         assert_eq!(drag.range(), Some(((1, 2), (3, 5))));
         let click = Drag {
             anchor: Some((1, 1)),
             head: Some((1, 1)),
             dragging: false,
+            ..Drag::default()
         };
         assert_eq!(click.range(), None);
     }
@@ -966,5 +1236,74 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         assert!(!session.is_alive());
+    }
+
+    /// A program that asks where the cursor is gets the answer: the shell
+    /// reads it from its input, and prints it.
+    #[cfg(unix)]
+    #[test]
+    fn the_position_of_the_cursor_is_answered_to_a_program() {
+        let mut command = CommandBuilder::new("bash");
+        command.env("PS1", "$ ");
+        let Ok(session) = Session::spawn_command(command, 24, 80) else {
+            return;
+        };
+        session.write(b"printf '\\033[6n'; read -s -t 3 -d R reply; echo \"answer=${reply#*[}\"\n");
+        assert!(wait_for(&session, "answer="));
+        assert!(wait_for(&session, ";"), "a row and a column");
+        session.write(b"exit\n");
+    }
+
+    #[test]
+    fn the_mouse_is_reported_the_way_the_program_asked() {
+        let sgr = mouse_report(vt100::MouseProtocolEncoding::Sgr, 0, false, (4, 9));
+        assert_eq!(sgr, b"\x1b[<0;10;5M");
+        let release = mouse_report(vt100::MouseProtocolEncoding::Sgr, 0, true, (4, 9));
+        assert_eq!(release, b"\x1b[<0;10;5m");
+        let old = mouse_report(vt100::MouseProtocolEncoding::Default, 64, false, (0, 0));
+        assert_eq!(old, vec![0x1b, b'[', b'M', 96, 33, 33]);
+    }
+
+    #[test]
+    fn the_word_under_a_click_loses_the_punctuation_around_it() {
+        let row = "error at (src/app.rs:12:5), see";
+        assert_eq!(word_at(row, 14).as_deref(), Some("src/app.rs:12:5"));
+        assert_eq!(word_at(row, 5), None);
+        assert_eq!(word_at("", 0), None);
+    }
+
+    #[test]
+    fn the_queries_of_a_program_have_answers() {
+        let mut parser = vt100::Parser::new(nonzero(24), nonzero(80), 0);
+        parser.process(b"abc");
+        let reply = queries_answered(b"\x1b[6n\x1b[c", parser.screen());
+        assert_eq!(reply, b"\x1b[1;4R\x1b[?1;2c");
+        assert!(queries_answered(b"plain", parser.screen()).is_empty());
+    }
+
+    #[test]
+    fn a_search_goes_back_through_the_history_and_forth_again() {
+        let mut command = CommandBuilder::new("sh");
+        command.env("PS1", "$ ");
+        let Ok(session) = Session::spawn_command(command, 5, 40) else {
+            return;
+        };
+        session.write(
+            b"echo needle-$((0+1)); seq 1 30; echo needle-$((1+1)); seq 31 60; echo end-$((5+5))\n",
+        );
+        assert!(wait_for(&session, "end-10"));
+        // From the bottom: the last needle, then the one before, then none.
+        assert!(session.find("NEEDLE-2", true));
+        let first = session.with_screen(|s| s.contents()).unwrap();
+        assert!(first.contains("needle-2"), "{first}");
+        assert!(session.find("needle-1", true));
+        let second = session.with_screen(|s| s.contents()).unwrap();
+        assert!(second.contains("needle-1"), "{second}");
+        assert!(!session.find("needle-1", true));
+        // And forth again.
+        assert!(session.find("needle-2", false));
+        let back = session.with_screen(|s| s.contents()).unwrap();
+        assert!(back.contains("needle-2"), "{back}");
+        assert!(!session.find("absent", true));
     }
 }

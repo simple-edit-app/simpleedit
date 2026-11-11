@@ -18,6 +18,10 @@ pub struct HistoryView {
     pub old: String,
     pub current: Option<String>,
     pub chunks: Vec<Chunk>,
+    /// The files of the rows that are gone from the disk, and whether the
+    /// scope has several files: found once, not for every row of every frame.
+    pub gone: std::collections::HashSet<PathBuf>,
+    pub several: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -25,6 +29,9 @@ pub enum HistoryMsg {
     /// The history of the file in front.
     OpenCurrent,
     Open(PathBuf),
+    /// The rows of the history, read in the background (and the text the
+    /// file has now).
+    Rows(PathBuf, Option<String>, Vec<Row>),
     Search(String),
     Searched(String, Vec<usize>),
     Select(usize),
@@ -161,13 +168,49 @@ impl SimpleEditApp {
         if let Some(text) = &now {
             let _ = store.record(&scope, text, lh::now());
         }
-        let rows = store.rows(&scope);
+        // Every index of the folder is read: not on the interface's thread.
+        let scope_read = scope.clone();
+        Task::perform(
+            async move {
+                let rows = tokio::task::spawn_blocking(move || {
+                    Store::global()
+                        .map(|s| s.rows(&scope_read))
+                        .unwrap_or_default()
+                })
+                .await
+                .unwrap_or_default();
+                (scope, now, rows)
+            },
+            |(scope, now, rows)| Message::History(HistoryMsg::Rows(scope, now, rows)),
+        )
+    }
+
+    /// The history is read: the window opens on the latest change.
+    fn history_rows_ready(
+        &mut self,
+        scope: PathBuf,
+        now: Option<String>,
+        rows: Vec<Row>,
+    ) -> Task<Message> {
+        let Some(store) = Store::global() else {
+            return Task::none();
+        };
         if rows.is_empty() {
             self.set_status(t!("history.empty"), false);
             return Task::none();
         }
         let shown = (0..rows.len()).collect();
+        let gone: std::collections::HashSet<PathBuf> = rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Revision { path, .. } if !path.exists() => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        let several = scope.is_dir() || !scope.exists();
         let mut view = HistoryView {
+            gone,
+            several,
             scope,
             rows,
             shown,
@@ -469,6 +512,7 @@ impl SimpleEditApp {
                 _ => Task::none(),
             },
             HistoryMsg::Open(path) => self.history_open(path),
+            HistoryMsg::Rows(scope, now, rows) => self.history_rows_ready(scope, now, rows),
             HistoryMsg::Search(query) => self.history_search(query),
             HistoryMsg::Searched(asked, found) => {
                 if let ActiveOverlay::LocalHistory(view) = &mut self.overlay {
@@ -583,7 +627,7 @@ impl SimpleEditApp {
     ) -> Element<'a, Message> {
         let p = se_theme::palette(dark);
         let ghost = move |active: bool| (se_theme::GhostButton { dark, active }).style();
-        let several = view.scope.is_dir() || !view.scope.exists();
+        let several = view.several;
         let mut list = column![].spacing(1);
         for index in &view.shown {
             let Some(row) = view.rows.get(*index) else {
@@ -600,7 +644,7 @@ impl SimpleEditApp {
                             .unwrap_or(path)
                             .display()
                             .to_string();
-                        let gone = !path.exists();
+                        let gone = view.gone.contains(path);
                         line = line.push(
                             text(if gone {
                                 t!("history.gone", file = shown.as_str()).to_string()
@@ -763,6 +807,17 @@ impl SimpleEditApp {
 
 #[cfg(test)]
 mod tests {
+    /// Opens the history of a path as the app does, the read in the
+    /// background being done here.
+    fn open_history(app: &mut SimpleEditApp, path: PathBuf) -> Task<Message> {
+        let now = app.file_text(&path).map(|(text, _)| text);
+        if let Some(text) = &now {
+            let _ = Store::global().unwrap().record(&path, text, lh::now());
+        }
+        let rows = Store::global().unwrap().rows(&path);
+        app.update(Message::History(HistoryMsg::Rows(path, now, rows)))
+    }
+
     use super::*;
 
     /// An app with a project of one file, and its history reachable.
@@ -795,7 +850,7 @@ mod tests {
         let store = Store::global().unwrap();
         store.record(&path, "old\n", 100);
         let mut app = app_on(dir.path());
-        let _ = app.update(Message::History(HistoryMsg::Open(path.clone())));
+        let _ = open_history(&mut app, path.clone());
         let rows = revision_rows(&app);
         assert_eq!(rows.len(), 2, "what the file holds now is kept too");
         let _ = app.update(Message::History(HistoryMsg::Select(rows[1])));
@@ -813,7 +868,7 @@ mod tests {
         let store = Store::global().unwrap();
         store.record(&path, "was here\n", 100);
         let mut app = app_on(dir.path());
-        let _ = app.update(Message::History(HistoryMsg::Open(dir.path().to_path_buf())));
+        let _ = open_history(&mut app, dir.path().to_path_buf());
         assert_eq!(view(&app).current, None);
         let _ = app.update(Message::History(HistoryMsg::Revert));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "was here\n");
@@ -830,7 +885,7 @@ mod tests {
         std::fs::write(&path, &now).unwrap();
         Store::global().unwrap().record(&path, &old, 100);
         let mut app = app_on(dir.path());
-        let _ = app.update(Message::History(HistoryMsg::Open(path.clone())));
+        let _ = open_history(&mut app, path.clone());
         let older = revision_rows(&app)[1];
         let _ = app.update(Message::History(HistoryMsg::Select(older)));
         assert_eq!(view(&app).chunks.len(), 2);
@@ -848,7 +903,7 @@ mod tests {
         std::fs::write(&path, old.replace("line 199\n", "changed\n")).unwrap();
         Store::global().unwrap().record(&path, &old, 100);
         let mut app = app_on(dir.path());
-        let open = app.update(Message::History(HistoryMsg::Open(path)));
+        let open = open_history(&mut app, path);
         // The revision that differs is picked, and shown on its change.
         assert_eq!(view(&app).selected, Some(revision_rows(&app)[1]));
         assert_eq!(app.history_diff.changes(), 1);
@@ -873,7 +928,7 @@ mod tests {
         std::fs::write(&path, &now).unwrap();
         Store::global().unwrap().record(&path, &old, 100);
         let mut app = app_on(dir.path());
-        let _ = app.update(Message::History(HistoryMsg::Open(path.clone())));
+        let _ = open_history(&mut app, path.clone());
         let older = revision_rows(&app)[1];
         let _ = app.update(Message::History(HistoryMsg::Select(older)));
         assert!(app.history_diff.side_by_side, "two files by default");
@@ -899,7 +954,7 @@ mod tests {
         store.record(&path, "after\n", 200);
         std::fs::write(&path, "after\n").unwrap();
         let mut app = app_on(dir.path());
-        let _ = app.update(Message::History(HistoryMsg::Open(dir.path().to_path_buf())));
+        let _ = open_history(&mut app, dir.path().to_path_buf());
         let label = view(&app)
             .rows
             .iter()
@@ -936,7 +991,7 @@ mod tests {
         let path = PathBuf::from(format!("/nowhere/off-{}.txt", lh::now()));
         app.history_record(&path, "text");
         assert!(Store::global().unwrap().file(&path).revisions.is_empty());
-        let _ = app.update(Message::History(HistoryMsg::Open(path)));
+        let _ = open_history(&mut app, path);
         assert_eq!(app.overlay, ActiveOverlay::None);
     }
 
@@ -961,7 +1016,7 @@ mod tests {
         store.record(&path, "fn main() {\n    middle();\n}\n", t + 1200);
         std::fs::write(&path, "fn main() {\n    new();\n    more();\n}\n").unwrap();
         let mut app = app_on(dir.path());
-        let _ = app.update(Message::History(HistoryMsg::Open(path)));
+        let _ = open_history(&mut app, path);
         let older = revision_rows(&app)[2];
         let _ = app.update(Message::History(HistoryMsg::Select(older)));
         let _ = app.update(Message::History(HistoryMsg::Diff(DiffNav::Scrolled(

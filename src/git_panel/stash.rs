@@ -17,6 +17,8 @@ pub struct State {
     pub message: String,
     /// Keep the staged changes in the index when stashing.
     pub keep_index: bool,
+    /// Stash only the staged changes (`git stash push --staged`).
+    pub staged: bool,
     /// The name of the branch to create from a stash.
     pub branch: String,
 }
@@ -131,9 +133,9 @@ impl Panel {
 
     pub(super) fn stash_push(&mut self) -> Task<Message> {
         let message = std::mem::take(&mut self.stash.message);
-        let keep_index = self.stash.keep_index;
+        let (keep_index, staged) = (self.stash.keep_index, self.stash.staged);
         self.act(move |repo| async move {
-            history::stash_push(&repo, &message, keep_index).await?;
+            history::stash_push(&repo, &message, keep_index, staged).await?;
             Ok(String::new())
         })
     }

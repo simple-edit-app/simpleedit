@@ -329,8 +329,9 @@ fn collection_rows<'a>(
         dark,
     );
     let id = collection.id;
+    let running = state.run.is_some();
     out.push(crate::pointer_area::context_menu(head, move || {
-        collection_menu(id, dark)
+        collection_menu(id, running, dark)
     }));
     if is_open {
         item_rows(
@@ -476,7 +477,7 @@ fn history_rows<'a>(out: &mut Vec<Element<'a, Message>>, state: &'a State, dark:
     }
 }
 
-fn collection_menu(id: u64, dark: bool) -> Element<'static, Message> {
+fn collection_menu(id: u64, running: bool, dark: bool) -> Element<'static, Message> {
     container(
         column![
             menu_bar::item(
@@ -498,12 +499,21 @@ fn collection_menu(id: u64, dark: bool) -> Element<'static, Message> {
                 dark,
                 api(ApiMsg::AskRename(id, 0))
             ),
-            menu_bar::item(
-                t!("api.run_collection").to_string(),
-                None,
-                dark,
-                api(ApiMsg::RunCollection(id))
-            ),
+            if running {
+                menu_bar::item(
+                    t!("api.run_stop").to_string(),
+                    None,
+                    dark,
+                    api(ApiMsg::CancelRun),
+                )
+            } else {
+                menu_bar::item(
+                    t!("api.run_collection").to_string(),
+                    None,
+                    dark,
+                    api(ApiMsg::RunCollection(id)),
+                )
+            },
             menu_bar::item(
                 t!("api.export").to_string(),
                 None,
@@ -1069,6 +1079,7 @@ fn body_section<'a>(path: &Path, tab: &'a ApiTab, dark: bool) -> Element<'a, Mes
             BodyKind::Json => t!("api.body_json"),
             BodyKind::Text => t!("api.body_text"),
             BodyKind::Form => t!("api.body_form"),
+            BodyKind::Multipart => t!("api.body_multipart"),
             BodyKind::File => t!("api.body_file"),
         };
         r.push(
@@ -1130,6 +1141,14 @@ fn body_section<'a>(path: &Path, tab: &'a ApiTab, dark: bool) -> Element<'a, Mes
             col.into()
         }
         BodyKind::Form => pairs_table(path, Table::Form, &tab.request.body.form, false, dark),
+        BodyKind::Multipart => column![
+            text(t!("api.body_multipart_hint").to_string())
+                .size(11.5)
+                .color(p.muted),
+            pairs_table(path, Table::Form, &tab.request.body.form, false, dark),
+        ]
+        .spacing(6)
+        .into(),
         BodyKind::File => row![
             button(text(t!("api.choose_file").to_string()).size(12.5))
                 .padding([4, 12])

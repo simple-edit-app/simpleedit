@@ -51,31 +51,31 @@ pub const SERVERS: &[ServerInfo] = &[
         binary: "pyright-langserver",
         label: "Python",
         extensions: &["py", "pyi"],
-        installer: Installer::Npm(&["pyright"]),
+        installer: Installer::Npm(&["pyright@1"]),
     },
     ServerInfo {
         binary: "typescript-language-server",
         label: "TypeScript / JavaScript",
         extensions: &["ts", "tsx", "js", "jsx", "mjs", "cjs", "mts", "cts"],
-        installer: Installer::Npm(&["typescript-language-server", "typescript@5"]),
+        installer: Installer::Npm(&["typescript-language-server@6", "typescript@5"]),
     },
     ServerInfo {
         binary: "gopls",
         label: "Go",
         extensions: &["go"],
-        installer: Installer::Go("golang.org/x/tools/gopls@latest"),
+        installer: Installer::Go("golang.org/x/tools/gopls@v0.24.0"),
     },
     ServerInfo {
         binary: "bash-language-server",
         label: "Shell",
         extensions: &["sh", "bash"],
-        installer: Installer::Npm(&["bash-language-server"]),
+        installer: Installer::Npm(&["bash-language-server@5"]),
     },
     ServerInfo {
         binary: "intelephense",
         label: "PHP",
         extensions: &["php"],
-        installer: Installer::Npm(&["intelephense"]),
+        installer: Installer::Npm(&["intelephense@1"]),
     },
     ServerInfo {
         binary: "csharp-ls",
@@ -192,7 +192,7 @@ pub async fn install(binary: &'static str) -> Result<(), String> {
     let mut command = match info.installer {
         Installer::Npm(packages) => {
             let mut c = tool("npm")?;
-            c.args(["install", "-g", "--prefix"])
+            c.args(["install", "-g", "--ignore-scripts", "--prefix"])
                 .arg(&root)
                 .args(packages);
             c

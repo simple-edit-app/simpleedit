@@ -241,14 +241,24 @@ impl SimpleEditApp {
         since: Option<&str>,
     ) -> Element<'_, Message> {
         let p = se_theme::palette(dark);
-        let mut entries = crate::changelog::embedded();
-        if let Some(since) = since {
-            entries = crate::changelog::between(entries, since, env!("CARGO_PKG_VERSION"));
-        }
+        // The whole changelog is shown as it is compiled in; only a part of it
+        // is copied.
+        let part;
+        let entries: &[crate::changelog::Entry] = match since {
+            Some(since) => {
+                part = crate::changelog::between(
+                    crate::changelog::embedded(),
+                    since,
+                    env!("CARGO_PKG_VERSION"),
+                );
+                &part
+            }
+            None => crate::changelog::embedded_ref(),
+        };
         container(
             column![
                 text(title).size(18).color(p.accent),
-                scrollable(changelog_list(dark, &entries))
+                scrollable(changelog_list(dark, entries))
                     .height(Length::Fixed(380.0))
                     .width(Length::Fill),
                 button(text(t!("about.close").to_string()).size(13))
@@ -443,7 +453,7 @@ impl SimpleEditApp {
         // Left empty, the name is the next free `scratchN`, shown as a hint.
         // (Only looked up when it is shown: it stats the folder.)
         let suggestion = if scratch.name.is_empty() {
-            crate::scratch::next_name(&scratch.dir, scratch.ext.as_str())
+            crate::scratch::suggested_name(&scratch.dir, scratch.ext.as_str())
         } else {
             String::new()
         };
@@ -623,16 +633,67 @@ impl SimpleEditApp {
                     ),
             );
         let body: Element<Message> = match self.terminal.active_session() {
-            Some(session) => crate::terminal::view(session, dark, self.terminal.focused),
+            Some(session) => crate::terminal::view(
+                session,
+                dark,
+                self.terminal.focused,
+                self.terminal.search.as_deref().unwrap_or(""),
+            ),
             None => Space::new().into(),
         };
-        column![
-            resize_edge(dark),
-            container(header).padding([4, 12]),
-            container(body).width(Length::Fill).height(Length::Fill),
-        ]
-        .height(Length::Fixed(self.panel_height))
-        .into()
+        let mut panel = column![resize_edge(dark), container(header).padding([4, 12])];
+        if let Some(query) = &self.terminal.search {
+            panel = panel.push(
+                container(
+                    row![
+                        iced::widget::text_input(&t!("terminal.search"), query)
+                            .id(super::terminal_search_id())
+                            .on_input(Message::TerminalSearchInput)
+                            .on_submit(Message::TerminalSearchNext(true))
+                            .size(12.5)
+                            .padding([3, 8])
+                            .style(se_theme::Field::new(dark).style()),
+                        button(text("↑").size(13))
+                            .padding([1, 8])
+                            .on_press(Message::TerminalSearchNext(true))
+                            .style(
+                                (se_theme::GhostButton {
+                                    dark,
+                                    active: false
+                                })
+                                .style()
+                            ),
+                        button(text("↓").size(13))
+                            .padding([1, 8])
+                            .on_press(Message::TerminalSearchNext(false))
+                            .style(
+                                (se_theme::GhostButton {
+                                    dark,
+                                    active: false
+                                })
+                                .style()
+                            ),
+                        button(text("×").size(13))
+                            .padding([1, 8])
+                            .on_press(Message::TerminalSearchToggle)
+                            .style(
+                                (se_theme::GhostButton {
+                                    dark,
+                                    active: false
+                                })
+                                .style()
+                            ),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+                )
+                .padding([2, 12]),
+            );
+        }
+        panel
+            .push(container(body).width(Length::Fill).height(Length::Fill))
+            .height(Length::Fixed(self.panel_height))
+            .into()
     }
 
     /// Where a name is used, as a compact list under the top edge: file and
@@ -1111,7 +1172,8 @@ impl SimpleEditApp {
             .to_json()
             .ok_or_else(|| t!("status.session_not_serialized").to_string())?;
         crate::session::Session::write(&json).map_err(|e| e.to_string())?;
-        self.last_session = fingerprint(&json);
+        self.last_session
+            .store(fingerprint(&json), std::sync::atomic::Ordering::Relaxed);
         self.session_rev = self.rev;
         Ok(())
     }
@@ -1126,17 +1188,26 @@ impl SimpleEditApp {
         }
         self.bookmarks.save();
         self.session_rev = self.rev;
-        let json = self.build_session().to_json()?;
-        let print = fingerprint(&json);
-        if print == self.last_session {
-            return None;
-        }
-        self.last_session = print;
+        // Only the copy of the text is made here; the JSON, its fingerprint
+        // and the write are done off the interface's thread.
+        let session = self.build_session();
+        let last = self.last_session.clone();
         self.session_writes += 1;
         let number = self.session_writes;
         Some(async move {
             tokio::task::spawn_blocking(move || {
-                crate::session::Session::write_numbered(&json, number).map_err(|e| e.to_string())
+                let json = session
+                    .to_json()
+                    .ok_or_else(|| t!("status.session_not_serialized").to_string())?;
+                let print = fingerprint(&json);
+                // Nothing changed since the last write: nothing to do.
+                if print == last.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Ok(());
+                }
+                crate::session::Session::write_numbered(&json, number)
+                    .map_err(|e| e.to_string())?;
+                last.store(print, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
             })
             .await
             .map_err(|e| e.to_string())?

@@ -436,14 +436,26 @@ impl SimpleEditApp {
                 Task::none()
             }
             DbMsg::BackupOpen(conn, database, schema, table, restore) => {
+                let dialect = self
+                    .db
+                    .connection(conn)
+                    .map(|c| c.dialect)
+                    .unwrap_or_default();
                 self.db.backup = Some(Backup {
                     conn,
+                    dialect,
                     database,
                     schema,
                     table,
                     restore,
                     spec: database::protocol::ToolSpec {
-                        format: "custom".into(),
+                        // The others write SQL, and only SQL.
+                        format: if dialect == database::protocol::Dialect::Postgres {
+                            "custom"
+                        } else {
+                            "plain"
+                        }
+                        .into(),
                         no_owner: true,
                         no_privileges: true,
                         single_transaction: restore,

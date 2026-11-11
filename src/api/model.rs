@@ -100,15 +100,19 @@ pub enum BodyKind {
     Json,
     Text,
     Form,
+    /// `multipart/form-data`: the fields of `form`, a value that starts
+    /// with `@` being a file to send.
+    Multipart,
     File,
 }
 
 impl BodyKind {
-    pub const ALL: [BodyKind; 5] = [
+    pub const ALL: [BodyKind; 6] = [
         BodyKind::None,
         BodyKind::Json,
         BodyKind::Text,
         BodyKind::Form,
+        BodyKind::Multipart,
         BodyKind::File,
     ];
 }
@@ -662,6 +666,9 @@ pub enum ResolvedBody {
     Bytes(Vec<u8>),
     /// A file, read when the request goes.
     File(String),
+    /// The fields of a `multipart/form-data` body; a value that starts with
+    /// `@` is the path of a file, read when the request goes.
+    Multipart(Vec<(String, String)>),
 }
 
 /// A random 64-bit number (the standard library's per-hasher random keys).
@@ -862,7 +869,7 @@ impl Request {
         match self.body.kind {
             BodyKind::None => {}
             BodyKind::Json | BodyKind::Text => note(&self.body.text),
-            BodyKind::Form => {
+            BodyKind::Form | BodyKind::Multipart => {
                 for f in self
                     .body
                     .form
@@ -960,6 +967,18 @@ impl Request {
                     Some("application/x-www-form-urlencoded"),
                 )
             }
+            BodyKind::Multipart => (
+                ResolvedBody::Multipart(
+                    self.body
+                        .form
+                        .iter()
+                        .filter(|f| f.enabled && !f.key.trim().is_empty())
+                        .map(|f| (sub(f.key.trim()), sub(&f.value)))
+                        .collect(),
+                ),
+                // The boundary goes with the type: the client says both.
+                None,
+            ),
             BodyKind::File => (
                 ResolvedBody::File(sub(self.body.file.trim())),
                 Some("application/octet-stream"),

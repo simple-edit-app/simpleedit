@@ -353,6 +353,9 @@ pub enum Message {
     /// The folder may run its own programs.
     TrustFolder(PathBuf),
     RenameSymbol,
+    /// The names the file declares, in a list to pick from.
+    OpenOutline,
+    OutlineLoaded(PathBuf, Result<Vec<crate::lsp::SymbolHit>, String>),
     RenameInput(String),
     RenameConfirm,
     Renamed(u64, Result<Vec<crate::lsp::FileEdits>, String>),
@@ -385,6 +388,9 @@ pub enum Message {
     FindHistory(String),
     FindPin,
     FindSelect(usize),
+    FindScrolled(f32),
+    /// Leave the match of this line out of "Replace all" (or put it back).
+    FindExcludeAt(usize),
     FindReplaceOne,
     FindReplaceAll,
     FindReplaceConfirm(bool),
@@ -632,7 +638,15 @@ pub enum Message {
     TerminalTick,
     TerminalFocus(bool),
     TerminalCopy(String),
+    /// A word of the terminal was clicked with Command: a place to open
+    /// (`file:line`), from the folder the shell started in.
+    TerminalOpen(String, PathBuf),
     TerminalPaste,
+    /// Opens (or closes) the search of the terminal.
+    TerminalSearchToggle,
+    TerminalSearchInput(String),
+    /// To the next match: `true` goes back in the history.
+    TerminalSearchNext(bool),
     TerminalPasteText(Option<String>),
     /// The pointer entered a menu title: switches menus if one is already open.
     HoverMenu(TopMenu),
@@ -655,6 +669,8 @@ pub enum Message {
     Undo,
     Redo,
     AutoSave,
+    /// The watcher heard a change on the disk.
+    FsChanged,
     // Raw key press forwarded from the subscription (non-capturing fn pointer)
     KeyPressed {
         key: String,
@@ -737,6 +753,12 @@ pub enum Message {
     FoldClick(usize, crate::folding::Scope),
     /// Ctrl/Cmd+click on a name: look for where it is defined.
     GotoDefinition,
+    /// Where the type of the name under the cursor is declared.
+    GotoTypeDefinition,
+    /// The imports of the file, put in order by its language server.
+    OrganizeImports,
+    /// What implements the name under the cursor.
+    GotoImplementation,
     /// A line of the list of references was chosen.
     OpenReference(usize),
     /// Installs a language server (its program name) from the Preferences.
@@ -839,6 +861,8 @@ pub struct SimpleEditApp {
     tree_view: (f32, f32),
     /// The tabs closed, last one last (Ctrl+Shift+T opens them again).
     closed_tabs: Vec<PathBuf>,
+    /// The text of the untitled tabs that were closed with some in them.
+    closed_untitled: Vec<String>,
     /// The list of every tab is open, from where its button was pressed.
     tab_list: Option<iced::Point>,
     /// The panels of the sidebar that are open (the bar on its left).
@@ -908,6 +932,10 @@ pub struct SimpleEditApp {
     /// Whether the window has the focus: the periodic checks of the disk and
     /// of Git wait while it has not.
     window_focused: bool,
+    /// The disk is watched for changes.
+    watch: crate::watch::Watch,
+    /// Something changed on the disk since the tree and the marks were read.
+    fs_dirty: bool,
     /// The last right click on the editor was in the gutter.
     gutter_click: bool,
     /// The line of the gutter that was right-clicked (for the blame menu).
@@ -938,7 +966,9 @@ pub struct SimpleEditApp {
     config_dirty: bool,
     /// Fingerprint of the last session JSON written, so unchanged sessions
     /// aren't rewritten.
-    last_session: u64,
+    /// The fingerprint of the session last written (shared with the job that
+    /// writes it).
+    last_session: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Held while this is the window that saves the session.
     session_lock: Option<crate::session::InstanceLock>,
     /// Whether this window saves the session and the bookmarks.
@@ -1003,6 +1033,9 @@ pub struct SimpleEditApp {
     /// Whether the next edit should open a new undo group.
     /// True at start, after whitespace, after a cursor move, after delete.
     undo_new_group: bool,
+    /// When an undo step was last made (steps are merged, on a big file, when
+    /// they come in the same second).
+    last_undo_at: Option<std::time::Instant>,
     /// The kind of deletion (Backspace or Delete) the open undo group is
     /// made of, so that the next one of the same kind joins it.
     undo_deletion: Option<std::mem::Discriminant<text_editor::Edit>>,
@@ -1106,6 +1139,11 @@ impl SimpleEditApp {
     fn blank(config: Config) -> Self {
         crate::trust::set_all(&config.trusted_folders);
         crate::lsp::set_completion_options(&config.completion_options);
+        crate::api::http::set_network(crate::api::http::Network {
+            ca_file: config.api_ca_file.clone(),
+            client_cert: config.api_client_cert.clone(),
+            proxy: config.api_proxy.clone(),
+        });
         Self {
             bookmarks: crate::bookmarks::Bookmarks::default(),
             editor: EditorState::new(),
@@ -1130,6 +1168,7 @@ impl SimpleEditApp {
             mru: Vec::new(),
             tab_switch: None,
             closed_tabs: Vec::new(),
+            closed_untitled: Vec::new(),
             preview_tab: None,
             preview_replaces: None,
             tree_click: None,
@@ -1196,6 +1235,8 @@ impl SimpleEditApp {
             autosaving: false,
             ticks: 0,
             window_focused: true,
+            watch: crate::watch::Watch::default(),
+            fs_dirty: true,
             gutter_click: false,
             gutter_line: None,
             revert: None,
@@ -1212,7 +1253,7 @@ impl SimpleEditApp {
             redo_stack: History::default(),
             undo_cache: HashMap::new(),
             config_dirty: false,
-            last_session: 0,
+            last_session: Default::default(),
             session_lock: None,
             session_owner: true,
             rev: 1,
@@ -1242,6 +1283,7 @@ impl SimpleEditApp {
             file_size: None,
             size_for: None,
             undo_new_group: true,
+            last_undo_at: None,
             undo_deletion: None,
             view_mode: ViewMode::Raw,
             preview: PreviewDoc::None,
@@ -1544,7 +1586,13 @@ impl SimpleEditApp {
         let autosave =
             iced::time::every(std::time::Duration::from_secs(1)).map(|_| Message::AutoSave);
 
-        let mut subscriptions = vec![keys, double_shift, modifiers, autosave];
+        let mut subscriptions = vec![
+            keys,
+            double_shift,
+            modifiers,
+            autosave,
+            crate::watch::changes().map(|()| Message::FsChanged),
+        ];
         // Enter, when no field took it (a row was clicked): opens the match.
         if self.overlay == ActiveOverlay::FindInFiles {
             subscriptions.push(iced::event::listen_with(|event, status, _window| {
@@ -1635,8 +1683,10 @@ impl SimpleEditApp {
             );
         }
         if self.git.open {
+            // The watcher says when to look; the clock is a safety net then.
+            let every = if self.watch.active() { 15 } else { 2 };
             subscriptions.push(
-                iced::time::every(std::time::Duration::from_secs(2))
+                iced::time::every(std::time::Duration::from_secs(every))
                     .map(|_| Message::Git(crate::git_panel::GitMsg::Tick)),
             );
         }
@@ -1841,6 +1891,7 @@ impl SimpleEditApp {
                     &self.config.project_colors,
                     &self.file_marks,
                     self.panels,
+                    self.tree_view,
                     self.sidebar_width,
                 )
             };
@@ -2102,6 +2153,17 @@ impl SimpleEditApp {
             Some(confirm) => crate::floating::modal(
                 with_prefs,
                 crate::database::admin_view::confirm(confirm, dark),
+                None,
+                dark,
+                false,
+            ),
+            None => with_prefs,
+        };
+
+        let with_prefs: Element<Message> = match &self.db.ssh_trust {
+            Some(trust) => crate::floating::modal(
+                with_prefs,
+                crate::database::admin_view::ssh_trust(trust, dark),
                 None,
                 dark,
                 false,
@@ -3038,7 +3100,7 @@ impl SimpleEditApp {
                 self.overlay = ActiveOverlay::None;
                 let command = self.close_path(path.clone());
                 self.bookmarks.clear(&path);
-                if let Err(e) = std::fs::remove_file(&path) {
+                if let Err(e) = crate::fsutil::trash_or_remove(&path) {
                     if e.kind() != std::io::ErrorKind::NotFound {
                         self.scratch.error = Some(e.to_string());
                     }
@@ -3087,7 +3149,45 @@ impl SimpleEditApp {
                 Task::none()
             }
             Message::TerminalCopy(text) => iced::clipboard::write(text),
+            Message::TerminalOpen(word, dir) => {
+                let dir = if dir.as_os_str().is_empty() {
+                    self.projects.roots.first().cloned().unwrap_or_default()
+                } else {
+                    dir
+                };
+                match crate::tasks::location_with(&word, &dir, &mut |p| p.is_file()) {
+                    Some(at) => self.task_open_at(at),
+                    None => Task::none(),
+                }
+            }
             Message::TerminalPaste => iced::clipboard::read().map(Message::TerminalPasteText),
+            Message::TerminalSearchToggle => {
+                if self.terminal.search.is_some() {
+                    self.terminal.search = None;
+                    self.terminal.focused = true;
+                    Task::none()
+                } else {
+                    self.terminal.search = Some(String::new());
+                    self.terminal.focused = false;
+                    iced::widget::operation::focus(terminal_search_id())
+                }
+            }
+            Message::TerminalSearchInput(text) => {
+                if let Some(session) = self.terminal.active_session() {
+                    session.forget_found();
+                }
+                self.terminal.search = Some(text);
+                Task::none()
+            }
+            Message::TerminalSearchNext(older) => {
+                let query = self.terminal.search.clone().unwrap_or_default();
+                if let Some(session) = self.terminal.active_session() {
+                    if !session.find(&query, older) {
+                        self.set_status(t!("terminal.search_none"), false);
+                    }
+                }
+                Task::none()
+            }
             Message::TerminalPasteText(text) => {
                 // No escape sequence may come from a paste: `ESC[201~` would
                 // end the bracketed paste and what follows would run.
@@ -3641,6 +3741,8 @@ impl SimpleEditApp {
                 }
                 Task::none()
             }
+            Message::OpenOutline => self.open_outline(),
+            Message::OutlineLoaded(path, result) => self.outline_loaded(path, result),
             Message::RenameSymbol => {
                 if self
                     .editor
@@ -3703,7 +3805,7 @@ impl SimpleEditApp {
                 ) else {
                     return Task::none();
                 };
-                if !self.lint.hover.is_none()
+                if self.lint.hover.is_some()
                     || self.large_view().is_some()
                     || crate::lsp::server_of(&ext).is_none()
                 {
@@ -4011,6 +4113,16 @@ impl SimpleEditApp {
                 Task::none()
             }
             Message::FindSelect(index) => self.finder_select(index),
+            Message::FindExcludeAt(i) => {
+                if let Some(o) = self.finder.hits.get_mut(i) {
+                    o.excluded = !o.excluded;
+                }
+                Task::none()
+            }
+            Message::FindScrolled(offset) => {
+                self.finder.scrolled = offset;
+                Task::none()
+            }
             Message::FindPreviewAction(action) => self.finder_preview_action(action),
             Message::FindPreviewMenu(what) => self.finder_preview_menu(what),
             Message::FindPreviewPasted(text) => match text {
@@ -4320,6 +4432,11 @@ impl SimpleEditApp {
                 );
                 if self.preferences.update(msg, &mut self.config) {
                     self.config_dirty = true;
+                    crate::api::http::set_network(crate::api::http::Network {
+                        ca_file: self.config.api_ca_file.clone(),
+                        client_cert: self.config.api_client_cert.clone(),
+                        proxy: self.config.api_proxy.clone(),
+                    });
                 }
                 if servers_page {
                     return Task::perform(
@@ -4504,8 +4621,23 @@ impl SimpleEditApp {
                     // Formatters end their output with a newline; a fragment
                     // that didn't end with one shouldn't gain one.
                     let had_newline = selected.ends_with('\n');
+                    // A language with only a language server: it formats the
+                    // range, in the file.
+                    let by_server = if crate::formatter::has_formatter(&ext) {
+                        None
+                    } else {
+                        target.clone().zip(self.editor.content.selection_range())
+                    };
+                    let content = crate::editor::buffer_text(&self.editor.content);
+                    let (spaces, width) = self.indent();
                     Task::perform(
                         async move {
+                            if let Some((path, (start, end))) = by_server {
+                                return crate::lsp::format_range(
+                                    &ext, &path, &content, start, end, spaces, width,
+                                )
+                                .await;
+                            }
                             crate::formatter::format(selected, ext, target)
                                 .await
                                 .map(|f| {
@@ -4612,15 +4744,33 @@ impl SimpleEditApp {
                 // what Git says (now and then).
                 // Not while the window is in the background.
                 let watching = self.window_focused;
-                if watching && self.ticks.is_multiple_of(2) {
+                // What is watched: the projects, and the folders of the open
+                // files that are in none.
+                if self.ticks.is_multiple_of(5) {
+                    self.sync_watch();
+                }
+                // Told by the watcher: looked at when something changed (and
+                // now and then, in case an event was lost); without a
+                // watcher, at intervals.
+                let driven = self.watch.active();
+                let changed = std::mem::take(&mut self.fs_dirty);
+                let every = |n: u32, ticks: u32| {
+                    if driven {
+                        changed || ticks.is_multiple_of(30)
+                    } else {
+                        ticks.is_multiple_of(n)
+                    }
+                };
+                if watching && every(2, self.ticks) {
                     self.projects.refresh(false);
                 }
-                let states = if watching && self.ticks.is_multiple_of(3) {
+                let states = if watching && every(3, self.ticks) {
                     self.refresh_file_states()
                 } else {
                     Task::none()
                 };
-                let external = if watching {
+                let external = if watching && (!driven || changed || self.ticks.is_multiple_of(30))
+                {
                     self.check_external_change()
                 } else {
                     Task::none()
@@ -4631,7 +4781,7 @@ impl SimpleEditApp {
                 }
                 self.ticks = self.ticks.wrapping_add(1);
                 // The marks follow HEAD, which a commit made elsewhere moves.
-                let marks = if self.ticks.is_multiple_of(10) {
+                let marks = if every(10, self.ticks) {
                     self.refresh_marks_base()
                 } else {
                     self.refresh_marks_now();
@@ -4641,7 +4791,11 @@ impl SimpleEditApp {
                 // and then, to notice conflicts.
                 let probe = if watching
                     && !self.git.open
-                    && self.ticks.is_multiple_of(5)
+                    && (if driven {
+                        changed
+                    } else {
+                        self.ticks.is_multiple_of(5)
+                    })
                     && self.current_file.as_deref().is_some_and(|p| !is_virtual(p))
                 {
                     Task::done(Message::Git(crate::git_panel::GitMsg::Tick))
@@ -4669,7 +4823,11 @@ impl SimpleEditApp {
                 ]);
                 // The session is built (on this thread) every third tick at
                 // most.
-                if self.rev == self.session_rev || !self.ticks.is_multiple_of(3) {
+                // On a big buffer the copy of its text waits for a pause in the
+                // typing.
+                let typing_in_big = self.editor.content.line_count() > 40_000
+                    && self.last_edit.elapsed() < std::time::Duration::from_secs(3);
+                if self.rev == self.session_rev || !self.ticks.is_multiple_of(3) || typing_in_big {
                     return external;
                 }
                 match self.session_write_job() {
@@ -4679,12 +4837,21 @@ impl SimpleEditApp {
                     None => external,
                 }
             }
+            Message::FsChanged => {
+                self.fs_dirty = true;
+                // The Git panel does not wait for its own clock.
+                if self.git.open && self.watch.active() {
+                    return Task::done(Message::Git(crate::git_panel::GitMsg::Tick));
+                }
+                Task::none()
+            }
             Message::SessionWritten(result) => {
                 match result {
                     Ok(()) => {}
                     Err(e) => {
                         // Try again at the next tick.
-                        self.last_session = 0;
+                        self.last_session
+                            .store(0, std::sync::atomic::Ordering::Relaxed);
                         self.session_rev = 0;
                         self.set_status(format!("{}: {}", t!("status.session_not_saved"), e), true);
                     }
@@ -4960,6 +5127,11 @@ impl SimpleEditApp {
                         ("ArrowUp", false, false) if !self.finder.multiline => self.finder_step(-1),
                         // Ctrl+Enter: to the Results panel.
                         ("Return", true, false) => self.finder_to_window(),
+                        // Alt+Delete: leave the match out of "Replace all" (or put it back).
+                        ("Delete", false, true) => {
+                            self.finder_toggle_exclude();
+                            Task::none()
+                        }
                         _ => Task::none(),
                     };
                 }
@@ -5274,6 +5446,33 @@ impl SimpleEditApp {
                 }
             }
             Message::GotoDefinition => self.goto_definition(),
+            Message::GotoTypeDefinition => self.goto_by_server(false),
+            Message::OrganizeImports => {
+                if self.is_formatting {
+                    return Task::none();
+                }
+                let (Some(path), Some(ext)) =
+                    (self.current_file.clone(), self.editor.language.clone())
+                else {
+                    return Task::none();
+                };
+                if is_untitled(&path) || crate::lsp::server_of(&ext).is_none() {
+                    self.set_status(t!("outline.no_server"), true);
+                    return Task::none();
+                }
+                self.is_formatting = true;
+                self.set_status(t!("status.formatting"), false);
+                let content = crate::editor::buffer_text(&self.editor.content);
+                let job = FormatJob {
+                    path: Some(path.clone()),
+                    source: fingerprint(&content),
+                };
+                Task::perform(
+                    async move { crate::lsp::organize_imports(&ext, &path, &content).await },
+                    move |result| Message::FileFormatted(job.clone(), result),
+                )
+            }
+            Message::GotoImplementation => self.goto_by_server(true),
             Message::OpenReference(index) => {
                 let ActiveOverlay::References(list) = &self.overlay else {
                     return Task::none();
@@ -5920,6 +6119,26 @@ impl SimpleEditApp {
             }
         }
 
+        // Backspace right after an opener the auto-pairing closed takes the
+        // closer with it.
+        if matches!(
+            action,
+            text_editor::Action::Edit(text_editor::Edit::Backspace)
+        ) && self.editor.content.selection().is_none()
+            && self.backspace_pair()
+        {
+            self.is_dirty = true;
+            return Task::none();
+        }
+        // Typing a closer on a line of its own steps back one indentation.
+        if let text_editor::Action::Edit(text_editor::Edit::Insert(ch @ ('}' | ')' | ']'))) =
+            &action
+        {
+            if self.config.auto_indent {
+                self.dedent_before_closer(*ch);
+            }
+        }
+
         // Auto-pairing of brackets and quotes
         if let text_editor::Action::Edit(text_editor::Edit::Insert(ch)) = &action {
             if let Some(command) = self.autopair(*ch, &action) {
@@ -5935,6 +6154,73 @@ impl SimpleEditApp {
             self.is_dirty = true;
         }
         Task::none()
+    }
+
+    /// Backspace between an opener and the closer that was added with it:
+    /// both go. `false` when the cursor is not in such a pair.
+    fn backspace_pair(&mut self) -> bool {
+        use text_editor::{Action, Edit};
+        let (line, col) = self.editor.content.cursor_position();
+        let Some(i) = self
+            .pending_closers
+            .iter()
+            .position(|&(l, c, _)| l == line && c == col)
+        else {
+            return false;
+        };
+        let closer = self.pending_closers[i].2;
+        let opener = match closer {
+            ')' => '(',
+            ']' => '[',
+            '}' => '{',
+            other => other,
+        };
+        let Some(text) = self.editor.content.line(line).map(|l| l.to_string()) else {
+            return false;
+        };
+        let col = col.min(text.len());
+        if text.get(..col).and_then(|b| b.chars().next_back()) != Some(opener)
+            || text.get(col..).and_then(|a| a.chars().next()) != Some(closer)
+        {
+            return false;
+        }
+        self.pending_closers.remove(i);
+        self.editor.content.perform(Action::Edit(Edit::Delete));
+        self.editor.content.perform(Action::Edit(Edit::Backspace));
+        true
+    }
+
+    /// A closer typed after nothing but indentation takes one level off it.
+    fn dedent_before_closer(&mut self, closer: char) {
+        let (line, col) = self.editor.content.cursor_position();
+        if self.editor.content.selection().is_some() {
+            return;
+        }
+        let Some(text) = self.editor.content.line(line).map(|l| l.to_string()) else {
+            return;
+        };
+        let col = col.min(text.len());
+        let (before, after) = (&text[..col], &text[col..]);
+        if before.is_empty()
+            || !before.chars().all(|c| c == ' ' || c == '\t')
+            || after.starts_with(closer)
+        {
+            return;
+        }
+        let unit = self.indent_unit();
+        let remove = if before.ends_with(&unit) {
+            unit.chars().count()
+        } else if before.ends_with('\t') {
+            1
+        } else {
+            // Less than a unit of spaces: all of them.
+            before.chars().count().min(unit.chars().count())
+        };
+        for _ in 0..remove {
+            self.editor
+                .content
+                .perform(text_editor::Action::Edit(text_editor::Edit::Backspace));
+        }
     }
 
     /// Characters typed on the cursor's line push the auto-inserted closers
@@ -6066,6 +6352,42 @@ impl SimpleEditApp {
         )
     }
 
+    /// Asks the language server for the type of the name under the cursor
+    /// (`implementations` false) or for what implements it. There is no
+    /// pattern search to fall back on.
+    fn goto_by_server(&mut self, implementations: bool) -> Task<Message> {
+        let (Some(path), Some(language)) =
+            (self.current_file.clone(), self.editor.language.clone())
+        else {
+            return Task::none();
+        };
+        if is_untitled(&path) || crate::lsp::server_of(&language).is_none() {
+            self.set_status(t!("outline.no_server"), true);
+            return Task::none();
+        }
+        let (line, col) = self.editor.content.cursor_position();
+        let Some(word) = self
+            .editor
+            .content
+            .line(line)
+            .and_then(|text| crate::definition::word_at(&text, col).map(str::to_string))
+        else {
+            return Task::none();
+        };
+        let text = crate::editor::buffer_text(&self.editor.content);
+        self.overlay = ActiveOverlay::References(RefList::searching(word.clone()));
+        Task::perform(
+            async move {
+                if implementations {
+                    crate::lsp::implementation(&language, &path, &text, line, col).await
+                } else {
+                    crate::lsp::type_definition(&language, &path, &text, line, col).await
+                }
+            },
+            move |outcome| Message::DefinitionFound(word.clone(), outcome),
+        )
+    }
+
     /// Goes to a definition, opening its file if need be.
     fn jump_to(&mut self, hit: crate::definition::Hit) -> Task<Message> {
         self.remember_place();
@@ -6173,10 +6495,25 @@ impl SimpleEditApp {
         Snapshot {
             text: crate::editor::buffer_text(&self.editor.content),
             cursor: self.editor.content.cursor_position(),
+            extras: self.editor.content.extra_carets(),
         }
     }
 
     fn push_undo(&mut self) {
+        // A step is a copy of the whole text: on a file of megabytes, the steps
+        // that come within the same second are one, so that typing does not
+        // copy it at every Enter and every pasted line.
+        const BIG: usize = 2 * 1024 * 1024;
+        let big = self.undo_stack.newest_len().is_some_and(|n| n > BIG);
+        if big
+            && self
+                .last_undo_at
+                .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(1))
+        {
+            self.redo_stack.clear();
+            return;
+        }
+        self.last_undo_at = Some(std::time::Instant::now());
         let snapshot = self.snapshot();
         self.undo_stack.push_back(snapshot);
         trim_history(&mut self.undo_stack);
@@ -6214,6 +6551,9 @@ impl SimpleEditApp {
         self.undo_new_group = true;
         self.replace_buffer_text(&snap.text);
         self.restore_cursor(line, col);
+        // The other cursors come back too (a text that is not the one they
+        // were made for would put them wrong, so they are checked).
+        self.editor.content.set_extra_carets(&snap.extras);
         Task::none()
     }
 
@@ -6236,6 +6576,7 @@ impl SimpleEditApp {
         self.undo_stack.push_back(Snapshot {
             text: old.clone(),
             cursor: self.editor.content.cursor_position(),
+            extras: self.editor.content.extra_carets(),
         });
         trim_history(&mut self.undo_stack);
         self.redo_stack.clear();
@@ -6455,6 +6796,28 @@ impl SimpleEditApp {
         self.editor.content.select_bytes(line, col, 0);
         self.pending_closers.push((line, col, close));
         Some(Task::none())
+    }
+
+    /// Watches the project folders, and the folders of the open files that
+    /// are in none of them.
+    fn sync_watch(&mut self) {
+        // Not in the tests: they would watch the temporary folders of all.
+        if cfg!(test) {
+            return;
+        }
+        let roots: Vec<PathBuf> = self.projects.roots.clone();
+        let mut single: Vec<PathBuf> = Vec::new();
+        for file in self.sidebar.files() {
+            if is_untitled(file) || is_virtual(file) {
+                continue;
+            }
+            if let Some(dir) = file.parent() {
+                if !single.iter().any(|d| d == dir) {
+                    single.push(dir.to_path_buf());
+                }
+            }
+        }
+        self.watch.set(&roots, &single);
     }
 
     /// Whether the tab for `path` holds unsaved changes.
@@ -7385,8 +7748,29 @@ impl SimpleEditApp {
         if index.is_some() && !is_untitled(&path) && !is_virtual(&path) {
             self.closed_tabs.retain(|p| *p != path);
             self.closed_tabs.push(path.clone());
-            if self.closed_tabs.len() > 50 {
-                self.closed_tabs.remove(0);
+            if self.closed_tabs.len() > 50
+                && is_untitled(&self.closed_tabs.remove(0))
+                && !self.closed_untitled.is_empty()
+            {
+                self.closed_untitled.remove(0);
+            }
+        }
+        // An untitled tab that held some text can be opened again too.
+        if index.is_some() && is_untitled(&path) && !is_virtual(&path) {
+            let kept = if self.current_file.as_ref() == Some(&path) {
+                Some(crate::editor::buffer_text(&self.editor.content))
+            } else {
+                self.file_cache
+                    .get(&path)
+                    .and_then(|b| b.content.as_ref())
+                    .map(crate::editor::buffer_text)
+            };
+            if let Some(text) = kept.filter(|t| !t.trim().is_empty()) {
+                self.closed_untitled.push(text);
+                if self.closed_untitled.len() > 20 {
+                    self.closed_untitled.remove(0);
+                }
+                self.closed_tabs.push(path.clone());
             }
         }
         self.file_cache.remove(&path);
@@ -7648,6 +8032,21 @@ impl SimpleEditApp {
     /// Ctrl+Shift+T: the last tab closed that can still be read.
     fn reopen_tab(&mut self) -> Task<Message> {
         while let Some(path) = self.closed_tabs.pop() {
+            if is_untitled(&path) {
+                let Some(text) = self.closed_untitled.pop() else {
+                    continue;
+                };
+                self.stash_current();
+                self.untitled_counter += 1;
+                let reopened = untitled_path(self.untitled_counter);
+                let buffer = CachedBuffer {
+                    content: Some(crate::code_editor::Content::with_text(&text)),
+                    dirty: true,
+                    ..CachedBuffer::blank()
+                };
+                self.load_buffer(reopened, buffer);
+                return Task::none();
+            }
             if self.sidebar.files().contains(&path) || !path.is_file() {
                 continue;
             }
@@ -7805,6 +8204,7 @@ impl SimpleEditApp {
                         let snapshot = Snapshot {
                             text: old_text,
                             cursor: old.cursor_position(),
+                            extras: old.extra_carets(),
                         };
                         let (undo, redo) = self.undo_cache.entry(path.clone()).or_default();
                         undo.push_back(snapshot);
@@ -7927,7 +8327,10 @@ impl SimpleEditApp {
             // A saved file may have changed since this copy was made.
             let changed =
                 !is_untitled(&path) && entry.stamp.is_some() && DiskStamp::of(&path) != entry.stamp;
-            if changed && !entry.dirty {
+            // Gone from the disk (deleted or moved): the copy is kept, as it
+            // was, and the status says so; saving recreates the file.
+            let deleted = changed && DiskStamp::of(&path).is_none();
+            if changed && !deleted && !entry.dirty {
                 return Task::perform(read_file(path, false), Message::TabRead);
             }
             let Some(entry) = self.file_cache.remove(&path) else {
@@ -7939,7 +8342,12 @@ impl SimpleEditApp {
             if changed {
                 // Modified here and there: saving will ask before overwriting.
                 self.external_warned = true;
-                self.set_status(t!("status.changed_on_disk"), true);
+                let message = if deleted {
+                    t!("status.deleted_on_disk")
+                } else {
+                    t!("status.changed_on_disk")
+                };
+                self.set_status(message, true);
             } else {
                 self.set_status(t!("status.file_opened"), false);
                 self.offer_language_server(&path);
@@ -9038,6 +9446,10 @@ fn rename_field_id() -> iced::widget::Id {
     iced::widget::Id::new("rename-field")
 }
 
+fn terminal_search_id() -> iced::widget::Id {
+    iced::widget::Id::new("terminal-search")
+}
+
 fn goto_line_id() -> iced::widget::Id {
     iced::widget::Id::new("goto-line")
 }
@@ -9174,8 +9586,10 @@ async fn delete_file(path: PathBuf, from_git: bool, days: u32) -> Result<bool, S
             }
         }
     }
-    tokio::fs::remove_file(&path)
+    let target = path.clone();
+    tokio::task::spawn_blocking(move || crate::fsutil::trash_or_remove(&target))
         .await
+        .map_err(|e| e.to_string())?
         .map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(false)
 }

@@ -9,6 +9,10 @@ mod protocol;
 #[path = "../common/mod.rs"]
 mod common;
 
+#[allow(dead_code)]
+#[path = "../../src/database/import.rs"]
+mod import;
+
 use common::{Engine, Row, Shape};
 use protocol::{
     Column, ColumnDef, ConstraintDef, ConstraintKind, Database, ForeignKey, IndexDef, Kind,
@@ -27,6 +31,11 @@ struct Session {
     name: String,
     /// A transaction begun by this driver (not one the user ran).
     begun: bool,
+    /// When the request being answered must be over (milliseconds after
+    /// `epoch`, 0: no limit); SQLite is told to stop what runs past it.
+    deadline: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    epoch: std::time::Instant,
+    limit_ms: u64,
 }
 
 impl Session {
@@ -45,7 +54,7 @@ impl Session {
             OpenFlags::SQLITE_OPEN_READ_WRITE
         } | OpenFlags::SQLITE_OPEN_URI
             | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let conn = Connection::open_with_flags(path, flags).map_err(clean)?;
+        let mut conn = Connection::open_with_flags(path, flags).map_err(clean)?;
         let wait = if target.query_timeout == 0 {
             5000
         } else {
@@ -53,6 +62,19 @@ impl Session {
         };
         conn.busy_timeout(std::time::Duration::from_millis(wait))
             .map_err(clean)?;
+        // A real time limit: the statement that runs past it is interrupted
+        // (the busy timeout only bounds the wait for a lock).
+        let deadline = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let epoch = std::time::Instant::now();
+        let seen = deadline.clone();
+        conn.progress_handler(
+            1000,
+            Some(move || {
+                let end = seen.load(std::sync::atomic::Ordering::Relaxed);
+                end != 0 && epoch.elapsed().as_millis() as u64 >= end
+            }),
+        )
+        .map_err(clean)?;
         conn.execute_batch("PRAGMA foreign_keys = ON")
             .map_err(clean)?;
         if !target.startup_script.trim().is_empty() {
@@ -65,11 +87,20 @@ impl Session {
             conn,
             name,
             begun: false,
+            deadline,
+            epoch,
+            limit_ms: target.query_timeout * 1000,
         })
     }
 }
 
 fn clean(error: rusqlite::Error) -> String {
+    if matches!(
+        &error,
+        rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ffi::ErrorCode::OperationInterrupted
+    ) {
+        return "the query was stopped: it ran past the time limit".to_string();
+    }
     error.to_string()
 }
 
@@ -95,6 +126,16 @@ fn text_of(value: ValueRef<'_>) -> (Option<String>, bool) {
 }
 
 impl Engine for Session {
+    fn start_request(&mut self) {
+        let end = if self.limit_ms == 0 {
+            0
+        } else {
+            self.epoch.elapsed().as_millis() as u64 + self.limit_ms
+        };
+        self.deadline
+            .store(end, std::sync::atomic::Ordering::Relaxed);
+    }
+
     fn quote(&self, name: &str) -> String {
         quote(name)
     }
@@ -614,7 +655,7 @@ mod tests {
 
     fn call(path: &str, request: Value) -> Result<Value, String> {
         let mut request = request;
-        request["target"] = json!({ "database": path });
+        request["target"] = json!({ "database": path, "dialect": "sqlite" });
         let open = |r: &Request| Session::open(r).map(|s| Box::new(s) as Box<dyn Engine>);
         common::run(&request.to_string(), &mut None, &open, false)
     }
@@ -891,6 +932,136 @@ mod tests {
     }
 
     #[test]
+    fn a_csv_and_a_json_file_are_imported_in_one_transaction() {
+        let (dir, path) = database();
+        let csv = dir.path().join("in.csv");
+        std::fs::write(&csv, "name,note\nZed,\"a, b\"\nYan,\n").unwrap();
+        let spec = |format: &str, key0: &str, key1: &str| {
+            json!({"format": format, "delimiter": ",", "header": true, "file_columns": 2,
+                   "empty_null": true,
+                   "mapping": [
+                       {"index": 0, "key": key0, "column": "name", "kind": "TEXT"},
+                       {"index": 1, "key": key1, "column": "note", "kind": "TEXT"}]})
+        };
+        let done = call(
+            &path,
+            json!({"op": "import", "schema": "main", "table": "customers",
+                   "path": csv.to_string_lossy(), "import": spec("csv", "", "")}),
+        )
+        .unwrap();
+        assert_eq!(done["imported"], 2);
+        let json_file = dir.path().join("in.json");
+        std::fs::write(&json_file, r#"[{"n": "Xi", "t": 5}, {"n": "Wu"}]"#).unwrap();
+        let done = call(
+            &path,
+            json!({"op": "import", "schema": "main", "table": "customers",
+                   "path": json_file.to_string_lossy(), "import": spec("json", "n", "t")}),
+        )
+        .unwrap();
+        assert_eq!(done["imported"], 2);
+        let conn = Connection::open(&path).unwrap();
+        let note: Option<String> = conn
+            .query_row("SELECT note FROM customers WHERE name = 'Zed'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(note.as_deref(), Some("a, b"));
+        let empty: Option<String> = conn
+            .query_row("SELECT note FROM customers WHERE name = 'Yan'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(empty, None);
+        let five: String = conn
+            .query_row("SELECT note FROM customers WHERE name = 'Xi'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(five, "5");
+        // A duplicate name fails the whole file: nothing of it is kept.
+        let again = call(
+            &path,
+            json!({"op": "import", "schema": "main", "table": "customers",
+                   "path": csv.to_string_lossy(), "import": spec("csv", "", "")}),
+        );
+        assert!(again.is_err());
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM customers", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 7);
+    }
+
+    #[test]
+    fn a_dump_restores_into_an_empty_file_with_the_same_rows() {
+        let (dir, path) = database();
+        let sql = dir.path().join("backup.sql");
+        let done = call(
+            &path,
+            json!({"op": "dump", "path": sql.to_string_lossy(), "tool": {"format": "plain"}}),
+        )
+        .unwrap();
+        assert!(done["size"].as_u64().unwrap() > 0);
+        let text = std::fs::read_to_string(&sql).unwrap();
+        assert!(text.contains("CREATE TABLE customers"), "{text}");
+        assert!(text.contains("INSERT INTO \"customers\""), "{text}");
+        // Into a fresh file: the tables, the rows (a quote, a NULL, a comma).
+        let other = dir.path().join("fresh.db");
+        Connection::open(&other).unwrap();
+        let other_path = other.to_string_lossy().into_owned();
+        call(
+            &other_path,
+            json!({"op": "restore", "path": sql.to_string_lossy()}),
+        )
+        .unwrap();
+        let (a, b) = (
+            Connection::open(&path).unwrap(),
+            Connection::open(&other).unwrap(),
+        );
+        let rows = |c: &Connection| -> Vec<(i64, String, Option<String>)> {
+            c.prepare("SELECT id, name, note FROM customers ORDER BY id")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(rows(&a), rows(&b));
+        assert_eq!(rows(&b).len(), 3);
+        let items: i64 = b
+            .query_row("SELECT count(*) FROM \"Order Items\"", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(items, 2);
+        // One table only, and the structure alone.
+        let one = dir.path().join("one.sql");
+        call(
+            &path,
+            json!({"op": "dump", "table": "log", "path": one.to_string_lossy(),
+                   "tool": {"schema_only": true}}),
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&one).unwrap();
+        assert!(
+            text.contains("CREATE TABLE log") && !text.contains("INSERT"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_query_that_runs_past_the_time_limit_is_interrupted() {
+        let (_dir, path) = database();
+        let open = |r: &Request| Session::open(r).map(|s| Box::new(s) as Box<dyn Engine>);
+        let mut slot = None;
+        let request = json!({"op": "query", "target": {"database": path, "query_timeout": 1},
+            "statements": ["CREATE TEMP TABLE big AS WITH RECURSIVE c(x) AS \
+                            (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT x FROM c"]});
+        let started = std::time::Instant::now();
+        let answer = common::run(&request.to_string(), &mut slot, &open, true);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let shown = format!("{answer:?}");
+        assert!(shown.contains("time limit"), "{shown}");
+    }
+
+    #[test]
     fn a_commit_that_fails_leaves_no_transaction_and_a_retry_writes_once() {
         let (_dir, path) = database();
         let open = |r: &Request| Session::open(r).map(|s| Box::new(s) as Box<dyn Engine>);
@@ -1002,7 +1173,7 @@ mod tests {
             .iter()
             .any(|c| c.table == "customers" && c.name == "note"));
         // What this kind of source does not have is said, not guessed.
-        assert!(call(&path, json!({"op": "dump"}))
+        assert!(call(&path, json!({"op": "health"}))
             .unwrap_err()
             .contains("not available"));
     }

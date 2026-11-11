@@ -177,6 +177,14 @@ impl Panel {
             dark,
         );
         column_ = column_.push(head_row);
+        column_ = column_.push(self.tree_row(
+            0,
+            t!("git.reflog").to_string(),
+            self.log.branch.as_deref() == Some(crate::git::history::REFLOG),
+            Some(crate::git::history::REFLOG.to_string()),
+            None,
+            dark,
+        ));
 
         let Some(refs) = &self.log.refs else {
             return self.tree_frame(column_, dark);
@@ -1016,6 +1024,9 @@ impl Panel {
                         .color(p.muted),
                 ]
                 .spacing(4);
+                if let Some(signature) = &log.signature {
+                    info = info.push(text(signature.as_str()).size(12).color(p.muted));
+                }
                 if !log.contained_in.is_empty() {
                     let shown: Vec<&str> = log
                         .contained_in

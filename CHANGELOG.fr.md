@@ -1,5 +1,23 @@
 # Journal des modifications
 
+## [1.26.0] - 2026-11-11
+
+### Ajouté
+- Fichiers : l'arbre des projets, les marques Git et le fichier ouvert suivent le disque par un observateur de fichiers au lieu d'être interrogés ; les fichiers supprimés vont à la corbeille du système ; un onglet « Sans titre » fermé avec du texte peut être rouvert (Ctrl+Maj+T) ; un fichier supprimé derrière un onglet ouvert est signalé quand l'onglet s'affiche.
+- Éditeur : Retour arrière emporte la paire fermée automatiquement, une parenthèse fermante tapée seule sur sa ligne recule d'un niveau d'indentation, les autres endroits du mot sous le curseur sont marqués, Ctrl+Espace liste les mots du fichier (et les snippets de l'utilisateur, écrits dans le fichier de config) sans serveur de langage, Alt+Suppr exclut une occurrence du « Tout remplacer » et chaque ligne a sa case, l'annulation ramène les autres curseurs.
+- Serveurs de langage : noms du fichier (palette de commandes), aller au type et aux implémentations, organiser les imports, formatage d'une sélection, réponse valide à `workspace/applyEdit`.
+- Terminal : la souris atteint les programmes qui la demandent, la position du curseur et les requêtes du terminal reçoivent une réponse, Cmd/Ctrl+clic ouvre `fichier:ligne`, recherche dans l'historique.
+- Git : boîte de dialogue de connexion pour les push et les pull, clone, le reflog dans le journal, `git clean` avec aperçu, sous-modules et worktrees, stash « seulement l'indexé », vérification de la signature d'un commit.
+- Bases de données : designer, import, sauvegarde et restauration, vidage et suppression de tables pour MySQL et SQLite ; paramètres de requête (`:nom`, `?`) dans la console ; « Filtrer par cette valeur » et colonnes masquées dans la grille ; Stop pendant le chargement d'une page ; SQLite interrompt une requête qui dépasse sa limite de temps ; confirmation de la clé d'un serveur SSH inconnu.
+- API : corps multipart (aussi en curl et Postman), cookies gardés entre les requêtes, arrêt d'un « Run collection », page Réseau dans les Préférences (autorités de certification, certificat client, proxy).
+- Tâches : les erreurs et avertissements de la sortie deviennent des problèmes de leurs fichiers.
+
+### Modifié
+- Le tunnel SSH d'une source de données n'accepte plus sans demander un hôte qu'il ne connaît pas.
+- Les serveurs de langage s'installent avec des versions épinglées et sans scripts d'installation.
+- Les pilotes de bases de données se compilent à part de l'éditeur (`--no-default-features` compile l'éditeur seul) ; le client API fait confiance aux autorités de certification du système.
+- Beaucoup de listes et de vues font moins de travail : seules les lignes et colonnes visibles sont construites, la session s'écrit en arrière-plan, le pilote PostgreSQL ne s'enquiert des transactions que si besoin.
+
 ## [1.25.0] - 2026-11-09
 
 ### Ajouté

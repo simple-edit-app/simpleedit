@@ -143,6 +143,9 @@ fn internal_query(
     }
 }
 
+/// How long a session may sit idle before it is asked whether it is there.
+const IDLE_PING: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// The connection a request is about, kept in `slot` when the driver serves
 /// several requests: it is reused while the target and the database are the
 /// same and the server has not hung up.
@@ -156,7 +159,19 @@ fn run(input: &str, slot: &mut Option<(String, Session)>, serving: bool) -> Resu
         &request.database
     };
     let key = serde_json::to_string(&(&request.target, database)).unwrap_or_default();
-    let usable = matches!(slot, Some((k, s)) if *k == key && !s.client.is_closed());
+    // A session left idle may have been dropped by a firewall or a restart
+    // without this side knowing: after a while it is asked a question first.
+    let mut gone = false;
+    if let Some((k, s)) = slot.as_mut() {
+        if *k == key && !s.client.is_closed() && s.last_seen.elapsed() >= IDLE_PING {
+            if s.client.simple_query("").is_ok() {
+                s.last_seen = Instant::now();
+            } else {
+                gone = true;
+            }
+        }
+    }
+    let usable = !gone && matches!(slot, Some((k, s)) if *k == key && !s.client.is_closed());
     // Only reading operations leave the tables as they were.
     if !usable
         || !matches!(
@@ -198,6 +213,7 @@ fn run(input: &str, slot: &mut Option<(String, Session)>, serving: bool) -> Resu
         }
     }
     let session = &mut slot.as_mut().expect("just opened").1;
+    session.last_seen = Instant::now();
     let tunnel_port = session.tunnel_port;
     let client = &mut session.client;
     match request.op.as_str() {
@@ -238,9 +254,30 @@ fn run(input: &str, slot: &mut Option<(String, Session)>, serving: bool) -> Resu
             import(client, &request)
         }
         "query" => {
+            let was_open = session.in_transaction;
             let mut answer = guarded(client, &request.target, |c| query(c, &request))?;
             if serving {
-                let open = in_transaction(client);
+                // Whether a transaction is open is asked of the server only
+                // when it may have changed: one was open, a statement says
+                // BEGIN, COMMIT… or one failed.
+                let touched = was_open
+                    || answer.get("failed").is_some_and(|f| !f.is_null())
+                    || request.statements.iter().any(|sql| {
+                        protocol::sql_tokens(sql, protocol::Dialect::Postgres)
+                            .iter()
+                            .any(|t| {
+                                t.kind == protocol::TokenKind::Word
+                                    && matches!(
+                                        sql[t.start..t.end].to_uppercase().as_str(),
+                                        "BEGIN" | "START" | "COMMIT" | "END" | "ROLLBACK" | "ABORT"
+                                    )
+                            })
+                    });
+                let open = if touched {
+                    in_transaction(client)
+                } else {
+                    false
+                };
                 answer["in_transaction"] = json!(open);
                 session.in_transaction = open;
             }
@@ -325,6 +362,8 @@ struct Session {
     tunnel_port: Option<u16>,
     /// Whether the last statement left a transaction open.
     in_transaction: bool,
+    /// When the session last answered (a long idle one is asked first).
+    last_seen: Instant,
     /// The connections the tree opened to the other databases of the server.
     others: std::collections::HashMap<String, Session>,
 }
@@ -409,6 +448,7 @@ impl Session {
             _tunnel: tunnel,
             tunnel_port,
             in_transaction: false,
+            last_seen: Instant::now(),
             others: std::collections::HashMap::new(),
         })
     }
@@ -1194,7 +1234,7 @@ fn rows(client: &mut Client, request: &Request) -> Result<Value, String> {
         None,
     );
     let has_more = fetched.len() as u64 > limit;
-    let data: Vec<Value> = fetched
+    let mut data: Vec<Value> = fetched
         .iter()
         .take(limit as usize)
         .map(|row| {
@@ -1218,9 +1258,11 @@ fn rows(client: &mut Client, request: &Request) -> Result<Value, String> {
         Vec::new()
     };
     let editable = shape.is_table && !request.target.read_only;
+    let truncated = protocol::cap_page_json(&mut data);
     Ok(json!({
         "columns": shape.columns,
         "rows": data,
+        "truncated": truncated,
         "has_more": has_more,
         "primary_key": shape.primary_key,
         "ctids": ctids,
@@ -1303,9 +1345,11 @@ fn result_rows(client: &mut Client, request: &Request) -> Result<Value, String> 
             },
         }
     };
+    let truncated = protocol::cap_page_json(&mut data);
     Ok(json!({
         "columns": columns,
         "rows": data,
+        "truncated": truncated,
         "has_more": has_more,
         "primary_key": primary_key,
         "editable": editable,

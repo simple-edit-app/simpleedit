@@ -82,7 +82,36 @@ pub async fn run_with(
 
 /// `git push …`: it may take far longer than local commands.
 pub async fn run_network(repo: &Path, args: &[&str]) -> Result<String, String> {
-    run_timed(repo, args, None, &[], NETWORK_TIMEOUT).await
+    // What the user asked for may need a password or a passphrase: a dialog
+    // asks, since there is no terminal to do it.
+    let helper = askpass_helper();
+    let mut env: Vec<(&str, &str)> = Vec::new();
+    if let Some(path) = helper.as_deref().and_then(Path::to_str) {
+        env.extend([
+            ("GIT_ASKPASS", path),
+            ("SSH_ASKPASS", path),
+            ("SSH_ASKPASS_REQUIRE", "force"),
+        ]);
+    }
+    run_timed(repo, args, None, &env, NETWORK_TIMEOUT).await
+}
+
+/// The script that asks for a password in a dialog, written once in the
+/// data folder (owner only), and where it is.
+fn askpass_helper() -> Option<PathBuf> {
+    const SCRIPT: &str = include_str!("askpass.sh");
+    let dir = crate::fsutil::data_dir()?.join("simpleedit");
+    let path = dir.join("askpass.sh");
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(SCRIPT) {
+        std::fs::create_dir_all(&dir).ok()?;
+        crate::fsutil::write_atomic(&path, SCRIPT.as_bytes(), true).ok()?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).ok()?;
+    }
+    Some(path)
 }
 
 /// What a forced push adds to `--force-with-lease`. Alone, the lease is
@@ -1219,6 +1248,26 @@ async fn run_allow_failure(repo: &Path, args: &[&str]) -> String {
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(all(test, unix))]
+mod askpass_tests {
+    #[test]
+    fn the_password_dialog_script_is_written_private_and_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = super::askpass_helper().expect("a data folder in tests");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        let script = std::fs::read_to_string(&path).unwrap();
+        assert!(script.starts_with("#!/bin/sh"));
+        // Run with no dialog tool, a headless box says no instead of hanging.
+        let status = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+}
 
 #[cfg(test)]
 pub(crate) mod testing {

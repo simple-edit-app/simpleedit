@@ -54,7 +54,13 @@ impl SimpleEditApp {
     pub(super) fn db_tree_message(&mut self, msg: DbMsg) -> Task<Message> {
         match msg {
             DbMsg::NewTable(conn, database, schema) => {
-                self.db.designer = Some(Designer::for_new_table(conn, database, schema));
+                let dialect = self
+                    .db
+                    .connection(conn)
+                    .map(|c| c.dialect)
+                    .unwrap_or_default();
+                self.db.designer =
+                    Some(Designer::for_new_table(conn, database, schema).for_dialect(dialect));
                 Task::none()
             }
             DbMsg::ShowDiagram(conn, database, schema) => {

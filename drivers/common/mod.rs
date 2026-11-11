@@ -54,6 +54,9 @@ pub trait Engine {
     }
     /// `column` equals `literal`, NULLs included.
     fn same(&self, column: &str, literal: &str) -> String;
+    /// A request is about to be answered (an engine with a time limit of its
+    /// own starts its clock).
+    fn start_request(&mut self) {}
     fn version(&mut self) -> Result<String, String>;
     fn tree(&mut self, request: &Request) -> Result<Vec<Database>, String>;
     fn shape(&mut self, schema: &str, table: &str) -> Result<Shape, String>;
@@ -200,6 +203,7 @@ pub fn run(
         }
     }
     let engine = slot.as_mut().expect("just opened").1.as_mut();
+    engine.start_request();
     let answer = answer(engine, &request);
     if serving {
         return answer.map(|mut value| {
@@ -247,7 +251,20 @@ fn answer(engine: &mut dyn Engine, request: &Request) -> Result<Value, String> {
         }
         "definition" => Ok(json!({ "definition": engine.definition(request)? })),
         "cancel" => Ok(json!({ "stopped": engine.cancel(request.pid)? })),
-        "health" | "dump" | "restore" | "import" => Err(format!(
+        "import" => {
+            if request.target.read_only {
+                return Err("this data source is read-only".to_string());
+            }
+            import(engine, request)
+        }
+        "dump" => dump(engine, request),
+        "restore" => {
+            if request.target.read_only {
+                return Err("this data source is read-only".to_string());
+            }
+            restore(engine, request)
+        }
+        "health" => Err(format!(
             "{} is not available for this kind of data source",
             request.op
         )),
@@ -394,9 +411,11 @@ fn rows(engine: &mut dyn Engine, request: &Request) -> Result<Value, String> {
     let editable = shape.is_table
         && !request.target.read_only
         && (!shape.primary_key.is_empty() || shape.row_id.is_some());
+    let truncated = protocol::cap_page(&mut data);
     Ok(json!({
         "columns": shape.columns,
         "rows": data,
+        "truncated": truncated,
         "has_more": has_more,
         "primary_key": shape.primary_key,
         "ctids": ctids,
@@ -445,9 +464,11 @@ fn result_rows(engine: &mut dyn Engine, request: &Request) -> Result<Value, Stri
             nullable: true,
         })
         .collect();
+    let truncated = protocol::cap_page(&mut data);
     Ok(json!({
         "columns": columns,
         "rows": data,
+        "truncated": truncated,
         "has_more": has_more,
         "primary_key": Vec::<String>::new(),
         "editable": false,
@@ -560,6 +581,280 @@ fn change_sql(
 
 /// The changes in one transaction: if one fails, or does not touch exactly
 /// one row, none is made.
+/// A backup as SQL: for each table of the scope (a table, a schema, or the
+/// whole source), its definition and then its rows as INSERT statements.
+fn dump(engine: &mut dyn Engine, request: &Request) -> Result<Value, String> {
+    use std::io::Write;
+    if request.path.is_empty() {
+        return Err("no file to write".to_string());
+    }
+    let spec = request.tool.clone().unwrap_or_default();
+    let tree = engine.tree(request)?;
+    let mut tables: Vec<(String, String)> = Vec::new();
+    for database in &tree {
+        for schema in &database.schemas {
+            for table in &schema.tables {
+                let wanted = (request.table.is_empty() || table.name == request.table)
+                    && (request.schema.is_empty() || schema.name == request.schema);
+                if wanted && table.kind == protocol::Kind::Table {
+                    tables.push((schema.name.clone(), table.name.clone()));
+                }
+            }
+        }
+    }
+    if tables.is_empty() {
+        return Err("nothing to back up".to_string());
+    }
+    let file =
+        std::fs::File::create(&request.path).map_err(|e| format!("{}: {e}", request.path))?;
+    let mut out = std::io::BufWriter::new(file);
+    let write_err = |e: std::io::Error| e.to_string();
+    writeln!(out, "-- SimpleEdit SQL backup").map_err(write_err)?;
+    // The tables refer to each other in any order: the checks wait for the end.
+    let (off, on) = match request.target.dialect {
+        protocol::Dialect::Sqlite => ("PRAGMA foreign_keys = OFF;", "PRAGMA foreign_keys = ON;"),
+        protocol::Dialect::Mysql => ("SET FOREIGN_KEY_CHECKS = 0;", "SET FOREIGN_KEY_CHECKS = 1;"),
+        protocol::Dialect::Postgres => ("", ""),
+    };
+    if !off.is_empty() {
+        writeln!(out, "{off}").map_err(write_err)?;
+    }
+    for (schema, table) in &tables {
+        let mut one = request.clone();
+        one.schema = schema.clone();
+        one.table = table.clone();
+        if !spec.data_only {
+            let definition = engine.definition(&one)?;
+            writeln!(out, "\n{}", definition.trim_end()).map_err(write_err)?;
+        }
+        if spec.schema_only {
+            continue;
+        }
+        let source = table_name(engine, schema, table);
+        // Written without the schema, as the definition is: the file goes
+        // into whatever database it is restored to.
+        let target = engine.quote(table);
+        let mut batch: Vec<String> = Vec::new();
+        let mut names: Vec<String> = Vec::new();
+        let literal = |engine: &dyn Engine, v: &Option<String>, number: bool| match v {
+            None => "NULL".to_string(),
+            Some(t) if number => t.clone(),
+            Some(t) => engine.literal(t),
+        };
+        let mut lines: Vec<String> = Vec::new();
+        let quote_names = |engine: &dyn Engine, names: &[String]| {
+            names
+                .iter()
+                .map(|n| engine.quote(n))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let sql = format!("SELECT * FROM {source}");
+        let mut rows: Vec<(Vec<bool>, Row)> = Vec::new();
+        engine.each(&sql, &mut |cols: &[String], numbers: &[bool], row: Row| {
+            if names.is_empty() {
+                names = cols.to_vec();
+            }
+            rows.push((numbers.to_vec(), row));
+            Ok(())
+        })?;
+        for (numbers, row) in &rows {
+            let cells: Vec<String> = row
+                .iter()
+                .zip(numbers.iter().chain(std::iter::repeat(&false)))
+                .map(|(v, n)| literal(&*engine, v, *n))
+                .collect();
+            batch.push(format!("({})", cells.join(", ")));
+            if batch.len() >= IMPORT_BATCH {
+                lines.push(format!(
+                    "INSERT INTO {target} ({}) VALUES {};",
+                    quote_names(&*engine, &names),
+                    batch.join(", ")
+                ));
+                batch.clear();
+            }
+            if lines.len() >= 64 {
+                for l in lines.drain(..) {
+                    writeln!(out, "{l}").map_err(write_err)?;
+                }
+            }
+        }
+        if !batch.is_empty() {
+            lines.push(format!(
+                "INSERT INTO {target} ({}) VALUES {};",
+                quote_names(&*engine, &names),
+                batch.join(", ")
+            ));
+        }
+        for l in lines {
+            writeln!(out, "{l}").map_err(write_err)?;
+        }
+    }
+    if !on.is_empty() {
+        writeln!(out, "\n{on}").map_err(write_err)?;
+    }
+    out.flush().map_err(write_err)?;
+    drop(out);
+    let size = std::fs::metadata(&request.path).map_or(0, |m| m.len());
+    Ok(json!({ "path": request.path, "tool": "SimpleEdit SQL", "size": size, "said": "" }))
+}
+
+/// Runs the statements of a backup file, one after the other, in one
+/// transaction where the system has one for them.
+fn restore(engine: &mut dyn Engine, request: &Request) -> Result<Value, String> {
+    if request.path.is_empty() {
+        return Err("no file to read".to_string());
+    }
+    let text =
+        std::fs::read_to_string(&request.path).map_err(|e| format!("{}: {e}", request.path))?;
+    let dialect = request.target.dialect;
+    let mut statements: Vec<&str> = Vec::new();
+    let mut start = 0;
+    for token in protocol::sql_tokens(&text, dialect) {
+        if token.kind == protocol::TokenKind::Punct && &text[token.start..token.end] == ";" {
+            statements.push(&text[start..token.start]);
+            start = token.end;
+        }
+    }
+    statements.push(&text[start..]);
+    let mut ran = 0u64;
+    for (i, sql) in statements.iter().enumerate() {
+        // Only comments are not a statement.
+        let body: String = protocol::sql_tokens(sql, dialect)
+            .iter()
+            .filter(|t| t.kind != protocol::TokenKind::Comment)
+            .map(|t| &sql[t.start..t.end])
+            .collect::<Vec<_>>()
+            .join(" ");
+        if body.trim().is_empty() {
+            continue;
+        }
+        let started = Instant::now();
+        match engine.execute(sql.trim()) {
+            Ok(n) => {
+                record(&sql_head(sql.trim()), started, Some(n), None);
+                ran += 1;
+            }
+            Err(message) => {
+                record(&sql_head(sql.trim()), started, None, Some(message.clone()));
+                return Err(format!("statement {}: {message}", i + 1));
+            }
+        }
+    }
+    Ok(json!({ "tool": "SimpleEdit SQL", "said": format!("{ran} statements") }))
+}
+
+/// Rows per INSERT when a file is imported.
+const IMPORT_BATCH: usize = 500;
+
+/// Puts the rows of a CSV or JSON file into a table: INSERT statements, in
+/// one transaction (all of the file or none).
+fn import(engine: &mut dyn Engine, request: &Request) -> Result<Value, String> {
+    let spec = request
+        .import
+        .as_ref()
+        .ok_or_else(|| "nothing to import".to_string())?;
+    if spec.mapping.is_empty() {
+        return Err("no column to fill".to_string());
+    }
+    let text =
+        std::fs::read_to_string(&request.path).map_err(|e| format!("{}: {e}", request.path))?;
+    // One entry per row, one value per mapped column: `None` is NULL.
+    let rows: Vec<Vec<Option<String>>> = if spec.format == "json" {
+        let value: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        let objects = match value {
+            Value::Array(list) => list,
+            other => vec![other],
+        };
+        objects
+            .iter()
+            .map(|object| {
+                spec.mapping
+                    .iter()
+                    .map(|m| match object.get(&m.key) {
+                        None | Some(Value::Null) => None,
+                        Some(Value::String(s)) => Some(s.clone()),
+                        Some(other) => Some(other.to_string()),
+                    })
+                    .collect()
+            })
+            .collect()
+    } else {
+        let delimiter = spec.delimiter.chars().next().unwrap_or(',');
+        let mut records = crate::import::parse_csv(&text, delimiter);
+        if spec.header && !records.is_empty() {
+            records.remove(0);
+        }
+        records
+            .iter()
+            .filter(|r| !(r.len() == 1 && r[0].is_empty()))
+            .map(|record| {
+                spec.mapping
+                    .iter()
+                    .map(|m| {
+                        let value = record.get(m.index).cloned().unwrap_or_default();
+                        (!(spec.empty_null && value.is_empty())).then_some(value)
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+    let target = table_name(engine, &request.schema, &request.table);
+    let columns: Vec<String> = spec
+        .mapping
+        .iter()
+        .map(|m| engine.quote(&m.column))
+        .collect();
+    engine.begin()?;
+    let mut imported = 0u64;
+    for batch in rows.chunks(IMPORT_BATCH) {
+        let values: Vec<String> = batch
+            .iter()
+            .map(|row| {
+                let cells: Vec<String> = row
+                    .iter()
+                    .zip(&spec.mapping)
+                    .map(|(value, m)| match value {
+                        Some(text) => engine.literal_for(&m.kind, text),
+                        None => "NULL".to_string(),
+                    })
+                    .collect();
+                format!("({})", cells.join(", "))
+            })
+            .collect();
+        let sql = format!(
+            "INSERT INTO {target} ({}) VALUES {}",
+            columns.join(", "),
+            values.join(", ")
+        );
+        let started = Instant::now();
+        match engine.execute(&sql) {
+            Ok(n) => {
+                record(&sql_head(&sql), started, Some(n), None);
+                imported += n;
+            }
+            Err(message) => {
+                record(&sql_head(&sql), started, None, Some(message.clone()));
+                let _ = engine.rollback();
+                return Err(message);
+            }
+        }
+    }
+    if let Err(message) = engine.commit() {
+        let _ = engine.rollback();
+        return Err(message);
+    }
+    Ok(json!({ "imported": imported }))
+}
+
+/// The start of a long statement, for the log.
+fn sql_head(sql: &str) -> String {
+    match sql.char_indices().nth(200) {
+        Some((at, _)) => format!("{}…", &sql[..at]),
+        None => sql.to_string(),
+    }
+}
+
 fn apply(engine: &mut dyn Engine, request: &Request) -> Result<Value, String> {
     let (schema, table) = (request.schema.as_str(), request.table.as_str());
     let shape = engine.shape(schema, table)?;

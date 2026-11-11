@@ -161,23 +161,30 @@ fn read_request(item: &Value, inherited: &Option<Auth>, warnings: &mut Vec<Strin
             };
         }
         Some("formdata") => {
-            // Multipart is not sent here: the text fields are kept as a form.
+            // A file of this machine is not picked by a collection from
+            // elsewhere: its part is kept empty ("@"), to choose again.
+            let mut had_file = false;
             let fields: Vec<Pair> = body["formdata"]
                 .as_array()
                 .map(|l| {
                     l.iter()
-                        .filter(|f| f["type"].as_str() != Some("file"))
-                        .map(|f| Pair {
-                            enabled: !f["disabled"].as_bool().unwrap_or(false),
-                            key: text(&f["key"]),
-                            value: text(&f["value"]),
+                        .map(|f| {
+                            let file = f["type"].as_str() == Some("file");
+                            had_file |= file && !text(&f["src"]).is_empty();
+                            Pair {
+                                enabled: !f["disabled"].as_bool().unwrap_or(false),
+                                key: text(&f["key"]),
+                                value: if file { "@".into() } else { text(&f["value"]) },
+                            }
                         })
                         .collect()
                 })
                 .unwrap_or_default();
-            warnings.push(t!("api.warn_multipart", name = name).to_string());
+            if had_file {
+                warnings.push(t!("api.warn_multipart", name = name).to_string());
+            }
             request.body = Body {
-                kind: BodyKind::Form,
+                kind: BodyKind::Multipart,
                 form: fields,
                 ..Body::default()
             };
@@ -426,6 +433,23 @@ fn request_json(request: &Request) -> Value {
                 json!({"mode": "urlencoded", "urlencoded": pairs_json(&request.body.form)}),
             );
         }
+        BodyKind::Multipart => {
+            let parts: Vec<Value> = request
+                .body
+                .form
+                .iter()
+                .map(|f| match f.value.strip_prefix('@') {
+                    Some(src) => json!({"key": f.key, "type": "file", "src": src,
+                                        "disabled": !f.enabled}),
+                    None => json!({"key": f.key, "value": f.value, "type": "text",
+                                   "disabled": !f.enabled}),
+                })
+                .collect();
+            out.insert(
+                "body".into(),
+                json!({"mode": "formdata", "formdata": parts}),
+            );
+        }
         BodyKind::File => {
             out.insert(
                 "body".into(),
@@ -575,7 +599,7 @@ mod tests {
         };
         assert_eq!(
             (multi.body.kind, multi.body.form.len()),
-            (BodyKind::Form, 1)
+            (BodyKind::Multipart, 2)
         );
         let Item::Request(plain) = &got.collection.items[2] else {
             panic!()
@@ -610,8 +634,8 @@ mod tests {
         let text = export_collection(&first);
         assert!(text.contains(SCHEMA));
         let mut back = import_collection(&text).unwrap();
-        // The multipart form and the unsupported sign-in were changed on the
-        // way in, so nothing is left to warn about on the way back.
+        // The files of the multipart form and the unsupported sign-in were
+        // changed on the way in, so nothing is left to warn about on the way back.
         assert!(back.warnings.is_empty(), "{:?}", back.warnings);
         let mut again = 0;
         back.collection.number(&mut again);

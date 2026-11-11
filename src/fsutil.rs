@@ -163,6 +163,20 @@ pub fn set_aside(path: &Path) -> Option<PathBuf> {
     std::fs::rename(path, &aside).ok().map(|()| aside)
 }
 
+/// Removes a file or a folder by sending it to the system trash; when there
+/// is no trash (a headless box, another volume), it is deleted for good.
+pub fn trash_or_remove(path: &Path) -> std::io::Result<()> {
+    // Unit tests delete for good: they must not fill the developer's trash.
+    if !cfg!(test) && trash::delete(path).is_ok() {
+        return Ok(());
+    }
+    if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

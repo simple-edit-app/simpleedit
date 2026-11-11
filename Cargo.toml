@@ -1,6 +1,6 @@
 [package]
 name = "simpleedit"
-version = "1.25.0"
+version = "1.26.0"
 edition = "2021"
 rust-version = "1.90"
 description = "A fast, stable, cross-platform text editor"
@@ -19,15 +19,30 @@ path = "src/main.rs"
 [[bin]]
 name = "simpleedit-db-postgres"
 path = "drivers/postgres/main.rs"
+required-features = ["drivers"]
 
 # The SQLite and MySQL / MariaDB drivers: the same, for those databases.
 [[bin]]
 name = "simpleedit-db-sqlite"
 path = "drivers/sqlite/main.rs"
+required-features = ["drivers"]
 
 [[bin]]
 name = "simpleedit-db-mysql"
 path = "drivers/mysql/main.rs"
+required-features = ["drivers"]
+
+[[test]]
+name = "sql_drivers"
+path = "tests/sql_drivers.rs"
+required-features = ["drivers"]
+
+[features]
+# The database drivers (separate programs, built beside the editor) and what
+# only they need: PostgreSQL, MySQL and SQLite, with their TLS. The editor
+# itself compiles without them: `cargo build --bin simpleedit --no-default-features`.
+default = ["drivers"]
+drivers = ["dep:postgres", "dep:rustls", "dep:tokio-postgres-rustls", "dep:rustls-native-certs", "dep:rusqlite", "dep:mysql"]
 
 [dependencies]
 iced = { version = "0.14", features = ["advanced", "tokio", "lazy", "selector", "canvas"] }
@@ -42,9 +57,8 @@ serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision
 rfd = "0.14"
 dirs = "5"
 rust-i18n = "3"
-once_cell = "1"
 image = { version = "0.25", default-features = false, features = ["png"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "brotli", "deflate"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots", "multipart", "gzip", "brotli", "deflate"] }
 tokio = { version = "1", features = ["rt", "process", "io-util", "time", "sync", "fs", "macros"] }
 sha2 = "0.10"
 ed25519-dalek = { version = "2", default-features = false }
@@ -54,16 +68,18 @@ vt100 = "0.18.1"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 similar = "3.2.1"
 unicode-width = "0.2"
-postgres = { version = "0.19", default-features = false }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-tokio-postgres-rustls = "0.14.0"
-rustls-native-certs = "0.8.5"
+postgres = { version = "0.19", default-features = false, optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+tokio-postgres-rustls = { version = "0.14.0", optional = true }
+rustls-native-certs = { version = "0.8.5", optional = true }
 sqlformat = "0.5.0"
 spellbook = "0.4"
 rust_xlsxwriter = "0.102.0"
-serde_yaml = "0.9"
-rusqlite = { version = "0.41", features = ["bundled"] }
-mysql = { version = "28", default-features = false, features = ["minimal-rust", "rustls-tls-ring"] }
+serde_norway = "0.9"
+rusqlite = { version = "0.41", features = ["bundled", "hooks"], optional = true }
+mysql = { version = "28", default-features = false, features = ["minimal-rust", "rustls-tls-ring"], optional = true }
+trash = "5.3.0"
+notify = "8"
 
 # The system menu bar on macOS (File, Edit, View and Help up there).
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -103,6 +119,7 @@ copyright = "2024, sindus"
 license-file = ["LICENSE", "0"]
 extended-description = "A fast, stable, cross-platform text editor with syntax highlighting for 30+ languages."
 depends = "$auto"
+recommends = "policykit-1 | pkexec"
 section = "editors"
 priority = "optional"
 assets = [
@@ -113,8 +130,11 @@ assets = [
 ]
 
 
-# iced_winit 0.14.1 without winit's default macOS menu, whose Cmd+Q quits
-# without saving the session.
+# Patched copies of iced 0.14.1 crates; see vendor/PATCHES.md (a test fails
+# when a patch is no longer applied).
+# - iced_winit: without winit's default macOS menu, whose Cmd+Q quits without
+#   saving the session.
+# - iced_graphics: `set_hidden_lines` for code folding.
 [patch.crates-io]
 iced_winit = { path = "vendor/iced_winit" }
 iced_graphics = { path = "vendor/iced_graphics" }

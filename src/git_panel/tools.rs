@@ -68,7 +68,25 @@ pub enum Dialog {
     Merge(String, MergeOptions),
     Rebase(String, RebaseOptions),
     Messages(Vec<String>),
+    /// What `git clean` would remove, to look at and confirm.
+    Clean {
+        files: Vec<String>,
+        ignored: bool,
+    },
+    /// A repository to clone.
+    Clone {
+        url: String,
+        dest: String,
+        running: bool,
+        error: Option<String>,
+    },
     Repos(Vec<RepoLine>, Vec<(String, Result<(), String>)>),
+    /// The submodules and the worktrees of the repository.
+    Trees {
+        submodules: Vec<gt::Submodule>,
+        worktrees: Vec<gt::Worktree>,
+        error: Option<String>,
+    },
     Extract {
         sha: String,
         paths: Vec<String>,
@@ -140,6 +158,21 @@ pub enum ToolMsg {
     RebaseOnto(String),
     RebaseRun,
     OpenMessages,
+    OpenClean,
+    OpenTrees,
+    TreesLoaded(Result<(Vec<gt::Submodule>, Vec<gt::Worktree>), String>),
+    SubmodulesUpdate,
+    WorktreeOpen(PathBuf),
+    CleanLoaded(Result<Vec<String>, String>),
+    CleanIgnored(bool),
+    CleanRun,
+    OpenClone,
+    CloneUrl(String),
+    CloneDest(String),
+    CloneBrowse,
+    CloneDestPicked(Option<PathBuf>),
+    CloneRun,
+    CloneDone(Result<PathBuf, String>),
     MessagesLoaded(Result<Vec<String>, String>),
     UseMessage(String),
     OpenRepos,
@@ -161,6 +194,10 @@ impl ToolMsg {
                 | ToolMsg::RemotesLoaded(_)
                 | ToolMsg::PatchMade(..)
                 | ToolMsg::MessagesLoaded(_)
+                | ToolMsg::CleanLoaded(_)
+                | ToolMsg::TreesLoaded(_)
+                | ToolMsg::CloneDone(_)
+                | ToolMsg::CloneDestPicked(_)
                 | ToolMsg::ReposLoaded(_)
                 | ToolMsg::ReposDone(_)
         )
@@ -605,6 +642,190 @@ impl Panel {
                     Ok(String::new())
                 })
             }
+            ToolMsg::OpenTrees => {
+                let Some(repo) = repo else {
+                    return Task::none();
+                };
+                Task::perform(
+                    async move {
+                        let modules = gt::submodules(&repo).await?;
+                        let trees = gt::worktrees(&repo).await?;
+                        Ok((modules, trees))
+                    },
+                    |r| tool(ToolMsg::TreesLoaded(r)),
+                )
+            }
+            ToolMsg::TreesLoaded(result) => {
+                match result {
+                    Ok((submodules, worktrees)) => {
+                        self.dialog = Some(Dialog::Trees {
+                            submodules,
+                            worktrees,
+                            error: None,
+                        })
+                    }
+                    Err(e) => self.notice = Some((e, true)),
+                }
+                Task::none()
+            }
+            ToolMsg::SubmodulesUpdate => {
+                self.dialog = None;
+                self.act(move |repo| async move {
+                    gt::submodules_update(&repo).await?;
+                    Ok(String::new())
+                })
+            }
+            ToolMsg::WorktreeOpen(path) => {
+                // A worktree is a project like any other.
+                self.dialog = None;
+                Task::done(Message::ProjectPicked(Some(path)))
+            }
+            ToolMsg::OpenClean => {
+                let Some(repo) = repo else {
+                    return Task::none();
+                };
+                Task::perform(async move { gt::clean_preview(&repo, false).await }, |r| {
+                    tool(ToolMsg::CleanLoaded(r))
+                })
+            }
+            ToolMsg::CleanLoaded(result) => {
+                match result {
+                    Ok(files) => {
+                        let ignored =
+                            matches!(self.dialog, Some(Dialog::Clean { ignored: true, .. }));
+                        self.dialog = Some(Dialog::Clean { files, ignored });
+                    }
+                    Err(e) => self.notice = Some((e, true)),
+                }
+                Task::none()
+            }
+            ToolMsg::CleanIgnored(on) => {
+                let Some(repo) = repo else {
+                    return Task::none();
+                };
+                if let Some(Dialog::Clean { ignored, .. }) = self.dialog.as_mut() {
+                    *ignored = on;
+                }
+                Task::perform(async move { gt::clean_preview(&repo, on).await }, |r| {
+                    tool(ToolMsg::CleanLoaded(r))
+                })
+            }
+            ToolMsg::CleanRun => {
+                let Some(Dialog::Clean { files, ignored }) = self.dialog.take() else {
+                    return Task::none();
+                };
+                if files.is_empty() {
+                    return Task::none();
+                }
+                self.act(move |repo| async move {
+                    gt::clean_run(&repo, ignored).await?;
+                    Ok(String::new())
+                })
+            }
+            ToolMsg::OpenClone => {
+                self.typing = true;
+                self.dialog = Some(Dialog::Clone {
+                    url: String::new(),
+                    dest: String::new(),
+                    running: false,
+                    error: None,
+                });
+                Task::none()
+            }
+            ToolMsg::CloneUrl(text) => {
+                if let Some(Dialog::Clone {
+                    url, dest, error, ..
+                }) = self.dialog.as_mut()
+                {
+                    *url = text;
+                    *error = None;
+                    // The name of the folder follows the address while it was
+                    // not typed apart: `…/name.git` goes in the folder `name`.
+                    let name = url
+                        .trim_end_matches('/')
+                        .rsplit(['/', ':'])
+                        .next()
+                        .unwrap_or("")
+                        .trim_end_matches(".git")
+                        .to_string();
+                    if let Some(parent) = std::path::Path::new(dest.as_str()).parent() {
+                        if !dest.is_empty() && !name.is_empty() {
+                            *dest = parent.join(&name).to_string_lossy().into_owned();
+                        }
+                    }
+                }
+                Task::none()
+            }
+            ToolMsg::CloneDest(text) => {
+                if let Some(Dialog::Clone { dest, error, .. }) = self.dialog.as_mut() {
+                    *dest = text;
+                    *error = None;
+                }
+                Task::none()
+            }
+            ToolMsg::CloneBrowse => Task::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .pick_folder()
+                        .await
+                        .map(|f| f.path().to_path_buf())
+                },
+                |picked| tool(ToolMsg::CloneDestPicked(picked)),
+            ),
+            ToolMsg::CloneDestPicked(picked) => {
+                if let (Some(folder), Some(Dialog::Clone { url, dest, .. })) =
+                    (picked, self.dialog.as_mut())
+                {
+                    let name = url
+                        .trim_end_matches('/')
+                        .rsplit(['/', ':'])
+                        .next()
+                        .unwrap_or("")
+                        .trim_end_matches(".git")
+                        .to_string();
+                    *dest = folder.join(name).to_string_lossy().into_owned();
+                }
+                Task::none()
+            }
+            ToolMsg::CloneRun => {
+                let Some(Dialog::Clone {
+                    url,
+                    dest,
+                    running,
+                    error,
+                }) = self.dialog.as_mut()
+                else {
+                    return Task::none();
+                };
+                if *running {
+                    return Task::none();
+                }
+                *running = true;
+                *error = None;
+                let (url, dest) = (url.clone(), PathBuf::from(dest.trim()));
+                Task::perform(
+                    async move {
+                        gt::clone_repo(&url, &dest).await?;
+                        Ok(dest)
+                    },
+                    |r| tool(ToolMsg::CloneDone(r)),
+                )
+            }
+            ToolMsg::CloneDone(result) => match result {
+                Ok(path) => {
+                    // The clone is a project like any other.
+                    self.dialog = None;
+                    self.typing = false;
+                    Task::done(Message::ProjectPicked(Some(path)))
+                }
+                Err(e) => {
+                    if let Some(Dialog::Clone { running, error, .. }) = self.dialog.as_mut() {
+                        *running = false;
+                        *error = Some(e);
+                    }
+                    Task::none()
+                }
+            },
             ToolMsg::OpenMessages => {
                 let Some(repo) = repo else {
                     return Task::none();
@@ -1065,6 +1286,149 @@ impl Panel {
             ]
             .spacing(10)
             .into(),
+            Dialog::Trees {
+                submodules,
+                worktrees,
+                error,
+            } => {
+                let mut list = column![text(t!("git.worktrees").to_string())
+                    .size(12.5)
+                    .color(p.muted)]
+                .spacing(2);
+                for tree in worktrees {
+                    list = list.push(
+                        button(
+                            row![
+                                text(tree.path.to_string_lossy().into_owned())
+                                    .size(12.5)
+                                    .width(Length::Fill)
+                                    .wrapping(iced::widget::text::Wrapping::None),
+                                text(tree.branch.as_str()).size(12).color(p.muted),
+                            ]
+                            .spacing(8),
+                        )
+                        .padding([4, 8])
+                        .width(Length::Fill)
+                        .on_press(tool(ToolMsg::WorktreeOpen(tree.path.clone())))
+                        .style(ghost(false)),
+                    );
+                }
+                list = list.push(
+                    text(t!("git.submodules").to_string())
+                        .size(12.5)
+                        .color(p.muted),
+                );
+                if submodules.is_empty() {
+                    list = list.push(text(t!("git.no_submodules").to_string()).size(12));
+                }
+                for module in submodules {
+                    let state = match module.state {
+                        '-' => t!("git.submodule_missing").to_string(),
+                        '+' => t!("git.submodule_moved").to_string(),
+                        'U' => t!("git.submodule_conflict").to_string(),
+                        _ => String::new(),
+                    };
+                    list = list.push(
+                        row![
+                            text(module.path.as_str()).size(12.5).width(Length::Fill),
+                            text(state).size(12).color(p.muted),
+                            text(module.sha.chars().take(8).collect::<String>())
+                                .size(12)
+                                .font(se_theme::MONO)
+                                .color(p.muted),
+                        ]
+                        .spacing(8),
+                    );
+                }
+                let mut body = column![
+                    title(t!("git.trees_title").to_string()),
+                    scrollable(list)
+                        .style(se_theme::Scrollbar { dark }.style())
+                        .height(Length::Fixed(190.0)),
+                    row![primary(
+                        t!("git.submodules_update").to_string(),
+                        (idle && !submodules.is_empty()).then_some(tool(ToolMsg::SubmodulesUpdate))
+                    )],
+                ]
+                .spacing(10);
+                if let Some(e) = error {
+                    body = body.push(text(e.as_str()).size(12).color(se_theme::error_color(dark)));
+                }
+                body.into()
+            }
+            Dialog::Clean { files, ignored } => {
+                let mut list = column![].spacing(1);
+                for file in files.iter().take(500) {
+                    list = list.push(text(file.as_str()).size(12).font(se_theme::MONO));
+                }
+                if files.len() > 500 {
+                    list = list.push(
+                        text(t!("git.clean_more", n = files.len() - 500).to_string())
+                            .size(12)
+                            .color(p.muted),
+                    );
+                }
+                column![
+                    title(t!("git.clean_title").to_string()),
+                    text(if files.is_empty() {
+                        t!("git.clean_nothing").to_string()
+                    } else {
+                        t!("git.clean_text", n = files.len()).to_string()
+                    })
+                    .size(12.5)
+                    .color(p.muted),
+                    scrollable(list)
+                        .style(se_theme::Scrollbar { dark }.style())
+                        .height(Length::Fixed(160.0)),
+                    flag(t!("git.clean_ignored").to_string(), *ignored)
+                        .on_toggle(|on| tool(ToolMsg::CleanIgnored(on))),
+                    row![primary(
+                        t!("git.clean_run").to_string(),
+                        (idle && !files.is_empty()).then_some(tool(ToolMsg::CleanRun))
+                    )]
+                    .spacing(8),
+                ]
+                .spacing(10)
+                .into()
+            }
+            Dialog::Clone {
+                url,
+                dest,
+                running,
+                error,
+            } => {
+                let field = |hint: String, value: &str, on: fn(String) -> ToolMsg| {
+                    text_input(&hint, value)
+                        .on_input(move |t| tool(on(t)))
+                        .on_submit(tool(ToolMsg::CloneRun))
+                        .size(12.5)
+                        .padding([4, 8])
+                        .style(se_theme::Field::new(dark).style())
+                };
+                let mut body = column![
+                    title(t!("git.clone_title").to_string()),
+                    field(t!("git.clone_url").to_string(), url, ToolMsg::CloneUrl),
+                    row![
+                        field(t!("git.clone_dest").to_string(), dest, ToolMsg::CloneDest),
+                        plain("…".to_string(), Some(tool(ToolMsg::CloneBrowse))),
+                    ]
+                    .spacing(6),
+                    row![primary(
+                        if *running {
+                            t!("git.cloning").to_string()
+                        } else {
+                            t!("git.clone").to_string()
+                        },
+                        (!*running && !url.trim().is_empty() && !dest.trim().is_empty())
+                            .then_some(tool(ToolMsg::CloneRun))
+                    )],
+                ]
+                .spacing(10);
+                if let Some(e) = error {
+                    body = body.push(text(e.as_str()).size(12).color(se_theme::error_color(dark)));
+                }
+                body.into()
+            }
             Dialog::Messages(list) => {
                 let mut rows = column![].spacing(1);
                 for message in list {

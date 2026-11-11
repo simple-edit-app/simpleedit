@@ -36,6 +36,9 @@ pub struct TaskPanel {
     /// Where the log is scrolled to (offset, viewport height) once the user
     /// left the end; `None` while it follows the end.
     pub away: Option<(f32, f32)>,
+    /// What the output of the run says is wrong, by file: shown with the
+    /// problems of the editor.
+    pub problems: std::collections::HashMap<PathBuf, Vec<crate::lint::Diagnostic>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +47,52 @@ pub enum Done {
     /// Ended without a code, or could not start.
     NoCode,
     Stopped,
+}
+
+/// The problem a line of output says, if it says one: an error or a warning
+/// at a place.
+fn task_problem(
+    line: &str,
+    before: Option<&str>,
+    place: &Location,
+) -> Option<crate::lint::Diagnostic> {
+    use crate::lint::Severity;
+    let severity_of = |text: &str| {
+        let t = text.trim_start().to_lowercase();
+        if t.starts_with("error") || t.contains(": error") || t.contains(" error ") {
+            Some(Severity::Error)
+        } else if t.starts_with("warning") || t.contains(": warning") {
+            Some(Severity::Warning)
+        } else {
+            None
+        }
+    };
+    // `--> place`: the message is the line before.
+    let (text, severity) = if line.trim_start().starts_with("-->") {
+        let b = before?;
+        (b.to_string(), severity_of(b)?)
+    } else {
+        (line.to_string(), severity_of(line)?)
+    };
+    let message = text
+        .trim()
+        .trim_start_matches("error")
+        .trim_start_matches("warning")
+        .trim_start_matches([':', ' '])
+        .to_string();
+    let (row, col) = (place.line.saturating_sub(1), place.col.saturating_sub(1));
+    Some(crate::lint::Diagnostic {
+        line: row,
+        col,
+        end_line: row,
+        end_col: col + 1,
+        severity,
+        message: if message.is_empty() { text } else { message },
+        code: None,
+        source: "Task".to_string(),
+        fixes: Vec::new(),
+        raw: None,
+    })
 }
 
 pub(super) fn log_id() -> iced::widget::Id {
@@ -91,6 +140,7 @@ impl SimpleEditApp {
         self.tasks.run += 1;
         let run = self.tasks.run;
         self.tasks.lines.clear();
+        self.clear_task_problems();
         self.tasks.away = None;
         self.tasks.done = None;
         self.tasks.task = Some(task.clone());
@@ -146,16 +196,52 @@ impl SimpleEditApp {
                 .entry(path.to_path_buf())
                 .or_insert_with(|| path.is_file())
         };
+        let mut touched: Vec<PathBuf> = Vec::new();
         for raw in raws {
             let text = engine::strip_ansi(&raw);
             let at = engine::location_with(&text, &dir, &mut is_file);
+            if let Some(place) = &at {
+                // What the line says; the compilers that give the place on a
+                // line of its own (`--> src/a.rs:3:4`) said it just before.
+                let before = self.tasks.lines.last().map(|l| l.text.as_str());
+                if let Some(problem) = task_problem(&text, before, place) {
+                    self.tasks
+                        .problems
+                        .entry(place.path.clone())
+                        .or_default()
+                        .push(problem);
+                    if !touched.contains(&place.path) {
+                        touched.push(place.path.clone());
+                    }
+                }
+            }
             self.tasks.lines.push(OutLine { text, at });
+        }
+        for path in touched {
+            let n = self.tasks.problems.get(&path).map_or(0, |p| {
+                p.iter()
+                    .filter(|d| d.severity == crate::lint::Severity::Error)
+                    .count()
+            });
+            if n > 0 {
+                self.file_marks.set_errors(&path, n);
+            }
         }
         if self.tasks.lines.len() > MAX_LINES {
             let extra = self.tasks.lines.len() - MAX_LINES;
             self.tasks.lines.drain(..extra);
         }
         iced::widget::operation::snap_to_end(log_id())
+    }
+
+    /// The problems of the last run go (with their marks in the tree).
+    pub(super) fn clear_task_problems(&mut self) {
+        let old: Vec<PathBuf> = self.tasks.problems.drain().map(|(p, _)| p).collect();
+        for path in old {
+            if self.lint.file.as_ref() != Some(&path) {
+                self.file_marks.set_errors(&path, 0);
+            }
+        }
     }
 
     pub(super) fn task_stop(&mut self) -> Task<Message> {
@@ -372,6 +458,38 @@ mod tests {
         let _ = app.update(Message::TaskEvent(run, Event::Done(Some(2))));
         assert_eq!(app.tasks.done, Some(Done::Code(2)));
         assert!(app.status_is_error);
+    }
+
+    #[test]
+    fn what_the_output_says_is_wrong_becomes_problems_of_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.rs");
+        std::fs::write(&file, "").unwrap();
+        let mut app = app();
+        let _ = app.start_task(task(dir.path()));
+        let run = app.tasks.run;
+        let lines = [
+            "error[E0425]: cannot find value `x`",
+            " --> a.rs:3:4",
+            "warning: unused variable: `y`",
+            "  --> a.rs:5:9",
+            "a.rs:7:1: just a note about a place",
+        ];
+        let packet = lines.iter().map(|l| l.to_string()).collect();
+        let _ = app.update(Message::TaskEvent(run, Event::Lines(packet)));
+        let found = &app.tasks.problems[&file];
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(
+            (found[0].severity, found[0].line, found[0].col),
+            (crate::lint::Severity::Error, 2, 3)
+        );
+        assert!(found[0].message.contains("cannot find value"));
+        assert_eq!(found[1].severity, crate::lint::Severity::Warning);
+        // The tree marks the file; a new run forgets all of it.
+        assert!(app.file_marks.has_errors(&file, false));
+        let _ = app.start_task(task(dir.path()));
+        assert!(app.tasks.problems.is_empty());
+        assert!(!app.file_marks.has_errors(&file, false));
     }
 
     #[test]

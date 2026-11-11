@@ -51,6 +51,7 @@ mod search;
 mod session;
 mod sidebar;
 mod spell;
+mod ssh_trust;
 mod tab_strip;
 mod tabs;
 mod tasks;
@@ -59,6 +60,7 @@ mod text_ops;
 mod theme;
 mod trust;
 mod updater;
+mod watch;
 
 i18n!("src/i18n");
 

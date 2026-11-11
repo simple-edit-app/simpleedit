@@ -170,6 +170,7 @@ impl SidebarState {
         colors: &std::collections::BTreeMap<String, usize>,
         marks: &crate::projects::Marks,
         panels: Panels,
+        tree_view: (f32, f32),
         width: f32,
     ) -> Element<'a, Message> {
         let lbl_close = t!("sidebar.close").to_string();
@@ -446,6 +447,7 @@ impl SidebarState {
                     marks,
                     current_file,
                     marked,
+                    tree_view,
                     dark,
                 ))
                 .id(tree_id())
@@ -562,12 +564,21 @@ fn project_tree<'a>(
     marks: &crate::projects::Marks,
     current: &Option<PathBuf>,
     marked: &HashSet<PathBuf>,
+    tree_view: (f32, f32),
     dark: bool,
 ) -> Element<'a, Message> {
     let p = theme::palette(dark);
-    let items: Vec<Element<Message>> = projects
-        .rows()
+    // Only the lines in view (and a few around them) become widgets: a tree
+    // of tens of thousands of lines would otherwise be rebuilt at each frame.
+    let all = projects.rows();
+    let (first, last) = visible_lines(all.len(), tree_view);
+    let stride = TREE_ROW + 1.0;
+    let top = Space::new().height(Length::Fixed(first as f32 * stride));
+    let bottom = Space::new().height(Length::Fixed((all.len() - last) as f32 * stride));
+    let items: Vec<Element<Message>> = all
         .into_iter()
+        .skip(first)
+        .take(last - first)
         .map(|line| {
             let path = line.entry.path.clone();
             let current_file = !line.entry.is_dir && current.as_ref() == Some(&path);
@@ -770,12 +781,39 @@ fn project_tree<'a>(
             .into()
         })
         .collect();
-    column(items).spacing(1).into()
+    column![top, column(items).spacing(1), bottom].into()
+}
+
+/// The lines to build of `total`, for a view that is scrolled `offset` and
+/// `height` high (the first view, whose height is not known yet, builds a
+/// good number). The line that is selected or current is not forced in: the
+/// tree scrolls to it.
+fn visible_lines(total: usize, (offset, height): (f32, f32)) -> (usize, usize) {
+    const AROUND: usize = 15;
+    let height = if height > 0.0 { height } else { 1200.0 };
+    let stride = TREE_ROW + 1.0;
+    let first = ((offset / stride) as usize).saturating_sub(AROUND);
+    let last = (((offset + height) / stride).ceil() as usize + AROUND).min(total);
+    (first.min(last), last)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_lines_in_view_and_a_few_around_are_built() {
+        // At the top, a view of 270 px shows 10 lines.
+        assert_eq!(visible_lines(10_000, (0.0, 270.0)), (0, 25));
+        // Scrolled to line 1000.
+        let (first, last) = visible_lines(10_000, (27_000.0, 270.0));
+        assert_eq!((first, last), (985, 1025));
+        // A short tree is all there is; past the end is clamped.
+        assert_eq!(visible_lines(5, (0.0, 270.0)), (0, 5));
+        assert_eq!(visible_lines(5, (9_000.0, 270.0)), (5, 5));
+        // Height not known yet: a good number.
+        assert!(visible_lines(10_000, (0.0, 0.0)).1 > 40);
+    }
 
     #[test]
     fn add_file_appends_and_deduplicates() {

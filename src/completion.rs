@@ -628,6 +628,55 @@ pub fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
 }
 
+/// The snippets of the user that begin like `prefix` (nothing typed: all), for
+/// a file of this extension, as proposals.
+pub fn snippet_items(
+    snippets: &[crate::config::UserSnippet],
+    ext: &str,
+    prefix: &str,
+) -> Vec<Item> {
+    let wanted = prefix.to_lowercase();
+    let list: Vec<Value> = snippets
+        .iter()
+        .filter(|s| {
+            s.languages.is_empty() || s.languages.iter().any(|l| l.eq_ignore_ascii_case(ext))
+        })
+        .filter(|s| !s.trigger.is_empty() && s.trigger.to_lowercase().starts_with(&wanted))
+        .map(|s| {
+            serde_json::json!({
+                "label": s.trigger,
+                "kind": 15,
+                "detail": "snippet",
+                "insertText": s.body,
+                "insertTextFormat": 2,
+            })
+        })
+        .collect();
+    parse_list(&Value::Array(list), "").0
+}
+
+/// The words of a text as proposals (no language server): each one once, the
+/// short ones and the one being typed (`prefix`) left out.
+pub fn buffer_words(text: &str, prefix: &str) -> Vec<Item> {
+    const MAX_WORDS: usize = 5_000;
+    let mut seen = std::collections::HashSet::new();
+    let mut labels = Vec::new();
+    for word in text.split(|c: char| !is_word_char(c)) {
+        if word.chars().count() < 3
+            || word == prefix
+            || word.chars().next().is_some_and(|c| c.is_ascii_digit())
+            || !seen.insert(word)
+        {
+            continue;
+        }
+        labels.push(serde_json::json!({ "label": word, "kind": 1 }));
+        if labels.len() >= MAX_WORDS {
+            break;
+        }
+    }
+    parse_list(&Value::Array(labels), "").0
+}
+
 /// Where the word that ends at byte `col` of `line` starts.
 pub fn word_start_col(line: &str, col: usize) -> usize {
     let col = col.min(line.len());

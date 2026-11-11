@@ -28,6 +28,121 @@ pub async fn get_from_revision(repo: &Path, rev: &str, path: &str) -> Result<(),
     .map(|_| ())
 }
 
+// ─── Cleaning, cloning ──────────────────────────────────────────────────────
+
+/// The files and folders `git clean` would remove (untracked ones, and the
+/// ignored ones too with `ignored`), without removing anything.
+pub async fn clean_preview(repo: &Path, ignored: bool) -> Result<Vec<String>, String> {
+    let mut args = vec!["clean", "-nd"];
+    if ignored {
+        args.push("-x");
+    }
+    let out = run(repo, &args).await?;
+    Ok(out
+        .lines()
+        .filter_map(|l| l.strip_prefix("Would remove "))
+        .map(str::to_string)
+        .collect())
+}
+
+/// Removes what [`clean_preview`] lists.
+pub async fn clean_run(repo: &Path, ignored: bool) -> Result<(), String> {
+    let mut args = vec!["clean", "-fd"];
+    if ignored {
+        args.push("-x");
+    }
+    run(repo, &args).await.map(|_| ())
+}
+
+/// Clones `url` into the folder `dest` (which must not exist yet; its parent
+/// must).
+pub async fn clone_repo(url: &str, dest: &Path) -> Result<(), String> {
+    let url = url.trim();
+    if url.is_empty() || url.starts_with('-') {
+        return Err(t!("git.err_clone_url").to_string());
+    }
+    let (Some(parent), Some(name)) = (dest.parent(), dest.file_name()) else {
+        return Err(t!("git.err_clone_dest").to_string());
+    };
+    if !parent.is_dir() || dest.exists() {
+        return Err(t!("git.err_clone_dest").to_string());
+    }
+    let name = name.to_string_lossy();
+    super::run_network(parent, &["clone", "--", url, &name])
+        .await
+        .map(|_| ())
+}
+
+// ─── Submodules, worktrees ──────────────────────────────────────────────────
+
+/// A submodule of the repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Submodule {
+    pub path: String,
+    /// What git says of it: `-` not initialised, `+` not at the commit the
+    /// repository wants, `U` in conflict, a space when all is well.
+    pub state: char,
+    pub sha: String,
+}
+
+/// The submodules, as `git submodule status` lists them.
+pub async fn submodules(repo: &Path) -> Result<Vec<Submodule>, String> {
+    let out = run(repo, &["submodule", "status"]).await?;
+    Ok(out
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|line| {
+            let state = line.chars().next()?;
+            let rest = line.get(state.len_utf8()..)?;
+            let mut words = rest.split_whitespace();
+            let sha = words.next()?.to_string();
+            let path = words.next()?.to_string();
+            Some(Submodule {
+                path,
+                state: if state == ' ' { ' ' } else { state },
+                sha,
+            })
+        })
+        .collect())
+}
+
+/// Initialises and updates every submodule, nested ones too.
+pub async fn submodules_update(repo: &Path) -> Result<(), String> {
+    super::run_network(repo, &["submodule", "update", "--init", "--recursive"])
+        .await
+        .map(|_| ())
+}
+
+/// A worktree of the repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Worktree {
+    pub path: std::path::PathBuf,
+    /// The branch, or `HEAD detached`.
+    pub branch: String,
+}
+
+/// The worktrees, the main one first.
+pub async fn worktrees(repo: &Path) -> Result<Vec<Worktree>, String> {
+    let out = run(repo, &["worktree", "list", "--porcelain"]).await?;
+    let mut found: Vec<Worktree> = Vec::new();
+    for line in out.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            found.push(Worktree {
+                path: path.into(),
+                branch: "HEAD detached".to_string(),
+            });
+        } else if let (Some(branch), Some(last)) = (line.strip_prefix("branch "), found.last_mut())
+        {
+            last.branch = branch.trim_start_matches("refs/heads/").to_string();
+        } else if line == "bare" {
+            if let Some(last) = found.last_mut() {
+                last.branch = "bare".to_string();
+            }
+        }
+    }
+    Ok(found)
+}
+
 // ─── Committing ─────────────────────────────────────────────────────────────
 
 /// What a commit can be made with, besides its message.
@@ -500,6 +615,92 @@ mod tests {
 
     fn write(repo: &Repo, name: &str, text: &str) {
         std::fs::write(repo.path().join(name), text).unwrap();
+    }
+
+    fn block<T>(f: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    #[test]
+    fn clean_lists_what_it_would_remove_and_then_removes_it() {
+        let repo = Repo::new();
+        commit(&repo, "kept.txt", "k\n", "first");
+        write(&repo, ".gitignore", "*.log\n");
+        repo.git(&["add", "."]);
+        repo.git(&["commit", "-q", "-m", "ignore"]);
+        write(&repo, "stray.txt", "x\n");
+        write(&repo, "debug.log", "x\n");
+        std::fs::create_dir(repo.path().join("scratch")).unwrap();
+        write(&repo, "scratch/a.txt", "x\n");
+        let listed = block(clean_preview(repo.path(), false)).unwrap();
+        assert_eq!(listed, vec!["scratch/", "stray.txt"]);
+        let with_ignored = block(clean_preview(repo.path(), true)).unwrap();
+        assert!(with_ignored.contains(&"debug.log".to_string()));
+        // Looking removed nothing; doing it keeps what git tracks.
+        assert!(repo.path().join("stray.txt").exists());
+        block(clean_run(repo.path(), false)).unwrap();
+        assert!(!repo.path().join("stray.txt").exists());
+        assert!(!repo.path().join("scratch").exists());
+        assert!(repo.path().join("debug.log").exists());
+        assert!(repo.path().join("kept.txt").exists());
+    }
+
+    #[test]
+    fn a_repository_is_cloned_into_a_new_folder_and_bad_asks_are_refused() {
+        let origin = Repo::new();
+        commit(&origin, "a.txt", "a\n", "first");
+        let parent = tempfile::tempdir().unwrap();
+        let dest = parent.path().join("copy");
+        let url = origin.path().to_string_lossy().into_owned();
+        block(clone_repo(&url, &dest)).unwrap();
+        assert!(dest.join("a.txt").exists());
+        // The folder exists now; an option is no address.
+        assert!(block(clone_repo(&url, &dest)).is_err());
+        assert!(block(clone_repo("--upload-pack=x", &parent.path().join("o"))).is_err());
+        assert!(block(clone_repo("", &parent.path().join("p"))).is_err());
+    }
+
+    #[test]
+    fn submodules_and_worktrees_are_listed() {
+        let lib = Repo::new();
+        commit(&lib, "l.txt", "l\n", "lib");
+        let repo = Repo::new();
+        commit(&repo, "a.txt", "a\n", "first");
+        let url = lib.path().to_string_lossy().into_owned();
+        // `file` transport is refused by default for submodules.
+        repo.git(&[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            &url,
+            "vendor",
+        ]);
+        repo.git(&["commit", "-q", "-m", "add the submodule"]);
+        let modules = block(submodules(repo.path())).unwrap();
+        assert_eq!(modules.len(), 1);
+        assert_eq!(
+            (modules[0].path.as_str(), modules[0].state),
+            ("vendor", ' ')
+        );
+        let side = tempfile::tempdir().unwrap();
+        let dest = side.path().join("wt");
+        repo.git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "other",
+            &dest.to_string_lossy(),
+        ]);
+        let trees = block(worktrees(repo.path())).unwrap();
+        assert_eq!(trees.len(), 2);
+        assert_eq!(trees[1].branch, "other");
     }
 
     fn commit(repo: &Repo, name: &str, text: &str, message: &str) -> String {

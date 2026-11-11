@@ -110,3 +110,47 @@ jobs:
       # reported as warnings; a vulnerability fails the job.
       - run: cargo install --locked cargo-audit --version 0.22.2
       - run: cargo audit
+
+  drivers-live:
+    name: Database drivers (PostgreSQL, MySQL)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: dev
+          POSTGRES_PASSWORD: secret
+          POSTGRES_DB: shop
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U dev -d shop" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: secret
+          MYSQL_DATABASE: shop
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -psecret" --health-interval 5s
+          --health-timeout 5s --health-retries 20
+    env:
+      SE_PG_TEST: 127.0.0.1:5432:shop:dev:secret
+      SIMPLEEDIT_TEST_MYSQL: 127.0.0.1:3306:root:secret:shop
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - name: Install Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxkbcommon-dev libvulkan-dev
+      - run: cargo build --locked --bins
+      - name: Driver tests against the real servers
+        env:
+          SIMPLEEDIT_DB_DRIVER: ${{ github.workspace }}/target/debug/simpleedit-db-postgres
+        run: |
+          cargo test --locked --test sql_drivers
+          cargo test --locked --bin simpleedit live_ -- --ignored

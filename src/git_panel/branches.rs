@@ -687,6 +687,18 @@ impl Panel {
                 t!("git.repos").to_string(),
                 GitMsg::Tool(super::tools::ToolMsg::OpenRepos)
             ),
+            act_msg(
+                t!("git.trees_action").to_string(),
+                GitMsg::Tool(super::tools::ToolMsg::OpenTrees)
+            ),
+            act_msg(
+                t!("git.clone_action").to_string(),
+                GitMsg::Tool(super::tools::ToolMsg::OpenClone)
+            ),
+            act_msg(
+                t!("git.clean_action").to_string(),
+                GitMsg::Tool(super::tools::ToolMsg::OpenClean)
+            ),
             notice,
         ]
         .spacing(4)
