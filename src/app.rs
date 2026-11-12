@@ -1950,15 +1950,20 @@ impl SimpleEditApp {
             );
             // Under the dropdown and below the menu bar (its titles stay
             // clickable), anywhere else closes the menu.
+            // Both layers are opaque: the pointer must not reach the editor
+            // beneath (its hover over a word would close the menu), nor a
+            // click in the gaps between the entries the area that closes it.
             let outside = column![
                 Space::new().height(bounds.y + bounds.height),
-                iced::widget::mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
-                    .on_press(Message::CloseMenu)
-                    .on_right_press(Message::CloseMenu),
+                iced::widget::opaque(
+                    iced::widget::mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
+                        .on_press(Message::CloseMenu)
+                        .on_right_press(Message::CloseMenu)
+                ),
             ];
             crate::floating::at_point(
                 iced::widget::stack![base, outside],
-                dropdown,
+                iced::widget::opaque(dropdown),
                 bounds.x,
                 bounds.y + bounds.height,
             )
@@ -2390,7 +2395,12 @@ impl Message {
             | Message::HintAnswer(..)
             | Message::CompletionWheel(_)
             | Message::CompletionResolved(..)
-            | Message::CompletionBusy(..) => true,
+            | Message::CompletionBusy(..)
+            | Message::SymbolHover(_)
+            | Message::SymbolHoverLoaded(..)
+            // The poll for files sent by another instance ticks every
+            // 300 ms; a file it brings opens through its own messages.
+            | Message::IpcPoll => true,
             _ => false,
         }
     }

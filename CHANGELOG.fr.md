@@ -1,5 +1,11 @@
 # Journal des modifications
 
+## [1.26.1] - 2026-11-12
+
+### Corrigé
+- Les menus de la barre de menus ne se ferment plus seuls quand le pointeur descend dedans : la vérification des fichiers envoyés par une autre fenêtre, ou le pointeur qui atteignait l'éditeur entre deux entrées, les fermait, et « Vérifier les mises à jour » était hors d'atteinte dans le menu Aide.
+- Git : l'aperçu de `git clean` liste les fichiers à supprimer quand Git parle une autre langue que l'anglais.
+
 ## [1.26.0] - 2026-11-11
 
 ### Ajouté

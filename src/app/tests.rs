@@ -47,6 +47,9 @@ mod behavior_tests {
             Message::LintCloseCheck(0),
             Message::FinderFiles(Vec::new()),
             Message::FindResults(0, Ok(Vec::new())),
+            Message::SymbolHover(None),
+            Message::SymbolHoverLoaded(0, iced::Point::ORIGIN, Ok(None)),
+            Message::IpcPoll,
         ] {
             let _ = app.update(message);
             assert_eq!(app.open_menu, Some(TopMenu::Edit));
@@ -54,6 +57,41 @@ mod behavior_tests {
         // A real action closes it.
         let _ = app.update(Message::ToggleSidebar);
         assert_eq!(app.open_menu, None);
+    }
+
+    #[test]
+    fn the_pointer_in_an_open_menu_does_not_reach_what_lies_beneath() {
+        let mut app = app();
+        let _ = app.handle(Message::ToggleMenu(TopMenu::Help));
+        let anchor =
+            iced::Rectangle::new(iced::Point::new(200.0, 8.0), iced::Size::new(50.0, 26.0));
+        let _ = app.handle(Message::MenuBounds(TopMenu::Help, Some(anchor)));
+        let mut ui =
+            iced_test::Simulator::with_size(iced::Settings::default(), (1280.0, 800.0), app.view());
+        // The card's padding, between its edge and the first entry: neither
+        // an entry nor the area outside that closes the menu.
+        ui.point_at(iced::Point::new(
+            anchor.x + 2.0,
+            anchor.y + anchor.height + 2.0,
+        ));
+        let _ = ui.simulate(iced_test::simulator::click());
+        // Far below the card, over the editor: the click closes the menu,
+        // and nothing else hears the pointer.
+        ui.point_at(iced::Point::new(600.0, 500.0));
+        let _ = ui.simulate(iced_test::simulator::click());
+        let messages: Vec<Message> = ui.into_messages().collect();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| matches!(m, Message::CloseMenu))
+                .count(),
+            1,
+            "{messages:?}"
+        );
+        assert!(
+            messages.iter().all(|m| matches!(m, Message::CloseMenu)),
+            "{messages:?}"
+        );
     }
 
     #[test]

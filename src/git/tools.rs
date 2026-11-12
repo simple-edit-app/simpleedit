@@ -37,7 +37,8 @@ pub async fn clean_preview(repo: &Path, ignored: bool) -> Result<Vec<String>, St
     if ignored {
         args.push("-x");
     }
-    let out = run(repo, &args).await?;
+    // The lines are read in English, whatever the user's language.
+    let out = run_with(repo, &args, None, &[("LC_ALL", "C")]).await?;
     Ok(out
         .lines()
         .filter_map(|l| l.strip_prefix("Would remove "))

@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.26.1] - 2026-11-12
+
+### Fixed
+- The menus of the menu bar no longer close by themselves while the pointer moves down them: the check for files sent by another window, or the pointer reaching the editor between two entries, closed them, and "Check for updates" could not be reached in the Help menu.
+- Git: the preview of `git clean` lists the files to remove when Git speaks another language than English.
+
 ## [1.26.0] - 2026-11-11
 
 ### Added

@@ -553,6 +553,23 @@ fn excerpt(line: &str, start: usize, len: usize) -> (String, (usize, usize)) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    fn thread_time() -> std::time::Duration {
+        let mut at = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `at` is a valid timespec for the call to fill.
+        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut at) };
+        std::time::Duration::new(at.tv_sec as u64, at.tv_nsec as u32)
+    }
+
+    #[cfg(not(unix))]
+    fn thread_time() -> std::time::Duration {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        START.get_or_init(std::time::Instant::now).elapsed()
+    }
+
     /// A big project: the whole list is ranked for a query within a frame.
     #[test]
     fn two_hundred_thousand_paths_are_ranked_fast_enough_for_a_keystroke() {
@@ -566,15 +583,19 @@ mod tests {
             })
             .collect();
         let query = prepare_query("mod42cmp7file9");
-        let started = std::time::Instant::now();
+        // The time this thread spends ranking, not the time on the clock: the
+        // other tests share the processor and would count otherwise.
+        let started = thread_time();
         let hits = paths
             .iter()
             .filter_map(|p| score_prepared(&query, p))
             .count();
-        let took = started.elapsed();
+        let took = thread_time() - started;
         assert!(hits > 0);
-        // Unoptimised test builds are the slowest: still well under a second.
-        assert!(took < std::time::Duration::from_millis(1500), "{took:?}");
+        // Unoptimised test builds are the slowest: about 1.5 s with every core
+        // busy, a few milliseconds once optimised. A ranking gone quadratic
+        // would take minutes.
+        assert!(took < std::time::Duration::from_secs(3), "{took:?}");
     }
 
     #[test]
