@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.26.2] - 2026-11-12
+
+### Fixed
+- The window no longer freezes for tens of seconds when a big project is opened: on Linux the watcher of the disk walked every folder, `node_modules` and `.git/objects` included, while the window waited. Only the folders that matter are watched now, and the folders made later in turn.
+
 ## [1.26.1] - 2026-11-12
 
 ### Fixed

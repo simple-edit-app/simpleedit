@@ -1,5 +1,10 @@
 # Journal des modifications
 
+## [1.26.2] - 2026-11-12
+
+### Corrigé
+- La fenêtre ne se fige plus pendant des dizaines de secondes à l'ouverture d'un gros projet : sous Linux, l'observateur du disque parcourait tous les dossiers, `node_modules` et `.git/objects` compris, pendant que la fenêtre attendait. Seuls les dossiers utiles sont surveillés désormais, et les dossiers créés ensuite à leur tour.
+
 ## [1.26.1] - 2026-11-12
 
 ### Corrigé

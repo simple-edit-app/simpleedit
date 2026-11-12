@@ -5037,7 +5037,7 @@ dependencies = [
 
 [[package]]
 name = "simpleedit"
-version = "1.26.1"
+version = "1.26.2"
 dependencies = [
  "chrono",
  "dirs",
