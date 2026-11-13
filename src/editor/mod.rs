@@ -571,7 +571,7 @@ pub mod statusbar {
         pub dark: bool,
         /// Cursor as (line, column in characters), both from 0.
         pub cursor: (usize, usize),
-        pub line_ending: &'a str,
+        pub line_ending: String,
         pub language: Option<&'a str>,
         pub selection: Option<String>,
         pub file_size: Option<u64>,
@@ -730,10 +730,7 @@ pub mod statusbar {
                     .color(muted),
             )
             .push(choice(indent, crate::app::TextOption::Indent))
-            .push(choice(
-                info.line_ending.to_string(),
-                crate::app::TextOption::LineEnding,
-            ))
+            .push(choice(info.line_ending, crate::app::TextOption::LineEnding))
             .push(choice(
                 info.encoding.to_string(),
                 crate::app::TextOption::Encoding,

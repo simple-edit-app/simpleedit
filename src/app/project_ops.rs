@@ -50,6 +50,49 @@ fn copy_all(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Moves a file or folder. Onto another disk a rename is refused ("Invalid
+/// cross-device link"): it is copied, then the original is removed.
+fn move_path(from: &Path, to: &Path) -> std::io::Result<()> {
+    match std::fs::rename(from, to) {
+        Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {
+            copy_cleanly(from, to).map_err(std::io::Error::other)?;
+            let kind = std::fs::symlink_metadata(from)?.file_type();
+            let removed = if kind.is_dir() {
+                std::fs::remove_dir_all(from)
+            } else {
+                std::fs::remove_file(from)
+            };
+            // The original could not go: only one of them must remain.
+            removed.inspect_err(|_| {
+                let _ = if to.is_dir() {
+                    std::fs::remove_dir_all(to)
+                } else {
+                    std::fs::remove_file(to)
+                };
+            })
+        }
+        other => other,
+    }
+}
+
+/// `copy_all`, and what was made of the copy is removed if it fails (a full
+/// disk, a right missing): half a folder is not left behind. `to` is a name
+/// that did not exist.
+fn copy_cleanly(from: &Path, to: &Path) -> Result<(), String> {
+    // Never touch what was there already.
+    if std::fs::symlink_metadata(to).is_ok() {
+        return Err(format!("{}: already exists", to.display()));
+    }
+    copy_all(from, to).map_err(|e| {
+        let _ = match std::fs::symlink_metadata(to) {
+            Ok(m) if m.is_dir() => std::fs::remove_dir_all(to),
+            Ok(_) => std::fs::remove_file(to),
+            Err(_) => Ok(()),
+        };
+        e.to_string()
+    })
+}
+
 #[cfg(unix)]
 fn copy_link(from: &Path, to: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(std::fs::read_link(from)?, to)
@@ -174,19 +217,40 @@ impl SimpleEditApp {
                 Task::none()
             }
             NameFor::Rename(old) => self.rename_entry(old, target),
-            NameFor::Duplicate(from) => match copy_all(&from, &target) {
-                Ok(()) => {
-                    self.projects.refresh(true);
-                    if target.is_file() {
-                        return self.activate(target);
-                    }
-                    Task::none()
+            // A big folder takes a while: the window goes on meanwhile.
+            NameFor::Duplicate(from) => {
+                let to = target.clone();
+                Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || copy_cleanly(&from, &to))
+                            .await
+                            .map_err(|e| e.to_string())?
+                    },
+                    move |result| Message::EntryDuplicated(target.clone(), result),
+                )
+            }
+        }
+    }
+
+    /// A copy is made (or failed, and cleaned away).
+    pub(super) fn entry_duplicated(
+        &mut self,
+        target: PathBuf,
+        result: Result<(), String>,
+    ) -> Task<Message> {
+        match result {
+            Ok(()) => {
+                self.projects.refresh(true);
+                if target.is_file() {
+                    return self.activate(target);
                 }
-                Err(e) => {
-                    self.set_status(format!("{}: {e}", t!("status.error")), true);
-                    Task::none()
-                }
-            },
+                Task::none()
+            }
+            Err(e) => {
+                self.projects.refresh(true);
+                self.set_status(format!("{}: {e}", t!("status.error")), true);
+                Task::none()
+            }
         }
     }
 
@@ -210,7 +274,7 @@ impl SimpleEditApp {
             .filter(|c| c.starts_with(&old))
             .and_then(|c| c.strip_prefix(&old).ok().map(|rest| new.join(rest)));
         // Renamed first: the tabs stay as they are when it fails.
-        if let Err(e) = std::fs::rename(&old, &new) {
+        if let Err(e) = move_path(&old, &new) {
             self.set_status(format!("{}: {e}", t!("status.error")), true);
             return Task::none();
         }
@@ -221,11 +285,20 @@ impl SimpleEditApp {
                 Err(_) => p.to_path_buf(),
             }
         };
-        // The tabs that are not in the editor follow to the new path.
-        for p in inside
-            .iter()
-            .filter(|p| self.current_file.as_ref() != Some(*p))
-        {
+        // The tab in front goes back to the cache first, with its undo
+        // history: it follows to the new path like the others.
+        let mut tasks: Vec<Task<Message>> = Vec::new();
+        if let Some(current) = self.current_file.clone().filter(|c| inside.contains(c)) {
+            // The language servers let go of the old name.
+            tasks.push(Task::future(crate::lsp::did_close(current)).discard());
+            self.stash_current();
+            self.current_file = None;
+            self.is_dirty = false;
+            self.saved_fp = None;
+            self.disk_stamp = None;
+        }
+        // The tabs follow to the new path.
+        for p in inside.iter() {
             let to = moved(p);
             self.sidebar.rename_file(p, to.clone());
             if let Some(buffer) = self.file_cache.remove(p) {
@@ -240,10 +313,6 @@ impl SimpleEditApp {
             if self.preview_tab.as_ref() == Some(p) {
                 self.preview_tab = Some(to);
             }
-        }
-        let mut tasks: Vec<Task<Message>> = Vec::new();
-        if let Some(current) = self.current_file.clone().filter(|c| inside.contains(c)) {
-            tasks.push(self.close_path(current));
         }
         for closed in &mut self.closed_tabs {
             *closed = moved(closed);
@@ -288,18 +357,23 @@ impl SimpleEditApp {
         let days = self.config.local_history_days;
         tasks.push(Task::perform(
             async move {
-                if days > 0 {
-                    if let Some(store) = crate::local_history::Store::global() {
-                        store.record_tree(&dir, crate::local_history::now());
-                    }
-                }
                 let target = dir.clone();
-                tokio::task::spawn_blocking(move || crate::fsutil::trash_or_remove(&target))
-                    .await
-                    .map_err(|e| std::io::Error::other(e.to_string()))
-                    .and_then(|r| r)
-                    .map(|()| dir.clone())
-                    .map_err(|e| format!("{}: {e}", dir.display()))
+                // The files are read for the history (up to 2000) and the
+                // folder removed on a thread made for blocking work, not on
+                // one of the runtime.
+                tokio::task::spawn_blocking(move || {
+                    if days > 0 {
+                        if let Some(store) = crate::local_history::Store::global() {
+                            store.record_tree(&target, crate::local_history::now());
+                        }
+                    }
+                    crate::fsutil::trash_or_remove(&target)
+                })
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))
+                .and_then(|r| r)
+                .map(|()| dir.clone())
+                .map_err(|e| format!("{}: {e}", dir.display()))
             },
             Message::FolderDeleted,
         ));
@@ -428,6 +502,61 @@ mod tests {
     }
 
     #[test]
+    fn a_copy_that_fails_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("from");
+        std::fs::create_dir_all(from.join("a")).unwrap();
+        std::fs::write(from.join("a/ok.txt"), "x").unwrap();
+        // What is already there is never removed.
+        let taken = dir.path().join("taken");
+        std::fs::create_dir(&taken).unwrap();
+        assert!(copy_cleanly(&from, &taken).is_err());
+        assert!(taken.exists());
+        // A folder that cannot be read stops the copy: no half of it stays.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let unreadable = from.join("a");
+            std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let fresh = dir.path().join("fresh");
+            let failed = copy_cleanly(&from, &fresh);
+            std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // (Run as root nothing is unreadable: then the copy simply works.)
+            if failed.is_err() {
+                assert!(!fresh.exists(), "no half copy");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_move_to_another_disk_is_a_copy_then_a_removal() {
+        // /dev/shm is another filesystem than the temporary folder on most
+        // systems; where it is not, there is nothing to check.
+        let Ok(other) = tempfile::tempdir_in("/dev/shm") else {
+            return;
+        };
+        let here = tempfile::tempdir().unwrap();
+        let source = other.path().join("dir");
+        std::fs::create_dir_all(source.join("sub")).unwrap();
+        std::fs::write(source.join("sub/f.txt"), "x").unwrap();
+        let probe = other.path().join("probe");
+        std::fs::write(&probe, "").unwrap();
+        let crosses = std::fs::rename(&probe, here.path().join("probe"))
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::CrossesDevices);
+        if !crosses {
+            return;
+        }
+        let target = here.path().join("moved");
+        move_path(&source, &target).unwrap();
+        assert!(!source.exists());
+        assert_eq!(
+            std::fs::read_to_string(target.join("sub/f.txt")).unwrap(),
+            "x"
+        );
+    }
+
+    #[test]
     fn a_name_is_one_name_and_not_a_path() {
         assert!(valid_name("main.rs") && valid_name(".env") && valid_name("a b"));
         for bad in ["", ".", "..", "a/b", "a\\b", " a", "a "] {
@@ -473,11 +602,15 @@ mod tests {
         assert_eq!(dialog.input, "main copy.rs");
         let _ = app.update(Message::ProjectNameSubmit);
         let copy = dir.path().join("src/main copy.rs");
+        // The copy is made off the interface thread; it is run here.
+        copy_cleanly(&file, &copy).unwrap();
+        let _ = app.update(Message::EntryDuplicated(copy.clone(), Ok(())));
         assert_eq!(std::fs::read_to_string(&copy).unwrap(), "fn main() {}\n");
         assert_eq!(app.pending_open.as_ref(), Some(&copy), "the copy opens");
         // A folder, with what is in it.
         let _ = app.update(Message::DuplicateEntry(dir.path().join("src")));
         type_name(&mut app, "lib");
+        copy_cleanly(&dir.path().join("src"), &dir.path().join("lib")).unwrap();
         assert!(dir.path().join("lib/main.rs").is_file());
         assert!(
             dir.path().join("src/main.rs").is_file(),
@@ -508,7 +641,9 @@ mod tests {
         let new = dir.path().join("src/app.rs");
         assert!(new.is_file() && !old.exists());
         assert!(!app.sidebar.files().contains(&old));
-        assert_eq!(app.pending_open.as_ref(), Some(&new), "opened again");
+        // The tab moved with its buffer (and its undo history): no re-read.
+        assert_eq!(app.current_file.as_ref(), Some(&new));
+        assert_eq!(app.editor.content.text(), "fn main() {}\n");
         assert!(app.projects.rows().iter().any(|r| r.entry.name == "app.rs"));
     }
 

@@ -367,14 +367,15 @@ impl SimpleEditApp {
                 if requests.is_empty() {
                     return Task::none();
                 }
+                // A run is on its way: its status stays, nothing starts twice.
+                if self.api.run.is_some() {
+                    return Task::none();
+                }
                 let name = collection.name.clone();
                 self.set_status(
                     t!("api.running", name = name.as_str(), n = requests.len()),
                     false,
                 );
-                if self.api.run.is_some() {
-                    return Task::none();
-                }
                 let (task, handle) = Task::perform(
                     checks::run_all(requests, self.api.variables()),
                     move |(results, kept)| {

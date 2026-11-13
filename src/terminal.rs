@@ -360,7 +360,27 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         if let Ok(mut child) = self.child.lock() {
+            // The shell leads a group of its own: what it started (a dev
+            // server) is asked to end too, and forced after a delay, not
+            // left orphaned.
+            #[cfg(unix)]
+            let group = child.process_id().map(|pid| pid as i32);
+            #[cfg(unix)]
+            if let Some(id) = group {
+                // SAFETY: a signal to a process group has no memory effect.
+                unsafe { libc::killpg(id, libc::SIGTERM) };
+            }
             let _ = child.kill();
+            // Reaped: a dead shell is not left a zombie.
+            let _ = child.wait();
+            #[cfg(unix)]
+            if let Some(id) = group {
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    // SAFETY: as above; nothing happens if the group is gone.
+                    unsafe { libc::killpg(id, libc::SIGKILL) };
+                });
+            }
         }
     }
 }
@@ -1095,6 +1115,38 @@ mod tests {
 
     fn bytes(key: Key, modifiers: Modifiers, text: Option<&str>) -> Option<Vec<u8>> {
         encode_key(&key, modifiers, text, false)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closing_a_terminal_ends_what_its_shell_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("pid");
+        let mut command = CommandBuilder::new("sh");
+        command.arg("-c");
+        command.arg(format!("sleep 300 & echo $! > '{}'; wait", file.display()));
+        let session = Session::spawn_command(command, 24, 80).unwrap();
+        let wait_for = |what: &dyn Fn() -> bool| {
+            for _ in 0..100 {
+                if what() {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            false
+        };
+        let pid_of = || {
+            std::fs::read_to_string(&file)
+                .ok()
+                .and_then(|t| t.trim().parse::<i32>().ok())
+        };
+        assert!(wait_for(&|| pid_of().is_some()), "the shell started it");
+        let pid = pid_of().unwrap();
+        // SAFETY: signal 0 only tests that the process exists.
+        let alive = || unsafe { libc::kill(pid, 0) } == 0;
+        assert!(alive());
+        drop(session);
+        assert!(wait_for(&|| !alive()), "it did not outlive the terminal");
     }
 
     #[test]

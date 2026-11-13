@@ -270,8 +270,11 @@ pub enum DbMsg {
     ImportStructure(Done<protocol::Structure>),
     ImportPick,
     ImportPicked(Option<PathBuf>),
+    /// The start of the file picked, read in the background.
+    ImportRead(PathBuf, Result<Vec<u8>, String>),
     ImportFormat(import::Format),
     ImportDelimiter(char),
+    ImportEncoding(crate::tabs::Encoding),
     ImportHeader(bool),
     ImportEmptyNull(bool),
     ImportMap(usize, Option<String>),
@@ -356,6 +359,10 @@ pub struct Import {
     pub delimiter: char,
     pub header: bool,
     pub empty_null: bool,
+    /// How the bytes of the file are read.
+    pub encoding: crate::tabs::Encoding,
+    /// The start of the file as it is on disk, to read it in another encoding.
+    pub raw: Vec<u8>,
     /// What was read of the file, to cut it again when an option changes.
     pub text: String,
     pub sample: import::Sample,
@@ -1589,6 +1596,8 @@ pub async fn copy_table(
             header: true,
             file_columns: shape.columns.len(),
             empty_null: false,
+            // The copy of a table was written by this program.
+            encoding: "UTF-8".into(),
             mapping: shape
                 .columns
                 .iter()
@@ -4456,6 +4465,7 @@ mod tests {
                 header: true,
                 file_columns: 2,
                 empty_null: true,
+                encoding: "UTF-8".into(),
                 mapping: vec![
                     protocol::ImportColumn {
                         index: 0,

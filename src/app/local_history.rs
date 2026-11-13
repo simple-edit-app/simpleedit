@@ -80,6 +80,48 @@ pub(super) fn record_before_delete(path: &Path, days: u32) {
     }
 }
 
+/// A file on disk that a revert put back.
+#[derive(Debug, Clone)]
+pub struct Reverted {
+    path: PathBuf,
+    /// What it held (`None`: it was gone).
+    before: Option<String>,
+    after: String,
+    result: Result<(), String>,
+}
+
+/// Puts files back to a text, in the encoding each has (a file that is gone
+/// is made again). Each is written whole or not at all.
+fn revert_on_disk(files: Vec<(PathBuf, String)>) -> Vec<Reverted> {
+    files
+        .into_iter()
+        .map(|(path, after)| {
+            let read = std::fs::read(&path)
+                .ok()
+                .and_then(|b| crate::finder::decode_file(&b));
+            let result = match &read {
+                Some((_, encoding)) => encoding
+                    .encode(&after)
+                    .ok_or_else(|| path.display().to_string())
+                    .and_then(|bytes| {
+                        crate::fsutil::write_atomic(&path, &bytes, false).map_err(|e| e.to_string())
+                    }),
+                None => path
+                    .parent()
+                    .map_or(Ok(()), std::fs::create_dir_all)
+                    .and_then(|()| crate::fsutil::write_atomic(&path, after.as_bytes(), false))
+                    .map_err(|e| e.to_string()),
+            };
+            Reverted {
+                before: read.map(|(text, _)| text),
+                path,
+                after,
+                result,
+            }
+        })
+        .collect()
+}
+
 impl SimpleEditApp {
     fn history_on(&self) -> bool {
         self.config.local_history_days > 0
@@ -372,7 +414,7 @@ impl SimpleEditApp {
                 if let Some(dir) = path.parent() {
                     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
                 }
-                std::fs::write(path, new).map_err(|e| e.to_string())
+                crate::fsutil::write_atomic(path, new.as_bytes(), false).map_err(|e| e.to_string())
             }
         }
     }
@@ -398,13 +440,62 @@ impl SimpleEditApp {
         self.history_label(t!("history.auto_revert").to_string(), true);
         let mut done = 0;
         let mut failed = None;
+        // What an editor or a tab holds is put back here; the files on disk
+        // (there may be hundreds) in the background.
+        let mut on_disk: Vec<(PathBuf, String)> = Vec::new();
         for (path, text) in targets {
+            let held = self.current_file.as_deref() == Some(path.as_path())
+                || self
+                    .file_cache
+                    .get(&path)
+                    .is_some_and(|b| b.content.is_some());
+            if !held {
+                on_disk.push((path, text));
+                continue;
+            }
             match self.history_put(&path, &text) {
                 Ok(()) => done += 1,
                 Err(e) => failed = Some(e),
             }
         }
         self.overlay = ActiveOverlay::None;
+        if on_disk.is_empty() {
+            return self.history_reverted(done, failed, Vec::new());
+        }
+        // The tests have no runtime to run a task: it is done on the spot.
+        if cfg!(test) {
+            let written = revert_on_disk(on_disk);
+            return self.history_reverted(done, failed, written);
+        }
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || revert_on_disk(on_disk))
+                    .await
+                    .unwrap_or_default()
+            },
+            move |written| Message::HistoryReverted(done, failed.clone(), written),
+        )
+    }
+
+    /// The files of a revert are back: the bookmarks follow, and it is told.
+    pub(super) fn history_reverted(
+        &mut self,
+        mut done: usize,
+        mut failed: Option<String>,
+        written: Vec<Reverted>,
+    ) -> Task<Message> {
+        for w in written {
+            match w.result {
+                Ok(()) => {
+                    done += 1;
+                    if let Some(before) = &w.before {
+                        self.history_record(&w.path, before);
+                        self.bookmarks.remap(&w.path, before, &w.after);
+                    }
+                }
+                Err(e) => failed = Some(e),
+            }
+        }
         match failed {
             Some(e) => self.set_status(format!("{}: {e}", t!("status.error")), true),
             None => {

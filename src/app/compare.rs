@@ -59,14 +59,40 @@ impl SimpleEditApp {
 
     /// What is on disk against what is in the editor.
     pub(super) fn compare_with_disk(&mut self) -> Task<Message> {
-        let (Some(path), Some(right)) = (self.current_file.clone(), self.compare_current()) else {
+        let Some(path) = self.current_file.clone() else {
             return Task::none();
         };
-        match file_io::read_decoded(&path) {
-            Ok((raw, _)) => {
-                let disk = TextFormat::decode(&raw).0;
-                self.open_comparison((t!("compare.on_disk").to_string(), disk), right)
-            }
+        // Read off the interface thread, in the encoding of the tab: the
+        // detected one could differ and show differences that are not there.
+        let encoding = self.format.encoding;
+        let read = move || {
+            let bytes = file_io::read_bytes(&path)?;
+            let raw = encoding
+                .decode(&bytes)
+                .unwrap_or_else(|| crate::tabs::Encoding::detect(&bytes).0);
+            Ok(TextFormat::decode(&raw).0)
+        };
+        // The tests have no runtime to run a task: it is done on the spot.
+        if cfg!(test) {
+            return self.compare_disk_read(read());
+        }
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(read)
+                    .await
+                    .map_err(|e| e.to_string())?
+            },
+            Message::CompareDiskRead,
+        )
+    }
+
+    /// The file as it is on disk has been read: it is set against the editor.
+    pub(super) fn compare_disk_read(&mut self, result: Result<String, String>) -> Task<Message> {
+        let Some(right) = self.compare_current() else {
+            return Task::none();
+        };
+        match result {
+            Ok(disk) => self.open_comparison((t!("compare.on_disk").to_string(), disk), right),
             Err(e) => {
                 self.set_status(format!("{}: {e}", t!("status.error")), true);
                 Task::none()

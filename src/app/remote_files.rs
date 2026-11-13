@@ -416,6 +416,32 @@ mod tests {
     }
 
     #[test]
+    fn the_link_to_the_remote_file_survives_a_restart() {
+        let mut app = app();
+        let local = PathBuf::from("/tmp/simpleedit-test-link/f.txt");
+        app.sidebar.add_file(local.clone());
+        app.remote_files.insert(
+            local.clone(),
+            (
+                RemoteFile {
+                    host: "me@box".into(),
+                    path: "/srv/f.txt".into(),
+                },
+                Some(7),
+            ),
+        );
+        let session = app.build_session();
+        let json = session.to_json().unwrap();
+        let back: crate::session::Session = serde_json::from_str(&json).unwrap();
+        let mut fresh = SimpleEditApp::blank(Config::default());
+        let _ = fresh.restore_session(back);
+        let (file, date) = fresh.remote_files.get(&local).expect("the link");
+        assert_eq!(file.host, "me@box");
+        assert_eq!(file.path, "/srv/f.txt");
+        assert_eq!(*date, Some(7));
+    }
+
+    #[test]
     fn a_failed_download_stays_in_the_window() {
         let mut app = app();
         let _ = app.update(Message::OpenRemote);

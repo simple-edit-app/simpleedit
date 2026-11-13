@@ -23,163 +23,7 @@ impl LineEnding {
     }
 }
 
-/// The character encoding of a file; the editor holds Unicode, this is
-/// applied again when saving.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Encoding {
-    #[default]
-    Utf8,
-    Utf8Bom,
-    Utf16Le,
-    Utf16Be,
-    Windows1252,
-    Latin1,
-    Latin9,
-}
-
-/// What Windows-1252 puts at 0x80..=0x9F (the controls where it has no
-/// character).
-const CP1252_HIGH: [char; 32] = [
-    '€', '\u{81}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{8d}', 'Ž', '\u{8f}',
-    '\u{90}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\u{9d}', 'ž', 'Ÿ',
-];
-
-impl Encoding {
-    pub const ALL: [Encoding; 7] = [
-        Encoding::Utf8,
-        Encoding::Utf8Bom,
-        Encoding::Utf16Le,
-        Encoding::Utf16Be,
-        Encoding::Windows1252,
-        Encoding::Latin1,
-        Encoding::Latin9,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Encoding::Utf8 => "UTF-8",
-            Encoding::Utf8Bom => "UTF-8 BOM",
-            Encoding::Utf16Le => "UTF-16 LE",
-            Encoding::Utf16Be => "UTF-16 BE",
-            Encoding::Windows1252 => "Windows-1252",
-            Encoding::Latin1 => "ISO-8859-1",
-            Encoding::Latin9 => "ISO-8859-15",
-        }
-    }
-
-    /// The character a byte stands for in a one-byte encoding.
-    fn single(self, byte: u8) -> char {
-        match (self, byte) {
-            (Encoding::Windows1252, 0x80..=0x9f) => CP1252_HIGH[(byte - 0x80) as usize],
-            (Encoding::Latin9, 0xa4) => '€',
-            (Encoding::Latin9, 0xa6) => 'Š',
-            (Encoding::Latin9, 0xa8) => 'š',
-            (Encoding::Latin9, 0xb4) => 'Ž',
-            (Encoding::Latin9, 0xb8) => 'ž',
-            (Encoding::Latin9, 0xbc) => 'Œ',
-            (Encoding::Latin9, 0xbd) => 'œ',
-            (Encoding::Latin9, 0xbe) => 'Ÿ',
-            _ => byte as char,
-        }
-    }
-
-    /// The text of `bytes` read as this encoding; `None` if they are not
-    /// valid in it (only UTF-8 and UTF-16 can be wrong).
-    pub fn decode(self, bytes: &[u8]) -> Option<String> {
-        match self {
-            Encoding::Utf8 => String::from_utf8(bytes.to_vec()).ok(),
-            Encoding::Utf8Bom => {
-                let body = bytes.strip_prefix(&[0xef, 0xbb, 0xbf][..]).unwrap_or(bytes);
-                String::from_utf8(body.to_vec()).ok()
-            }
-            Encoding::Utf16Le | Encoding::Utf16Be => {
-                let big = self == Encoding::Utf16Be;
-                let body = bytes
-                    .strip_prefix(if big {
-                        &[0xfe, 0xff][..]
-                    } else {
-                        &[0xff, 0xfe][..]
-                    })
-                    .unwrap_or(bytes);
-                if body.len() % 2 != 0 {
-                    return None;
-                }
-                let units: Vec<u16> = body
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|c| {
-                        if big {
-                            u16::from_be_bytes([c[0], c[1]])
-                        } else {
-                            u16::from_le_bytes([c[0], c[1]])
-                        }
-                    })
-                    .collect();
-                String::from_utf16(&units).ok()
-            }
-            _ => Some(bytes.iter().map(|b| self.single(*b)).collect()),
-        }
-    }
-
-    /// The encoding a file seems to be in, and its text: a byte order mark
-    /// says, else UTF-8 if it is valid, else Windows-1252.
-    pub fn detect(bytes: &[u8]) -> (String, Encoding) {
-        let by_mark = if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
-            Some(Encoding::Utf8Bom)
-        } else if bytes.starts_with(&[0xff, 0xfe]) {
-            Some(Encoding::Utf16Le)
-        } else if bytes.starts_with(&[0xfe, 0xff]) {
-            Some(Encoding::Utf16Be)
-        } else {
-            None
-        };
-        if let Some(text) = by_mark.and_then(|e| e.decode(bytes).map(|t| (t, e))) {
-            return text;
-        }
-        match String::from_utf8(bytes.to_vec()) {
-            Ok(text) => (text, Encoding::Utf8),
-            Err(_) => (
-                Encoding::Windows1252.decode(bytes).unwrap_or_default(),
-                Encoding::Windows1252,
-            ),
-        }
-    }
-
-    /// The bytes of `text` in this encoding; `None` if a character has none
-    /// in it.
-    pub fn encode(self, text: &str) -> Option<Vec<u8>> {
-        match self {
-            Encoding::Utf8 => Some(text.as_bytes().to_vec()),
-            Encoding::Utf8Bom => {
-                let mut out = vec![0xef, 0xbb, 0xbf];
-                out.extend_from_slice(text.as_bytes());
-                Some(out)
-            }
-            Encoding::Utf16Le | Encoding::Utf16Be => {
-                let big = self == Encoding::Utf16Be;
-                let mut out = if big {
-                    vec![0xfe, 0xff]
-                } else {
-                    vec![0xff, 0xfe]
-                };
-                for unit in text.encode_utf16() {
-                    out.extend_from_slice(&if big {
-                        unit.to_be_bytes()
-                    } else {
-                        unit.to_le_bytes()
-                    });
-                }
-                Some(out)
-            }
-            _ => {
-                let table: std::collections::HashMap<char, u8> =
-                    (0..=255u8).map(|b| (self.single(b), b)).collect();
-                text.chars().map(|c| table.get(&c).copied()).collect()
-            }
-        }
-    }
-}
+pub use crate::encoding::Encoding;
 
 /// How a file stores its text; the editor itself only ever holds `\n`-joined
 /// lines, so this is applied again when saving.
@@ -189,6 +33,9 @@ pub struct TextFormat {
     /// Whether the file ended with a line break.
     pub final_newline: bool,
     pub encoding: Encoding,
+    /// The file mixes line endings (or has a lone `\r`): a save keeps the
+    /// ending of the lines that were not touched, until one is chosen.
+    pub mixed: bool,
 }
 
 impl Default for TextFormat {
@@ -197,6 +44,7 @@ impl Default for TextFormat {
             ending: LineEnding::Lf,
             final_newline: true,
             encoding: Encoding::Utf8,
+            mixed: false,
         }
     }
 }
@@ -213,6 +61,8 @@ impl TextFormat {
         } else {
             LineEnding::Lf
         };
+        let lone_cr = raw.replace("\r\n", "").contains('\r');
+        let mixed = lone_cr || (crlf > 0 && lf > 0);
         let text = if raw.contains('\r') {
             raw.replace("\r\n", "\n").replace('\r', "\n")
         } else {
@@ -225,8 +75,83 @@ impl TextFormat {
                 ending,
                 final_newline,
                 encoding: Encoding::Utf8,
+                mixed,
             },
         )
+    }
+
+    /// Like `encode_bytes`, for a file that mixes line endings: the lines
+    /// that are as the file on disk has them keep their own ending, the
+    /// others (typed, changed) take the dominant one.
+    pub fn encode_bytes_for(self, text: &str, path: &Path) -> Option<Vec<u8>> {
+        if self.mixed {
+            if let Some(original) = std::fs::read(path)
+                .ok()
+                .and_then(|bytes| self.encoding.decode(&bytes))
+            {
+                return self.encoding.encode(&self.encode_keeping(text, &original));
+            }
+        }
+        self.encode_bytes(text)
+    }
+
+    /// The text laid out as `encode` does, but every line the same in
+    /// `original` (as read from disk) keeps the ending it had there.
+    pub fn encode_keeping(self, text: &str, original: &str) -> String {
+        let dominant = match self.ending {
+            LineEnding::Lf => "\n",
+            LineEnding::Crlf => "\r\n",
+        };
+        // The lines of the original, each with its ending.
+        let mut old: Vec<(&str, &str)> = Vec::new();
+        let mut rest = original;
+        while !rest.is_empty() {
+            let end = rest.find(['\r', '\n']).unwrap_or(rest.len());
+            let line = &rest[..end];
+            let tail = &rest[end..];
+            let term = if tail.starts_with("\r\n") {
+                "\r\n"
+            } else if tail.starts_with('\r') {
+                "\r"
+            } else if tail.starts_with('\n') {
+                "\n"
+            } else {
+                ""
+            };
+            old.push((line, term));
+            rest = &tail[term.len()..];
+        }
+        let body = text.strip_suffix('\n').unwrap_or(text);
+        if text.is_empty() {
+            return String::new();
+        }
+        let new: Vec<&str> = body.split('\n').collect();
+        let old_lines: Vec<&str> = old.iter().map(|(l, _)| *l).collect();
+        let mut terms: Vec<&str> = vec![dominant; new.len()];
+        for op in similar::capture_diff_slices(similar::Algorithm::Myers, &old_lines, &new) {
+            if let similar::DiffOp::Equal {
+                old_index,
+                new_index,
+                len,
+            } = op
+            {
+                for k in 0..len {
+                    // The last line of the original may have had none.
+                    if !old[old_index + k].1.is_empty() {
+                        terms[new_index + k] = old[old_index + k].1;
+                    }
+                }
+            }
+        }
+        let mut out = String::with_capacity(body.len() + new.len());
+        for (i, line) in new.iter().enumerate() {
+            out.push_str(line);
+            // The last line has an ending only if the file ends with one.
+            if i + 1 < new.len() || self.final_newline {
+                out.push_str(terms[i]);
+            }
+        }
+        out
     }
 
     /// The bytes to write: the text laid out as the file stores it, in its
@@ -438,11 +363,32 @@ mod encoding_tests {
     }
 
     #[test]
+    fn a_mixed_file_keeps_the_ending_of_the_lines_that_were_not_touched() {
+        let raw = "a\r\nb\nc\rd\r\n";
+        let (text, format) = TextFormat::decode(raw);
+        assert!(format.mixed);
+        assert_eq!(text, "a\nb\nc\nd\n");
+        // Nothing changed: the same bytes.
+        assert_eq!(format.encode_keeping(&text, raw), raw);
+        // One line changed, one added: only those take the dominant ending.
+        let edited = "a\nB\nc\nnew\nd\n";
+        assert_eq!(
+            format.encode_keeping(edited, raw),
+            "a\r\nB\r\nc\rnew\r\nd\r\n"
+        );
+        // A file with one ending is not mixed.
+        assert!(!TextFormat::decode("a\r\nb\r\n").1.mixed);
+        assert!(!TextFormat::decode("a\nb\n").1.mixed);
+        assert!(TextFormat::decode("a\rb").1.mixed);
+    }
+
+    #[test]
     fn a_format_writes_the_layout_then_the_encoding() {
         let format = TextFormat {
             ending: LineEnding::Crlf,
             final_newline: true,
             encoding: Encoding::Latin1,
+            mixed: false,
         };
         assert_eq!(format.encode_bytes("é\n"), Some(vec![0xe9, b'\r', b'\n']));
     }

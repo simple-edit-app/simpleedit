@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.27.0] - 2026-11-13
+
+### Fixed
+- Data: quitting asks first when a table grid has edits waiting for Commit or a merge tab is half settled; "Get from revision" asks before it replaces a file, and keeps the file as it was (Ctrl+Z in a diff, local history); copies of remote (SSH) files go on being sent back after a restart; a file that mixes line endings keeps the ending of the lines that were not touched (the status bar says "Mixed endings" until one is chosen); conflict resolutions, the undo of a hunk, `.gitignore`, the personal dictionary and a file brought back by the local history are written whole or not at all; renaming the open file keeps its undo history.
+- Menus: a build writing in the project, the auto-save, a file rewritten by another program and the output of a task no longer close an open menu; the layers of the menus keep their place in the window so the editor keeps its focus.
+- Databases: "UPDATE/DELETE without WHERE" is no longer fooled by a sub-query or a `WITH`; a CSV in Windows-1252 (Excel) or UTF-16 can be imported, with an encoding choice in the window.
+- API: tokens in headers, parameters and addresses stay out of the history; the keychain is asked once the environments are written, in the background, not at each key.
+- Tasks: compilers speak English to the Problems panel; closing a terminal ends what its shell started; "New window" leaves no zombie process.
+- Files: UTF-16 without a byte order mark opens as text; parts of a file over 64 MiB are read in their encoding and a binary one is refused; "Compare with disk" reads the file in the encoding of the tab; names that are not UTF-8 are listed by Ctrl+P; moving to another disk copies then removes; a failed "Duplicate" removes its half copy; the bookmarks panel shows the text of the tabs; a folder made just now is watched at once; the replaced preview tab is closed for the language servers; "Run collection" during a run keeps its status; the auto-save of a batch counts its files.
+
+### Changed
+- Speed: duplicating a folder, "Replace all", rename of a symbol, a revert of the local history, the reload of the tree, the dictionary, the preview of a search, the encoding change, "Revert" and the file chosen to import run off the interface thread; Ctrl+P keeps the candidates of the query it goes on from; the tree draws only the lines in view; the settings and bookmarks are written by the tick, not at each step; no more poll of 300 ms for files sent by another window; the terminal's frames do not redo the rest of the window.
+
 ## [1.26.2] - 2026-11-12
 
 ### Fixed

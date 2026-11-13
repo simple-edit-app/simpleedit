@@ -328,12 +328,11 @@ impl SimpleEditApp {
         if !self.config.lint_enabled || self.lint.key.is_none() || self.lint.ran.is_empty() {
             return None;
         }
-        let shown: Vec<Diagnostic> = self
-            .visible_problems()
-            .into_iter()
-            .map(|i| self.lint.diagnostics[i].clone())
-            .collect();
-        Some(lint::counts(&shown))
+        Some(lint::counts_of(
+            self.visible_problems()
+                .into_iter()
+                .map(|i| &self.lint.diagnostics[i]),
+        ))
     }
 
     /// Said in the status bar when the language is on but no tool could

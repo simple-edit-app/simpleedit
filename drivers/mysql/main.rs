@@ -11,6 +11,10 @@ mod protocol;
 mod common;
 
 #[allow(dead_code)]
+#[path = "../../src/encoding.rs"]
+mod encoding;
+
+#[allow(dead_code)]
 #[path = "../../src/database/import.rs"]
 mod import;
 #[path = "../common/tunnel.rs"]

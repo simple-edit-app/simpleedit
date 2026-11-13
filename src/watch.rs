@@ -192,7 +192,7 @@ impl Watch {
 
     /// Watches the folders made in the projects since the last time, and what
     /// they hold (a folder moved in, an archive unpacked).
-    fn watch_created(&mut self) {
+    pub fn watch_created(&mut self) {
         let Some(watcher) = self.watcher.as_mut() else {
             return;
         };

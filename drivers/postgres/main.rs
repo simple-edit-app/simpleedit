@@ -15,6 +15,14 @@
 #[path = "../../src/database/protocol.rs"]
 mod protocol;
 
+#[allow(dead_code)]
+#[path = "../../src/encoding.rs"]
+mod encoding;
+
+#[allow(dead_code)]
+#[path = "../../src/database/import.rs"]
+mod import;
+
 use std::cell::RefCell;
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
@@ -1907,7 +1915,17 @@ fn import(client: &mut Client, request: &Request) -> Result<Value, String> {
         let started = Instant::now();
         let loaded = (|| -> Result<u64, String> {
             let mut writer = transaction.copy_in(copy.as_str()).map_err(clean)?;
-            std::io::copy(&mut file, &mut writer).map_err(|e| clean_copy(&e))?;
+            if matches!(spec.encoding.as_str(), "" | "UTF-8") {
+                std::io::copy(&mut file, &mut writer).map_err(|e| clean_copy(&e))?;
+            } else {
+                // Another encoding (Excel writes Windows-1252): the server
+                // is given UTF-8.
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+                let text = import::decode_file(bytes, &spec.encoding)?;
+                std::io::Write::write_all(&mut writer, text.as_bytes())
+                    .map_err(|e| clean_copy(&e))?;
+            }
             writer.finish().map_err(clean)
         })();
         match &loaded {

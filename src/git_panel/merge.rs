@@ -35,6 +35,13 @@ pub struct MergeTab {
     typed_at: Option<Instant>,
 }
 
+impl MergeTab {
+    /// Whether conflicts were settled or edited and not yet applied.
+    pub fn is_modified(&self) -> bool {
+        !self.past.is_empty()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum MergeMsg {
     /// Put a side of conflict `n` into the result.

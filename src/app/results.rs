@@ -40,6 +40,23 @@ pub struct ResultTab {
     pub hits: Vec<Occurrence>,
     pub selected: usize,
     pub pinned: bool,
+    /// Changes with the list of matches (not with what is left out): the
+    /// layout below is made again only then.
+    rev: u64,
+    layout: std::cell::RefCell<Option<KeptLayout>>,
+}
+
+/// The layout of a list, as of a revision and a way of grouping.
+type KeptLayout = (u64, bool, std::rc::Rc<Vec<(Line, f32)>>);
+
+/// A line of the list, by the match it comes from.
+#[derive(Debug, Clone, Copy)]
+enum Line {
+    /// The folder of that match.
+    Dir(usize),
+    /// The file of that match, and how many matches it has.
+    File(usize, usize),
+    Hit(usize),
 }
 
 #[derive(Default)]
@@ -98,6 +115,8 @@ impl SimpleEditApp {
             hits,
             selected: 0,
             pinned: false,
+            rev: 0,
+            layout: Default::default(),
         };
         let r = &mut self.results;
         match r.tabs.get_mut(r.active) {
@@ -175,14 +194,28 @@ impl SimpleEditApp {
         };
         let hits: Vec<crate::finder::TextHit> =
             chosen.iter().map(|i| tab.hits[*i].hit.clone()).collect();
-        let (count, files, done) = self.replace_found(&search, &hits);
+        self.replace_found_later(&search, &hits, finder::ReplaceTarget::Results(chosen))
+    }
+
+    /// A replacement from the Results panel is done: what was replaced
+    /// leaves the list.
+    pub(super) fn results_replaced(
+        &mut self,
+        chosen: &[usize],
+        count: usize,
+        files: usize,
+        done: Vec<usize>,
+    ) -> Task<Message> {
         // Only what was replaced leaves the list.
         let left = chosen.len() - done.len();
         if let Some(tab) = self.results_tab() {
             let mut gone: Vec<usize> = done.into_iter().map(|d| chosen[d]).collect();
             gone.sort_unstable();
             for i in gone.into_iter().rev() {
-                tab.hits.remove(i);
+                if i < tab.hits.len() {
+                    tab.hits.remove(i);
+                    tab.rev += 1;
+                }
             }
             tab.selected = tab.selected.min(tab.hits.len().saturating_sub(1));
         }
@@ -244,6 +277,7 @@ impl SimpleEditApp {
                 if let Some(tab) = self.results_tab() {
                     if tab.selected < tab.hits.len() {
                         tab.hits.remove(tab.selected);
+                        tab.rev += 1;
                         tab.selected = tab.selected.min(tab.hits.len().saturating_sub(1));
                     }
                 }
@@ -274,6 +308,7 @@ impl SimpleEditApp {
                 if generation == self.results.generation {
                     if let (Some(tab), Ok(hits)) = (self.results_tab(), found) {
                         tab.hits = hits;
+                        tab.rev += 1;
                         tab.selected = 0;
                     }
                 }
@@ -523,42 +558,49 @@ impl SimpleEditApp {
 
         let mut list = column![].spacing(0);
         if let Some(t) = tab {
-            let per_file = per_file(&t.hits);
             // First the layout, in numbers: each line has a height that does
             // not depend on what it holds, so that only the lines in view
-            // (and a few around) are made into widgets.
-            enum Line<'x> {
-                Dir(Option<&'x Path>),
-                File(&'x Path, usize),
-                Hit(usize),
-            }
-            let mut layout: Vec<(Line, f32)> = Vec::with_capacity(t.hits.len() * 2);
-            {
-                let mut last_dir: Option<&Path> = None;
-                let mut last_file: Option<&Path> = None;
-                for (i, o) in t.hits.iter().enumerate() {
-                    let path = o.hit.path.as_path();
-                    if r.group_dirs {
-                        let dir = path.parent();
-                        if dir != last_dir {
-                            last_dir = dir;
-                            layout.push((Line::Dir(dir), DIR_ROW));
+            // (and a few around) are made into widgets. It is kept until the
+            // list changes.
+            let layout = {
+                let mut kept = t.layout.borrow_mut();
+                match kept.as_ref() {
+                    Some((rev, dirs, layout)) if *rev == t.rev && *dirs == r.group_dirs => {
+                        layout.clone()
+                    }
+                    _ => {
+                        let per_file = per_file(&t.hits);
+                        let mut layout: Vec<(Line, f32)> = Vec::with_capacity(t.hits.len() * 2);
+                        let mut last_dir: Option<&Path> = None;
+                        let mut last_file: Option<&Path> = None;
+                        for (i, o) in t.hits.iter().enumerate() {
+                            let path = o.hit.path.as_path();
+                            if r.group_dirs {
+                                let dir = path.parent();
+                                if dir != last_dir {
+                                    last_dir = dir;
+                                    layout.push((Line::Dir(i), DIR_ROW));
+                                }
+                            }
+                            if Some(path) != last_file {
+                                last_file = Some(path);
+                                let in_file = per_file.get(path).copied().unwrap_or(0);
+                                layout.push((Line::File(i, in_file), FILE_ROW));
+                            }
+                            layout.push((Line::Hit(i), ROW));
                         }
+                        let layout = std::rc::Rc::new(layout);
+                        *kept = Some((t.rev, r.group_dirs, layout.clone()));
+                        layout
                     }
-                    if Some(path) != last_file {
-                        last_file = Some(path);
-                        let in_file = per_file.get(path).copied().unwrap_or(0);
-                        layout.push((Line::File(path, in_file), FILE_ROW));
-                    }
-                    layout.push((Line::Hit(i), ROW));
                 }
-            }
+            };
             let (offset, height) = (r.scrolled, r.view_height.max(120.0));
             let margin = 6.0 * ROW;
             let mut top = 0.0f32;
             let mut above = 0.0f32;
             let mut below = 0.0f32;
-            for (line, h) in &layout {
+            for (line, h) in layout.iter() {
                 let bottom = top + h;
                 if bottom < offset - margin {
                     above += h;
@@ -566,7 +608,8 @@ impl SimpleEditApp {
                     below += h;
                 } else {
                     match line {
-                        Line::Dir(dir) => {
+                        Line::Dir(at) => {
+                            let dir = t.hits[*at].hit.path.parent();
                             list = list.push(
                                 container(
                                     row![
@@ -583,7 +626,8 @@ impl SimpleEditApp {
                                 .padding([0, 8]),
                             );
                         }
-                        Line::File(path, in_file) => {
+                        Line::File(at, in_file) => {
+                            let path = t.hits[*at].hit.path.as_path();
                             let name = path
                                 .file_name()
                                 .map(|n| n.to_string_lossy().into_owned())

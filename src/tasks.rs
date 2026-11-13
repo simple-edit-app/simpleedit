@@ -267,6 +267,11 @@ pub fn run(task: TaskSpec) -> impl iced::futures::Stream<Item = Event> {
         let spawned = command
             .arg(&task.command)
             .current_dir(&task.dir)
+            // The messages of compilers in English: the panel looks for
+            // `error` and `warning` (`erreur :` would go unseen). Only the
+            // messages: the encoding and the rest of the locale stay.
+            .env("LC_MESSAGES", "C")
+            .env_remove("LANGUAGE")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -544,6 +549,26 @@ mod tests {
             "{lines:?}"
         );
         assert_eq!(events.last(), Some(&Event::Done(Some(3))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_task_speaks_english_whatever_the_language_of_the_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let events: Vec<Event> = runtime.block_on(async {
+            run(spec(
+                "t",
+                "echo \"$LC_MESSAGES/${LANGUAGE-unset}\"",
+                dir.path(),
+            ))
+            .collect()
+            .await
+        });
+        assert!(flat(&events).contains(&"C/unset".to_string()));
     }
 
     #[cfg(unix)]

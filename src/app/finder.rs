@@ -123,6 +123,8 @@ pub struct FinderState {
     pub undo: Vec<Written>,
     /// The text of the file of the selected match, for the preview.
     preview: Option<(PathBuf, crate::code_editor::Content)>,
+    /// A file the preview waits for (read in the background).
+    preview_pending: Option<PathBuf>,
     /// The preview was typed in: the list keeps its place when it is looked
     /// at again, and the preview its cursor.
     preview_edited: bool,
@@ -173,6 +175,7 @@ impl Default for FinderState {
             confirm_all: false,
             undo: Vec::new(),
             preview: None,
+            preview_pending: None,
             preview_edited: false,
             keep_selected: false,
             scrolled: 0.0,
@@ -726,14 +729,74 @@ impl SimpleEditApp {
             .as_ref()
             .is_some_and(|(p, _)| *p == path);
         if !same {
-            let text = self.file_text(&path).map(|(t, _)| t).unwrap_or_default();
-            self.finder.preview = Some((path, crate::code_editor::Content::with_text(&text)));
+            // What an editor or a tab holds is at hand; a file is read in
+            // the background (`finder_preview_task`).
+            let held = if self.current_file.as_deref() == Some(path.as_path()) {
+                Some(crate::editor::buffer_text(&self.editor.content))
+            } else {
+                self.file_cache.get(&path).and_then(CachedBuffer::text)
+            };
+            match held {
+                Some(text) => {
+                    self.finder.preview_pending = None;
+                    self.finder.preview =
+                        Some((path, crate::code_editor::Content::with_text(&text)));
+                }
+                None if cfg!(test) => {
+                    let text = self.file_text(&path).map(|(t, _)| t).unwrap_or_default();
+                    self.finder.preview =
+                        Some((path, crate::code_editor::Content::with_text(&text)));
+                }
+                None => {
+                    self.finder.preview = None;
+                    self.finder.preview_pending = Some(path);
+                    return;
+                }
+            }
         }
         if !(same && self.finder.preview_edited) {
             if let Some((_, content)) = self.finder.preview.as_mut() {
                 content.select_bytes(hit.line, hit.col, hit.len);
             }
         }
+    }
+
+    /// Reads, off the interface thread, the file the preview waits for.
+    pub(super) fn finder_preview_task(&mut self) -> Task<Message> {
+        let Some(path) = self.finder.preview_pending.take() else {
+            return Task::none();
+        };
+        let from = path.clone();
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    std::fs::read(&from)
+                        .ok()
+                        .and_then(|b| crate::finder::decode_file(&b))
+                        .map(|(t, _)| t)
+                        .unwrap_or_default()
+                })
+                .await
+                .unwrap_or_default()
+            },
+            move |text| Message::FinderPreviewRead(path.clone(), text),
+        )
+    }
+
+    /// The file of the preview was read: it is shown if still wanted.
+    pub(super) fn finder_preview_read(&mut self, path: PathBuf, text: String) {
+        let Some(hit) = self
+            .finder
+            .hits
+            .get(self.finder.selected)
+            .filter(|o| o.hit.path == path)
+            .map(|o| o.hit.clone())
+        else {
+            return;
+        };
+        let mut content = crate::code_editor::Content::with_text(&text);
+        content.select_bytes(hit.line, hit.col, hit.len);
+        self.finder.preview = Some((path, content));
     }
 
     /// A file's text now (the editor's, a tab's, or the file's), and where
@@ -920,89 +983,166 @@ impl SimpleEditApp {
     /// Replaces, as `search` says, the matches of `chosen` (found by it)
     /// that are still there: in the editor and the tabs (undone with
     /// Ctrl+Z), in the other files on disk (undone with "Undo the
-    /// replacement"). Gives how many matches, in how many files.
-    /// Gives how many matches, in how many files, and which of `chosen` (by
-    /// index) were replaced: not those of a text changed since they were
-    /// found, whose places no longer say which matches were chosen.
+    /// replacement"). Gives how many matches, in how many files, and which of
+    /// `chosen` (by index) were replaced: not those of a text changed since
+    /// they were found, whose places no longer say which matches were chosen.
+    ///
+    /// The files on disk are done here and now: for one match. A replacement
+    /// of many goes through `replace_found_later`.
     pub(super) fn replace_found(
         &mut self,
         search: &Search,
         chosen: &[TextHit],
     ) -> (usize, usize, Vec<usize>) {
-        let Some(replace) = &search.replace else {
-            return (0, 0, Vec::new());
-        };
-        let Ok(re) = crate::find_replace::compile(&search.options) else {
-            return (0, 0, Vec::new());
-        };
-        let mut by_file: Vec<(PathBuf, Vec<usize>)> = Vec::new();
-        for (i, hit) in chosen.iter().enumerate() {
-            match by_file.iter_mut().find(|(p, _)| *p == hit.path) {
-                Some((_, indices)) => indices.push(i),
-                None => by_file.push((hit.path.clone(), vec![i])),
+        let (mut replaced, jobs) = self.replace_in_memory(search, chosen);
+        let disk = replace_on_disk(search.clone(), jobs);
+        self.replace_settle(&mut replaced, disk);
+        (replaced.count, replaced.files, replaced.done)
+    }
+
+    /// The same, with the files on disk read and written off the interface
+    /// thread: `target` says what is done of the answer.
+    pub(super) fn replace_found_later(
+        &mut self,
+        search: &Search,
+        chosen: &[TextHit],
+        target: ReplaceTarget,
+    ) -> Task<Message> {
+        let (mut replaced, jobs) = self.replace_in_memory(search, chosen);
+        replaced.target = target;
+        if jobs.is_empty() {
+            return self.replace_done(replaced, Vec::new());
+        }
+        let search = search.clone();
+        // The tests have no runtime to run a task: it is done on the spot.
+        if cfg!(test) {
+            let disk = replace_on_disk(search, jobs);
+            return self.replace_done(replaced, disk);
+        }
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || replace_on_disk(search, jobs))
+                    .await
+                    .unwrap_or_default()
+            },
+            move |disk| Message::ReplaceDone(Box::new(replaced.clone()), disk),
+        )
+    }
+
+    /// The answer of a replacement that went to disk in the background.
+    pub(super) fn replace_done(
+        &mut self,
+        mut replaced: Replaced,
+        disk: Vec<DiskDone>,
+    ) -> Task<Message> {
+        self.replace_settle(&mut replaced, disk);
+        match replaced.target {
+            ReplaceTarget::Finder => {
+                let (matches, files) = (matches_text(replaced.count), files_text(replaced.files));
+                self.set_status(
+                    t!("findrep.replaced", matches = matches, files = files),
+                    false,
+                );
+                self.search_files(false)
+            }
+            ReplaceTarget::Results(chosen) => {
+                self.results_replaced(&chosen, replaced.count, replaced.files, replaced.done)
             }
         }
-        let (mut count, mut files) = (0, 0);
-        let mut done = Vec::new();
-        let mut written = Vec::new();
+    }
+
+    /// The files held in the editor or a tab are replaced now (in memory);
+    /// those on disk are left as jobs, one per file.
+    fn replace_in_memory(
+        &mut self,
+        search: &Search,
+        chosen: &[TextHit],
+    ) -> (Replaced, Vec<DiskJob>) {
+        let mut replaced = Replaced::default();
+        let Some(replace) = &search.replace else {
+            return (replaced, Vec::new());
+        };
+        let Ok(re) = crate::find_replace::compile(&search.options) else {
+            return (replaced, Vec::new());
+        };
+        // The matches of each file, in the order of the files found.
+        let mut by_file: Vec<(PathBuf, Vec<usize>)> = Vec::new();
+        let mut at: HashMap<&Path, usize> = HashMap::new();
+        for (i, hit) in chosen.iter().enumerate() {
+            match at.get(hit.path.as_path()) {
+                Some(&k) => by_file[k].1.push(i),
+                None => {
+                    at.insert(hit.path.as_path(), by_file.len());
+                    by_file.push((hit.path.clone(), vec![i]));
+                }
+            }
+        }
+        let mut jobs = Vec::new();
         for (path, indices) in by_file {
-            let Some((text, holder)) = self.file_text(&path) else {
+            // Only a file that is open is read here.
+            let held = if self.current_file.as_deref() == Some(path.as_path()) {
+                Some((
+                    crate::editor::buffer_text(&self.editor.content),
+                    Holder::Editor,
+                ))
+            } else {
+                self.file_cache
+                    .get(&path)
+                    .and_then(CachedBuffer::text)
+                    .map(|t| (t, Holder::Tab))
+            };
+            let Some((text, holder)) = held else {
+                jobs.push(DiskJob {
+                    path,
+                    hits: indices
+                        .into_iter()
+                        .map(|i| (i, chosen[i].line, chosen[i].col, chosen[i].stamp))
+                        .collect(),
+                });
                 continue;
             };
-            let stamp = crate::finder::text_stamp(&text);
-            let places: HashMap<(usize, usize), usize> = indices
-                .into_iter()
-                .filter(|&i| chosen[i].stamp == 0 || chosen[i].stamp == stamp)
-                .map(|i| ((chosen[i].line, chosen[i].col), i))
-                .collect();
-            if places.is_empty() {
+            let places = places_of(&text, chosen, &indices);
+            let Some((new, count, done)) =
+                replace_in_text(&re, search, replace, &path, &text, &places)
+            else {
                 continue;
-            }
-            let ext = path
-                .extension()
-                .map(|e| e.to_string_lossy().to_ascii_lowercase())
-                .unwrap_or_default();
-            // Looked for again in the text of now: only the matches that
-            // are still where they were found.
-            let kept: Vec<crate::find_replace::Found> = crate::find_replace::find_in(
-                &text,
-                &ext,
-                &re,
-                search.options.context,
-                search.options.regex,
-                Some(replace),
-            )
-            .into_iter()
-            .filter(|f| places.contains_key(&(f.line, f.col)))
-            .collect();
-            if kept.is_empty() {
-                continue;
-            }
-            let new = crate::find_replace::apply(&text, &kept);
-            if new == text {
-                continue;
-            }
+            };
             self.history_record(&path, &text);
             if !self.put_text(&path, &holder, &text, &new) {
                 continue;
             }
             self.history_record(&path, &new);
-            count += kept.len();
-            files += 1;
-            done.extend(
-                kept.iter()
-                    .filter_map(|f| places.get(&(f.line, f.col)).copied()),
-            );
-            written.push(Written {
+            replaced.count += count;
+            replaced.files += 1;
+            replaced.done.extend(done);
+            replaced.written.push(Written {
                 path,
                 before: text,
                 after: new,
             });
         }
-        if !written.is_empty() {
-            self.finder.undo = written;
+        (replaced, jobs)
+    }
+
+    /// What was written on disk is added to the count, the history and the
+    /// bookmarks, and kept to be undone.
+    fn replace_settle(&mut self, replaced: &mut Replaced, disk: Vec<DiskDone>) {
+        for done in disk {
+            self.history_record(&done.path, &done.before);
+            self.history_record(&done.path, &done.after);
+            self.bookmarks.remap(&done.path, &done.before, &done.after);
+            replaced.count += done.count;
+            replaced.files += 1;
+            replaced.done.extend(done.done);
+            replaced.written.push(Written {
+                path: done.path,
+                before: done.before,
+                after: done.after,
+            });
         }
-        (count, files, done)
+        if !replaced.written.is_empty() {
+            self.finder.undo = std::mem::take(&mut replaced.written);
+        }
     }
 
     /// A file's text becomes `new`, where it is held: undone with Ctrl+Z in
@@ -1126,11 +1266,8 @@ impl SimpleEditApp {
             .filter(|o| !o.excluded)
             .map(|o| o.hit.clone())
             .collect();
-        let (count, files, _) = self.replace_found(&search, &chosen);
-        let (matches, files) = (matches_text(count), files_text(files));
-        let done = t!("findrep.replaced", matches = matches, files = files);
-        self.set_status(done, false);
-        self.search_files(false)
+        // The files on disk are read and written in the background.
+        self.replace_found_later(&search, &chosen, ReplaceTarget::Finder)
     }
 
     // ── On screen ──
@@ -2121,6 +2258,147 @@ mod todo_tests {
 
 /// Writes `text` to a file on disk in the encoding the file has now; an
 /// error if it cannot be written, or a character has no place in it.
+/// What becomes of the answer of a replacement made in the background.
+#[derive(Debug, Clone, Default)]
+pub enum ReplaceTarget {
+    /// The window of the search.
+    #[default]
+    Finder,
+    /// The Results panel: the matches that were chosen (by index in its list).
+    Results(Vec<usize>),
+}
+
+/// What a replacement did so far.
+#[derive(Debug, Clone, Default)]
+pub struct Replaced {
+    pub count: usize,
+    pub files: usize,
+    /// Which of the matches chosen were replaced.
+    pub done: Vec<usize>,
+    written: Vec<Written>,
+    pub target: ReplaceTarget,
+}
+
+/// A file on disk to replace in: the matches chosen in it, as (index in
+/// the list chosen, line, column, fingerprint of the text they were found in).
+#[derive(Debug, Clone)]
+pub struct DiskJob {
+    path: PathBuf,
+    hits: Vec<(usize, usize, usize, u64)>,
+}
+
+/// A file on disk that was replaced in.
+#[derive(Debug, Clone)]
+pub struct DiskDone {
+    path: PathBuf,
+    before: String,
+    after: String,
+    count: usize,
+    done: Vec<usize>,
+}
+
+/// The matches of `indices` that are in a text still as it was when they
+/// were found, by place, with their index.
+fn places_of(text: &str, chosen: &[TextHit], indices: &[usize]) -> HashMap<(usize, usize), usize> {
+    let stamp = crate::finder::text_stamp(text);
+    indices
+        .iter()
+        .copied()
+        .filter(|&i| chosen[i].stamp == 0 || chosen[i].stamp == stamp)
+        .map(|i| ((chosen[i].line, chosen[i].col), i))
+        .collect()
+}
+
+/// What replacing makes of one text: the new text, how many matches, and
+/// which of those chosen (looked for again in the text of now: only the
+/// matches that are still where they were found).
+fn replace_in_text(
+    re: &regex::Regex,
+    search: &Search,
+    replace: &Replace,
+    path: &Path,
+    text: &str,
+    places: &HashMap<(usize, usize), usize>,
+) -> Option<(String, usize, Vec<usize>)> {
+    if places.is_empty() {
+        return None;
+    }
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let kept: Vec<crate::find_replace::Found> = crate::find_replace::find_in(
+        text,
+        &ext,
+        re,
+        search.options.context,
+        search.options.regex,
+        Some(replace),
+    )
+    .into_iter()
+    .filter(|f| places.contains_key(&(f.line, f.col)))
+    .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    let new = crate::find_replace::apply(text, &kept);
+    if new == text {
+        return None;
+    }
+    let done = kept
+        .iter()
+        .filter_map(|f| places.get(&(f.line, f.col)).copied())
+        .collect();
+    Some((new, kept.len(), done))
+}
+
+/// Replaces in files that nothing holds open: each is read once (its
+/// encoding is the one it is written back in) and written whole or not at all.
+/// A file that cannot be read or written is left as it is.
+fn replace_on_disk(search: Search, jobs: Vec<DiskJob>) -> Vec<DiskDone> {
+    let Some(replace) = &search.replace else {
+        return Vec::new();
+    };
+    let Ok(re) = crate::find_replace::compile(&search.options) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for job in jobs {
+        let Some((text, encoding)) = std::fs::read(&job.path)
+            .ok()
+            .and_then(|b| crate::finder::decode_file(&b))
+        else {
+            continue;
+        };
+        let stamp = crate::finder::text_stamp(&text);
+        let places: HashMap<(usize, usize), usize> = job
+            .hits
+            .iter()
+            .filter(|(_, _, _, s)| *s == 0 || *s == stamp)
+            .map(|(i, line, col, _)| ((*line, *col), *i))
+            .collect();
+        let Some((new, count, done)) =
+            replace_in_text(&re, &search, replace, &job.path, &text, &places)
+        else {
+            continue;
+        };
+        let Some(bytes) = encoding.encode(&new) else {
+            continue;
+        };
+        if crate::fsutil::write_atomic(&job.path, &bytes, false).is_err() {
+            continue;
+        }
+        out.push(DiskDone {
+            path: job.path,
+            before: text,
+            after: new,
+            count,
+            done,
+        });
+    }
+    out
+}
+
 fn write_encoded(path: &Path, text: &str) -> Result<(), ()> {
     let encoding = std::fs::read(path)
         .ok()

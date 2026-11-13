@@ -124,6 +124,9 @@ pub struct CompletionState {
     info: HashMap<ServerKey, lsp::CompletionInfo>,
     /// Servers already started (or being started) for completion.
     asked: HashSet<ServerKey>,
+    /// The server of each file seen (finding the root of its project looks at
+    /// the disk; it is not asked again at each key).
+    keys: HashMap<(PathBuf, String), ServerKey>,
     /// Whether a server is installed, by file extension.
     installed: HashMap<String, bool>,
     pub snippet: Option<SnippetRun>,
@@ -236,7 +239,12 @@ impl SimpleEditApp {
         let Some((path, ext)) = self.completion_target() else {
             return Task::none();
         };
-        let key = server_key(&path, &ext);
+        let key = self
+            .completion
+            .keys
+            .entry((path.clone(), ext.clone()))
+            .or_insert_with(|| server_key(&path, &ext))
+            .clone();
         if !self.completion.asked.insert(key.clone()) {
             return Task::none();
         }
@@ -253,6 +261,7 @@ impl SimpleEditApp {
     /// The servers were stopped: they are prepared again on next use.
     pub(super) fn completion_servers_restarted(&mut self) {
         self.completion.asked.clear();
+        self.completion.keys.clear();
         self.completion.info.clear();
         self.completion.session = None;
         self.completion.hint = None;

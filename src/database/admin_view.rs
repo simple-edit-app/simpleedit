@@ -1169,6 +1169,24 @@ pub fn import<'a>(im: &'a super::Import, dark: bool) -> Element<'a, Message> {
                 .on_toggle(|on| Message::Db(DbMsg::ImportEmptyNull(on))),
         );
         body = body.push(options);
+        // The accents of a file made by Excel are in Windows-1252.
+        if im.format == Format::Csv {
+            let mut encodings = row![text(t!("db.import_encoding").to_string())
+                .size(12)
+                .color(p.muted)]
+            .spacing(4)
+            .align_y(Alignment::Center);
+            for encoding in crate::database::import::ENCODINGS {
+                encodings = encodings.push(toggle(
+                    encoding.label().to_string(),
+                    im.encoding == encoding
+                        || (encoding == crate::tabs::Encoding::Utf8
+                            && im.encoding == crate::tabs::Encoding::Utf8Bom),
+                    Message::Db(DbMsg::ImportEncoding(encoding)),
+                ));
+            }
+            body = body.push(encodings);
+        }
 
         // Where each field goes.
         let skip = t!("db.import_skip").to_string();

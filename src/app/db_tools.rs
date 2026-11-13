@@ -113,6 +113,8 @@ impl SimpleEditApp {
                     delimiter: ',',
                     header: true,
                     empty_null: true,
+                    encoding: crate::tabs::Encoding::Utf8,
+                    raw: Vec::new(),
                     text: String::new(),
                     sample: import::Sample::default(),
                     mapping: Vec::new(),
@@ -173,29 +175,57 @@ impl SimpleEditApp {
                 |path| Message::Db(DbMsg::ImportPicked(path)),
             ),
             DbMsg::ImportPicked(path) => {
-                let (Some(path), Some(im)) = (path, self.db.import.as_mut()) else {
+                let (Some(path), Some(_)) = (path, self.db.import.as_ref()) else {
                     return Task::none();
                 };
-                im.format = Format::of(&path.to_string_lossy());
-                match read_sample(&path, im.format) {
-                    Ok(text) => {
-                        if im.format == Format::Csv {
-                            im.delimiter = import::detect_delimiter(&text);
-                        }
-                        im.text = text;
-                        im.error = None;
-                        im.imported = None;
-                        im.path = Some(path);
-                        im.reread();
-                    }
-                    Err(error) => im.error = Some(error),
+                let format = Format::of(&path.to_string_lossy());
+                // A JSON is read whole (up to 64 MiB): not on this thread.
+                if cfg!(test) {
+                    let read = read_sample(&path, format);
+                    return self.db_import_read(path, read);
                 }
-                Task::none()
+                Task::perform(
+                    async move {
+                        let from = path.clone();
+                        let read = tokio::task::spawn_blocking(move || read_sample(&from, format))
+                            .await
+                            .map_err(|e| e.to_string())
+                            .and_then(|r| r);
+                        (path, read)
+                    },
+                    |(path, read)| Message::Db(DbMsg::ImportRead(path, read)),
+                )
             }
+            DbMsg::ImportRead(path, read) => self.db_import_read(path, read),
             DbMsg::ImportFormat(format) => {
                 if let Some(im) = self.db.import.as_mut() {
                     im.format = format;
                     im.reread();
+                }
+                Task::none()
+            }
+            DbMsg::ImportEncoding(encoding) => {
+                if let Some(im) = self.db.import.as_mut() {
+                    if !im.raw.is_empty() {
+                        // The accents are read again from the bytes.
+                        let (text, _) = match encoding {
+                            crate::tabs::Encoding::Utf16Le | crate::tabs::Encoding::Utf16Be => {
+                                let cut = im.raw.len() - im.raw.len() % 2;
+                                (
+                                    encoding.decode(&im.raw[..cut]).unwrap_or_default(),
+                                    encoding,
+                                )
+                            }
+                            crate::tabs::Encoding::Utf8 => {
+                                (String::from_utf8_lossy(&im.raw).into_owned(), encoding)
+                            }
+                            other => (other.decode(&im.raw).unwrap_or_default(), other),
+                        };
+                        im.encoding = encoding;
+                        im.text = text;
+                        im.delimiter = import::detect_delimiter(&im.text);
+                        im.reread();
+                    }
                 }
                 Task::none()
             }
@@ -245,6 +275,7 @@ impl SimpleEditApp {
                 };
                 let spec = import::spec(
                     im.format,
+                    im.encoding,
                     im.delimiter,
                     im.header,
                     im.empty_null,
@@ -603,6 +634,46 @@ impl SimpleEditApp {
         }
     }
 
+    /// The start of the file to import has been read.
+    fn db_import_read(
+        &mut self,
+        path: std::path::PathBuf,
+        read: Result<Vec<u8>, String>,
+    ) -> Task<Message> {
+        let Some(im) = self.db.import.as_mut() else {
+            return Task::none();
+        };
+        im.format = Format::of(&path.to_string_lossy());
+        match read {
+            Ok(bytes) => {
+                // A JSON is UTF-8 by its standard; a CSV may be anything
+                // (Excel writes Windows-1252).
+                let (text, encoding) = if im.format == Format::Csv {
+                    import::detect_sample(&bytes, bytes.len() >= import::SAMPLE_BYTES)
+                } else {
+                    (
+                        String::from_utf8_lossy(&bytes).into_owned(),
+                        crate::tabs::Encoding::Utf8,
+                    )
+                };
+                if im.format == Format::Csv {
+                    im.delimiter = import::detect_delimiter(&text);
+                    im.raw = bytes;
+                } else {
+                    im.raw = Vec::new();
+                }
+                im.encoding = encoding;
+                im.text = text;
+                im.error = None;
+                im.imported = None;
+                im.path = Some(path);
+                im.reread();
+            }
+            Err(error) => im.error = Some(error),
+        }
+        Task::none()
+    }
+
     /// Reads the numbers of the database the health window is about.
     fn db_health_load(&mut self) -> Task<Message> {
         let Some((conn, database)) = self
@@ -632,7 +703,7 @@ impl SimpleEditApp {
 
 /// What is read of a file to show it: the start of a CSV, all of a JSON (its
 /// keys are in all of it).
-fn read_sample(path: &std::path::Path, format: Format) -> Result<String, String> {
+fn read_sample(path: &std::path::Path, format: Format) -> Result<Vec<u8>, String> {
     use std::io::Read;
     let limit = if format == Format::Json {
         64 * 1024 * 1024
@@ -644,5 +715,5 @@ fn read_sample(path: &std::path::Path, format: Format) -> Result<String, String>
     file.take(limit as u64)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    Ok(bytes)
 }

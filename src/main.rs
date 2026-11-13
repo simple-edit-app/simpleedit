@@ -20,6 +20,7 @@ mod config;
 mod database;
 mod definition;
 mod editor;
+mod encoding;
 mod everywhere;
 mod file_icons;
 mod find_replace;

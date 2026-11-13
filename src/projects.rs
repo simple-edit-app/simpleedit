@@ -260,6 +260,68 @@ type IgnoredAnswer = (
     std::collections::HashSet<PathBuf>,
 );
 
+/// A folder as it was read.
+#[derive(Debug, Clone)]
+pub struct LoadedDir {
+    dir: PathBuf,
+    modified: Option<SystemTime>,
+    list: Vec<Entry>,
+    /// What Git said of it, when it was asked.
+    ignored: Option<IgnoredAnswer>,
+}
+
+/// The folders to read again, and how.
+#[derive(Debug, Clone)]
+pub struct ReloadJob {
+    dirs: Vec<(PathBuf, Option<IgnoredAnswer>)>,
+    exclude: Vec<String>,
+    hide_ignored: bool,
+}
+
+impl ReloadJob {
+    /// Reads the folders (it asks Git, and the disk may be slow).
+    pub fn run(self) -> Vec<LoadedDir> {
+        self.dirs
+            .iter()
+            .map(|(dir, cache)| load_dir(dir, &self.exclude, self.hide_ignored, cache.as_ref()))
+            .collect()
+    }
+}
+
+/// Reads a folder: what it holds, less what is left out and, when asked,
+/// what Git ignores (Git is not asked again while the names and the ignore
+/// files are those of `cache`).
+fn load_dir(
+    dir: &Path,
+    exclude: &[String],
+    hide_ignored: bool,
+    cache: Option<&IgnoredAnswer>,
+) -> LoadedDir {
+    let at = modified(dir);
+    let mut list = read_children(dir);
+    list.retain(|e| !crate::finder::excluded(&e.name, e.is_dir, exclude));
+    let mut answer = None;
+    if hide_ignored {
+        let names = list_fingerprint(&list);
+        let stamps = ignore_stamps(dir);
+        let ignored = match cache.filter(|(n, s, _)| *n == names && *s == stamps) {
+            Some((_, _, set)) => set.clone(),
+            None => {
+                let set = ignored_of(dir, &list);
+                answer = Some((names, stamps, set.clone()));
+                set
+            }
+        };
+        list.retain(|e| !ignored.contains(&e.path));
+    }
+    LoadedDir {
+        dir: dir.to_path_buf(),
+        modified: at,
+        list,
+        ignored: answer,
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct Projects {
     /// What Git ignores is left out.
@@ -309,29 +371,60 @@ impl Projects {
     }
 
     fn load(&mut self, dir: &Path) {
-        let mut list = read_children(dir);
-        list.retain(|e| !crate::finder::excluded(&e.name, e.is_dir, &self.exclude));
-        if self.hide_ignored {
-            let names = list_fingerprint(&list);
-            let stamps = ignore_stamps(dir);
-            let cached = self
-                .ignored_cache
-                .get(dir)
-                .filter(|(n, s, _)| *n == names && *s == stamps)
-                .map(|(_, _, set)| set.clone());
-            let ignored = match cached {
-                Some(set) => set,
-                None => {
-                    let set = ignored_of(dir, &list);
-                    self.ignored_cache
-                        .insert(dir.to_path_buf(), (names, stamps, set.clone()));
-                    set
-                }
-            };
-            list.retain(|e| !ignored.contains(&e.path));
+        let loaded = load_dir(
+            dir,
+            &self.exclude,
+            self.hide_ignored,
+            self.ignored_cache.get(dir),
+        );
+        self.keep(loaded);
+    }
+
+    /// What was read of a folder is put in.
+    fn keep(&mut self, loaded: LoadedDir) {
+        if let Some(answer) = loaded.ignored {
+            self.ignored_cache.insert(loaded.dir.clone(), answer);
         }
         self.children
-            .insert(dir.to_path_buf(), (modified(dir), list));
+            .insert(loaded.dir, (loaded.modified, loaded.list));
+    }
+
+    /// What it takes to read, off the interface thread, the open folders that
+    /// changed on the disk (`None`: none did).
+    pub fn reload_job(&self) -> Option<ReloadJob> {
+        let dirs: Vec<(PathBuf, Option<IgnoredAnswer>)> = self
+            .expanded
+            .iter()
+            .filter(|dir| self.children.get(*dir).map(|(at, _)| *at) != Some(modified(dir)))
+            .map(|dir| (dir.clone(), self.ignored_cache.get(dir).cloned()))
+            .collect();
+        (!dirs.is_empty()).then(|| ReloadJob {
+            dirs,
+            exclude: self.exclude.clone(),
+            hide_ignored: self.hide_ignored,
+        })
+    }
+
+    /// The folders read in the background; those that are no longer open
+    /// are left out. True if anything changed.
+    pub fn reloaded(&mut self, loaded: Vec<LoadedDir>) -> bool {
+        let mut changed = false;
+        for item in loaded {
+            if !self.expanded.contains(&item.dir) {
+                continue;
+            }
+            // A folder that is gone is no longer open.
+            if item.modified.is_none() && !item.dir.is_dir() {
+                self.expanded.remove(&item.dir);
+                self.children.remove(&item.dir);
+                changed = true;
+                continue;
+            }
+            let before = self.children.get(&item.dir).map(|(_, l)| l.clone());
+            changed |= before.as_ref() != Some(&item.list);
+            self.keep(item);
+        }
+        changed
     }
 
     /// Shows or leaves out what Git ignores.
@@ -548,6 +641,99 @@ impl Projects {
         rows
     }
 
+    /// How many lines `rows` has, without making them.
+    pub fn row_count(&self) -> usize {
+        fn count(p: &Projects, dir: &Path) -> usize {
+            let Some((_, list)) = p.children.get(dir) else {
+                return 0;
+            };
+            list.iter()
+                .map(|e| {
+                    1 + if e.is_dir && p.expanded.contains(&e.path) {
+                        count(p, &e.path)
+                    } else {
+                        0
+                    }
+                })
+                .sum()
+        }
+        self.roots
+            .iter()
+            .map(|root| {
+                1 + if self.expanded.contains(root) {
+                    count(self, root)
+                } else {
+                    0
+                }
+            })
+            .sum()
+    }
+
+    /// The lines `first..last` of `rows`: only those are made (a tree of tens
+    /// of thousands of lines is drawn at each frame).
+    pub fn rows_between(&self, first: usize, last: usize) -> Vec<Row> {
+        let mut out = Vec::with_capacity(last.saturating_sub(first));
+        let mut at = 0usize;
+        for root in &self.roots {
+            if at >= last {
+                break;
+            }
+            let open = self.expanded.contains(root);
+            if at >= first {
+                out.push(Row {
+                    entry: Entry {
+                        path: root.clone(),
+                        name: root.file_name().map_or_else(
+                            || root.display().to_string(),
+                            |n| n.to_string_lossy().into_owned(),
+                        ),
+                        is_dir: true,
+                    },
+                    depth: 0,
+                    open,
+                    root: true,
+                });
+            }
+            at += 1;
+            if open {
+                self.walk(root, 1, first, last, &mut at, &mut out);
+            }
+        }
+        out
+    }
+
+    fn walk(
+        &self,
+        dir: &Path,
+        depth: usize,
+        first: usize,
+        last: usize,
+        at: &mut usize,
+        out: &mut Vec<Row>,
+    ) {
+        let Some((_, list)) = self.children.get(dir) else {
+            return;
+        };
+        for entry in list {
+            if *at >= last {
+                return;
+            }
+            let open = entry.is_dir && self.expanded.contains(&entry.path);
+            if *at >= first {
+                out.push(Row {
+                    entry: entry.clone(),
+                    depth,
+                    open,
+                    root: false,
+                });
+            }
+            *at += 1;
+            if open {
+                self.walk(&entry.path, depth + 1, first, last, at, out);
+            }
+        }
+    }
+
     fn push_children(&self, dir: &Path, depth: usize, rows: &mut Vec<Row>) {
         let Some((_, list)) = self.children.get(dir) else {
             return;
@@ -589,6 +775,26 @@ mod tests {
         rows.iter()
             .map(|r| format!("{}{}", "  ".repeat(r.depth), r.entry.name))
             .collect()
+    }
+
+    #[test]
+    fn a_window_of_the_lines_is_the_same_as_cutting_all_of_them() {
+        let dir = tree();
+        let mut projects = Projects::new(vec![dir.path().to_path_buf()], vec![], false, vec![]);
+        projects.expanded.insert(dir.path().join("src"));
+        projects.expanded.insert(dir.path().join("src/deep"));
+        projects.refresh(true);
+        let all = projects.rows();
+        assert_eq!(projects.row_count(), all.len());
+        for first in 0..=all.len() {
+            for last in first..=all.len() {
+                assert_eq!(
+                    names(&projects.rows_between(first, last)),
+                    names(&all[first..last]),
+                    "{first}..{last}"
+                );
+            }
+        }
     }
 
     #[test]

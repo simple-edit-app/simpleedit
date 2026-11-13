@@ -20,6 +20,9 @@ pub struct FileSession {
     /// Whether the file ends with a line break (new files do).
     #[serde(default = "yes")]
     pub final_newline: bool,
+    /// The file mixes line endings.
+    #[serde(default)]
+    pub mixed: bool,
     /// The label of the encoding the file is in ("" is UTF-8).
     #[serde(default)]
     pub encoding: String,
@@ -88,6 +91,19 @@ pub struct Session {
     /// The API requests with changes not kept (without their credentials).
     #[serde(default)]
     pub api_tabs: Vec<ApiSession>,
+    /// The local copies of files of another machine, to send back on save.
+    #[serde(default)]
+    pub remote_files: Vec<RemoteSession>,
+}
+
+/// The link of a local copy to the file it came from (over SSH).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteSession {
+    pub local: String,
+    pub host: String,
+    pub path: String,
+    /// The date the file had on the machine when last read or sent.
+    pub date: Option<u64>,
 }
 
 /// A request of an API tab that was changed and not kept.
@@ -198,6 +214,7 @@ mod tests {
             language: None,
             dirty: true,
             crlf: false,
+            mixed: false,
             final_newline: true,
             encoding: String::new(),
             stamp: None,
@@ -216,6 +233,7 @@ mod tests {
             active_file: Some("/a/b.txt".into()),
             untitled_counter: 3,
             api_tabs: vec![],
+            remote_files: vec![],
         };
         let back: Session = serde_json::from_str(&session.to_json().unwrap()).unwrap();
         assert_eq!(back.files[0].path(), PathBuf::from("/a/b.txt"));

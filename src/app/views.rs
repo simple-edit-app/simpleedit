@@ -192,6 +192,7 @@ impl SimpleEditApp {
             | ActiveOverlay::ConfirmQuit(_)
             | ActiveOverlay::ConfirmTrust(_)
             | ActiveOverlay::ConfirmScratchDelete(_)
+            | ActiveOverlay::ConfirmGitGet(..)
             | ActiveOverlay::ConfirmFileDelete(..)
             | ActiveOverlay::ProjectName(_)
             | ActiveOverlay::FindInFiles
@@ -1108,6 +1109,7 @@ impl SimpleEditApp {
                     dirty,
                     crlf: format.ending == crate::tabs::LineEnding::Crlf,
                     final_newline: format.final_newline,
+                    mixed: format.mixed,
                     encoding: format.encoding.label().to_string(),
                     stamp,
                 };
@@ -1155,6 +1157,21 @@ impl SimpleEditApp {
                 .filter(|p| !self.is_scratch(p) && !is_virtual(p))
                 .map(|p| p.to_string_lossy().into_owned()),
             untitled_counter: self.untitled_counter,
+            remote_files: {
+                let mut links: Vec<_> = self
+                    .remote_files
+                    .iter()
+                    .filter(|(local, _)| self.sidebar.files().contains(local))
+                    .map(|(local, (file, date))| crate::session::RemoteSession {
+                        local: local.to_string_lossy().into_owned(),
+                        host: file.host.clone(),
+                        path: file.path.clone(),
+                        date: *date,
+                    })
+                    .collect();
+                links.sort_by(|a, b| a.local.cmp(&b.local));
+                links
+            },
         }
     }
 
@@ -1186,7 +1203,7 @@ impl SimpleEditApp {
         if !self.session_owner {
             return None;
         }
-        self.bookmarks.save();
+        let bookmarks = self.bookmarks.take_write();
         self.session_rev = self.rev;
         // Only the copy of the text is made here; the JSON, its fingerprint
         // and the write are done off the interface's thread.
@@ -1196,6 +1213,12 @@ impl SimpleEditApp {
         let number = self.session_writes;
         Some(async move {
             tokio::task::spawn_blocking(move || {
+                if let Some((path, json)) = bookmarks {
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = crate::fsutil::write_atomic(&path, json.as_bytes(), true);
+                }
                 let json = session
                     .to_json()
                     .ok_or_else(|| t!("status.session_not_serialized").to_string())?;
@@ -1229,6 +1252,7 @@ impl SimpleEditApp {
                     LineEnding::Lf
                 },
                 final_newline: fs.final_newline,
+                mixed: fs.mixed,
                 encoding: crate::tabs::Encoding::ALL
                     .into_iter()
                     .find(|e| e.label() == fs.encoding)
@@ -1267,6 +1291,20 @@ impl SimpleEditApp {
             };
             self.sidebar.add_file(path.clone());
             self.file_cache.insert(path, buffer);
+        }
+
+        // A copy of a remote file keeps going back to its machine on save.
+        for link in session.remote_files {
+            self.remote_files.insert(
+                PathBuf::from(link.local),
+                (
+                    crate::remote::RemoteFile {
+                        host: link.host,
+                        path: link.path,
+                    },
+                    link.date,
+                ),
+            );
         }
 
         // The requests that were changed and not kept come back as tabs.

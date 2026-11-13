@@ -284,6 +284,8 @@ pub struct ImportSpec {
     pub file_columns: usize,
     /// An empty value is NULL, not an empty text.
     pub empty_null: bool,
+    /// The label of the encoding of a CSV ("": found from the file).
+    pub encoding: String,
     pub mapping: Vec<ImportColumn>,
 }
 
@@ -991,6 +993,39 @@ pub enum Risk {
     Writes,
 }
 
+/// Whether an `UPDATE` or `DELETE` (after the `WITH` that may come first) has
+/// no `WHERE` of its own: one inside a sub-query or a `WITH` body is not it.
+fn touches_every_row(sql: &str, dialect: Dialect) -> bool {
+    let mut depth = 0usize;
+    let mut verb: Option<String> = None;
+    let mut has_where = false;
+    let mut after_with = false;
+    for token in sql_tokens(sql, dialect) {
+        let text = &sql[token.start..token.end];
+        match token.kind {
+            TokenKind::Punct if text == "(" => depth += 1,
+            TokenKind::Punct if text == ")" => depth = depth.saturating_sub(1),
+            TokenKind::Word if depth == 0 => {
+                let word = text.to_uppercase();
+                match (&verb, word.as_str()) {
+                    (None, "WITH") => after_with = true,
+                    (None, "UPDATE" | "DELETE") => verb = Some(word),
+                    // The statement the `WITH` serves is not one that
+                    // writes everywhere.
+                    (None, "SELECT" | "INSERT" | "MERGE" | "REPLACE" | "VALUES") => {
+                        return false;
+                    }
+                    (None, _) if !after_with => return false,
+                    (Some(_), "WHERE" | "CURRENT") => has_where = true,
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    verb.is_some() && !has_where
+}
+
 /// What is risky in a statement. `production`: the source is one where every
 /// change is asked about.
 pub fn risk_of(sql: &str, production: bool, dialect: Dialect) -> Option<Risk> {
@@ -1000,9 +1035,7 @@ pub fn risk_of(sql: &str, production: bool, dialect: Dialect) -> Option<Risk> {
     if first == "EXPLAIN" && !words.iter().any(|w| w == "ANALYZE") {
         return None;
     }
-    let touches_all = matches!(first, "UPDATE" | "DELETE")
-        && !words.iter().any(|w| w == "WHERE" || w == "CURRENT");
-    if touches_all {
+    if touches_every_row(sql, dialect) {
         return Some(Risk::NoWhere);
     }
     // Controlling a transaction or the session is not a change of the data.
@@ -1728,6 +1761,41 @@ mod tests {
             "jdbc:postgresql://localhost:5432/shop"
         );
         assert_eq!(jdbc_url("h", 1, " "), "jdbc:postgresql://h:1/");
+    }
+
+    #[test]
+    fn only_the_where_of_the_statement_itself_counts() {
+        let pg = Dialect::Postgres;
+        // The WHERE of a sub-query is not the one of the UPDATE.
+        assert_eq!(
+            risk_of(
+                "UPDATE t SET a = (SELECT b FROM u WHERE u.id = 1)",
+                false,
+                pg
+            ),
+            Some(Risk::NoWhere)
+        );
+        // A WITH comes first: the verb after it is the one that counts.
+        assert_eq!(
+            risk_of("WITH x AS (SELECT 1 WHERE true) DELETE FROM t", false, pg),
+            Some(Risk::NoWhere)
+        );
+        assert_eq!(
+            risk_of(
+                "WITH x AS (SELECT 1) DELETE FROM t WHERE id IN (SELECT * FROM x)",
+                false,
+                pg
+            ),
+            None
+        );
+        assert_eq!(
+            risk_of("WITH x AS (SELECT 1) SELECT * FROM x", false, pg),
+            None
+        );
+        assert_eq!(
+            risk_of("UPDATE t SET a = 1 WHERE id = (SELECT 1)", false, pg),
+            None
+        );
     }
 
     #[test]

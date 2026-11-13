@@ -757,8 +757,8 @@ fn import(engine: &mut dyn Engine, request: &Request) -> Result<Value, String> {
     if spec.mapping.is_empty() {
         return Err("no column to fill".to_string());
     }
-    let text =
-        std::fs::read_to_string(&request.path).map_err(|e| format!("{}: {e}", request.path))?;
+    let bytes = std::fs::read(&request.path).map_err(|e| format!("{}: {e}", request.path))?;
+    let text = crate::import::decode_file(bytes, &spec.encoding)?;
     // One entry per row, one value per mapped column: `None` is NULL.
     let rows: Vec<Vec<Option<String>>> = if spec.format == "json" {
         let value: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;

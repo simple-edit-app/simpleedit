@@ -3,6 +3,20 @@
 
 use std::path::{Path, PathBuf};
 
+/// A path as git prints it (bytes): a name that is not UTF-8 is kept as it is
+/// on disk, not changed into `�` (which would name no file).
+fn path_of(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).as_ref())
+    }
+}
+
 /// Folders never looked into when the files are listed without Git.
 const HEAVY: &[&str] = &[
     ".git",
@@ -105,7 +119,7 @@ pub fn list_files(root: &Path, exclude: &[String], ignored: bool) -> Vec<PathBuf
                 .stdout
                 .split(|b| *b == 0)
                 .filter(|p| !p.is_empty())
-                .map(|p| root.join(String::from_utf8_lossy(p).as_ref()))
+                .map(|p| root.join(path_of(p)))
                 .collect();
             // A submodule or a nested repository is listed as one folder:
             // its own files are listed in turn.
@@ -121,7 +135,7 @@ pub fn list_files(root: &Path, exclude: &[String], ignored: bool) -> Vec<PathBuf
                         .iter()
                         .flat_map(|o| o.stdout.split(|b| *b == 0))
                         .filter(|p| !p.is_empty())
-                        .map(|p| root.join(String::from_utf8_lossy(p).as_ref())),
+                        .map(|p| root.join(path_of(p))),
                 )
                 // A file deleted but not committed is still listed by Git.
                 .filter(|p| p.is_file())
@@ -553,6 +567,14 @@ fn excerpt(line: &str, start: usize, len: usize) -> (String, (usize, usize)) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn a_name_that_is_not_utf8_is_listed_as_it_is_on_disk() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = super::path_of(b"dir/caf\xe9.txt");
+        assert_eq!(path.as_os_str().as_bytes(), b"dir/caf\xe9.txt");
+    }
+
     #[cfg(unix)]
     fn thread_time() -> std::time::Duration {
         let mut at = libc::timespec {

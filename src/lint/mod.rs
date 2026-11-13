@@ -299,8 +299,15 @@ pub struct Counts {
     pub others: usize,
 }
 
+#[cfg(test)]
 pub fn counts(diagnostics: &[Diagnostic]) -> Counts {
-    diagnostics.iter().fold(Counts::default(), |mut c, d| {
+    counts_of(diagnostics.iter())
+}
+
+/// The same, for diagnostics that are not in a list of their own (nothing is
+/// copied: it is made at each frame).
+pub fn counts_of<'a>(diagnostics: impl Iterator<Item = &'a Diagnostic>) -> Counts {
+    diagnostics.fold(Counts::default(), |mut c, d| {
         match d.severity {
             Severity::Error => c.errors += 1,
             Severity::Warning => c.warnings += 1,

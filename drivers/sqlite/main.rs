@@ -10,6 +10,10 @@ mod protocol;
 mod common;
 
 #[allow(dead_code)]
+#[path = "../../src/encoding.rs"]
+mod encoding;
+
+#[allow(dead_code)]
 #[path = "../../src/database/import.rs"]
 mod import;
 
@@ -989,6 +993,44 @@ mod tests {
             .query_row("SELECT count(*) FROM customers", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 7);
+    }
+
+    #[test]
+    fn a_csv_in_windows_1252_is_imported_with_its_accents() {
+        let (dir, path) = database();
+        let csv = dir.path().join("excel.csv");
+        // « Élodie;café » as Excel writes it in French.
+        std::fs::write(&csv, b"name;note\n\xc9lodie;caf\xe9\n").unwrap();
+        let spec = |encoding: &str| {
+            json!({"format": "csv", "delimiter": ";", "header": true, "file_columns": 2,
+                   "empty_null": true, "encoding": encoding,
+                   "mapping": [
+                       {"index": 0, "key": "", "column": "name", "kind": "TEXT"},
+                       {"index": 1, "key": "", "column": "note", "kind": "TEXT"}]})
+        };
+        // Said to be UTF-8 it is refused, in nothing half done.
+        let refused = call(
+            &path,
+            json!({"op": "import", "schema": "main", "table": "customers",
+                   "path": csv.to_string_lossy(), "import": spec("UTF-8")}),
+        );
+        assert!(refused.unwrap_err().contains("not valid UTF-8"));
+        let done = call(
+            &path,
+            json!({"op": "import", "schema": "main", "table": "customers",
+                   "path": csv.to_string_lossy(), "import": spec("Windows-1252")}),
+        )
+        .unwrap();
+        assert_eq!(done["imported"], 1);
+        let conn = Connection::open(&path).unwrap();
+        let note: String = conn
+            .query_row(
+                "SELECT note FROM customers WHERE name = 'Élodie'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(note, "café");
     }
 
     #[test]

@@ -100,6 +100,12 @@ pub struct Speller {
     ignored: HashSet<String>,
 }
 
+impl std::fmt::Debug for Speller {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Speller")
+    }
+}
+
 impl Speller {
     pub fn from_text(aff: &str, dic: &str) -> Result<Speller, String> {
         let dictionary = spellbook::Dictionary::new(aff, dic).map_err(|e| e.to_string())?;

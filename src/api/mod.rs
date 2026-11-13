@@ -504,6 +504,11 @@ impl State {
         store::save_environments(&self.environments, self.active_env, self.next_id);
     }
 
+    /// Done when it returns, for the app that quits.
+    pub fn save_environments_now(&self) {
+        store::save_environments_now(&self.environments, self.active_env, self.next_id);
+    }
+
     /// Adds a request that was sent to the history, newest first.
     pub fn remember(&mut self, entry: HistoryEntry) {
         self.history.insert(0, entry);

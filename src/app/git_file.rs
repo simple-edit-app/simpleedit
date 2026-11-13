@@ -517,6 +517,29 @@ impl SimpleEditApp {
         self.bookmark_panel.open = false;
     }
 
+    /// The restore of a file from a revision was confirmed: the file as it
+    /// is now is kept (Ctrl+Z in a diff, local history) before it is written.
+    pub(super) fn git_get_confirmed(
+        &mut self,
+        repo: PathBuf,
+        file: String,
+        rev: String,
+    ) -> Task<Message> {
+        self.overlay = ActiveOverlay::None;
+        let path = repo.join(&file);
+        if let Ok(bytes) = super::file_io::read_bytes(&path) {
+            self.history_record(&path, &String::from_utf8_lossy(&bytes));
+        }
+        self.remember_file(path);
+        Task::perform(
+            async move {
+                crate::git::tools::get_from_revision(&repo, &rev, &file).await?;
+                Ok(t!("git.file_got").to_string())
+            },
+            Message::GitFileDone,
+        )
+    }
+
     pub(super) fn git_file_done(&mut self, result: Result<String, String>) -> Task<Message> {
         match result {
             Ok(said) => self.set_status(said, false),
@@ -579,13 +602,10 @@ impl SimpleEditApp {
             }
         };
         if get {
-            return Task::perform(
-                async move {
-                    crate::git::tools::get_from_revision(&repo, &rev, &file).await?;
-                    Ok(t!("git.file_got").to_string())
-                },
-                Message::GitFileDone,
-            );
+            // It replaces the file and its index entry: nothing of what was
+            // there comes back from git, so the user is asked first.
+            self.overlay = ActiveOverlay::ConfirmGitGet(repo, file, rev);
+            return Task::none();
         }
         let short = rev.chars().take(8).collect::<String>();
         let title = format!("{file} ↔ {short}");
@@ -649,10 +669,23 @@ mod tests {
         let _ = app.update(Message::GitPickVerified(Ok((
             repo.path().to_path_buf(),
             "f".into(),
-            old,
+            old.clone(),
             true,
         ))));
         assert_eq!(app.sidebar.files().len(), tabs, "no diff tab opens");
+        // Nothing is written before the user agrees.
+        assert!(matches!(app.overlay, ActiveOverlay::ConfirmGitGet(..)));
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("f")).unwrap(),
+            "new"
+        );
+        let _ = app.update(Message::GitGetConfirmed(
+            repo.path().to_path_buf(),
+            "f".into(),
+            old,
+        ));
+        assert!(matches!(app.overlay, ActiveOverlay::None));
+        assert_eq!(app.work_undo.len(), 1, "the file as it was is kept");
     }
 
     /// Draws the panel and two dialogs, to look at them without a screen:

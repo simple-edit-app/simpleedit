@@ -55,6 +55,23 @@ impl Target {
 /// What other instances sent and the window has not taken yet.
 static INBOX: Mutex<Vec<Vec<Target>>> = Mutex::new(Vec::new());
 
+/// Woken when something is put in `INBOX`: the window does not look at it on
+/// a clock (a poll every 300 ms redraws it for nothing).
+static ARRIVED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// A message each time files arrive from another instance.
+pub fn arrivals() -> iced::Subscription<()> {
+    iced::Subscription::run(|| {
+        iced::stream::channel(1, async |mut output| {
+            use iced::futures::SinkExt;
+            loop {
+                ARRIVED.notified().await;
+                let _ = output.send(()).await;
+            }
+        })
+    })
+}
+
 /// Everything received since the last call.
 pub fn take() -> Vec<Vec<Target>> {
     INBOX
@@ -153,6 +170,8 @@ fn listen_at(path: &Path) -> bool {
                     if let Ok(mut inbox) = INBOX.lock() {
                         inbox.push(targets);
                     }
+                    // A permit is kept if the window is not waiting yet.
+                    ARRIVED.notify_one();
                 }
             }
         }

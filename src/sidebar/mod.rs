@@ -570,15 +570,14 @@ fn project_tree<'a>(
     let p = theme::palette(dark);
     // Only the lines in view (and a few around them) become widgets: a tree
     // of tens of thousands of lines would otherwise be rebuilt at each frame.
-    let all = projects.rows();
-    let (first, last) = visible_lines(all.len(), tree_view);
+    let total = projects.row_count();
+    let (first, last) = visible_lines(total, tree_view);
     let stride = TREE_ROW + 1.0;
     let top = Space::new().height(Length::Fixed(first as f32 * stride));
-    let bottom = Space::new().height(Length::Fixed((all.len() - last) as f32 * stride));
-    let items: Vec<Element<Message>> = all
+    let bottom = Space::new().height(Length::Fixed((total - last) as f32 * stride));
+    let items: Vec<Element<Message>> = projects
+        .rows_between(first, last)
         .into_iter()
-        .skip(first)
-        .take(last - first)
         .map(|line| {
             let path = line.entry.path.clone();
             let current_file = !line.entry.is_dir && current.as_ref() == Some(&path);

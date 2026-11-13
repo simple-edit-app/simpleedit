@@ -40,10 +40,12 @@ pub(super) fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
 }
 
 /// Whether bytes are those of a binary file (an image, an archive…): a NUL in
-/// the first 8 KiB, which text never holds, except UTF-16 with its byte
-/// order mark. Opened as text, the first save would change its bytes.
+/// the first 8 KiB, which text never holds, except UTF-16 (with its byte
+/// order mark, or with the NUL of every other byte). Opened as text, the first save would change its bytes.
 pub(super) fn is_binary(bytes: &[u8]) -> bool {
-    let utf16 = bytes.starts_with(&[0xff, 0xfe]) || bytes.starts_with(&[0xfe, 0xff]);
+    let utf16 = bytes.starts_with(&[0xff, 0xfe])
+        || bytes.starts_with(&[0xfe, 0xff])
+        || Encoding::utf16_without_mark(bytes).is_some();
     !utf16 && bytes[..bytes.len().min(8192)].contains(&0)
 }
 
@@ -65,9 +67,25 @@ pub(super) fn read_window(
     file.seek(SeekFrom::Start(from - lead))
         .map_err(read_error)?;
     let mut bytes = Vec::new();
-    file.take(window + lead)
+    (&mut file)
+        .take(window + lead)
         .read_to_end(&mut bytes)
         .map_err(read_error)?;
+    // What the start of the file is: a binary one is not shown as text, and
+    // the others are read in their encoding, not as UTF-8 with `�`.
+    let mut head = Vec::new();
+    file.seek(SeekFrom::Start(0)).map_err(read_error)?;
+    (&mut file)
+        .take(65536)
+        .read_to_end(&mut head)
+        .map_err(read_error)?;
+    if head[..head.len().min(8192)].contains(&0) {
+        return Err(t!("status.err_binary").to_string());
+    }
+    let single_byte = match Encoding::detect_prefix(&head, size > head.len() as u64).1 {
+        e @ (Encoding::Windows1252 | Encoding::Latin1 | Encoding::Latin9) => Some(e),
+        _ => None,
+    };
     let mut start = from;
     let mut body = &bytes[lead as usize..];
     if lead == 1 && bytes[0] != b'\n' {
@@ -90,7 +108,14 @@ pub(super) fn read_window(
         }
     }
     let end = start + body.len() as u64;
-    let text = TextFormat::decode(&String::from_utf8_lossy(body)).0;
+    let decoded = match (single_byte, std::str::from_utf8(body)) {
+        (Some(encoding), _) => encoding.decode(body).unwrap_or_default(),
+        (None, Ok(text)) => text.to_string(),
+        // Not UTF-8 from here on: the usual Windows encoding.
+        (None, Err(_)) => Encoding::Windows1252.decode(body).unwrap_or_default(),
+    };
+    let decoded = decoded.strip_prefix('\u{feff}').unwrap_or(&decoded);
+    let text = TextFormat::decode(decoded).0;
     Ok((text, start, end))
 }
 
@@ -102,10 +127,9 @@ pub(super) fn read_window_before(
     window: u64,
 ) -> Result<(String, u64, u64), String> {
     let from = end.saturating_sub(window);
-    let (text, start, _) = read_window(path, from, end - from)?;
-    // `read_window` cut at the last line break before `end`: that is `end`.
-    let end = start + text.len() as u64;
-    Ok((text, start, end))
+    // `read_window` cut at the last line break before `end`: that is `end`
+    // (as the bytes of the file count it, not the text it makes of them).
+    read_window(path, from, end - from)
 }
 
 /// A filesystem error in the interface language.
@@ -197,7 +221,7 @@ pub(super) async fn save_file(
     format: TextFormat,
 ) -> Result<(PathBuf, String), String> {
     tokio::task::spawn_blocking(move || {
-        let Some(bytes) = format.encode_bytes(&content) else {
+        let Some(bytes) = format.encode_bytes_for(&content, &path) else {
             return Err(t!("status.err_encoding", name = format.encoding.label()).to_string());
         };
         crate::fsutil::write_atomic(&path, &bytes, false)

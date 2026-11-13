@@ -214,6 +214,9 @@ pub enum ActiveOverlay {
     ConfirmOverwrite(PathBuf),
     /// A scratch file is about to be deleted for good.
     ConfirmScratchDelete(PathBuf),
+    /// A file is about to be replaced by what a revision has of it:
+    /// the repository, the file, the revision.
+    ConfirmGitGet(PathBuf, String, String),
     /// A text looked for in the files of the projects.
     FindInFiles,
     /// A name asked for a file or folder of a project.
@@ -325,6 +328,8 @@ pub enum Message {
     RemoteSent(PathBuf, Result<Option<u64>, String>),
     SpellFix,
     SpellChecked(Option<spelling::SpellChecked>),
+    /// The dictionary of a language, read in the background.
+    SpellerLoaded(String, Option<crate::spell::Speller>),
     SpellReplace(String),
     SpellAdd,
     SpellIgnore,
@@ -334,6 +339,10 @@ pub enum Message {
     CompareDisk,
     ComparePickFile,
     CompareFilePicked(Result<(PathBuf, String), String>),
+    /// The file on disk, read to be compared with the editor.
+    CompareDiskRead(Result<String, String>),
+    /// A file read again (as another encoding, or to drop the changes).
+    Reloaded(PathBuf, bool, Result<Loaded, String>),
     AskCompareClipboard,
     OpenTodos,
     TodosFound(Result<Vec<finder::Occurrence>, String>),
@@ -382,6 +391,17 @@ pub enum Message {
     FindPreviewAction(text_editor::Action),
     FindPreviewMenu(finder::PreviewMenu),
     FindPreviewPasted(Option<String>),
+    /// A replacement in many files is done (what it did, the files on disk).
+    /// The open folders of the tree, read in the background.
+    /// The text of the file of the preview of a search, read in the background.
+    FinderPreviewRead(PathBuf, String),
+    /// Files put back by a revert of the local history (how many already, the
+    /// failure, the files on disk).
+    HistoryReverted(usize, Option<String>, Vec<local_history::Reverted>),
+    ProjectsReloaded(Vec<crate::projects::LoadedDir>),
+    ReplaceDone(Box<finder::Replaced>, Vec<finder::DiskDone>),
+    /// A rename is done in the files on disk too.
+    RenameDone(Box<RenameOutcome>, Vec<DiskEdited>),
     FindDirPicked(Option<PathBuf>),
     FindRecursive,
     FindMenu(Option<finder::Menu>),
@@ -489,6 +509,8 @@ pub enum Message {
     RevealInFileManager(PathBuf),
     /// Asks a name for a copy of a file or folder.
     DuplicateEntry(PathBuf),
+    /// The copy of a file or folder is made (the copy, how it went).
+    EntryDuplicated(PathBuf, Result<(), String>),
     /// Asks a name for a file (false) or a folder (true) in a folder.
     NewProjectEntry(PathBuf, bool),
     RenameProjectEntry(PathBuf),
@@ -609,6 +631,8 @@ pub enum Message {
     GitFileDo(PathBuf, git_file::FileAction),
     GitFileRoot(PathBuf, git_file::FileAction, Option<PathBuf>),
     GitFileDone(Result<String, String>),
+    /// The restore of a file from a revision was confirmed.
+    GitGetConfirmed(PathBuf, String, String),
     GitFileDiff(Result<crate::git_panel::DiffTab, String>),
     GitFilePick(Result<git_file::Pick, String>),
     GitPickFilter(String),
@@ -618,6 +642,8 @@ pub enum Message {
     // Bookmarks panel
     ToggleBookmarkPanel,
     BookmarkClick(bookmark_panel::Target),
+    /// The lines of bookmarked files, read in the background.
+    BookmarkTexts(Vec<(PathBuf, Vec<String>)>),
     BookmarkFold(PathBuf),
     BookmarkDelete(bookmark_panel::Target),
     /// Bookmarks a file as a whole, or takes it out.
@@ -927,7 +953,8 @@ pub struct SimpleEditApp {
     marks_asked: Option<PathBuf>,
     last_edit: std::time::Instant,
     /// A save by itself is under way (it says nothing in the status bar).
-    autosaving: bool,
+    /// How many saves of an auto-save batch are still on their way.
+    autosaving: usize,
     ticks: u32,
     /// Whether the window has the focus: the periodic checks of the disk and
     /// of Git wait while it has not.
@@ -936,6 +963,12 @@ pub struct SimpleEditApp {
     watch: crate::watch::Watch,
     /// Something changed on the disk since the tree and the marks were read.
     fs_dirty: bool,
+    /// The tree of the projects is being read in the background.
+    projects_reloading: bool,
+    /// The text of the buffer as of a stamp (`buffer_text_shared`).
+    text_shared: std::cell::RefCell<Option<SharedText>>,
+    /// When the marks of the changed lines were last computed while typing.
+    marks_at: std::time::Instant,
     /// The last right click on the editor was in the gutter.
     gutter_click: bool,
     /// The line of the gutter that was right-clicked (for the blame menu).
@@ -1232,11 +1265,14 @@ impl SimpleEditApp {
             marks: None,
             marks_asked: None,
             last_edit: std::time::Instant::now(),
-            autosaving: false,
+            autosaving: 0,
             ticks: 0,
             window_focused: true,
             watch: crate::watch::Watch::default(),
             fs_dirty: true,
+            projects_reloading: false,
+            text_shared: Default::default(),
+            marks_at: std::time::Instant::now(),
             gutter_click: false,
             gutter_line: None,
             revert: None,
@@ -1436,7 +1472,13 @@ impl SimpleEditApp {
         )
         .then(|| self.git.status.clone());
         let git_done = matches!(&message, Message::Git(crate::git_panel::GitMsg::Done(_)));
+        // The terminal redraws 30 times a second: it changes nothing the rest
+        // of the window follows (the text, the preview, the lint, the marks).
+        let idle = matches!(&message, Message::TerminalTick);
         let command = self.handle(message);
+        if idle {
+            return command;
+        }
         if edits_text {
             self.snippet_follow();
         }
@@ -1467,14 +1509,18 @@ impl SimpleEditApp {
         self.sync_split();
         let marks_task = self.after_message(edits_text, status_before, git_done);
         self.track_mru();
-        self.settle_preview();
+        let preview_task = self.settle_preview();
         let lint_task = self.lint_tick();
-        let command = Task::batch([command, marks_task, lint_task]);
+        let command = Task::batch([command, marks_task, lint_task, preview_task]);
         if !typing {
             self.refresh_preview();
         }
         self.refresh_file_size();
-        self.refresh_bookmark_panel();
+        let command = Task::batch([
+            command,
+            self.refresh_bookmark_panel(),
+            self.finder_preview_task(),
+        ]);
         if !passive {
             self.refresh_selection_info();
         }
@@ -1610,9 +1656,7 @@ impl SimpleEditApp {
             }));
         }
         if self.ipc_listening {
-            subscriptions.push(
-                iced::time::every(std::time::Duration::from_millis(300)).map(|_| Message::IpcPoll),
-            );
+            subscriptions.push(crate::ipc::arrivals().map(|()| Message::IpcPoll));
         }
         if self.sidebar_resizing {
             subscriptions.push(iced::event::listen_with(
@@ -1746,7 +1790,11 @@ impl SimpleEditApp {
             offer: self.status_offer(),
             dark,
             cursor,
-            line_ending: self.format.ending.label(),
+            line_ending: if self.format.mixed {
+                t!("status.mixed_endings").to_string()
+            } else {
+                self.format.ending.label().to_string()
+            },
             language: self.editor.language.as_deref(),
             selection: selection_info,
             file_size: self.file_size,
@@ -1928,7 +1976,14 @@ impl SimpleEditApp {
         // Floating dropdown (menu bar)
         // Bounds resolve one update cycle after a menu first opens (see
         // Message::ToggleMenu); until then, render nothing.
-        let with_dropdown: Element<Message> = if let (Some(menu), Some(bounds)) = (
+        // The layers below are always there, empty when nothing is open: the
+        // tree of widgets must keep its shape, or the editor under them
+        // loses its focus and its scroll each time one opens or closes.
+        let (menu_outside, menu_dropdown, menu_at): (
+            Element<Message>,
+            Element<Message>,
+            iced::Point,
+        ) = if let (Some(menu), Some(bounds)) = (
             self.open_menu,
             self.open_menu
                 .and_then(|m| self.menu_bounds.get(&m).copied()),
@@ -1961,19 +2016,32 @@ impl SimpleEditApp {
                         .on_right_press(Message::CloseMenu)
                 ),
             ];
-            crate::floating::at_point(
-                iced::widget::stack![base, outside],
+            (
+                outside.into(),
                 iced::widget::opaque(dropdown),
-                bounds.x,
-                bounds.y + bounds.height,
+                iced::Point::new(bounds.x, bounds.y + bounds.height),
             )
         } else {
-            base
+            (
+                Space::new().into(),
+                Space::new().into(),
+                iced::Point::ORIGIN,
+            )
         };
+        let with_dropdown: Element<Message> = crate::floating::at_point(
+            iced::widget::stack![base, menu_outside],
+            menu_dropdown,
+            menu_at.x,
+            menu_at.y,
+        );
 
         // The modes behind the chevron of a Git button float where it was
         // pressed, over everything below; a click anywhere else closes them.
-        let with_dropdown: Element<Message> = match self.git.split_overlay(dark) {
+        let (split_outside, split_options, split_at): (
+            Element<Message>,
+            Element<Message>,
+            iced::Point,
+        ) = match self.git.split_overlay(dark) {
             Some((at, options)) => {
                 let outside =
                     iced::widget::mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
@@ -1981,15 +2049,20 @@ impl SimpleEditApp {
                         .on_right_press(Message::Git(crate::git_panel::GitMsg::CloseSplit));
                 // Right edge under the chevron, a little below the button.
                 let x = (at.x - crate::git_panel::branches::SPLIT_OPTIONS_WIDTH + 14.0).max(4.0);
-                crate::floating::at_point(
-                    iced::widget::stack![with_dropdown, outside],
-                    options,
-                    x,
-                    at.y + 14.0,
-                )
+                (outside.into(), options, iced::Point::new(x, at.y + 14.0))
             }
-            None => with_dropdown,
+            None => (
+                Space::new().into(),
+                Space::new().into(),
+                iced::Point::ORIGIN,
+            ),
         };
+        let with_dropdown: Element<Message> = crate::floating::at_point(
+            iced::widget::stack![with_dropdown, split_outside],
+            split_options,
+            split_at.x,
+            split_at.y,
+        );
 
         // The card of a problem floats under it. The layer is always there,
         // empty when no card is open: the tree of widgets must keep its shape,
@@ -2025,21 +2098,35 @@ impl SimpleEditApp {
             crate::floating::at_point(with_dropdown, hint, hint_at.x, hint_at.y);
 
         // The list of every tab, under its button; a click elsewhere closes it.
-        let with_dropdown: Element<Message> = match self.tab_list {
-            Some(at) => {
-                let outside =
-                    iced::widget::mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
-                        .on_press(Message::CloseTabList)
-                        .on_right_press(Message::CloseTabList);
-                crate::floating::at_point(
-                    iced::widget::stack![with_dropdown, outside],
-                    self.tab_list_view(dark),
-                    (at.x - views::TAB_LIST_WIDTH + 16.0).max(4.0),
-                    at.y + 14.0,
-                )
-            }
-            None => with_dropdown,
-        };
+        let (list_outside, tabs_list, tabs_at): (Element<Message>, Element<Message>, iced::Point) =
+            match self.tab_list {
+                Some(at) => {
+                    let outside = iced::widget::mouse_area(
+                        Space::new().width(Length::Fill).height(Length::Fill),
+                    )
+                    .on_press(Message::CloseTabList)
+                    .on_right_press(Message::CloseTabList);
+                    (
+                        outside.into(),
+                        self.tab_list_view(dark),
+                        iced::Point::new(
+                            (at.x - views::TAB_LIST_WIDTH + 16.0).max(4.0),
+                            at.y + 14.0,
+                        ),
+                    )
+                }
+                None => (
+                    Space::new().into(),
+                    Space::new().into(),
+                    iced::Point::ORIGIN,
+                ),
+            };
+        let with_dropdown: Element<Message> = crate::floating::at_point(
+            iced::widget::stack![with_dropdown, list_outside],
+            tabs_list,
+            tabs_at.x,
+            tabs_at.y,
+        );
 
         // The Preferences window floats over everything but the dialogs.
         let with_prefs: Element<Message> = if self.show_preferences {
@@ -2199,10 +2286,11 @@ impl SimpleEditApp {
         };
 
         // A pop-up at the top announces conflicts, until they are gone.
-        let with_prefs: Element<Message> = match self.conflict_toast(dark) {
-            Some(toast) => iced::widget::stack![with_prefs, toast].into(),
-            None => with_prefs,
-        };
+        // Its layer is always there too, for the focus of the editor.
+        let toast: Element<Message> = self
+            .conflict_toast(dark)
+            .unwrap_or_else(|| Space::new().into());
+        let with_prefs: Element<Message> = iced::widget::stack![with_prefs, toast].into();
 
         // Modal overlays
         match &self.overlay {
@@ -2305,6 +2393,13 @@ impl SimpleEditApp {
                         t!("projects.delete_confirm").to_string(),
                         Message::DeleteFolder(dir.clone()),
                     ),
+                    ActiveOverlay::ConfirmGitGet(repo, file, rev) => confirm_card(
+                        dark,
+                        t!("git.get_title").to_string(),
+                        git_get_message(file, rev),
+                        t!("git.get_confirm").to_string(),
+                        Message::GitGetConfirmed(repo.clone(), file.clone(), rev.clone()),
+                    ),
                     ActiveOverlay::ConfirmScratchDelete(path) => confirm_card(
                         dark,
                         t!("scratch.delete_title").to_string(),
@@ -2367,7 +2462,10 @@ impl Message {
                 crate::database::DbMsg::Scrolled(..) | crate::database::DbMsg::DriverProbed(..)
             ),
             Message::History(msg) => msg.is_background(),
-            Message::BlameLoaded(..) | Message::MarksBase(..) | Message::SpellChecked(_) => true,
+            Message::BlameLoaded(..)
+            | Message::MarksBase(..)
+            | Message::SpellChecked(_)
+            | Message::SpellerLoaded(..) => true,
             // What comes by itself (answers, timers) or from the pointer
             // merely passing over something: an open menu stays open.
             Message::FileStates(_)
@@ -2400,7 +2498,17 @@ impl Message {
             | Message::SymbolHoverLoaded(..)
             // The poll for files sent by another instance ticks every
             // 300 ms; a file it brings opens through its own messages.
-            | Message::IpcPoll => true,
+            | Message::IpcPoll
+            // A build writing in the project, the auto-save, a file
+            // rewritten by another program, the output of a running task.
+            | Message::FsChanged
+            | Message::FileSaved(..)
+            | Message::FileReloaded(_)
+            | Message::LargeRefreshed(..)
+            | Message::TaskEvent(..)
+            | Message::BookmarkTexts(_)
+            | Message::FinderPreviewRead(..)
+            | Message::ProjectsReloaded(_) => true,
             _ => false,
         }
     }
@@ -2779,10 +2887,10 @@ impl SimpleEditApp {
                             self.config.add_recent(&path);
                             self.config_dirty = true;
                         }
-                        if !self.autosaving {
+                        if self.autosaving == 0 {
                             self.set_status(t!("status.file_saved"), false);
                         }
-                        self.autosaving = false;
+                        self.autosaving = self.autosaving.saturating_sub(1);
                         // The tools that read the disk look again.
                         self.lint.force = self.config.lint_trigger != crate::lint::Trigger::Manual;
                         // The Git panel and the open diffs follow the save.
@@ -2796,9 +2904,9 @@ impl SimpleEditApp {
                             .discard();
                         return Task::batch([panel, self.refresh_diff_tabs(), sent, told]);
                     }
-                    Err(e) if e == CANCELLED => self.autosaving = false,
+                    Err(e) if e == CANCELLED => self.autosaving = self.autosaving.saturating_sub(1),
                     Err(e) => {
-                        self.autosaving = false;
+                        self.autosaving = self.autosaving.saturating_sub(1);
                         self.set_status(format!("{}: {}", t!("status.error"), e), true);
                     }
                 }
@@ -3034,6 +3142,7 @@ impl SimpleEditApp {
             Message::GitFileDo(path, action) => self.git_file_do(path, action),
             Message::GitFileRoot(path, action, root) => self.git_file_root(path, action, root),
             Message::GitFileDone(result) => self.git_file_done(result),
+            Message::GitGetConfirmed(repo, file, rev) => self.git_get_confirmed(repo, file, rev),
             Message::GitFileDiff(result) => self.git_file_diff(result),
             Message::GitFilePick(result) => self.git_file_pick(result),
             Message::GitPickFilter(filter) => {
@@ -3052,11 +3161,15 @@ impl SimpleEditApp {
                     self.scratch.open = false;
                     self.git.open = false;
                     self.db.console.open = false;
-                    self.refresh_bookmark_texts(true);
+                    return self.refresh_bookmark_texts(true);
                 }
                 Task::none()
             }
             Message::BookmarkClick(target) => self.bookmark_click(target),
+            Message::BookmarkTexts(read) => {
+                self.bookmark_texts_read(read);
+                Task::none()
+            }
             Message::BookmarkFold(path) => {
                 if !self.bookmark_panel.collapsed.remove(&path) {
                     self.bookmark_panel.collapsed.insert(path);
@@ -3434,6 +3547,7 @@ impl SimpleEditApp {
                 }
                 Task::none()
             }
+            Message::EntryDuplicated(target, result) => self.entry_duplicated(target, result),
             Message::DuplicateEntry(path) => self.ask_name(project_ops::NameFor::Duplicate(path)),
             Message::ShowInProjects(file) => {
                 if !self.projects.show(&file) {
@@ -3642,6 +3756,7 @@ impl SimpleEditApp {
             Message::RemoteDownloaded(file, result) => self.remote_downloaded(file, result),
             Message::RemoteSent(path, result) => self.remote_sent(path, result),
             Message::SpellFix => self.open_spell_fix(),
+            Message::SpellerLoaded(code, speller) => self.speller_loaded(code, speller),
             Message::SpellChecked(done) => {
                 self.spell_checked(done);
                 Task::none()
@@ -3655,6 +3770,8 @@ impl SimpleEditApp {
             Message::CompareClipboard(text) => self.compare_with_clipboard(text),
             Message::CompareDisk => self.compare_with_disk(),
             Message::ComparePickFile => self.compare_pick_file(),
+            Message::Reloaded(path, revert, result) => self.reloaded(path, revert, result),
+            Message::CompareDiskRead(result) => self.compare_disk_read(result),
             Message::CompareFilePicked(result) => self.compare_with_file(result),
             Message::OpenTodos => self.find_todos(),
             Message::TodosFound(result) => {
@@ -3744,10 +3861,22 @@ impl SimpleEditApp {
                 ])
             }
             Message::NewWindow => {
+                // The new window reads the settings from the disk.
+                if self.config_dirty && self.session_owner {
+                    self.config_dirty = false;
+                    self.config.save();
+                }
                 let started = std::env::current_exe()
                     .and_then(|exe| std::process::Command::new(exe).arg("--new-window").spawn());
-                if let Err(e) = started {
-                    self.set_status(format!("{}: {e}", t!("status.error")), true);
+                match started {
+                    // The window that closes is waited for, or it stays a
+                    // zombie until this one ends.
+                    Ok(mut child) => {
+                        std::thread::spawn(move || {
+                            let _ = child.wait();
+                        });
+                    }
+                    Err(e) => self.set_status(format!("{}: {e}", t!("status.error")), true),
                 }
                 Task::none()
             }
@@ -3821,7 +3950,9 @@ impl SimpleEditApp {
                 {
                     return Task::none();
                 }
-                let text = crate::editor::buffer_text(&self.editor.content);
+                // The text is made once per state of the buffer: the pointer
+                // resting on words copies nothing.
+                let text = self.buffer_text_shared();
                 let token = self.symbol_token;
                 Task::perform(
                     async move { crate::lsp::hover(&ext, &path, &text, line, col).await },
@@ -3992,28 +4123,7 @@ impl SimpleEditApp {
                     self.set_status(t!("large.read_only"), true);
                     return Task::none();
                 }
-                let Some(raw) = std::fs::read(&path)
-                    .ok()
-                    .and_then(|bytes| self.format.encoding.decode(&bytes))
-                else {
-                    self.set_status(
-                        t!("status.err_decode", name = self.format.encoding.label()),
-                        true,
-                    );
-                    return Task::none();
-                };
-                let (text, mut format) = TextFormat::decode(&raw);
-                format.encoding = self.format.encoding;
-                // The changes stay one Ctrl+Z away (`apply_reload` keeps
-                // the undo history).
-                self.is_dirty = false;
-                self.apply_reload(Loaded {
-                    stamp: DiskStamp::of(&path),
-                    path,
-                    text,
-                    format,
-                });
-                Task::none()
+                self.reload_later(path, self.format.encoding, true)
             }
             Message::ReloadEncoding(encoding) => {
                 self.overlay = ActiveOverlay::None;
@@ -4033,22 +4143,7 @@ impl SimpleEditApp {
                     self.set_status(t!("large.read_only"), true);
                     return Task::none();
                 }
-                let Some(raw) = std::fs::read(&path)
-                    .ok()
-                    .and_then(|bytes| encoding.decode(&bytes))
-                else {
-                    self.set_status(t!("status.err_decode", name = encoding.label()), true);
-                    return Task::none();
-                };
-                let (text, mut format) = TextFormat::decode(&raw);
-                format.encoding = encoding;
-                self.apply_reload(Loaded {
-                    stamp: DiskStamp::of(&path),
-                    path,
-                    text,
-                    format,
-                });
-                Task::none()
+                self.reload_later(path, encoding, false)
             }
             Message::SetLineEnding(ending) => {
                 if self.large_view().is_some() {
@@ -4057,8 +4152,10 @@ impl SimpleEditApp {
                     return Task::none();
                 }
                 self.overlay = ActiveOverlay::None;
-                if self.format.ending != ending {
+                if self.format.ending != ending || self.format.mixed {
                     self.format.ending = ending;
+                    // Chosen: every line takes it.
+                    self.format.mixed = false;
                     self.is_dirty = true;
                 }
                 Task::none()
@@ -4097,7 +4194,8 @@ impl SimpleEditApp {
                 } else {
                     (self.config.font_size + step as f32).clamp(8.0, 32.0)
                 };
-                self.config.save();
+                // Written by the next tick: a turn of the wheel is many steps.
+                self.config_dirty = true;
                 Task::none()
             }
             Message::FindDirChosen(dir) => {
@@ -4135,6 +4233,20 @@ impl SimpleEditApp {
             }
             Message::FindPreviewAction(action) => self.finder_preview_action(action),
             Message::FindPreviewMenu(what) => self.finder_preview_menu(what),
+            Message::HistoryReverted(done, failed, written) => {
+                self.history_reverted(done, failed, written)
+            }
+            Message::FinderPreviewRead(path, text) => {
+                self.finder_preview_read(path, text);
+                Task::none()
+            }
+            Message::ProjectsReloaded(loaded) => {
+                self.projects_reloading = false;
+                self.projects.reloaded(loaded);
+                Task::none()
+            }
+            Message::RenameDone(outcome, disk) => self.rename_done(*outcome, disk),
+            Message::ReplaceDone(replaced, disk) => self.replace_done(*replaced, disk),
             Message::FindPreviewPasted(text) => match text {
                 Some(text) if text.len() <= MAX_PASTE_BYTES => self.finder_preview_action(
                     text_editor::Action::Edit(text_editor::Edit::Paste(std::sync::Arc::new(text))),
@@ -4369,12 +4481,12 @@ impl SimpleEditApp {
             Message::ToggleHighContrast => {
                 self.config.high_contrast = !self.config.high_contrast;
                 se_theme::set_high_contrast(self.config.high_contrast);
-                self.config.save();
+                self.config_dirty = true;
                 Task::none()
             }
             Message::ThemeChanged(dark) => {
                 self.config.dark_mode = dark;
-                self.config.save();
+                self.config_dirty = true;
                 Task::none()
             }
             Message::Sidebar(msg) => match self.sidebar.update(msg) {
@@ -4474,6 +4586,15 @@ impl SimpleEditApp {
                 self.overlay = ActiveOverlay::ConfirmQuit(t!("quit.unsaved").to_string());
                 Task::none()
             }
+            // Edits waiting in a table grid or a merge tab are not in the
+            // session: closing would throw them away.
+            Message::Quit
+                if self.db_tabs.values().any(|t| !t.pending.is_empty())
+                    || self.merge_tabs.values().any(|t| t.is_modified()) =>
+            {
+                self.overlay = ActiveOverlay::ConfirmQuit(t!("quit.unsaved").to_string());
+                Task::none()
+            }
             Message::Quit => match self.save_session_now() {
                 Ok(()) => {
                     // A second window would undo the settings changed meanwhile
@@ -4481,7 +4602,7 @@ impl SimpleEditApp {
                     if self.session_owner {
                         self.config.save();
                     }
-                    self.api.save_environments();
+                    self.api.save_environments_now();
                     crate::tasks::stop_all();
                     crate::lsp::stop_servers();
                     std::process::exit(0)
@@ -4497,7 +4618,7 @@ impl SimpleEditApp {
                 if self.session_owner {
                     self.config.save();
                 }
-                self.api.save_environments();
+                self.api.save_environments_now();
                 crate::tasks::stop_all();
                 crate::lsp::stop_servers();
                 std::process::exit(0)
@@ -4745,7 +4866,7 @@ impl SimpleEditApp {
                 Task::none()
             }
             Message::AutoSave => {
-                self.flush_scratch();
+                let scratch = self.flush_scratch_later();
                 if self.config_dirty {
                     self.config_dirty = false;
                     self.config.save();
@@ -4771,8 +4892,9 @@ impl SimpleEditApp {
                         ticks.is_multiple_of(n)
                     }
                 };
+                let mut reload = Task::none();
                 if watching && every(2, self.ticks) {
-                    self.projects.refresh(false);
+                    reload = self.reload_projects();
                 }
                 let states = if watching && every(3, self.ticks) {
                     self.refresh_file_states()
@@ -4826,6 +4948,8 @@ impl SimpleEditApp {
                 let external = Task::batch([
                     external,
                     self.auto_save_files(),
+                    scratch,
+                    reload,
                     marks,
                     probe,
                     fetch,
@@ -4849,6 +4973,9 @@ impl SimpleEditApp {
             }
             Message::FsChanged => {
                 self.fs_dirty = true;
+                // A folder just made is watched now, not at the next sync:
+                // what is created in it straight away would be missed.
+                self.watch.watch_created();
                 // The Git panel does not wait for its own clock.
                 if self.git.open && self.watch.active() {
                     return Task::done(Message::Git(crate::git_panel::GitMsg::Tick));
@@ -6810,6 +6937,96 @@ impl SimpleEditApp {
 
     /// Watches the project folders, and the folders of the open files that
     /// are in none of them.
+    /// Reads the open folders that changed, off the interface thread (a
+    /// build writing in the project, a disk on the network).
+    fn reload_projects(&mut self) -> Task<Message> {
+        if self.projects_reloading {
+            return Task::none();
+        }
+        let Some(job) = self.projects.reload_job() else {
+            return Task::none();
+        };
+        // The tests have no runtime to run a task: it is done on the spot.
+        if cfg!(test) {
+            let loaded = job.run();
+            self.projects.reloaded(loaded);
+            return Task::none();
+        }
+        self.projects_reloading = true;
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || job.run())
+                    .await
+                    .unwrap_or_default()
+            },
+            Message::ProjectsReloaded,
+        )
+    }
+
+    /// Reads the file again as `encoding` says, off the interface thread (a
+    /// big file, a slow disk). `revert`: what was typed is dropped (it stays
+    /// one Ctrl+Z away).
+    fn reload_later(
+        &mut self,
+        path: PathBuf,
+        encoding: crate::tabs::Encoding,
+        revert: bool,
+    ) -> Task<Message> {
+        let read = {
+            let path = path.clone();
+            move || -> Result<Loaded, String> {
+                let stamp = DiskStamp::of(&path);
+                let bytes = std::fs::read(&path).map_err(file_io::read_error)?;
+                let raw = encoding
+                    .decode(&bytes)
+                    .ok_or_else(|| t!("status.err_decode", name = encoding.label()).to_string())?;
+                let (text, mut format) = TextFormat::decode(&raw);
+                format.encoding = encoding;
+                Ok(Loaded {
+                    path,
+                    text,
+                    format,
+                    stamp,
+                })
+            }
+        };
+        // The tests have no runtime to run a task: it is read on the spot.
+        if cfg!(test) {
+            return self.reloaded(path, revert, read());
+        }
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(read)
+                    .await
+                    .map_err(|e| e.to_string())?
+            },
+            move |result| Message::Reloaded(path.clone(), revert, result),
+        )
+    }
+
+    /// The file read again: it replaces what the editor shows, if that is
+    /// still the same file (and still unchanged, unless reverting).
+    fn reloaded(
+        &mut self,
+        path: PathBuf,
+        revert: bool,
+        result: Result<Loaded, String>,
+    ) -> Task<Message> {
+        match result {
+            Ok(loaded) => {
+                if self.current_file.as_ref() != Some(&path) || (self.is_dirty && !revert) {
+                    return Task::none();
+                }
+                if revert {
+                    self.is_dirty = false;
+                }
+                self.apply_reload(loaded);
+            }
+            Err(e) => self.set_status(e, true),
+        }
+        Task::none()
+    }
+
     fn sync_watch(&mut self) {
         // Not in the tests: they would watch the temporary folders of all.
         if cfg!(test) {
@@ -6962,8 +7179,13 @@ impl SimpleEditApp {
             self.overlay_seen = Some(now);
             self.overlay_pick = 0;
         }
-        // Small files follow every keystroke, big ones wait for the tick.
-        if edited && self.editor.content.line_count() < 3000 {
+        // Small files follow the typing, at most every 150 ms (a diff of the
+        // whole text each time is a cost); the tick catches up after.
+        if edited
+            && self.editor.content.line_count() < 3000
+            && (cfg!(test) || self.marks_at.elapsed() >= std::time::Duration::from_millis(150))
+        {
+            self.marks_at = std::time::Instant::now();
             self.refresh_marks_now();
         }
         spelling
@@ -7032,6 +7254,20 @@ impl SimpleEditApp {
 
     /// Which text the buffer holds: changes with every edit and when the text
     /// is replaced as a whole.
+    /// The text of the buffer, kept for as long as the buffer is not changed.
+    fn buffer_text_shared(&self) -> std::sync::Arc<String> {
+        let stamp = self.buffer_stamp();
+        let mut kept = self.text_shared.borrow_mut();
+        match kept.as_ref() {
+            Some((at, text)) if *at == stamp => text.clone(),
+            _ => {
+                let text = std::sync::Arc::new(crate::editor::buffer_text(&self.editor.content));
+                *kept = Some((stamp, text.clone()));
+                text
+            }
+        }
+    }
+
     fn buffer_stamp(&self) -> (u64, u64) {
         (self.editor.content.id(), self.editor.content.revision())
     }
@@ -7095,7 +7331,7 @@ impl SimpleEditApp {
 
     fn auto_save_files(&mut self) -> Task<Message> {
         if !self.config.auto_save
-            || self.autosaving
+            || self.autosaving > 0
             || self.last_edit.elapsed() < std::time::Duration::from_millis(700)
         {
             return Task::none();
@@ -7118,7 +7354,7 @@ impl SimpleEditApp {
         if tasks.is_empty() {
             return Task::none();
         }
-        self.autosaving = true;
+        self.autosaving = tasks.len();
         Task::batch(tasks)
     }
 
@@ -7852,6 +8088,25 @@ impl SimpleEditApp {
         crate::scratch::is_scratch(&self.scratch.dir, path)
     }
 
+    /// The same for the tick of the clock: written off the interface thread,
+    /// by the way of the auto-save.
+    fn flush_scratch_later(&mut self) -> Task<Message> {
+        let Some(path) = self.current_file.clone().filter(|p| self.is_scratch(p)) else {
+            return Task::none();
+        };
+        if !self.is_dirty || self.autosaving > 0 || self.changed_on_disk(&path) {
+            return Task::none();
+        }
+        // The tests have no runtime to run a task: it is written on the spot.
+        if cfg!(test) {
+            self.flush_scratch();
+            return Task::none();
+        }
+        let content = crate::editor::buffer_text(&self.editor.content);
+        self.autosaving = 1;
+        save_command(Some(path.clone()), save_file(path, content, self.format))
+    }
+
     /// Writes the scratch file in front if it was typed in: they are saved by
     /// themselves, with no question asked.
     fn flush_scratch(&mut self) {
@@ -7862,7 +8117,7 @@ impl SimpleEditApp {
             return;
         }
         let content = crate::editor::buffer_text(&self.editor.content);
-        let Some(bytes) = self.format.encode_bytes(&content) else {
+        let Some(bytes) = self.format.encode_bytes_for(&content, &path) else {
             self.set_status(
                 t!("status.err_encoding", name = self.format.encoding.label()),
                 true,
@@ -7969,19 +8224,21 @@ impl SimpleEditApp {
 
     /// Once the file of the preview is in the editor, the one it replaces
     /// goes and it takes its place; once it is edited, it stays.
-    fn settle_preview(&mut self) {
+    fn settle_preview(&mut self) -> Task<Message> {
         let Some(preview) = self.preview_tab.clone() else {
-            return;
+            return Task::none();
         };
         if self.current_file.as_ref() != Some(&preview) {
-            return;
+            return Task::none();
         }
+        let mut closing = Task::none();
         if self.is_dirty {
             self.preview_tab = None;
         }
         if let Some((old, index)) = self.preview_replaces.take() {
             if old != preview {
-                let _ = self.close_path(old);
+                // The language servers let go of the file that was replaced.
+                closing = self.close_path(old);
                 let files = self.sidebar.files();
                 if let Some(at) = files.iter().position(|p| *p == preview) {
                     let to = index.min(files.len().saturating_sub(1));
@@ -7989,6 +8246,7 @@ impl SimpleEditApp {
                 }
             }
         }
+        closing
     }
 
     /// The file in the editor goes first in the order of the ones seen.
@@ -8572,8 +8830,9 @@ impl SimpleEditApp {
                 return Task::none();
             }
         };
-        let (mut places, mut changed, mut skipped) = (0, 0, 0);
-        let mut written = Vec::new();
+        let mut outcome = RenameOutcome::default();
+        // The files nothing holds open are read and written in the background.
+        let mut on_disk: Vec<(PathBuf, Vec<crate::lint::Edit>)> = Vec::new();
         for file in files {
             let fix = crate::lint::Fix {
                 title: String::new(),
@@ -8583,43 +8842,75 @@ impl SimpleEditApp {
             if self.current_file.as_ref() == Some(&file.path) {
                 let old = crate::editor::buffer_text(&self.editor.content);
                 if fingerprint(&old) != source {
-                    skipped += 1;
+                    outcome.skipped += 1;
                     continue;
                 }
                 let (new, _) = crate::lint::apply(&old, &[&fix]);
                 let (line, col) = self.editor.content.cursor_position();
                 let _ = self.apply_text_edit(new, line, col, None);
-                places += file.edits.len();
-                changed += 1;
+                outcome.places += file.edits.len();
+                outcome.changed += 1;
                 continue;
             }
-            let Some((text, holder)) = self.file_text(&file.path) else {
+            let Some(text) = self.file_cache.get(&file.path).and_then(CachedBuffer::text) else {
+                on_disk.push((file.path, file.edits));
                 continue;
             };
-            if matches!(holder, finder::Holder::Tab) && self.is_path_dirty(&file.path) {
-                skipped += 1;
+            if self.is_path_dirty(&file.path) {
+                outcome.skipped += 1;
                 continue;
             }
             let (new, _) = crate::lint::apply(&text, &[&fix]);
-            if new != text && self.put_text(&file.path, &holder, &text, &new) {
-                places += file.edits.len();
-                changed += 1;
-                written.push(finder::Written {
+            if new != text && self.put_text(&file.path, &finder::Holder::Tab, &text, &new) {
+                outcome.places += file.edits.len();
+                outcome.changed += 1;
+                outcome.written.push(finder::Written {
                     path: file.path.clone(),
                     before: text,
                     after: new,
                 });
             }
         }
-        if !written.is_empty() {
-            self.finder.undo = written;
+        if on_disk.is_empty() {
+            return self.rename_done(outcome, Vec::new());
         }
-        let files = finder::files_text(changed);
+        // The tests have no runtime to run a task: it is done on the spot.
+        if cfg!(test) {
+            let disk = rename_on_disk(on_disk);
+            return self.rename_done(outcome, disk);
+        }
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || rename_on_disk(on_disk))
+                    .await
+                    .unwrap_or_default()
+            },
+            move |disk| Message::RenameDone(Box::new(outcome.clone()), disk),
+        )
+    }
+
+    /// The edits of a rename are made in the files on disk too: it is told.
+    fn rename_done(&mut self, mut outcome: RenameOutcome, disk: Vec<DiskEdited>) -> Task<Message> {
+        for w in disk {
+            self.bookmarks.remap(&w.path, &w.before, &w.after);
+            outcome.places += w.places;
+            outcome.changed += 1;
+            outcome.written.push(finder::Written {
+                path: w.path,
+                before: w.before,
+                after: w.after,
+            });
+        }
+        if !outcome.written.is_empty() {
+            self.finder.undo = std::mem::take(&mut outcome.written);
+        }
+        let files = finder::files_text(outcome.changed);
+        let places = outcome.places;
         let mut message = t!("rename.done", count = places, files = files.as_str()).to_string();
-        if skipped > 0 {
-            message = format!("{message}. {}", t!("rename.skipped", n = skipped));
+        if outcome.skipped > 0 {
+            message = format!("{message}. {}", t!("rename.skipped", n = outcome.skipped));
         }
-        self.set_status(message, skipped > 0);
+        self.set_status(message, outcome.skipped > 0);
         Task::none()
     }
 
@@ -8655,6 +8946,70 @@ impl SimpleEditApp {
             Message::SaveAsChosen(origin.clone(), result)
         })
     }
+}
+
+/// What the question before restoring a file from a revision says.
+fn git_get_message(file: &str, rev: &str) -> String {
+    let short = rev.chars().take(8).collect::<String>();
+    t!("git.get_message", file = file, rev = short.as_str()).to_string()
+}
+
+/// The text of the buffer as of a stamp.
+type SharedText = ((u64, u64), std::sync::Arc<String>);
+
+/// What a rename did so far.
+#[derive(Debug, Clone, Default)]
+pub struct RenameOutcome {
+    places: usize,
+    changed: usize,
+    skipped: usize,
+    written: Vec<finder::Written>,
+}
+
+/// A file on disk that a rename edited.
+#[derive(Debug, Clone)]
+pub struct DiskEdited {
+    path: PathBuf,
+    before: String,
+    after: String,
+    places: usize,
+}
+
+/// Makes the edits of a rename in files nothing holds open: each is read
+/// once, and written back in the encoding it had. One that cannot be read or
+/// written is left as it is.
+fn rename_on_disk(files: Vec<(PathBuf, Vec<crate::lint::Edit>)>) -> Vec<DiskEdited> {
+    let mut out = Vec::new();
+    for (path, edits) in files {
+        let Some((text, encoding)) = std::fs::read(&path)
+            .ok()
+            .and_then(|b| crate::finder::decode_file(&b))
+        else {
+            continue;
+        };
+        let fix = crate::lint::Fix {
+            title: String::new(),
+            edits: edits.clone(),
+            safe: true,
+        };
+        let (after, _) = crate::lint::apply(&text, &[&fix]);
+        if after == text {
+            continue;
+        }
+        let Some(bytes) = encoding.encode(&after) else {
+            continue;
+        };
+        if crate::fsutil::write_atomic(&path, &bytes, false).is_err() {
+            continue;
+        }
+        out.push(DiskEdited {
+            path,
+            before: text,
+            after,
+            places: edits.len(),
+        });
+    }
+    out
 }
 
 /// A text to paste in a terminal without its control characters (the escape

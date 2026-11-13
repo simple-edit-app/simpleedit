@@ -2,6 +2,44 @@
 //! one goes to.
 
 use super::protocol::{ImportColumn, ImportSpec};
+use crate::encoding::Encoding;
+
+/// The encodings a file can be read as in the import window.
+pub const ENCODINGS: [Encoding; 6] = [
+    Encoding::Utf8,
+    Encoding::Windows1252,
+    Encoding::Latin1,
+    Encoding::Latin9,
+    Encoding::Utf16Le,
+    Encoding::Utf16Be,
+];
+
+/// The encoding the start of a file seems to be in, and its text (`cut`: the
+/// file goes on after it).
+pub fn detect_sample(bytes: &[u8], cut: bool) -> (String, Encoding) {
+    Encoding::detect_prefix(bytes, cut)
+}
+
+/// The text of a whole file, from its encoding (`label` as `Encoding` gives
+/// it; empty: found from the bytes). The marks at the start are dropped.
+#[allow(dead_code)] // the drivers read the whole file
+pub fn decode_file(bytes: Vec<u8>, label: &str) -> Result<String, String> {
+    let encoding = Encoding::ALL.into_iter().find(|e| e.label() == label);
+    let Some(encoding) = encoding else {
+        return Ok(Encoding::detect(&bytes).0);
+    };
+    let text = match encoding {
+        // The same bytes, no copy.
+        Encoding::Utf8 => {
+            let body = bytes
+                .strip_prefix(&[0xef, 0xbb, 0xbf][..])
+                .map(<[u8]>::to_vec);
+            String::from_utf8(body.unwrap_or(bytes)).ok()
+        }
+        other => other.decode(&bytes),
+    };
+    text.ok_or_else(|| format!("the file is not valid {label}"))
+}
 
 /// Most of the file that is read to show it and to count its columns.
 pub const SAMPLE_BYTES: usize = 256 * 1024;
@@ -211,8 +249,10 @@ pub fn auto_map(names: &[String], named: bool, targets: &[Target]) -> Vec<Option
 
 /// What the driver is asked: the fields that go somewhere, as the column's
 /// type wants them.
+#[allow(clippy::too_many_arguments)]
 pub fn spec(
     format: Format,
+    encoding: Encoding,
     delimiter: char,
     header: bool,
     empty_null: bool,
@@ -245,6 +285,7 @@ pub fn spec(
         header,
         file_columns: names.len(),
         empty_null,
+        encoding: encoding.label().to_string(),
         mapping: columns,
     }
 }
@@ -252,6 +293,36 @@ pub fn spec(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_that_is_not_utf8_is_read_in_the_encoding_it_has() {
+        // « é » in Windows-1252, then a start cut in the middle of a UTF-8 one.
+        assert_eq!(
+            decode_file(b"caf\xe9;1".to_vec(), "Windows-1252").unwrap(),
+            "café;1"
+        );
+        assert_eq!(
+            decode_file(b"caf\xc3\xa9".to_vec(), "UTF-8").unwrap(),
+            "café"
+        );
+        assert!(decode_file(b"caf\xe9".to_vec(), "UTF-8").is_err());
+        assert_eq!(
+            decode_file(b"\xef\xbb\xbfa".to_vec(), "UTF-8").unwrap(),
+            "a"
+        );
+        assert_eq!(
+            detect_sample(b"caf\xe9", false).1,
+            Encoding::Windows1252,
+            "Excel in French"
+        );
+        let cut = &"é".as_bytes()[..1];
+        let mut sample = b"a".to_vec();
+        sample.extend_from_slice(cut);
+        assert_eq!(
+            detect_sample(&sample, true),
+            ("a".to_string(), Encoding::Utf8)
+        );
+    }
 
     #[test]
     fn a_csv_is_cut_into_records_and_fields() {
@@ -356,7 +427,16 @@ mod tests {
         t[0].kind = "integer".into();
         let names: Vec<String> = vec!["a".into(), "b".into(), "c".into()];
         let mapping = vec![Some("id".to_string()), None, Some("born".to_string())];
-        let s = spec(Format::Csv, ';', true, true, &names, &mapping, &t);
+        let s = spec(
+            Format::Csv,
+            Encoding::Utf8,
+            ';',
+            true,
+            true,
+            &names,
+            &mapping,
+            &t,
+        );
         assert_eq!(
             (s.format.as_str(), s.delimiter.as_str(), s.file_columns),
             ("csv", ";", 3)

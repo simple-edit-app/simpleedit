@@ -10,7 +10,7 @@ use std::sync::Arc;
 const MAX_LINES: usize = 20_000;
 /// Files with more lines than this are checked in the background, once the
 /// typing pauses: checking every word at each keystroke would slow it.
-const SYNC_LINES: usize = 2_000;
+const SYNC_LINES: usize = 300;
 /// The pause.
 const PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -49,6 +49,8 @@ pub struct Suggestion {
 #[derive(Default)]
 pub struct SpellState {
     speller: Option<Speller>,
+    /// The language whose dictionary is being read in the background.
+    loading: Option<String>,
     /// The code of the language of `speller`.
     language: String,
     available: Option<Vec<Language>>,
@@ -65,6 +67,17 @@ pub struct SpellState {
     pub choices: Vec<String>,
 }
 
+/// The dictionary of a language with the words the user added.
+fn load_speller(language: &Language) -> Option<Speller> {
+    let mut speller = Speller::load(language).ok()?;
+    if let Some(words) = personal_file().and_then(|f| std::fs::read_to_string(f).ok()) {
+        for word in words.lines().filter(|w| !w.trim().is_empty()) {
+            speller.add_personal(word.trim());
+        }
+    }
+    Some(speller)
+}
+
 fn personal_file() -> Option<PathBuf> {
     crate::fsutil::config_dir().map(|d| d.join("simpleedit").join("dictionary.txt"))
 }
@@ -74,9 +87,10 @@ impl SimpleEditApp {
         self.spell.available.get_or_insert_with(spell::languages)
     }
 
-    /// The dictionary of the language, loaded when first needed (and again
-    /// when the language changes).
-    fn ensure_speller(&mut self) -> bool {
+    /// The dictionary of the language: whether it is there. When it is not,
+    /// it is read in the background (the first file opened, a change of
+    /// language) and the check is made again when it comes.
+    fn ensure_speller(&mut self) -> (bool, Task<Message>) {
         let interface = self.config.locale.clone();
         let wanted = self.config.spell_language.clone();
         let picked = {
@@ -85,27 +99,71 @@ impl SimpleEditApp {
         };
         let Some(language) = picked else {
             self.spell.speller = None;
-            return false;
+            return (false, Task::none());
         };
         if self.spell.speller.is_some() && self.spell.language == language.code {
-            return true;
+            return (true, Task::none());
         }
-        match Speller::load(&language) {
-            Ok(mut speller) => {
-                if let Some(words) = personal_file().and_then(|f| std::fs::read_to_string(f).ok()) {
-                    for word in words.lines().filter(|w| !w.trim().is_empty()) {
-                        speller.add_personal(word.trim());
-                    }
+        // The tests have no runtime to run a task: it is read on the spot.
+        if cfg!(test) {
+            return match load_speller(&language) {
+                Some(speller) => {
+                    self.spell.language = language.code;
+                    self.spell.speller = Some(speller);
+                    (true, Task::none())
                 }
-                self.spell.language = language.code;
-                self.spell.speller = Some(speller);
-                true
-            }
-            Err(_) => {
-                self.spell.speller = None;
-                false
-            }
+                None => {
+                    self.spell.speller = None;
+                    (false, Task::none())
+                }
+            };
         }
+        if self.spell.loading.as_deref() == Some(language.code.as_str()) {
+            return (false, Task::none());
+        }
+        self.spell.loading = Some(language.code.clone());
+        let code = language.code.clone();
+        (
+            false,
+            Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(move || load_speller(&language))
+                        .await
+                        .ok()
+                        .flatten()
+                },
+                move |speller| Message::SpellerLoaded(code.clone(), speller),
+            ),
+        )
+    }
+
+    /// The dictionary was read: the words are checked with it.
+    pub(super) fn speller_loaded(
+        &mut self,
+        code: String,
+        speller: Option<Speller>,
+    ) -> Task<Message> {
+        if self.spell.loading.as_deref() == Some(code.as_str()) {
+            self.spell.loading = None;
+        }
+        // The language may have been changed while it was read.
+        let interface = self.config.locale.clone();
+        let wanted = self.config.spell_language.clone();
+        let current = {
+            let available = self.spell_languages();
+            spell::pick_language(&wanted, &interface, available).map(|l| l.code.clone())
+        };
+        if current.as_deref() != Some(code.as_str()) {
+            self.spell.key = None;
+            return self.refresh_spelling();
+        }
+        self.spell.speller = speller;
+        if self.spell.speller.is_some() {
+            self.spell.language = code;
+        }
+        self.spell.generation += 1;
+        self.spell.key = None;
+        self.refresh_spelling()
     }
 
     /// Looks again at the words when the text, the file or the settings
@@ -145,9 +203,12 @@ impl SimpleEditApp {
         if !later {
             self.spell.marks.clear();
         }
-        if !self.ensure_speller() {
+        let (ready, loading) = self.ensure_speller();
+        if !ready {
             self.spell.marks.clear();
-            return Task::none();
+            // Asked again when the dictionary is there.
+            self.spell.key = None;
+            return loading;
         }
         let text = crate::editor::buffer_text(&self.editor.content);
         let ext = self.editor.language.clone().unwrap_or_default();
@@ -272,7 +333,9 @@ impl SimpleEditApp {
                     let mut words = std::fs::read_to_string(&file).unwrap_or_default();
                     words.push_str(&found.word);
                     words.push('\n');
-                    let _ = std::fs::write(&file, words);
+                    if let Err(e) = crate::fsutil::write_atomic(&file, words.as_bytes(), false) {
+                        self.set_status(format!("{}: {e}", t!("status.error")), true);
+                    }
                 }
             } else {
                 speller.ignore(&found.word);

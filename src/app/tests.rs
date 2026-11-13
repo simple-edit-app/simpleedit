@@ -50,6 +50,10 @@ mod behavior_tests {
             Message::SymbolHover(None),
             Message::SymbolHoverLoaded(0, iced::Point::ORIGIN, Ok(None)),
             Message::IpcPoll,
+            Message::FsChanged,
+            Message::FileSaved(None, Err("x".into())),
+            Message::FileReloaded(Err("x".into())),
+            Message::LargeRefreshed(PathBuf::from("/x"), Err("x".into())),
         ] {
             let _ = app.update(message);
             assert_eq!(app.open_menu, Some(TopMenu::Edit));
@@ -793,6 +797,7 @@ mod behavior_tests {
             active_file: None,
             untitled_counter: 1,
             api_tabs: vec![],
+            remote_files: vec![],
         };
         let mut fs = crate::session::FileSession {
             path: String::new(),
@@ -802,6 +807,7 @@ mod behavior_tests {
             dirty: false,
             crlf: false,
             final_newline: true,
+            mixed: false,
             encoding: String::new(),
             stamp: None,
         };
@@ -1795,7 +1801,7 @@ mod behavior_tests {
         let mut app = app();
         dirty_real_file(&mut app, dir.path());
         let _ = app.handle(Message::AutoSave);
-        assert!(app.autosaving, "a save was started");
+        assert!(app.autosaving > 0, "a save was started");
     }
 
     #[test]
@@ -1806,18 +1812,18 @@ mod behavior_tests {
         dirty_real_file(&mut typing, dir.path());
         typing.last_edit = std::time::Instant::now();
         let _ = typing.handle(Message::AutoSave);
-        assert!(!typing.autosaving);
+        assert_eq!(typing.autosaving, 0);
         // Turned off.
         let mut off = app_with_autosave_off();
         dirty_real_file(&mut off, dir.path());
         let _ = off.handle(Message::AutoSave);
-        assert!(!off.autosaving);
+        assert_eq!(off.autosaving, 0);
         // Nothing to save: an untitled tab is not a file.
         let mut untitled = app();
         untitled.is_dirty = true;
         untitled.last_edit = std::time::Instant::now() - std::time::Duration::from_secs(5);
         let _ = untitled.handle(Message::AutoSave);
-        assert!(!untitled.autosaving);
+        assert_eq!(untitled.autosaving, 0);
     }
 
     #[test]
@@ -1827,7 +1833,7 @@ mod behavior_tests {
         let path = dirty_real_file(&mut app, dir.path());
         std::fs::write(&path, "changed elsewhere, and longer\n").unwrap();
         let _ = app.handle(Message::AutoSave);
-        assert!(!app.autosaving);
+        assert_eq!(app.autosaving, 0);
     }
 
     #[test]
@@ -2360,6 +2366,18 @@ mod behavior_tests {
         };
         let _ = app.update(Message::Db(DbMsg::Rows(path.clone(), Done::ok(page))));
         (app, path)
+    }
+
+    #[test]
+    fn quitting_asks_when_a_table_has_edits_waiting_for_the_commit() {
+        use crate::database::DbMsg;
+        let (mut app, path) = db_app(true);
+        let _ = app.update(Message::Db(DbMsg::Edit(path.clone(), 1, 1)));
+        let _ = app.update(Message::Db(DbMsg::EditInput(path.clone(), "x".into())));
+        let _ = app.update(Message::Db(DbMsg::EditCommit(path.clone())));
+        app.overlay = ActiveOverlay::None;
+        let _ = app.update(Message::Quit);
+        assert!(matches!(app.overlay, ActiveOverlay::ConfirmQuit(_)));
     }
 
     #[test]
@@ -5470,6 +5488,37 @@ mod large_file_tests {
             at = end;
         }
         assert_eq!(all, std::fs::read_to_string(&path).unwrap());
+    }
+
+    #[test]
+    fn a_part_of_a_large_file_is_read_in_its_encoding_and_a_binary_one_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        // Windows-1252: « é » is one byte, not `�`.
+        let latin = dir.path().join("latin.log");
+        std::fs::write(&latin, b"caf\xe9\nth\xe9\n").unwrap();
+        let (text, _, end) = file_io::read_window(&latin, 0, 1000).unwrap();
+        assert_eq!(text, "café\nthé\n");
+        assert_eq!(end, 9, "the bytes of the file, not of the text");
+        let bin = dir.path().join("a.bin");
+        std::fs::write(&bin, b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR").unwrap();
+        assert_eq!(
+            file_io::read_window(&bin, 0, 1000).unwrap_err(),
+            t!("status.err_binary").to_string()
+        );
+    }
+
+    #[test]
+    fn utf16_without_a_mark_is_text_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        let mut bytes = Vec::new();
+        for unit in "hello wörld\nline two\n".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        let (text, encoding) = file_io::read_decoded(&path).unwrap();
+        assert_eq!(text, "hello wörld\nline two\n");
+        assert_eq!(encoding, crate::tabs::Encoding::Utf16Le);
     }
 
     #[test]

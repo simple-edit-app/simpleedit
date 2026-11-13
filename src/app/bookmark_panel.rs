@@ -81,9 +81,10 @@ pub fn ribbon<'a, M: 'a>(color: Color, filled: bool) -> Element<'a, M> {
 }
 
 impl SimpleEditApp {
-    /// Reads, for the bookmarked files that need it, the lines to show.
-    /// `all` forgets what was read before.
-    pub(super) fn refresh_bookmark_texts(&mut self, all: bool) {
+    /// Reads, for the bookmarked files that need it, the lines to show (off
+    /// the interface thread). `all` forgets what was read before. A file open
+    /// in a tab is shown as the tab has it, not as the disk has it.
+    pub(super) fn refresh_bookmark_texts(&mut self, all: bool) -> Task<Message> {
         let entries = self.bookmarks.entries();
         let panel = &mut self.bookmark_panel;
         if all {
@@ -92,30 +93,64 @@ impl SimpleEditApp {
         panel
             .texts
             .retain(|path, _| entries.iter().any(|e| &e.path == path));
-        for entry in entries {
-            if entry.lines.is_empty() || panel.texts.contains_key(&entry.path) {
-                continue;
-            }
-            if let Ok(text) = file_io::read_text(&entry.path) {
-                panel
-                    .texts
-                    .insert(entry.path, text.lines().map(str::to_string).collect());
-            }
-        }
         panel.built = self.bookmarks.rev;
+        let current = self.current_file.clone();
+        let wanted: Vec<PathBuf> = entries
+            .into_iter()
+            .filter(|e| {
+                !e.lines.is_empty()
+                    && !panel.texts.contains_key(&e.path)
+                    && current.as_ref() != Some(&e.path)
+                    && !self
+                        .file_cache
+                        .get(&e.path)
+                        .is_some_and(|b| b.content.is_some())
+            })
+            .map(|e| e.path)
+            .collect();
+        if wanted.is_empty() {
+            return Task::none();
+        }
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    wanted
+                        .into_iter()
+                        .filter_map(|path| {
+                            let text = file_io::read_text(&path).ok()?;
+                            Some((path, text.lines().map(str::to_string).collect()))
+                        })
+                        .collect::<Vec<(PathBuf, Vec<String>)>>()
+                })
+                .await
+                .unwrap_or_default()
+            },
+            Message::BookmarkTexts,
+        )
+    }
+
+    /// The lines of the files that were read.
+    pub(super) fn bookmark_texts_read(&mut self, read: Vec<(PathBuf, Vec<String>)>) {
+        for (path, lines) in read {
+            self.bookmark_panel.texts.insert(path, lines);
+        }
     }
 
     /// Looks again at the files when the bookmarks changed.
-    pub(super) fn refresh_bookmark_panel(&mut self) {
+    pub(super) fn refresh_bookmark_panel(&mut self) -> Task<Message> {
         if self.bookmark_panel.open && self.bookmark_panel.built != self.bookmarks.rev {
-            self.refresh_bookmark_texts(false);
+            return self.refresh_bookmark_texts(false);
         }
+        Task::none()
     }
 
     /// The text of a bookmarked line: from the editor for the open file.
     fn bookmark_line_text(&self, path: &Path, line: usize) -> String {
         let text = if self.current_file.as_deref() == Some(path) {
             self.editor.content.line(line).map(|l| l.to_string())
+        } else if let Some(content) = self.file_cache.get(path).and_then(|b| b.content.as_ref()) {
+            // A tab behind the one in front: its text, with what was typed.
+            content.line(line).map(|l| l.to_string())
         } else {
             self.bookmark_panel
                 .texts

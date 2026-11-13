@@ -132,6 +132,80 @@ fn only_variables(value: &str) -> bool {
         })
 }
 
+/// Whether a header or a parameter of this name carries a credential.
+fn is_sensitive(name: &str) -> bool {
+    let name = name.trim().to_lowercase();
+    [
+        "authorization",
+        "cookie",
+        "key",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+    ]
+    .iter()
+    .any(|word| name.contains(word))
+}
+
+/// The address with the values of its sensitive parameters (`?api_key=…`) and
+/// the password of its user (`https://user:pass@host`) taken out.
+fn scrub_url(url: &str) -> String {
+    let (head, rest) = match url.split_once('?') {
+        Some((head, rest)) => (head, Some(rest)),
+        None => (url, None),
+    };
+    let mut out = String::new();
+    // `scheme://user:password@host`: only the part before the first `/`
+    // after the scheme can hold it.
+    let (scheme, after) = match head.split_once("://") {
+        Some((scheme, after)) => (format!("{scheme}://"), after),
+        None => (String::new(), head),
+    };
+    out.push_str(&scheme);
+    let (authority, path) = match after.find('/') {
+        Some(i) => after.split_at(i),
+        None => (after, ""),
+    };
+    match authority.rsplit_once('@') {
+        Some((user, host)) => {
+            let name = user.split(':').next().unwrap_or("");
+            if user.contains(':') && !only_variables(&user[name.len() + 1..]) {
+                out.push_str(name);
+                out.push('@');
+            } else {
+                out.push_str(user);
+                out.push('@');
+            }
+            out.push_str(host);
+        }
+        None => out.push_str(authority),
+    }
+    out.push_str(path);
+    if let Some(rest) = rest {
+        let (query, fragment) = match rest.split_once('#') {
+            Some((q, f)) => (q, Some(f)),
+            None => (rest, None),
+        };
+        let cleaned: Vec<String> = query
+            .split('&')
+            .map(|pair| match pair.split_once('=') {
+                Some((key, value)) if is_sensitive(key) && !only_variables(value) => {
+                    format!("{key}=")
+                }
+                _ => pair.to_string(),
+            })
+            .collect();
+        out.push('?');
+        out.push_str(&cleaned.join("&"));
+        if let Some(fragment) = fragment {
+            out.push('#');
+            out.push_str(fragment);
+        }
+    }
+    out
+}
+
 fn each_request(items: &mut [Item], f: &mut impl FnMut(&mut Request)) {
     for item in items {
         match item {
@@ -279,7 +353,41 @@ pub fn delete_collection(id: u64) {
     }
 }
 
+/// Secrets whose entry in the keychain is to go (a variable that was
+/// renamed or is no secret any more, an environment that was deleted). The
+/// keychain is asked only when the environments are written, in the
+/// background: it is a round trip on D-Bus (and a locked one asks a question).
+static STALE: std::sync::Mutex<Vec<(u64, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Writes the environments off the interface thread: the writes go one at a
+/// time, in order, and one that a newer call has overtaken is skipped (the
+/// newer one holds more).
 pub fn save_environments(environments: &[Environment], active: Option<u64>, next_id: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LATEST: AtomicU64 = AtomicU64::new(0);
+    static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let environments = environments.to_vec();
+    let ticket = LATEST.fetch_add(1, Ordering::SeqCst) + 1;
+    let job = move || {
+        let _turn = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+        if LATEST.load(Ordering::SeqCst) == ticket {
+            write_environments(&environments, active, next_id);
+        }
+    };
+    // Tests read the file right after.
+    if cfg!(test) {
+        job();
+    } else {
+        std::thread::spawn(job);
+    }
+}
+
+/// `save_environments`, done when it returns: for the app that quits.
+pub fn save_environments_now(environments: &[Environment], active: Option<u64>, next_id: u64) {
+    write_environments(environments, active, next_id);
+}
+
+fn write_environments(environments: &[Environment], active: Option<u64>, next_id: u64) {
     let Some(root) = dir() else { return };
     // A secret goes to the keychain; where there is none, the file keeps it.
     let kept: Vec<Environment> = environments
@@ -294,6 +402,17 @@ pub fn save_environments(environments: &[Environment], active: Option<u64>, next
             env
         })
         .collect();
+    // What was renamed or no longer secret is forgotten after the new names
+    // are kept: the secret is never gone under both.
+    let stale = STALE.lock().map(|mut s| std::mem::take(&mut *s));
+    for (id, key) in stale.unwrap_or_default() {
+        let still_used = environments
+            .iter()
+            .any(|e| e.id == id && e.vars.iter().any(|v| v.secret && v.key == key));
+        if !still_used {
+            let _ = keychain_save(id, &secret_name(&key), "");
+        }
+    }
     let file = EnvironmentsFile {
         active,
         next_id,
@@ -304,15 +423,38 @@ pub fn save_environments(environments: &[Environment], active: Option<u64>, next
     }
 }
 
-/// Forgets one secret variable's entry in the keychain.
+/// A secret variable's entry in the keychain is to be forgotten at the next
+/// write of the environments.
 pub fn forget_secret(env_id: u64, key: &str) {
-    let _ = keychain_save(env_id, &secret_name(key), "");
+    if key.is_empty() {
+        return;
+    }
+    if let Ok(mut stale) = STALE.lock() {
+        let entry = (env_id, key.to_string());
+        if !stale.contains(&entry) {
+            stale.push(entry);
+        }
+    }
 }
 
-/// Forgets the secrets of an environment that was deleted.
+/// The secrets of an environment that was deleted are forgotten (in the
+/// background).
 pub fn forget_secrets(env: &Environment) {
-    for var in env.vars.iter().filter(|v| v.secret) {
-        let _ = keychain_save(env.id, &secret_name(&var.key), "");
+    let secrets: Vec<(u64, String)> = env
+        .vars
+        .iter()
+        .filter(|v| v.secret)
+        .map(|v| (env.id, secret_name(&v.key)))
+        .collect();
+    let job = move || {
+        for (id, name) in secrets {
+            let _ = keychain_save(id, &name, "");
+        }
+    };
+    if cfg!(test) {
+        job();
+    } else {
+        std::thread::spawn(job);
     }
 }
 
@@ -357,6 +499,15 @@ fn write_history(mut kept: Vec<HistoryEntry>) {
                 value.clear();
             }
         }
+        // A token typed as a header (or pasted from a curl command, which
+        // puts everything there), or as a parameter, is a credential too.
+        let request = &mut entry.request;
+        for pair in request.headers.iter_mut().chain(request.params.iter_mut()) {
+            if is_sensitive(&pair.key) && !only_variables(&pair.value) {
+                pair.value.clear();
+            }
+        }
+        request.url = scrub_url(&request.url);
     }
     if let Ok(text) = serde_json::to_string(&kept) {
         write(&root.join("history.json"), &text);
@@ -452,6 +603,42 @@ mod tests {
     }
 
     #[test]
+    fn a_renamed_secret_is_forgotten_under_its_old_name_only_when_the_environments_are_written() {
+        let _guard = lock();
+        let var = |key: &str| Variable {
+            key: key.into(),
+            value: "s3cret".into(),
+            secret: true,
+            ..Variable::default()
+        };
+        let mut env = Environment {
+            id: 31,
+            name: "dev".into(),
+            vars: vec![var("old")],
+        };
+        save_environments(std::slice::from_ref(&env), None, 32);
+        assert_eq!(
+            crate::database::secrets::load(31, "api:old").as_deref(),
+            Some("s3cret")
+        );
+        // Typing the new name asks nothing of the keychain: the secret is
+        // still there under the old name until the write.
+        env.vars[0].key = "new".into();
+        forget_secret(31, "old");
+        assert_eq!(
+            crate::database::secrets::load(31, "api:old").as_deref(),
+            Some("s3cret")
+        );
+        save_environments(std::slice::from_ref(&env), None, 32);
+        assert!(crate::database::secrets::load(31, "api:old").is_none_or(|v| v.is_empty()));
+        assert_eq!(
+            crate::database::secrets::load(31, "api:new").as_deref(),
+            Some("s3cret")
+        );
+        forget_secrets(&env);
+    }
+
+    #[test]
     fn the_credentials_of_a_request_stay_out_of_the_files() {
         let _guard = lock();
         let mut request = Request::new("login");
@@ -478,6 +665,54 @@ mod tests {
         assert_eq!(load().collections, vec![collection]);
         delete_collection(8);
         assert!(crate::database::secrets::load(77, "apiauth:token").is_none());
+    }
+
+    #[test]
+    fn the_history_keeps_no_token_typed_as_a_header_a_parameter_or_in_the_address() {
+        let _guard = lock();
+        let mut request = Request::new("call");
+        request.id = 78;
+        request.url = "https://bob:hunter2@api.test/v1?api_key=abc123&page=2&t={{tok}}".into();
+        let pair = |key: &str, value: &str| crate::api::model::Pair {
+            enabled: true,
+            key: key.into(),
+            value: value.into(),
+        };
+        request.headers = vec![
+            pair("Authorization", "Bearer eyJ-secret"),
+            pair("X-Api-Key", "k-secret"),
+            pair("Cookie", "sid=cookie-secret"),
+            pair("X-Token", "{{token}}"),
+            pair("Accept", "application/json"),
+        ];
+        request.params = vec![pair("access_token", "p-secret"), pair("page", "2")];
+        save_history(&[HistoryEntry {
+            request,
+            ..HistoryEntry::default()
+        }]);
+        let history = std::fs::read_to_string(dir().unwrap().join("history.json")).unwrap();
+        for secret in [
+            "eyJ-secret",
+            "k-secret",
+            "cookie-secret",
+            "p-secret",
+            "abc123",
+            "hunter2",
+        ] {
+            assert!(!history.contains(secret), "{secret} was kept");
+        }
+        // What is not a credential, and the variables, stay.
+        for kept in [
+            "application/json",
+            "{{token}}",
+            "page=2",
+            "t={{tok}}",
+            "bob@api.test",
+        ] {
+            assert!(history.contains(kept), "{kept} was lost");
+        }
+        assert_eq!(scrub_url("https://h/p?x=1#top"), "https://h/p?x=1#top");
+        assert_eq!(scrub_url("not a url"), "not a url");
     }
 
     #[test]

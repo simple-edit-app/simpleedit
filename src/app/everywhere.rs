@@ -162,6 +162,11 @@ pub struct Everywhere {
     dirs: Vec<(PathBuf, String)>,
     files_loading: bool,
     files_generation: u64,
+    /// What the last ranking of the files kept: the letters of the query, the
+    /// list it was made on (`files_generation`, `files.len()`), the types
+    /// left out, and the files and folders (by place) that held them all. A
+    /// longer query holds a subset of them: only those are scored again.
+    ranked: std::cell::RefCell<Option<Ranked>>,
     symbols: Vec<SymbolHit>,
     /// The names of the file shown: the list of the Symbols tab then, in the
     /// order of the file, instead of what the servers know of the projects.
@@ -201,6 +206,17 @@ fn file_type(path: &Path) -> String {
 }
 
 /// The folders of the listed files, shown like them with a final `/`.
+/// See `EverywhereState::ranked`.
+#[derive(Debug, Clone)]
+struct Ranked {
+    letters: Vec<char>,
+    list: (u64, usize),
+    excluded: BTreeSet<String>,
+    with_dirs: bool,
+    files: Vec<usize>,
+    dirs: Vec<usize>,
+}
+
 fn folders_of(files: &[(PathBuf, String)]) -> Vec<(PathBuf, String)> {
     let mut seen = BTreeSet::new();
     let mut dirs = Vec::new();
@@ -411,6 +427,7 @@ impl SimpleEditApp {
         }
         self.everywhere.dirs = folders_of(&files);
         self.everywhere.files = files;
+        *self.everywhere.ranked.borrow_mut() = None;
         self.everywhere.files_loading = false;
         self.everywhere_refresh();
         // The servers need a file of each language to be asked.
@@ -661,30 +678,58 @@ impl SimpleEditApp {
         let name = name.trim();
         let excluded = &self.everywhere.excluded;
         let query = crate::finder::prepare_query(name);
+        // A query that goes on from the last one can only match what that
+        // matched (the letters in order): the others are not looked at again.
+        let list = (
+            self.everywhere.files_generation,
+            self.everywhere.files.len(),
+        );
+        let all_files: Vec<usize>;
+        let all_dirs: Vec<usize>;
+        let (candidate_files, candidate_dirs): (&[usize], &[usize]) =
+            match self.everywhere.ranked.borrow().as_ref() {
+                Some(r)
+                    if r.list == list
+                        && r.excluded == *excluded
+                        && r.with_dirs == place.is_none()
+                        && !r.letters.is_empty()
+                        && query.starts_with(&r.letters) =>
+                {
+                    all_files = r.files.clone();
+                    all_dirs = r.dirs.clone();
+                    (&all_files, &all_dirs)
+                }
+                _ => {
+                    all_files = (0..self.everywhere.files.len()).collect();
+                    all_dirs = (0..self.everywhere.dirs.len()).collect();
+                    (&all_files, &all_dirs)
+                }
+            };
         // Only the scores and positions are kept: the rows are cloned for
         // the best `limit` alone.
-        let mut scored: Vec<(i64, bool, usize)> = self
-            .everywhere
-            .files
+        let mut scored: Vec<(i64, bool, usize)> = candidate_files
             .iter()
-            .enumerate()
+            .map(|&i| (i, &self.everywhere.files[i]))
             .filter(|(_, (p, _))| excluded.is_empty() || !excluded.contains(&file_type(p)))
             .filter_map(|(i, (_, shown))| {
                 crate::finder::score_prepared(&query, shown).map(|s| (s, true, i))
             })
             .collect();
         if place.is_none() {
-            scored.extend(
-                self.everywhere
-                    .dirs
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, (_, shown))| {
-                        crate::finder::score_prepared(&query, shown.trim_end_matches('/'))
-                            .map(|s| (s, false, i))
-                    }),
-            );
+            scored.extend(candidate_dirs.iter().filter_map(|&i| {
+                let (_, shown) = &self.everywhere.dirs[i];
+                crate::finder::score_prepared(&query, shown.trim_end_matches('/'))
+                    .map(|s| (s, false, i))
+            }));
         }
+        *self.everywhere.ranked.borrow_mut() = Some(Ranked {
+            letters: query.clone(),
+            list,
+            excluded: excluded.clone(),
+            with_dirs: place.is_none(),
+            files: scored.iter().filter(|s| s.1).map(|s| s.2).collect(),
+            dirs: scored.iter().filter(|s| !s.1).map(|s| s.2).collect(),
+        });
         // Best first; the order of the list for equal scores (files first).
         let best = |a: &(i64, bool, usize), b: &(i64, bool, usize)| {
             b.0.cmp(&a.0).then(b.1.cmp(&a.1)).then(a.2.cmp(&b.2))
@@ -1980,6 +2025,34 @@ mod tests {
 
     fn selected(app: &SimpleEditApp) -> &Row {
         &app.everywhere.rows[app.everywhere.selected]
+    }
+
+    #[test]
+    fn a_longer_query_ranks_the_same_as_when_typed_at_once() {
+        let dir = project();
+        let mut app = app_on(dir.path());
+        open(&mut app, dir.path(), Tab::Files);
+        let names = |app: &SimpleEditApp| -> Vec<String> {
+            app.everywhere
+                .rows
+                .iter()
+                .filter_map(|r| match r {
+                    Row::File(_, shown, _) => Some(shown.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        for query in ["m", "ma", "mai", "main", "main.r"] {
+            typed(&mut app, query);
+        }
+        let step_by_step = names(&app);
+        // Typed again from nothing: the list is scored as a whole.
+        typed(&mut app, "");
+        typed(&mut app, "main.r");
+        assert_eq!(names(&app), step_by_step);
+        // A shorter one than the last widens the list again.
+        typed(&mut app, "m");
+        assert!(names(&app).len() >= step_by_step.len());
     }
 
     #[test]

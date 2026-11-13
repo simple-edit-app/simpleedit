@@ -1225,8 +1225,10 @@ impl SimpleEditApp {
             | DbMsg::ImportStructure(_)
             | DbMsg::ImportPick
             | DbMsg::ImportPicked(_)
+            | DbMsg::ImportRead(..)
             | DbMsg::ImportFormat(_)
             | DbMsg::ImportDelimiter(_)
+            | DbMsg::ImportEncoding(_)
             | DbMsg::ImportHeader(_)
             | DbMsg::ImportEmptyNull(_)
             | DbMsg::ImportMap(..)

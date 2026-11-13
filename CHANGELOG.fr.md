@@ -1,5 +1,18 @@
 # Journal des modifications
 
+## [1.27.0] - 2026-11-13
+
+### Corrigé
+- Données : quitter demande d'abord confirmation quand une grille de table a des modifications en attente ou qu'un onglet de fusion est à moitié réglé ; « Récupérer depuis une révision » demande avant de remplacer un fichier, et garde le fichier tel qu'il était (Ctrl+Z dans un diff, historique local) ; les copies de fichiers distants (SSH) continuent d'être renvoyées après un redémarrage ; un fichier aux fins de ligne mélangées garde la fin des lignes qu'on n'a pas touchées (la barre d'état dit « Fins mixtes » tant qu'aucune n'est choisie) ; les résolutions de conflit, l'annulation d'un bloc, `.gitignore`, le dictionnaire personnel et un fichier rendu par l'historique local sont écrits en entier ou pas du tout ; renommer le fichier ouvert garde son historique d'annulation.
+- Menus : un build qui écrit dans le projet, l'enregistrement automatique, un fichier réécrit par un autre programme et la sortie d'une tâche ne ferment plus un menu ouvert ; les couches des menus gardent leur place dans la fenêtre, donc l'éditeur garde le focus.
+- Bases de données : l'alerte « UPDATE/DELETE sans WHERE » ne se laisse plus tromper par une sous-requête ou un `WITH` ; un CSV en Windows-1252 (Excel) ou en UTF-16 s'importe, avec un choix d'encodage dans la fenêtre.
+- API : les jetons dans les en-têtes, les paramètres et les adresses n'entrent plus dans l'historique ; le trousseau n'est sollicité qu'à l'écriture des environnements, en arrière-plan, pas à chaque touche.
+- Tâches : les compilateurs parlent anglais au panneau des problèmes ; fermer un terminal termine ce que son shell a lancé ; « Nouvelle fenêtre » ne laisse plus de processus zombie.
+- Fichiers : l'UTF-16 sans marque d'ordre des octets s'ouvre comme du texte ; les parties d'un fichier de plus de 64 Mo sont lues dans leur encodage et un binaire est refusé ; « Comparer avec le disque » lit le fichier dans l'encodage de l'onglet ; les noms qui ne sont pas en UTF-8 sont listés par Ctrl+P ; déplacer vers un autre disque copie puis supprime ; un « Dupliquer » en échec retire sa copie partielle ; le panneau des signets montre le texte des onglets ; un dossier qu'on vient de créer est surveillé aussitôt ; l'onglet d'aperçu remplacé est fermé pour les serveurs de langage ; « Lancer la collection » pendant un lancement garde son statut ; l'enregistrement automatique d'un lot compte ses fichiers.
+
+### Modifié
+- Vitesse : dupliquer un dossier, « Tout remplacer », le renommage d'un symbole, un retour de l'historique local, le rechargement de l'arbre, le dictionnaire, l'aperçu d'une recherche, le changement d'encodage, « Rétablir » et le fichier choisi à importer se font hors du fil de l'interface ; Ctrl+P garde les candidats de la recherche qu'il prolonge ; l'arbre ne dessine que les lignes en vue ; les réglages et les signets sont écrits par la minuterie, pas à chaque cran ; plus d'interrogation toutes les 300 ms pour les fichiers envoyés par une autre fenêtre ; les images du terminal ne refont plus le reste de la fenêtre.
+
 ## [1.26.2] - 2026-11-12
 
 ### Corrigé

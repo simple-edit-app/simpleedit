@@ -488,9 +488,17 @@ pub async fn merge_text(repo: &Path, path: &str) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
+/// Writes a file of the user whole or not at all (a crash or a full disk
+/// must not leave it cut short).
+async fn write_whole(path: PathBuf, text: String) -> std::io::Result<()> {
+    tokio::task::spawn_blocking(move || crate::fsutil::write_atomic(&path, text.as_bytes(), false))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
 /// Writes the settled text of a conflicted file and marks it settled.
 pub async fn resolve_with(repo: &Path, path: &str, text: &str) -> Result<(), String> {
-    tokio::fs::write(repo.join(path), text)
+    write_whole(repo.join(path), text.to_string())
         .await
         .map_err(|e| format!("{path}: {e}"))?;
     run(repo, &["add", "--", path]).await.map(|_| ())
@@ -847,7 +855,7 @@ pub async fn rollback_block(
         })
         .collect();
     lines.splice(block.at..end, old);
-    tokio::fs::write(&target, lines.concat())
+    write_whole(target.clone(), lines.concat())
         .await
         .map_err(|e| format!("{path}: {e}"))
 }
@@ -1050,7 +1058,7 @@ pub async fn ignore_file(repo: &Path, path: &str) -> Result<bool, String> {
         }
         text.push_str(&pattern);
         text.push('\n');
-        tokio::fs::write(&file, text)
+        write_whole(file.clone(), text)
             .await
             .map_err(|e| format!(".gitignore: {e}"))?;
     }

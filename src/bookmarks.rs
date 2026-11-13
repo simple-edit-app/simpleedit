@@ -100,6 +100,17 @@ impl Bookmarks {
         })
     }
 
+    /// What to write, if the bookmarks changed since the last write: for a
+    /// write off the interface thread.
+    pub fn take_write(&mut self) -> Option<(PathBuf, String)> {
+        if !self.dirty {
+            return None;
+        }
+        let (path, json) = (Self::store()?, serde_json::to_string(self).ok()?);
+        self.dirty = false;
+        Some((path, json))
+    }
+
     /// Writes the bookmarks if they changed since the last write. A failed
     /// write is retried on the next call.
     pub fn save(&mut self) {
